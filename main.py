@@ -6,6 +6,7 @@ from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain.agents import Tool
 from langchain.agents import initialize_agent
 import google.generativeai as genai
+import time
 
 os.environ["GOOGLE_API_KEY"] = "AIzaSyAUfhIfOVjkaUBIUam4DiX8PhD3617xIT4"
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
@@ -13,25 +14,40 @@ os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = "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"
 os.environ["LANGCHAIN_PROJECT"] = "pr-kindly-self-49"
 
-def initialize_second_llm():
-    # Configure generative AI with API key
-    genai.configure(api_key="AIzaSyCrFl6efNwRJ8cGu8HQe1wCl1AVUHgRpGk")
+tic = time.perf_counter()
+print("Initialising embedding model")
+model = SentenceTransformer('sentence-transformers/all-MiniLM-L12-v2')
+toc = time.perf_counter()
+print(f"Initialised embedding model in {toc - tic:0.4f} seconds")
 
-    # Generation configuration for the AI model
-    generation_config = {
-        "temperature": 0,
-        "top_p": 0.95,
-        "top_k": 64,
-        "max_output_tokens": 8192,
-        "response_mime_type": "text/plain"
-        # Pass the tool to the model configuration
-    }
-    model = SentenceTransformer('sentence-transformers/all-MiniLM-L12-v2')
+def initialize_pinecone():
+    tic = time.perf_counter()
+    print("Initialising pinecone")
+    pc = Pinecone(api_key="84641b3f-7be7-4a15-aa8e-91552da0ca04")
 
-    def fetch_product_data(query: str) -> str:
-        """Searches the database and returns top 3 products matching the query."""
+    index_name = "egenie-products"
+
+    if index_name not in pc.list_indexes().names():
+        pc.create_index(
+        name=index_name,
+        dimension=384,
+        metric="cosine",
+        spec=ServerlessSpec(
+            cloud='aws',
+            region='us-east-1'
+        )
+    )
+    
+    index = pc.Index(index_name)
+    toc = time.perf_counter()
+    print(f"Initialised pinecone in {toc - tic:0.4f} seconds")
+    return index
+
+def fetch_product_data(query: str) -> str:
+        """Searches the database and returns top 5 products matching the query."""
 
         print("Query to the db: ",query)
+        tic = time.perf_counter()
         query_vector = model.encode(query).tolist()
         # Perform the similarity search
         search_results = index.query(
@@ -51,68 +67,73 @@ def initialize_second_llm():
             # print(product['description'])
         # print(product_data)
         # print(product_data)
-        
+        toc = time.perf_counter()
+        print(f" pinecone querying took {toc - tic:0.4f} seconds")
 
         return product_data
+
+def initialize_second_llm():
+    tic = time.perf_counter()
+    print("Initialising backend LLM")
+    # Configure generative AI with API key
+    genai.configure(api_key="AIzaSyB7AQZhEs_jYxPcHfGG6X9H5YSZafm4LKg")
+
+    # Generation configuration for the AI model
+    generation_config = {
+        "temperature": 0.0,
+        "top_p": 0.95,
+        "top_k": 64,
+        "max_output_tokens": 8192,
+        "response_mime_type": "text/plain"
+        # Pass the tool to the model configuration
+    }
 
     # Initialize the generative model
     genaimodel = genai.GenerativeModel(
         model_name="gemini-1.5-flash",
         generation_config=generation_config,
+
         system_instruction="""You are an assistant AI which will help another AI who is asking questions to you about which products do we have in our database. You MUST ALWAYS use the tools provided to you to find information for every query, DO NOT generate product recommendations by yourself and ALWAYS use the tools response.
-        
-        Ensure you exclude terms like "not" or "without" from the search query to avoid incorrect results.
 
         You have the ability to perform product searches on the database, just generate a query to search on the database based on what the requesting AI needs. The query you generate for the fetch_product_data tool has to be in the form of a product description or name of a product or price of the product, as you are searching on a vector databse the results will be similar to what keywords you are searching. The keywords should be short and precise to get perfect results.
         
-        When receiving a response from the tool, parse the JSON response to extract the relevant product information such as name, link, description, and price of the product.
-        
-        DO NOT ask for follow up questions. Your task is to generate a search query which is going to be invoked on a pinecone vector database which has product information. You have the ability to search on our pinecone database. The query which you will insert, you will get a response which matches the words of your query, you recieve top 5 matches to your query, Hence your query should be small and precise to fetch relevant products and help the other AI by providing them with all the product details you receive so they can help the customer requesting for the product. Your job is to only analyse the question of the AI, form a perfect query to search on our pinecone database and then return all the product information in a neat formatted way. NEVER generate product recommendations from your own memory. Product details should be strictly based on the data from the tools.
+        DO NOT ask for follow up questions. Your task is to generate a search query which is going to be invoked on a pinecone vector database which has product information. You have the ability to search on our pinecone database. The query which you will insert, you will get a response which matches the words of your query, you recieve top 5 matches to your query, Hence your query should be small and precise to fetch relevant products and help the other AI by providing them with all the product details you receive so they can help the customer requesting for the product. Your job is to only analyse the question of the AI, form a perfect query to search on our pinecone database and return the output of the tool as a response to the requesting AI. Give all the product information, do not leave out any product information recieved from searching the database and always include a link . NEVER generate product recommendations from your own memory. Product details should be strictly based on the data from the tools.
         """
         , tools=[fetch_product_data]
     )
-
+    toc = time.perf_counter()
+    print(f"Initialised backend LLM in {toc - tic:0.4f} seconds")
     return genaimodel
 
 def initialize_first_llm():
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+    tic = time.perf_counter()
+    print("Initialising frontend LLM")
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+    toc = time.perf_counter()
+    print(f"Initialised frontend LLM in {toc - tic:0.4f} seconds")
     return llm
-
-def initialize_pinecone():
-    pc = Pinecone(api_key="84641b3f-7be7-4a15-aa8e-91552da0ca04")
-
-    index_name = "egenie-products"
-
-    if index_name not in pc.list_indexes().names():
-        pc.create_index(
-        name=index_name,
-        dimension=384,
-        metric="cosine",
-        spec=ServerlessSpec(
-            cloud='aws',
-            region='us-east-1'
-        )
-    )
-    
-    index = pc.Index(index_name)
-    return index
-
-
+"""
+user -> llm -> backend llm -> llm -> user
+"""
 
 def initialize_langchain_agent():
-    
+    tic = time.perf_counter()
+    print("Initialising langchain agent")
     def ask_details(query):
-        chat_session = llm2.start_chat(enable_automatic_function_calling=True, history=[])
+        chat_session = llm2.start_chat(enable_automatic_function_calling=True)
+        tic = time.perf_counter()
         response = chat_session.send_message(query)
+        toc = time.perf_counter()
+        print(f"Backend LLM took {toc - tic:0.4f} seconds")
         return response.text
 
     search_tool = Tool(
-    name='Ask Another AI',
-    func=ask_details,
-    description=(
-        "This tool enables you to talk with another AI who will search the product information for you. You have to tell this AI what product you want to search for based on the user query, this AI will return you a response which contains top 5 product it found from the database. Format the response from this tool utilise this information to properly answer the user"
+        name='Ask Another AI',
+        func=ask_details,
+        description=(
+            "This tool enables you to talk with another AI who will search the product information for you. You have to tell this AI what product you want to search for based on the user query, this AI will return you a response which contains top 5 product it found from the database. Format the response from this tool utilise this information to properly answer the user"
+        )
     )
-)
 
     tools = [search_tool]
 
@@ -140,7 +161,7 @@ def initialize_langchain_agent():
         - Egenie4u specializes in a wide range of products, particularly in electronics, custom-built PCs, and computer peripherals. 
 
         # Objective:
-        Provide a friendly and human-like customer interaction experience, ensuring relevant product recommendations that match the user’s query and preferences, while effectively convincing the user to make a purchase.
+        Provide a friendly and human-like customer interaction experience, ensuring relevant product recommendations that match the user's query and preferences, while effectively convincing the user to make a purchase.
 
         # System:
         - Use a tool to talk with another AI for getting product details based on the user query.
@@ -227,6 +248,9 @@ def initialize_langchain_agent():
     # print(conversational_agent.agent.llm_chain.prompt.messages[0])
     conversational_agent.agent.llm_chain.prompt.messages[0].prompt.template = system
 
+    toc = time.perf_counter()
+    print(f"Initialised langchain agent in {toc - tic:0.4f} seconds")
+
     return conversational_agent
 
 
@@ -237,16 +261,12 @@ agent = initialize_langchain_agent()
 
 while True:
     user_input = input("You: ")
+    tic = time.perf_counter()
     response = agent(user_input)
     print("AI: ", response['output'])
+    toc = time.perf_counter()
+    print(f"Response took {toc - tic:0.4f} seconds")
 
     if user_input.lower() == 'exit':
         break
 
-
-
-# chat_session = model.start_chat(enable_automatic_function_calling=True, history=[])
-
-# matching_products = fetch_product_data(query)
-
-# print(matching_products[0]['name'])
