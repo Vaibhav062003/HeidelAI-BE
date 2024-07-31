@@ -43,6 +43,18 @@ def initialize_pinecone():
     print(f"Initialised pinecone in {toc - tic:0.4f} seconds")
     return index
 
+def format_product_data(product_data: list) -> str:
+    """Formats product data into a JSON string."""
+    formatted_products = []
+    for product in product_data:
+        formatted_products.append({
+            "name": product.get("name", ""),
+            "description": product.get("description", "").replace('\n', ' ').replace('"', '\\"'),
+            "price": product.get("price", ""),
+            "permalink": product.get("permalink", "")
+        })
+    return json.dumps(formatted_products, ensure_ascii=False)
+
 def fetch_product_data(query: str) -> str:
         """Searches the database and returns top 5 products matching the query."""
 
@@ -57,7 +69,6 @@ def fetch_product_data(query: str) -> str:
             include_metadata=True  # Ensure metadata is included
         )
 
-
         # Extract and return metadata from search results
         product_data = [result['metadata'] for result in search_results['matches']]
         count = 1
@@ -67,8 +78,10 @@ def fetch_product_data(query: str) -> str:
             # print(product['description'])
         # print(product_data)
         # print(product_data)
+
         toc = time.perf_counter()
         print(f" pinecone querying took {toc - tic:0.4f} seconds")
+        product_data = format_product_data(product_data)
 
         return product_data
 
@@ -93,12 +106,15 @@ def initialize_second_llm():
         model_name="gemini-1.5-flash",
         generation_config=generation_config,
 
-        system_instruction="""You are an assistant AI which will help another AI who is asking questions to you about which products do we have in our database. You MUST ALWAYS use the tools provided to you to find information for every query, DO NOT generate product recommendations by yourself and ALWAYS use the tools response.
+        system_instruction="""
+        You are an assistant AI that helps another AI by searching our product database. Always use the provided tools and do not generate product recommendations yourself.
 
-        You have the ability to perform product searches on the database, just generate a query to search on the database based on what the requesting AI needs. The query you generate for the fetch_product_data tool has to be in the form of a product description or name of a product or price of the product, as you are searching on a vector databse the results will be similar to what keywords you are searching. The keywords should be short and precise to get perfect results.
-        
-        DO NOT ask for follow up questions. Your task is to generate a search query which is going to be invoked on a pinecone vector database which has product information. You have the ability to search on our pinecone database. The query which you will insert, you will get a response which matches the words of your query, you recieve top 5 matches to your query, Hence your query should be small and precise to fetch relevant products and help the other AI by providing them with all the product details you receive so they can help the customer requesting for the product. Your job is to only analyse the question of the AI, form a perfect query to search on our pinecone database and return the output of the tool as a response to the requesting AI. Give all the product information, do not leave out any product information recieved from searching the database and always include a link . NEVER generate product recommendations from your own memory. Product details should be strictly based on the data from the tools.
+        DO NOT ask any questions.
+
+        Generate a precise search query based on the requesting AI's needs. The query should be a product description, name, or price, using short and precise keywords. Invoke the fetch_product_data tool to search the Pinecone vector database. Return the full response from the tool, including all product details and the link.
         """
+        
+        
         , tools=[fetch_product_data]
     )
     toc = time.perf_counter()
@@ -270,3 +286,9 @@ while True:
     if user_input.lower() == 'exit':
         break
 
+
+        """You are an assistant AI which will help another AI who is asking questions to you about which products do we have in our database. You MUST ALWAYS use the tools provided to you to find information for every query, DO NOT generate product recommendations by yourself and ALWAYS use the tools response.
+
+        You have the ability to perform product searches on the database, just generate a query to search on the database based on what the requesting AI needs. The query you generate for the fetch_product_data tool has to be in the form of a product description or name of a product or price of the product, as you are searching on a vector databse the results will be similar to what keywords you are searching. The keywords should be short and precise to get perfect results.
+        
+        DO NOT ask for follow up questions. Your task is to generate a search query which is going to be invoked on a pinecone vector database which has product information. You have the ability to search on our pinecone database. The query which you will insert, you will get a response which matches the words of your query, you recieve top 5 matches to your query, Hence your query should be small and precise to fetch relevant products and help the other AI by providing them with all the product details you receive so they can help the customer requesting for the product. Your job is to only analyse the question of the AI, form a perfect query to search on our pinecone database and return the output of the tool as a response to the requesting AI. Give all the product information, do not leave out any product information recieved from searching the database and always include a link."""
