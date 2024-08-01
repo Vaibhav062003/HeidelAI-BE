@@ -181,7 +181,8 @@ def initialize_langchain_agent():
 ###################################################################################################
 
 def initialize_database():
-    db_uri = "mysql://doadmin:AVNS_tiVES2PpTq7pDxUq42s@68.183.94.53/egen_chatbot"
+    # postgresql://egenie:mTt-zNDpB35pjYZ7lEotLw@chatbot-5648.7s5.aws-ap-south-1.cockroachlabs.cloud:26257/defaultdb
+    db_uri = "cockroachdb://egenie:mTt-zNDpB35pjYZ7lEotLw@chatbot-5648.7s5.aws-ap-south-1.cockroachlabs.cloud:26257/defaultdb"
 
     # Create the SQLAlchemy engine
     engine = create_engine(db_uri)
