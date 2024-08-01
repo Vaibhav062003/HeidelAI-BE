@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocke
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from langchain_community.utilities import SQLDatabase
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
@@ -181,13 +181,10 @@ def initialize_langchain_agent():
 ###################################################################################################
 
 def initialize_database():
-    # postgresql://egenie:mTt-zNDpB35pjYZ7lEotLw@chatbot-5648.7s5.aws-ap-south-1.cockroachlabs.cloud:26257/defaultdb
     db_uri = "cockroachdb://egenie:mTt-zNDpB35pjYZ7lEotLw@chatbot-5648.7s5.aws-ap-south-1.cockroachlabs.cloud:26257/defaultdb"
 
     # Create the SQLAlchemy engine
     engine = create_engine(db_uri)
-    
-    db = SQLDatabase(engine)
     
     # Create queries table if it doesn't exist
     create_table_query = """
@@ -199,9 +196,7 @@ def initialize_database():
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
-    alter_table_query = """
-    ALTER TABLE chat_history CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-    """
+
     # Create users table if it doesn't exist
     create_table_users = """
     CREATE TABLE IF NOT EXISTS users (
@@ -211,12 +206,14 @@ def initialize_database():
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
-    db.run(create_table_query)
-    db.run(alter_table_query)
-    db.run(create_table_users)
-    return db
 
-db = initialize_database()
+    with engine.connect() as connection:
+        connection.execute(text(create_table_query))
+        connection.execute(text(create_table_users))
+    
+    return engine
+
+engine = initialize_database()
 index = initialize_pinecone()
 llm1 = initialize_first_llm()
 agent = initialize_langchain_agent()
@@ -229,23 +226,14 @@ def generate_user_id():
 gkey = "86c9abe0-f0a8-4230-9fce-ba54a70c538f"
 BEARER_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZGVudGlmaWVyIjoyNjk1fQ.kSE16TbPskzEm1mX_RrIlXqWkF97pI9JzkOjVMsXl-Y"
 
-def sanitize_input(value):
-    # Sanitize for SQL injection
-    sanitized_value = re.sub(r"(['\"\\])", r"\\\1", value)
-    # Remove non-UTF-8 characters
-    return sanitized_value.encode('utf-8', 'ignore').decode('utf-8')
-
 def store_query_in_db(user_id, query, response):
-    sanitized_user_id = sanitize_input(user_id)
-    sanitized_query = sanitize_input(query)
-    sanitized_response = sanitize_input(response)
-        
-    insert_query = f"""
+    insert_query = text("""
     INSERT INTO chat_history (user_id, query, response)
-    VALUES ('{sanitized_user_id}','{sanitized_query}', '{sanitized_response}')
-    """
-    db.run(insert_query)
-
+    VALUES (:user_id, :query, :response)
+    """)
+    
+    with engine.connect() as connection:
+        connection.execute(insert_query, {'user_id': user_id, 'query': query, 'response': response})
 
 app = FastAPI()
 
@@ -283,12 +271,14 @@ def verify_jwt_token(authorization: str = Header(...)) -> str:
 async def protected_route(token: str = Depends(verify_jwt_token)):
     return {"success": True, "message": f"Access granted for {token}"}
 
-def store_user_in_db(db, userName, userEmail):
-    insert_query = f"""
+def store_user_in_db(userName, userEmail):
+    insert_query = text("""
     INSERT INTO users (userName, userEmail)
-    VALUES ('{userName}', '{userEmail}')
-    """
-    db.run(insert_query)
+    VALUES (:userName, :userEmail)
+    """)
+    
+    with engine.connect() as connection:
+        connection.execute(insert_query, {'userName': userName, 'userEmail': userEmail})
 
 @app.post("/send-mail-otp")
 async def send_otp(email_input: EmailInput):
@@ -310,7 +300,7 @@ async def send_otp(otp_input: OtpInput):
     userName = otp_input.name
     userEmail = otp_input.email
 
-    store_user_in_db(db,userName, userEmail)
+    store_user_in_db(userName, userEmail)
 
     url = 'https://api.fazpass.com/v1/otp/verify'
     payload = {'otp_id': otp_input.otp_id, 'otp' : otp_input.otp}
