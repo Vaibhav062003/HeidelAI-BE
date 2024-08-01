@@ -1,4 +1,4 @@
-import random, string, secrets, re, json, os, httpx, jwt
+import random, string, secrets, re, json, os, httpx, jwt, time
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -142,7 +142,6 @@ def initialize_langchain_agent():
         agent = 'chat-conversational-react-description',
         tools = tools,
         llm = llm1,
-        verbose = True,
         max_iterations = 3,
         early_stopping_method = 'generate',
         memory = memory
@@ -239,8 +238,7 @@ def store_query_in_db(user_id, query, response):
     sanitized_user_id = sanitize_input(user_id)
     sanitized_query = sanitize_input(query)
     sanitized_response = sanitize_input(response)
-    print("func called response: ", response)
-    
+        
     insert_query = f"""
     INSERT INTO chat_history (user_id, query, response)
     VALUES ('{sanitized_user_id}','{sanitized_query}', '{sanitized_response}')
@@ -343,9 +341,13 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
+            print("Input: ",data)
+            tic = time.perf_counter()
             output = agent(data)
             response = output['output']
-            print("Main response: ",response)
+            print("Response: ",response)
+            toc = time.perf_counter()
+            print(f"Response took {toc - tic:0.4f} seconds")
 
             # Store query and response in the database
             store_query_in_db(user_id, data, response)

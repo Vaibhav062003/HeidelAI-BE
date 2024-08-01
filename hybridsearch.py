@@ -54,7 +54,7 @@ bm25_encoder = BM25Encoder().default()
 bm25_encoder = BM25Encoder().load("bm25_values.json")
 
 retriever = PineconeHybridSearchRetriever(
-    top_k=10,
+    top_k=5,
     embeddings=embeddings, 
     sparse_encoder=bm25_encoder, 
     index=index
@@ -63,6 +63,6 @@ retriever = PineconeHybridSearchRetriever(
 # retriever.add_texts(products)
 tic = time.perf_counter()
 values =  retriever.invoke("gaming laptop")
-toc = time.perf_counter()
 print(values)
+toc = time.perf_counter()
 print(f"Response took {toc - tic:0.4f} seconds")
