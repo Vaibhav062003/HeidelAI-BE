@@ -241,7 +241,7 @@ def initialize_langchain_agent():
     return conversational_agent
 
 
-index = initialize_pinecone()
+# index = initialize_pinecone()
 llm1 = initialize_first_llm()
 llm2 = initialize_second_llm()
 agent = initialize_langchain_agent()

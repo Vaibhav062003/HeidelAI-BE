@@ -230,7 +230,7 @@ SQL Database Interaction Guidelines:
 4. Value-Based Recommendations:
    - Recommend products based on best value and budget
    - Consider factors like RAM, price, screen size, processor, and graphics card for electronics
-   - For other categories, focus on material quality, brand reputation, or customer ratings
+   - For other categories, focus on material qub ality, brand reputation, or customer ratings
 
 5. Default Recommendations:
    - If a customer doesn't specify requirements, ask for their budget and use case

@@ -15,7 +15,7 @@ os.environ["GOOGLE_API_KEY"] = "AIzaSyAUfhIfOVjkaUBIUam4DiX8PhD3617xIT4"
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = "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"
-os.environ["LANGCHAIN_PROJECT"] = "pr-kindly-self-49"
+os.environ["LANGCHAIN_PROJECT"] = "chatbot"
 
 model = SentenceTransformer('sentence-transformers/all-MiniLM-L12-v2')
 
@@ -129,7 +129,7 @@ search_product_tool = Tool(
     ]
 )
 
-def initialize_langchain_agent():
+def initialize_langchain_agent(llm1):
     tools = [search_product_tool, policies_tool, company_info_tool]
 
     memory = ConversationBufferWindowMemory(
@@ -161,7 +161,7 @@ def initialize_langchain_agent():
     - Assess the user's question to determine whether to call a tool for additional information.
     - Use the 'fetch_policies' tool for policy-related questions.
     - Use the 'fetch_company_info' tool for company-related questions.
-    - Use the 'search_product_tool' for product queries and provide relevant recommendations based on user preferences. 
+    - Use the 'search_product_tool' for product queries and provide relevant recommendations based on user preferences.
     - *ALWAYS include the link* to the product in the response.
     - If the query involves negation or exclusion (e.g., "Not gaming laptop"), reframe the query to ensure it effectively filters out the excluded terms. Construct a query that can be accurately used to search within a vector database.
 
@@ -171,12 +171,12 @@ def initialize_langchain_agent():
     # Instructions:
     - When providing product recommendations, **avoid starting responses with phrases like "Based on the information" or similar.** Instead, start with phrases like "We have ..." or "Here's ..." to make the response feel more engaging and customer-focused.
     - Follow the guidelines for customer engagement, product search, presenting products, and convincing the user as outlined above.
+    - Check the product names and return only those which are asked for in the query.
+    - Format the response in a clear and readable manner, using bullet points, paragraphs, and other formatting techniques to make it easy for the user to understand.
     """
 
     conversational_agent.agent.llm_chain.prompt.messages[0].prompt.template = system
     return conversational_agent
-
-
 
 ###################################################################################################
 
@@ -185,14 +185,24 @@ def initialize_database():
 
     # Create the SQLAlchemy engine
     engine = create_engine(db_uri)
+
+    drop_table = """
+    DROP TABLE IF EXISTS testing;
+    """
+    drop_table2 = """
+    DROP TABLE IF EXISTS users;
+    """
     
     # Create queries table if it doesn't exist
     create_table_query = """
     CREATE TABLE IF NOT EXISTS chat_history (
         id SERIAL PRIMARY KEY,
         user_id VARCHAR(50),
+        username TEXT,
+        userEmail TEXT,
         query TEXT,
         response TEXT,
+        time_taken TEXT,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
@@ -208,6 +218,8 @@ def initialize_database():
     """
 
     with engine.connect() as connection:
+        # connection.execute(text(drop_table))
+        # connection.execute(text(drop_table2))
         connection.execute(text(create_table_query))
         connection.execute(text(create_table_users))
     
@@ -215,8 +227,11 @@ def initialize_database():
 
 engine = initialize_database()
 index = initialize_pinecone()
-llm1 = initialize_first_llm()
-agent = initialize_langchain_agent()
+
+def get_agent():
+    llm1 = initialize_first_llm()
+    return initialize_langchain_agent(llm1)
+
 
 def generate_user_id():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=10))
@@ -226,21 +241,21 @@ def generate_user_id():
 gkey = "86c9abe0-f0a8-4230-9fce-ba54a70c538f"
 BEARER_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZGVudGlmaWVyIjoyNjk1fQ.kSE16TbPskzEm1mX_RrIlXqWkF97pI9JzkOjVMsXl-Y"
 
-def store_query_in_db(user_id, query, response):
+def store_query_in_db(user_id, username, userEmail, query, response, time_taken):
     insert_query = text("""
-    INSERT INTO chat_history (user_id, query, response)
-    VALUES (:user_id, :query, :response)
+    INSERT INTO chat_history (user_id, username, userEmail, query, response, time_taken)
+    VALUES (:user_id, :username, :userEmail, :query, :response, :time_taken)
     """)
     
     with engine.connect() as connection:
-        connection.execute(insert_query, {'user_id': user_id, 'query': query, 'response': response})
+        connection.execute(insert_query, {'user_id': user_id, 'username': username, 'userEmail': userEmail, 'query': query, 'response': response, 'time_taken': time_taken})
 
 app = FastAPI()
 
 # CORS middleware configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost", "https://egeniestores.com"],
+    allow_origins=["https://egeniestores.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -256,6 +271,16 @@ class OtpInput(BaseModel):
     email: str
 
 SECRET_KEY = secrets.token_hex(32) 
+
+def create_jwt_token(userName, userEmail, otp_id, otp):
+    token_payload = {
+        'userName': userName,
+        'userEmail': userEmail,  # Include the username in the token payload
+        'otp_id': otp_id,
+        'otp' : otp
+    }
+    token = jwt.encode(token_payload, SECRET_KEY, algorithm="HS256")
+    return token
 
 def verify_jwt_token(authorization: str = Header(...)) -> str:
     try:
@@ -312,8 +337,10 @@ async def send_otp(otp_input: OtpInput):
         response = await client.post(url, json=payload, headers=headers)
         if response.status_code == 200:
             # Create a JWT token with the payload and secret key
-            token_payload = {'otp_id': otp_input.otp_id, 'otp': otp_input.otp}
-            token = jwt.encode(token_payload, SECRET_KEY, algorithm="HS256")
+            # token_payload = {'otp_id': otp_input.otp_id, 'otp': otp_input.otp}
+            # token = jwt.encode(token_payload, SECRET_KEY, algorithm="HS256")
+
+            token = create_jwt_token(userName, userEmail, otp_input.otp_id, otp_input.otp)
 
             # Get the response data from the OTP verification API
             response_data = response.json()
@@ -325,27 +352,59 @@ async def send_otp(otp_input: OtpInput):
         else:
             raise HTTPException(status_code=response.status_code, detail=response.text)
 
+def extract_token_from_headers(headers):
+    # Extract the token from the 'Authorization' header
+    authorization = headers.get('Authorization', '')
+    if authorization.startswith('Bearer '):
+        return authorization.split(' ')[1]
+    return None
+
+def decode_jwt_token(token):
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, agent=Depends(get_agent)):
     await websocket.accept()
+
+    # Extract token from headers
+    token = extract_token_from_headers(websocket.headers)
+    if token:
+        token_data = decode_jwt_token(token)
+        if token_data:
+            username = token_data.get('userName', 'Unknown')
+            userEmail = token_data.get('userEmail', 'Unknown')
+        else:
+            username = 'Unknown'
+            userEmail = 'Unknown'
+    else:
+        username = 'Unknown'
+        userEmail = 'Unknown'
+
     user_id = generate_user_id()
     try:
         while True:
             data = await websocket.receive_text()
-            print("Input: ",data)
+            print("Input: ", data)
             tic = time.perf_counter()
             output = agent(data)
             response = output['output']
-            print("Response: ",response)
+            print("Response: ", response)
             toc = time.perf_counter()
             print(f"Response took {toc - tic:0.4f} seconds")
+            time_taken = round(toc - tic, 4)
 
             # Store query and response in the database
-            store_query_in_db(user_id, data, response)
+            store_query_in_db(user_id, username, userEmail, data, response, time_taken)
             
             await websocket.send_text(response)
     except WebSocketDisconnect:
         pass
+
 
 @app.get("/")
 async def get():

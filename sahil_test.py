@@ -13,7 +13,7 @@ os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = "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"
 os.environ["LANGCHAIN_PROJECT"] = "pr-kindly-self-49"
 
-model = SentenceTransformer('sentence-transformers/all-MiniLM-L12-v2')
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 
 def initialize_pinecone():

@@ -11,42 +11,37 @@
     <button onclick="sendMessage()">Send</button>
 
     <script>
-        const ws = new WebSocket('ws://127.0.0.1:8000/ws');
-
+        const ws = new WebSocket('http://127.0.0.1:8000/ws');
+    
         function formatTextResponse(response) {
-        // Replace line breaks with <br> for HTML rendering
-        let formattedText = response.replace(/\n/g, "<br>");
-        
-        // Replace **text** with <strong>text</strong> for bold styling
-        formattedText = formattedText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-        
-        // Replace URLs with clickable links
-        formattedText = formattedText.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-        
-        return formattedText;
-    }
-
+            let formattedText = response.replace(/\n/g, "<br>");
+            formattedText = formattedText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            formattedText = formattedText.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+            return formattedText;
+        }
+    
         ws.onmessage = function(event) {
             const messages = document.getElementById('messages');
             const message = document.createElement('div');
-            // console.log(event)
-            const botMessage = event.data
-            message.innerHTML = 'Bot: ' + botMessage;
+            const data = JSON.parse(event.data);
+            const botMessage = data.response;
+            message.innerHTML = formatTextResponse(botMessage);
             messages.appendChild(message);
         };
-
+    
         function sendMessage() {
             const input = document.getElementById('messageInput');
             const message = input.value;
             ws.send(message);
-
+    
             const messages = document.getElementById('messages');
             const userMessage = document.createElement('div');
             userMessage.textContent = 'You: ' + message;
             messages.appendChild(userMessage);
-
+    
             input.value = '';
         }
     </script>
+    
 </body>
 </html>
