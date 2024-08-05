@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from langchain_community.utilities import SQLDatabase
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
@@ -184,7 +185,7 @@ def initialize_database():
     db_uri = "cockroachdb://egenie:mTt-zNDpB35pjYZ7lEotLw@chatbot-5648.7s5.aws-ap-south-1.cockroachlabs.cloud:26257/defaultdb"
 
     # Create the SQLAlchemy engine
-    engine = create_engine(db_uri)
+    engine = create_engine(db_uri, pool_pre_ping=True)
 
     drop_table = """
     DROP TABLE IF EXISTS testing;
@@ -236,19 +237,40 @@ def get_agent():
 def generate_user_id():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=10))
 
-           
-"""Code modified from below"""
+
 gkey = "86c9abe0-f0a8-4230-9fce-ba54a70c538f"
 BEARER_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZGVudGlmaWVyIjoyNjk1fQ.kSE16TbPskzEm1mX_RrIlXqWkF97pI9JzkOjVMsXl-Y"
 
-def store_query_in_db(user_id, username, userEmail, query, response, time_taken):
+def store_query_in_db(user_id, username, userEmail, query, response, time_taken, max_retries=3, retry_delay=2):
     insert_query = text("""
     INSERT INTO chat_history (user_id, username, userEmail, query, response, time_taken)
     VALUES (:user_id, :username, :userEmail, :query, :response, :time_taken)
     """)
     
-    with engine.connect() as connection:
-        connection.execute(insert_query, {'user_id': user_id, 'username': username, 'userEmail': userEmail, 'query': query, 'response': response, 'time_taken': time_taken})
+    retries = 0
+    while retries < max_retries:
+        try:
+            with engine.connect() as connection:
+                connection.execute(insert_query, {
+                    'user_id': user_id,
+                    'username': username,
+                    'userEmail': userEmail,
+                    'query': query,
+                    'response': response,
+                    'time_taken': time_taken
+                })
+            print("Data inserted successfully.")
+            break  # Exit the loop if the query succeeds
+        except OperationalError as e:
+            if 'SSL SYSCALL error: EOF detected' in str(e):
+                retries += 1
+                print(f"SSL SYSCALL error detected. Retrying {retries}/{max_retries}...")
+                time.sleep(retry_delay)  # Wait before retrying
+            else:
+                raise e  # Re-raise if it's not the specific error we're handling
+
+    if retries == max_retries:
+        print("Failed to insert data after multiple retries.")
 
 app = FastAPI()
 
@@ -296,14 +318,29 @@ def verify_jwt_token(authorization: str = Header(...)) -> str:
 async def protected_route(token: str = Depends(verify_jwt_token)):
     return {"success": True, "message": f"Access granted for {token}"}
 
-def store_user_in_db(userName, userEmail):
+def store_user_in_db(userName, userEmail, max_retries=3, retry_delay=2):
     insert_query = text("""
     INSERT INTO users (userName, userEmail)
     VALUES (:userName, :userEmail)
     """)
     
-    with engine.connect() as connection:
-        connection.execute(insert_query, {'userName': userName, 'userEmail': userEmail})
+    retries = 0
+    while retries < max_retries:
+        try:
+            with engine.connect() as connection:
+                connection.execute(insert_query, {'userName': userName, 'userEmail': userEmail})
+            print("Data inserted successfully.")
+            break  # Exit the loop if the query succeeds
+        except OperationalError as e:
+            if 'SSL SYSCALL error: EOF detected' in str(e):
+                retries += 1
+                print(f"SSL SYSCALL error detected. Retrying {retries}/{max_retries}...")
+                time.sleep(retry_delay)  # Wait before retrying
+            else:
+                raise e  # Re-raise if it's not the specific error we're handling
+
+    if retries == max_retries:
+        print("Failed to insert data after multiple retries.")
 
 @app.post("/send-mail-otp")
 async def send_otp(email_input: EmailInput):
