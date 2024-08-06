@@ -1,6 +1,6 @@
 import psycopg2, os, time
 from sentence_transformers import SentenceTransformer
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain.agents import Tool
@@ -31,18 +31,7 @@ model = SentenceTransformer('all-MiniLM-L6-v2')
 def initialize_pinecone():
     pc = Pinecone(api_key="84641b3f-7be7-4a15-aa8e-91552da0ca04")
 
-    index_name = "egenie-products"
-
-    if index_name not in pc.list_indexes().names():
-        pc.create_index(
-        name=index_name,
-        dimension=384,
-        metric="cosine",
-        spec=ServerlessSpec(
-            cloud='aws',
-            region='us-east-1'
-        )
-    )
+    index_name = "egenie-new"
     
     index = pc.Index(index_name)
     return index
@@ -68,16 +57,27 @@ def fetch_product_data(query:str) -> list:
     query_vector = model.encode(query).tolist()
     search_results = index.query(
         vector=query_vector,
+        filter={"stock_quantity": {"$gt": 0}},
         top_k=5,
         include_values=False,  # Set to False to avoid fetching actual vectors, just metadata
         include_metadata=True  # Ensure metadata is included
     )
 
-    product_data = [result['metadata'] for result in search_results['matches']]
+    score_threshold = 0.4
+
+    # Access the 'matches' key in the search_results
+    product_data =  [
+        result['metadata']
+        for result in search_results['matches']  # Use 'matches' here
+        if result['score'] >= score_threshold
+    ]
+
+    # product_data = [result['metadata'] for result in search_results['matches']]
     count = 1
     for product in product_data:
         print(count, "-",product['name'])
         count += 1
+        print()
 
     return product_data
 
@@ -148,13 +148,22 @@ def search_by_price(input_str: str) -> list:
     
     search_results = index.query(
         vector=query_vector,
-        filter={"product_id": {"$in": [str(p[0]) for p in products]}},
+        filter={"product_id": {"$in": [product[0] for product in products]}, "stock_quantity": {"$gt": 0}},
         top_k=5,
         include_values=False,
         include_metadata=True
     )
 
-    product_data = [result['metadata'] for result in search_results['matches']]
+    score_threshold = 0.4
+
+    # Access the 'matches' key in the search_results
+    product_data =  [
+        result['metadata']
+        for result in search_results['matches']  # Use 'matches' here
+        if result['score'] >= score_threshold
+    ]
+
+    # product_data = [result['metadata'] for result in search_results['matches']]
     
     return product_data
 
@@ -162,7 +171,8 @@ def search_by_price(input_str: str) -> list:
 search_product_by_price_tool = Tool(
     name="search_by_price",
     func=search_by_price,
-    description="Searches the SQL database and vector index for products under a specified price and returns their metadata.",
+    description="Searches the SQL database and vector index for products under a specified price and returns their metadata."
+                "DO NOT use this tool for queries that asks for products OVER a specified amount. Use the other tool instead.",
     input_type="str",
     output_type="list",
     parameters={
@@ -203,6 +213,7 @@ def initialize_langchain_agent(llm1):
         llm = llm1,
         verbose = True,
         max_iterations = 3,
+        handle_parsing_errors=True,
         early_stopping_method = 'generate',
         memory = memory
     )
@@ -216,22 +227,24 @@ def initialize_langchain_agent(llm1):
     # Objective:
     Provide a friendly and human-like customer interaction experience, ensuring relevant product recommendations that match the user's query and preferences, while effectively convincing the user to make a purchase.
 
-    - Use the 'search_product_by_price_tool' to search products based on the price. 
     # System:
+    - Use the 'search_product_by_price_tool' to search products based on the price. 
     - ALWAYS provide your search query and price limit in the format: "query, amount" (e.g., "Laptops with good battery life, 50000").
     - Use the 'search_product_tool' for product queries and provide relevant recommendations based on user preferences.
     - Assess the user's question to determine whether to call a tool for additional information.
-    - *ALWAYS include the link* to the product in the response.
+    - *ALWAYS include the link and price* to the product in the response.
     - If the query involves negation or exclusion (e.g., "Not gaming laptop"), reframe the query to ensure it effectively filters out the excluded terms. Construct a query that can be accurately used to search within a vector database.
     
     # Task:
     Engage with the user, gather necessary details about their product preferences, and then utilize the tool to retrieve relevant products from the database. Ensure the recommendations are accurate and appealing to the user.
 
     # Instructions:
+    - Before displaying the products, filter out any irrelevant products based on the user's query. DO NOT get confused with laptops and laptop accessories like cooling pads.
     - When providing product recommendations, **avoid starting responses with phrases like "Based on the information" or similar.** Instead, start with phrases like "We have ..." or "Here's ..." to make the response feel more engaging and customer-focused.
     - Follow the guidelines for customer engagement, product search, presenting products, and convincing the user as outlined above.
     - Check the product names and return only those which are asked for in the query.
-    - Format the response in a clear and readable manner, using bullet points, paragraphs, and other formatting techniques to make it easy for the user to understand.
+    - Format the response in a clear and readable manner. Ensure that each product is separated by a line space for better readability.
+    - ALWAYS give the product name, description, price, and a link to the product page when displaying product recommendations.
     """
 
     conversational_agent.agent.llm_chain.prompt.messages[0].prompt.template = system
