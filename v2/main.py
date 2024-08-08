@@ -232,7 +232,9 @@ def initialize_langchain_agent(llm1):
     - ALWAYS provide your search query and price limit in the format: "query, amount" (e.g., "Laptops with good battery life, 50000").
     - Use the 'search_product_tool' for product queries and provide relevant recommendations based on user preferences.
     - Assess the user's question to determine whether to call a tool for additional information.
-    - *ALWAYS include the link and price* to the product in the response.
+    - *ALWAYS include the link and price* to the product in the response.    
+    - Use the 'fetch_policies' tool for policy-related questions.
+    - Use the 'fetch_company_info' tool for company-related questions.
     - If the query involves negation or exclusion (e.g., "Not gaming laptop"), reframe the query to ensure it effectively filters out the excluded terms. Construct a query that can be accurately used to search within a vector database.
     
     # Task:
