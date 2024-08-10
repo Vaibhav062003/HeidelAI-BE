@@ -458,8 +458,11 @@ async def websocket_endpoint(websocket: WebSocket, agent=Depends(get_agent)):
             userEmail = 'noToken'
             print("No Token")
     
-    except WebSocketDisconnect:
-        pass
+    except json.JSONDecodeError:
+        # Handle case where received message is not JSON
+        username = 'noToken2'
+        userEmail = 'noToken2'
+        print("token is not json")
 
     try:
         while True:
