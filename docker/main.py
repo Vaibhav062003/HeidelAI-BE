@@ -1,4 +1,4 @@
-import random, string, secrets, os, httpx, jwt, time
+import random, string, secrets, os, httpx, jwt, time, json
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -209,7 +209,7 @@ def initialize_langchain_agent(llm1):
     - When providing product recommendations, **avoid starting responses with phrases like "Based on the information" or similar.** Instead, start with phrases like "We have ..." or "Here's ..." to make the response feel more engaging and customer-focused.
     - Follow the guidelines for customer engagement, product search, presenting products, and convincing the user as outlined above.
     - Format the response in a clear and readable manner. Ensure that each product is separated by a line space for better readability.
-    - **ALWAYS include the price, product name and a link** of the product when displaying product recommendations.
+    - **ALWAYS include the price, product name and a link** to the product page when displaying product recommendations.
     """
 
     conversational_agent.agent.llm_chain.prompt.messages[0].prompt.template = system
@@ -224,9 +224,8 @@ def initialize_database():
     
     # Create queries table if it doesn't exist
     create_table_query = """
-    CREATE TABLE IF NOT EXISTS chat_history (
+    CREATE TABLE IF NOT EXISTS chat_history_v1 (
         id SERIAL PRIMARY KEY,
-        user_id VARCHAR(50),
         username TEXT,
         userEmail TEXT,
         query TEXT,
@@ -268,10 +267,10 @@ def generate_user_id():
 gkey = "86c9abe0-f0a8-4230-9fce-ba54a70c538f"
 BEARER_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZGVudGlmaWVyIjoyNjk1fQ.kSE16TbPskzEm1mX_RrIlXqWkF97pI9JzkOjVMsXl-Y"
 
-def store_query_in_db(user_id, username, userEmail, query, response, time_taken, max_retries=3, retry_delay=2):
+def store_query_in_db( username, userEmail, query, response, time_taken, max_retries=3, retry_delay=2):
     insert_query = text("""
-    INSERT INTO chat_history (user_id, username, userEmail, query, response, time_taken)
-    VALUES (:user_id, :username, :userEmail, :query, :response, :time_taken)
+    INSERT INTO chat_history_v1 (username, userEmail, query, response, time_taken)
+    VALUES (:username, :userEmail, :query, :response, :time_taken)
     """)
     
     retries = 0
@@ -279,7 +278,6 @@ def store_query_in_db(user_id, username, userEmail, query, response, time_taken,
         try:
             with engine.connect() as connection:
                 connection.execute(insert_query, {
-                    'user_id': user_id,
                     'username': username,
                     'userEmail': userEmail,
                     'query': query,
@@ -320,6 +318,7 @@ class OtpInput(BaseModel):
     email: str
 
 SECRET_KEY = secrets.token_hex(32) 
+print("Secret Key: ", SECRET_KEY)
 
 def create_jwt_token(userName, userEmail, otp_id, otp):
     token_payload = {
@@ -436,20 +435,34 @@ async def websocket_endpoint(websocket: WebSocket, agent=Depends(get_agent)):
     await websocket.accept()
 
     # Extract token from headers
-    token = extract_token_from_headers(websocket.headers)
-    if token:
-        token_data = decode_jwt_token(token)
-        if token_data:
-            username = token_data.get('userName', 'Unknown')
-            userEmail = token_data.get('userEmail', 'Unknown')
+    try:
+        auth_message = await websocket.receive_text()
+        print("auth_message received")
+        auth_data = json.loads(auth_message)
+        
+        if 'token' in auth_data:
+            print("Token exists")
+            token = auth_data['token']
+            token_data = decode_jwt_token(token)
+            if token_data:
+                username = token_data.get('userName')
+                userEmail = token_data.get('userEmail')
+                print("Username: ", username)
+                print("UserEmail: ", userEmail)
+            else:
+                username = 'Unknown'
+                userEmail = 'Unknown'
+                print("Invalid Token")
         else:
-            username = 'Unknown'
-            userEmail = 'Unknown'
-    else:
-        username = 'Unknown'
-        userEmail = 'Unknown'
+            username = 'noToken'
+            userEmail = 'noToken'
+            print("No Token")
+    
+    except json.JSONDecodeError:
+        # Handle case where received message is not JSON
+        username = 'noToken2'
+        userEmail = 'noToken2'
 
-    user_id = generate_user_id()
     try:
         while True:
             data = await websocket.receive_text()
@@ -463,7 +476,7 @@ async def websocket_endpoint(websocket: WebSocket, agent=Depends(get_agent)):
             time_taken = round(toc - tic, 4)
 
             # Store query and response in the database
-            store_query_in_db(user_id, username, userEmail, data, response, time_taken)
+            store_query_in_db(username, userEmail, data, response, time_taken)
             
             await websocket.send_text(response)
     except WebSocketDisconnect:

@@ -11,15 +11,15 @@
     <button onclick="sendMessage()">Send</button>
 
     <script>
-        // const ws = new WebSocket('wss://critical-donella-egeniestores2-12e8ec2b.koyeb.app/ws');
-        const ws = new WebSocket('ws://127.0.0.1:8000/ws');
+        const ws = new WebSocket('wss://critical-donella-egeniestores2-12e8ec2b.koyeb.app/ws');
+        // const ws = new WebSocket('ws://127.0.0.1:8000/ws');
 
     function formatTextResponse(response) {
         // Replace double **text** with <strong>text</strong> for bold styling
         let formattedText = response.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
         
         // Replace URLs with clickable "Check Product" links
-        formattedText = formattedText.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank">Check Product</a>');
+        formattedText = formattedText.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank"><u>Check Product</u></a>');
         
         // Replace line breaks with <br> for HTML rendering
         formattedText = formattedText.replace(/\n/g, "<br>");
