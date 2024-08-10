@@ -85,18 +85,15 @@ def fetch_product_data(query_str: str) -> list:
     search_results = index.query(
         vector=query_vector,
         filter=filters,
-        top_k=5,
+        top_k=4,
         include_values=False,
         include_metadata=True
     )
-
-    score_threshold = 0.35
 
     # Access the 'matches' key in the search_results
     product_data = [
         result['metadata']
         for result in search_results['matches']  # Use 'matches' here
-        if result['score'] >= score_threshold
     ]
 
     # Print product details
