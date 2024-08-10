@@ -1,11 +1,10 @@
-import random, string, secrets, re, json, os, httpx, jwt, time
+import random, string, secrets, os, httpx, jwt, time
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
-from langchain_community.utilities import SQLDatabase
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -16,61 +15,28 @@ os.environ["GOOGLE_API_KEY"] = "AIzaSyAUfhIfOVjkaUBIUam4DiX8PhD3617xIT4"
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = "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"
-os.environ["LANGCHAIN_PROJECT"] = "chatbot"
+os.environ["LANGCHAIN_PROJECT"] = "chatbot:v1.1"
 
-model = SentenceTransformer('sentence-transformers/all-MiniLM-L12-v2')
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def initialize_pinecone():
     pc = Pinecone(api_key="84641b3f-7be7-4a15-aa8e-91552da0ca04")
-    index_name = "egenie-products"
+    index_name = "egenie-test"
     index = pc.Index(index_name)
     
     return index
 
-def format_product_data(product_data: list) -> str:
-    """Formats product data into a JSON string."""
-    formatted_products = []
-    for product in product_data:
-        formatted_products.append({
-            "name": product.get("name", ""),
-            "description": product.get("description", "").replace('\n', ' ').replace('"', '\\"'),
-            "price": product.get("price", ""),
-            "permalink": product.get("permalink", "")
-        })
-    return json.dumps(formatted_products, ensure_ascii=False)
+def initialize_first_llm():
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+    return llm
 
-def fetch_product_data(query: str) -> str:
-        """Searches the database and returns top 5 products matching the query."""
-
-        print("Query to the db: ",query)
-        query_vector = model.encode(query).tolist()
-        search_results = index.query(
-            vector=query_vector,
-            top_k=5,
-            include_values=False,  # Set to False to avoid fetching actual vectors, just metadata
-            include_metadata=True  # Ensure metadata is included
-        )
-
-        product_data = [result['metadata'] for result in search_results['matches']]
-        count = 1
-        for product in product_data:
-            print(count, "-",product['name'])
-            count += 1
-
-        product_data = format_product_data(product_data)
-
-        return product_data
-
-def fetch_policies(query: str) -> str:
+def fetch_company_info(query: str) -> str:
     return """
     Egenie4u Policies:
     - Easy returns and fast shipping.
     - All products come with GST bills and are brand new, sealed.
     - Warranty claims supported through respective companies using Egenie4u's GST bill.
-    """
 
-def fetch_company_info(query: str) -> str:
-    return """
     About Egenie4u:
     - 22 years of wholesale expertise translated into competitive retail pricing.
     - Wide range of products, including high-end gaming PCs, consoles, and computer peripherals.
@@ -78,60 +44,125 @@ def fetch_company_info(query: str) -> str:
     - Commitment to customer satisfaction and after-sales support.
     """
 
-def initialize_first_llm():
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-    return llm
-
-policies_tool = Tool(
-    name="fetch_policies",
-    func=fetch_policies,
-    description="Fetches Egenie4u's return policies and other relevant policies."
-)
-
-company_info_tool = Tool(
+company_info_policies_tool = Tool(
     name="fetch_company_info",
     func=fetch_company_info,
-    description="Fetches information about Egenie4u, its history, and unique selling points."
+    description="Fetches both company information and policies for Egenie4u."
 )
+
+
+def fetch_product_data(query_str: str) -> list:
+    """
+    Searches the vector database for products based on the user's query and returns their metadata.
+
+    Args:
+        query_str (str): The user's search query, category, and price in the format "query, category, price".
+
+    Returns:
+        list: A list of metadata of products that match the search query.
+    """
+    # Split the input string into components
+    parts = query_str.split(",")
+    if len(parts) < 2:
+        raise ValueError("Input string must include at least query and category.")
+    
+    query = parts[0].strip()
+    category = parts[1].strip()
+    price = parts[2].strip() if len(parts) > 2 else "0"
+
+    filters = {
+        "category": category,
+        "stock_quantity": {"$gt": 0}
+    }
+    if price != "0":
+        filters["price"] = {"$lte": int(price)}
+
+    # Your search logic here
+    print(f"Query: {query}, Category: {category}, Price: {price}")
+
+    # Example of search logic
+    query_vector = model.encode(query).tolist()
+    search_results = index.query(
+        vector=query_vector,
+        filter=filters,
+        top_k=5,
+        include_values=False,
+        include_metadata=True
+    )
+
+    score_threshold = 0.35
+
+    # Access the 'matches' key in the search_results
+    product_data = [
+        result['metadata']
+        for result in search_results['matches']  # Use 'matches' here
+        if result['score'] >= score_threshold
+    ]
+
+    # Print product details
+    for i, product in enumerate(product_data):
+        print(i, "-", product['name'])
+        print()
+
+    return product_data
 
 search_product_tool = Tool(
     name="fetch_product_data",
     func=fetch_product_data,
     description=(
-        "Retrieves product details from a vector database based on the user's query. "
-        "Ensure your query is relevant and descriptive to improve search accuracy. "
-        "The tool performs a similarity search using vector embeddings to find the most "
-        "relevant products."
+        "Retrieves product details from a vector database based on the user's query, category, and price. "
+        "Ensure your inputs are relevant to improve search accuracy. The tool performs a similarity search using "
+        "vector embeddings and applies filters to find the most relevant products."
     ),
-    input_type="string",
+    input_type="dict",
     output_type="list",
     parameters={
-        "query": {
-            "type": "string",
+        "inputs": {
+            "type": "dict",
             "description": (
-                "The search query or product-related question from the user. "
-                "Keep in mind that the query should be descriptive and relevant to perform "
-                "an accurate similarity search in a vector database."
-            )
+                "A dictionary containing 'query', 'category', and 'price' for the search. "
+                "'query' is the search query, 'category' is the product category, and 'price' is the maximum price."
+            ),
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query or product-related question."
+                },
+                "category": {
+                    "type": "string",
+                    "description": "The category to filter products by. Strictly one of these [device, custom, accessories]" 
+                },
+                "price": {
+                    "type": "string",
+                    "description": "The maximum price to filter products by."
+                }
+            },
+            "required": ["query"]
         }
     },
     examples=[
         {
-            "input": "Looking for a gaming laptop with high performance",
+            "input": {
+                "query": "laptop",
+                "category": "device",
+                "price": "50000"
+            },
             "output": [
                 {
                     "name": "Lenovo Legion 5 Pro AMD Ryzen 7 5800H QHD Gaming Laptop",
                     "permalink": "https://egeniestores.com/product/lenovo-legion-5-pro/",
-                    "description": "Lenovo Legion 5 Pro -Pro-level performance.",
+                    "description": "Lenovo Legion 5 Pro - Pro-level performance.",
                     "price": "₹86,700"
-                },
+                }
             ]
         }
     ]
 )
 
+
+
 def initialize_langchain_agent(llm1):
-    tools = [search_product_tool, policies_tool, company_info_tool]
+    tools = [search_product_tool, company_info_policies_tool]
 
     memory = ConversationBufferWindowMemory(
         memory_key="chat_history",
@@ -143,11 +174,12 @@ def initialize_langchain_agent(llm1):
         agent = 'chat-conversational-react-description',
         tools = tools,
         llm = llm1,
+        verbose = True,
         max_iterations = 3,
+        handle_parsing_errors=True,
         early_stopping_method = 'generate',
         memory = memory
     )
-
     system = """
     # Context:
     - Your name is Lisa, an AI-powered marketing and customer support agent for Egenie4u, a premier e-commerce platform based in India.
@@ -159,40 +191,36 @@ def initialize_langchain_agent(llm1):
     Provide a friendly and human-like customer interaction experience, ensuring relevant product recommendations that match the user's query and preferences, while effectively convincing the user to make a purchase.
 
     # System:
-    - Assess the user's question to determine whether to call a tool for additional information.
-    - Use the 'fetch_policies' tool for policy-related questions.
-    - Use the 'fetch_company_info' tool for company-related questions.
-    - Use the 'search_product_tool' for product queries and provide relevant recommendations based on user preferences.
-    - *ALWAYS include the link* to the product in the response.
-    - If the query involves negation or exclusion (e.g., "Not gaming laptop"), reframe the query to ensure it effectively filters out the excluded terms. Construct a query that can be accurately used to search within a vector database.
-
+    - Use the search_product_tool for product queries. This tool handles both category and price filters.
+    - Only use the following categories for filtering: device, custom, and accessories. Any query outside these categories will not return results.
+    - Always provide the search query in the format: "query, category, price" (e.g., "Laptops with good battery life, device, 50000"). **If no price filter is provided by the user, use "0"**.
+    - Category Details:
+       - device: Includes products like mobiles, laptops, PlayStation, and similar electronic devices.
+       - accessories: Includes items like mice, keyboards, cooling pads, and other computer peripherals.
+       - custom: Includes only custom-built products crafted by Egenie4u.
+    - If the query involves exclusion (e.g., "Not gaming laptop"), reframe the query to effectively filter out these excluded terms while still applying the category filter.
+    - Assess the user's question to determine whether to call the tool with the appropriate query parameters. If the category is not one of device, custom, or accessories, do not fetch results.
+    - Use this tool when the user asks for information about Egenie4u's company details, history, unique selling points, or policies.
+    
     # Task:
     Engage with the user, gather necessary details about their product preferences, and then utilize the tool to retrieve relevant products from the database. Ensure the recommendations are accurate and appealing to the user.
 
     # Instructions:
     - When providing product recommendations, **avoid starting responses with phrases like "Based on the information" or similar.** Instead, start with phrases like "We have ..." or "Here's ..." to make the response feel more engaging and customer-focused.
     - Follow the guidelines for customer engagement, product search, presenting products, and convincing the user as outlined above.
-    - Check the product names and return only those which are asked for in the query.
-    - Format the response in a clear and readable manner, using bullet points, paragraphs, and other formatting techniques to make it easy for the user to understand.
+    - Format the response in a clear and readable manner. Ensure that each product is separated by a line space for better readability.
+    - **ALWAYS include the price, product name and a link** to the product page when displaying product recommendations.
     """
 
     conversational_agent.agent.llm_chain.prompt.messages[0].prompt.template = system
     return conversational_agent
 
-###################################################################################################
 
 def initialize_database():
     db_uri = "cockroachdb://egenie:mTt-zNDpB35pjYZ7lEotLw@chatbot-5648.7s5.aws-ap-south-1.cockroachlabs.cloud:26257/defaultdb"
 
     # Create the SQLAlchemy engine
     engine = create_engine(db_uri, pool_pre_ping=True)
-
-    drop_table = """
-    DROP TABLE IF EXISTS testing;
-    """
-    drop_table2 = """
-    DROP TABLE IF EXISTS users;
-    """
     
     # Create queries table if it doesn't exist
     create_table_query = """
@@ -219,8 +247,6 @@ def initialize_database():
     """
 
     with engine.connect() as connection:
-        # connection.execute(text(drop_table))
-        # connection.execute(text(drop_table2))
         connection.execute(text(create_table_query))
         connection.execute(text(create_table_users))
     
@@ -233,6 +259,7 @@ def get_agent():
     llm1 = initialize_first_llm()
     return initialize_langchain_agent(llm1)
 
+agent = get_agent()
 
 def generate_user_id():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=10))
