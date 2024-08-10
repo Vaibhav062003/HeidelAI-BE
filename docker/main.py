@@ -209,7 +209,7 @@ def initialize_langchain_agent(llm1):
     - When providing product recommendations, **avoid starting responses with phrases like "Based on the information" or similar.** Instead, start with phrases like "We have ..." or "Here's ..." to make the response feel more engaging and customer-focused.
     - Follow the guidelines for customer engagement, product search, presenting products, and convincing the user as outlined above.
     - Format the response in a clear and readable manner. Ensure that each product is separated by a line space for better readability.
-    - **ALWAYS include the price, product name and a link** to the product page when displaying product recommendations.
+    - **ALWAYS include the price, product name and a link** of the product when displaying product recommendations.
     """
 
     conversational_agent.agent.llm_chain.prompt.messages[0].prompt.template = system
@@ -304,7 +304,7 @@ app = FastAPI()
 # CORS middleware configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://egeniestores.com"],
+    allow_origins=["https://egeniestores.com", "http://localhost"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
