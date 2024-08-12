@@ -1,4 +1,5 @@
 import random, string, secrets, os, httpx, jwt, time, json
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -11,23 +12,35 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain.agents import Tool, initialize_agent
 
-os.environ["GOOGLE_API_KEY"] = "AIzaSyAUfhIfOVjkaUBIUam4DiX8PhD3617xIT4"
-os.environ["LANGCHAIN_TRACING_V2"] = "true"
-os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
-os.environ["LANGCHAIN_API_KEY"] = "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"
-os.environ["LANGCHAIN_PROJECT"] = "chatbot:v1.1"
+load_dotenv()
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+LLM_MODEL = os.getenv("LLM_MODEL")
+LANGCHAIN_TRACING_V2 = os.getenv("LANGCHAIN_TRACING_V2")
+LANGCHAIN_ENDPOINT = os.getenv("LANGCHAIN_ENDPOINT")
+LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
+LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX = os.getenv("PINECONE_INDEX")
+DB_URI = os.getenv("DB_URI")
+GKEY = os.getenv("GKEY")
+BEARER_TOKEN = os.getenv("BEARER_TOKEN")
+SECRET_KEY = os.getenv("SECRET_KEY")
+
+gkey = GKEY
+BEARER_TOKEN = BEARER_TOKEN
+SECRET_KEY = SECRET_KEY 
+
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def initialize_pinecone():
-    pc = Pinecone(api_key="84641b3f-7be7-4a15-aa8e-91552da0ca04")
-    index_name = "egenie-test"
-    index = pc.Index(index_name)
-    
+    pc = Pinecone(PINECONE_API_KEY)
+    index = pc.Index(PINECONE_INDEX)
     return index
 
 def initialize_first_llm():
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0)
     return llm
 
 def fetch_company_info(query: str) -> str:
@@ -215,7 +228,7 @@ def initialize_langchain_agent(llm1):
 
 
 def initialize_database():
-    db_uri = "cockroachdb://egenie:mTt-zNDpB35pjYZ7lEotLw@chatbot-5648.7s5.aws-ap-south-1.cockroachlabs.cloud:26257/defaultdb"
+    db_uri = DB_URI
 
     # Create the SQLAlchemy engine
     engine = create_engine(db_uri, pool_pre_ping=True)
@@ -249,21 +262,15 @@ def initialize_database():
     
     return engine
 
-engine = initialize_database()
-index = initialize_pinecone()
+
 
 def get_agent():
     llm1 = initialize_first_llm()
     return initialize_langchain_agent(llm1)
 
+engine = initialize_database()
+index = initialize_pinecone()
 agent = get_agent()
-
-def generate_user_id():
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=10))
-
-
-gkey = "86c9abe0-f0a8-4230-9fce-ba54a70c538f"
-BEARER_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZGVudGlmaWVyIjoyNjk1fQ.kSE16TbPskzEm1mX_RrIlXqWkF97pI9JzkOjVMsXl-Y"
 
 def store_query_in_db( username, userEmail, query, response, time_taken, max_retries=3, retry_delay=2):
     insert_query = text("""
@@ -315,8 +322,6 @@ class OtpInput(BaseModel):
     name : str
     email: str
 
-SECRET_KEY = secrets.token_hex(32) 
-print("Secret Key: ", SECRET_KEY)
 
 def create_jwt_token(userName, userEmail, otp_id, otp):
     token_payload = {
@@ -433,36 +438,58 @@ async def websocket_endpoint(websocket: WebSocket, agent=Depends(get_agent)):
     await websocket.accept()
 
     # Extract token from headers
-    try:
-        auth_message = await websocket.receive_text()
-        print("auth_message received")
-        auth_data = json.loads(auth_message)
+    # try:
+    #     auth_message = await websocket.receive_text()
+    #     print("auth_message received")
+    #     auth_data = json.loads(auth_message)
         
-        if 'token' in auth_data:
-            print("Token exists")
-            token = auth_data['token']
-            token_data = decode_jwt_token(token)
-            if token_data:
-                username = token_data.get('userName')
-                userEmail = token_data.get('userEmail')
-                print("Username: ", username)
-                print("UserEmail: ", userEmail)
-            else:
-                username = 'Unknown'
-                userEmail = 'Unknown'
-                print("Invalid Token")
-        else:
-            username = 'noToken'
-            userEmail = 'noToken'
-            print("No Token")
+    #     if 'token' in auth_data:
+    #         print("Token exists")
+    #         token = auth_data['token']
+    #         token_data = decode_jwt_token(token)
+    #         if token_data:
+    #             username = token_data.get('userName')
+    #             userEmail = token_data.get('userEmail')
+    #             print("Username: ", username)
+    #             print("UserEmail: ", userEmail)
+    #         else:
+    #             username = 'Unknown'
+    #             userEmail = 'Unknown'
+    #             print("Invalid Token")
+    #     else:
+    #         username = 'noToken'
+    #         userEmail = 'noToken'
+    #         print("No Token")
     
-    except json.JSONDecodeError:
-        # Handle case where received message is not JSON
-        username = 'noToken2'
-        userEmail = 'noToken2'
-        print("token is not json")
+    # except json.JSONDecodeError:
+    #     # Handle case where received message is not JSON
+    #     username = 'noToken2'
+    #     userEmail = 'noToken2'
+    #     print("token is not json")
+    #     pass
+
+    # except WebSocketDisconnect:
+    #     # Handle WebSocket disconnect
+    #     username = 'noToken2'
+    #     userEmail = 'noToken2'
+    #     print("Error: WebSocket disconnected")
+    #     pass
 
     try:
+        name = await websocket.receive_text()
+        print("Name: ", name)
+        tic = time.perf_counter()
+        output = agent(name)
+        response = output['output']
+        print("Response: ", response)
+        toc = time.perf_counter()
+        print(f"Response took {toc - tic:0.4f} seconds")
+        time_taken = round(toc - tic, 4)
+        username = name
+        userEmail = "Guest"
+        store_query_in_db(username, userEmail, name, response, time_taken)
+        await websocket.send_text(response)
+
         while True:
             data = await websocket.receive_text()
             print("Input: ", data)
