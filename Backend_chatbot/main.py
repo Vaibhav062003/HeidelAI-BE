@@ -1,9 +1,9 @@
 import os, time
+from datetime import datetime
 from dotenv import load_dotenv
 from langchain import hub
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import AIMessage, HumanMessage
-from typing import Literal
 from langchain_core.tools import tool
 from langchain.agents import AgentExecutor, create_structured_chat_agent
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
@@ -44,13 +44,13 @@ def top_n_most_visited_pages(n : int) -> list:
 
     request = RunReportRequest(
         property=f"properties/{property_id}",
-        dimensions=[Dimension(name="pagePathPlusQueryString")],
-        metrics=[Metric(name="activeUsers")],
-        date_ranges=[DateRange(start_date="yesterday", end_date="today")],
+        dimensions=[Dimension(name="unifiedScreenClass")],
+        metrics=[Metric(name="screenPageViews")],
+        date_ranges=[DateRange(start_date="2024-01-01", end_date="today")],
     )
     response = client.run_report(request)
 
-    excluded_pages = ['/']
+    excluded_pages = ['Home - Egenie4u']
     pages = []
     for i, row in enumerate(response.rows):
         if row.dimension_values[0].value not in excluded_pages:    
@@ -60,9 +60,59 @@ def top_n_most_visited_pages(n : int) -> list:
 
     return pages
 
+@tool
+def get_active_users_today():
+    """
+    Fetches the number of active users for the current day on the website.
+
+    Returns:
+        int: The number of active users for the current day.
+    """
+     
+    client = BetaAnalyticsDataClient()
+
+    today = datetime.today().strftime('%Y-%m-%d')
+
+    request = RunReportRequest(
+        property=f"properties/{property_id}",
+        metrics=[Metric(name="activeUsers")],
+        date_ranges=[DateRange(start_date=today, end_date=today)]
+    )
+
+    report = client.run_report(request)
+
+    for row in report.rows:
+        return row.metric_values[0].value
+
+@tool
+def get_device_model_data():
+    """
+    Fetches the data for device models used by users for the current day from Google Analytics 4.
+
+    Returns:
+        dict: A dictionary where keys are device models and values are the number of active users for each model.
+    """
+    client = BetaAnalyticsDataClient()
+
+    # Set the current date
+    today = datetime.today().strftime('%Y-%m-%d')
+
+    request = RunReportRequest(
+        property=f"properties/{property_id}",
+        dimensions=[Dimension(name="deviceModel")],
+        metrics=[Metric(name="activeUsers")], 
+        date_ranges=[DateRange(start_date="2024-01-01", end_date=today)]
+    )
+
+    response = client.run_report(request)
+
+    device_data = {row.dimension_values[0].value: int(row.metric_values[0].value) for row in response.rows}
+
+    return device_data
+
 def initialize_langchain_agent(llm):    
 
-    tools = [top_n_most_visited_pages]
+    tools = [top_n_most_visited_pages, get_active_users_today, get_device_model_data]
 
     prompt = hub.pull("hwchase17/structured-chat-agent")
 
