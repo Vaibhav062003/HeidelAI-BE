@@ -196,7 +196,7 @@ def get_total_page_views(start_date: str, end_date: str):
         int: The total number of page views recorded between the start date and end date.
 
     Example:
-        >>> get_total_page_views("2024-08-01", "2024-08-31")
+        get_total_page_views("2024-08-01", "2024-08-31")
         1500
     """
     try:

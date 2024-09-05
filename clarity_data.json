@@ -1,0 +1,337 @@
+[
+    {
+        "metricName": "DeadClickCount",
+        "information": [
+            {
+                "sessionsCount": "109",
+                "sessionsWithMetricPercentage": 4.59,
+                "sessionsWithoutMetricPercentage": 95.41,
+                "pagesViews": "5",
+                "subTotal": "10"
+            }
+        ]
+    },
+    {
+        "metricName": "ExcessiveScroll",
+        "information": [
+            {
+                "sessionsCount": "109",
+                "sessionsWithMetricPercentage": 0,
+                "sessionsWithoutMetricPercentage": 100,
+                "pagesViews": "0",
+                "subTotal": "0"
+            }
+        ]
+    },
+    {
+        "metricName": "RageClickCount",
+        "information": [
+            {
+                "sessionsCount": "109",
+                "sessionsWithMetricPercentage": 0,
+                "sessionsWithoutMetricPercentage": 100,
+                "pagesViews": "0",
+                "subTotal": "0"
+            }
+        ]
+    },
+    {
+        "metricName": "QuickbackClick",
+        "information": [
+            {
+                "sessionsCount": "109",
+                "sessionsWithMetricPercentage": 19.27,
+                "sessionsWithoutMetricPercentage": 80.73,
+                "pagesViews": "45",
+                "subTotal": "45"
+            }
+        ]
+    },
+    {
+        "metricName": "ScriptErrorCount",
+        "information": [
+            {
+                "sessionsCount": "109",
+                "sessionsWithMetricPercentage": 3.67,
+                "sessionsWithoutMetricPercentage": 96.33,
+                "pagesViews": "4",
+                "subTotal": "4"
+            }
+        ]
+    },
+    {
+        "metricName": "ErrorClickCount",
+        "information": [
+            {
+                "sessionsCount": "109",
+                "sessionsWithMetricPercentage": 0,
+                "sessionsWithoutMetricPercentage": 100,
+                "pagesViews": "0",
+                "subTotal": "0"
+            }
+        ]
+    },
+    {
+        "metricName": "ScrollDepth",
+        "information": [
+            {
+                "averageScrollDepth": 39.02
+            }
+        ]
+    },
+    {
+        "metricName": "Traffic",
+        "information": [
+            {
+                "totalSessionCount": "110",
+                "totalBotSessionCount": "13",
+                "distinctUserCount": "97",
+                "pagesPerSessionPercentage": 2.3703703703703702
+            }
+        ]
+    },
+    {
+        "metricName": "EngagementTime",
+        "information": [
+            {
+                "totalTime": "117",
+                "activeTime": "20"
+            }
+        ]
+    },
+    {
+        "metricName": "Browser",
+        "information": [
+            {
+                "name": "ChromeMobile",
+                "sessionsCount": "38"
+            },
+            {
+                "name": "Other",
+                "sessionsCount": "34"
+            },
+            {
+                "name": "MobileSafari",
+                "sessionsCount": "19"
+            },
+            {
+                "name": "Chrome",
+                "sessionsCount": "11"
+            },
+            {
+                "name": "SamsungInternet",
+                "sessionsCount": "4"
+            },
+            {
+                "name": "Opera",
+                "sessionsCount": "3"
+            },
+            {
+                "name": "MiuiBrowser",
+                "sessionsCount": "1"
+            }
+        ]
+    },
+    {
+        "metricName": "Device",
+        "information": [
+            {
+                "name": "Mobile",
+                "sessionsCount": "99"
+            },
+            {
+                "name": "PC",
+                "sessionsCount": "9"
+            },
+            {
+                "name": "Tablet",
+                "sessionsCount": "2"
+            }
+        ]
+    },
+    {
+        "metricName": "OS",
+        "information": [
+            {
+                "name": "IOS",
+                "sessionsCount": "55"
+            },
+            {
+                "name": "Android",
+                "sessionsCount": "46"
+            },
+            {
+                "name": "Windows",
+                "sessionsCount": "8"
+            },
+            {
+                "name": "Linux",
+                "sessionsCount": "1"
+            }
+        ]
+    },
+    {
+        "metricName": "Country",
+        "information": [
+            {
+                "name": "India",
+                "sessionsCount": "103"
+            },
+            {
+                "name": "United States",
+                "sessionsCount": "3"
+            },
+            {
+                "name": "Costa Rica",
+                "sessionsCount": "1"
+            },
+            {
+                "name": "Croatia",
+                "sessionsCount": "1"
+            },
+            {
+                "name": "Romania",
+                "sessionsCount": "1"
+            },
+            {
+                "name": "Russian Federation",
+                "sessionsCount": "1"
+            }
+        ]
+    },
+    {
+        "metricName": "PageTitle",
+        "information": [
+            {
+                "name": "Home - Egenie4u",
+                "sessionsCount": "66"
+            },
+            {
+                "name": "Laptops - Egenie Stores",
+                "sessionsCount": "13"
+            },
+            {
+                "name": "Lenovo Archives - Egenie Stores",
+                "sessionsCount": "9"
+            },
+            {
+                "name": "Hades - The Infernal Gaming Beast by egenie4u! - Egenie Stores",
+                "sessionsCount": "8"
+            },
+            {
+                "name": "PreBuilt PC's - Egenie Stores",
+                "sessionsCount": "7"
+            },
+            {
+                "name": "PC Components - Egenie Stores",
+                "sessionsCount": "7"
+            },
+            {
+                "name": "Mobile Phones - Egenie Stores",
+                "sessionsCount": "6"
+            },
+            {
+                "name": "Computer Peripherals - Egenie Stores",
+                "sessionsCount": "5"
+            },
+            {
+                "name": "Venom by eGenie4u - Egenie Stores",
+                "sessionsCount": "4"
+            },
+            {
+                "name": "15.6 inch Archives - Egenie Stores",
+                "sessionsCount": "3"
+            }
+        ]
+    },
+    {
+        "metricName": "ReferrerUrl",
+        "information": [
+            {
+                "name": null,
+                "sessionsCount": "63"
+            },
+            {
+                "name": "https://www.google.com/",
+                "sessionsCount": "17"
+            },
+            {
+                "name": "https://egeniestores.com/",
+                "sessionsCount": "10"
+            },
+            {
+                "name": "https://egeniestores.com/laptops/",
+                "sessionsCount": "9"
+            },
+            {
+                "name": "https://egeniestores.com/prebuilt-pcs/",
+                "sessionsCount": "6"
+            },
+            {
+                "name": "https://l.instagram.com/",
+                "sessionsCount": "5"
+            },
+            {
+                "name": "https://egeniestores.com/laptops/?product-page=2",
+                "sessionsCount": "4"
+            },
+            {
+                "name": "https://egeniestores.com/laptops/?product-page=3",
+                "sessionsCount": "3"
+            },
+            {
+                "name": "https://egeniestores.com/product-category/prebuilt-pcs/high-end-gaming-pcs/",
+                "sessionsCount": "3"
+            },
+            {
+                "name": "https://egeniestores.com/product-category/laptops/screen-size/15-6-inch/",
+                "sessionsCount": "3"
+            }
+        ]
+    },
+    {
+        "metricName": "PopularPages",
+        "information": [
+            {
+                "url": "https://egeniestores.com/",
+                "visitsCount": "81"
+            },
+            {
+                "url": "https://egeniestores.com/laptops/",
+                "visitsCount": "20"
+            },
+            {
+                "url": "https://egeniestores.com/pc-components/",
+                "visitsCount": "10"
+            },
+            {
+                "url": "https://egeniestores.com/product-category/brands/lenovo/",
+                "visitsCount": "10"
+            },
+            {
+                "url": "https://egeniestores.com/prebuilt-pcs/",
+                "visitsCount": "9"
+            },
+            {
+                "url": "https://egeniestores.com/mobile-phones/",
+                "visitsCount": "9"
+            },
+            {
+                "url": "https://egeniestores.com/product/hades-the-infernal-gaming-beast/",
+                "visitsCount": "8"
+            },
+            {
+                "url": "https://egeniestores.com/computer-peripherals/",
+                "visitsCount": "7"
+            },
+            {
+                "url": "https://egeniestores.com/product/lenovo-loq-2024-intel-core-i5-13450hx/",
+                "visitsCount": "6"
+            },
+            {
+                "url": "https://egeniestores.com/product/venom-by-egenie4u/",
+                "visitsCount": "5"
+            }
+        ]
+    }
+]
