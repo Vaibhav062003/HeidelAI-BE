@@ -1,30 +1,58 @@
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from google.protobuf.json_format import MessageToDict
+import pandas as pd
+import os
+from google.analytics.data_v1beta.types import (
+    DateRange,
+    Dimension,
+    Metric,
+    RunReportRequest,
+)
+from google.analytics.data_v1beta import BetaAnalyticsDataClient
 
-# Path to your credentials.json file
-SERVICE_ACCOUNT_FILE = 'credentials.json'
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = 'credentials.json'
+property_id = '451093576'
 
-# Scopes required by Google Analytics
-SCOPES = ['https://www.googleapis.com/auth/analytics.readonly']
+client = BetaAnalyticsDataClient()
 
-# Create credentials using the service account file
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+request = RunReportRequest(
+    property=f"properties/{property_id}",
+    dimensions=[
+        Dimension(name="newVsReturning")
+    ],
+    metrics=[
+        Metric(name="activeUsers")
+    ],
+    date_ranges=[
+        DateRange(start_date="2024-08-1", end_date="2024-08-31")
+    ]
+)
 
-# Initialize the Analytics API client
-analytics = build('analyticsdata', 'v1beta', credentials=credentials)
+response = client.run_report(request)
 
-def fetch_data():
-    response = analytics.properties().runReport(
-        property='properties/451093576',
-        body={
-            "dimensions": [{"name": "city"}],
-            "metrics": [{"name": "activeUsers"}],
-            "dateRanges": [{"startDate": "7daysAgo", "endDate": "today"}]
-        }
-    ).execute()
-    return response
+new_visitors = 0
+returning_visitors = 0
 
-# Fetch and print the data
-data = fetch_data()
-print(data)
+# Process the response and gather data
+for row in response.rows:
+    visitor_type = row.dimension_values[0].value
+    active_users = int(row.metric_values[0].value)
+    
+    if visitor_type == "new":
+        new_visitors += active_users
+    elif visitor_type == "returning":
+        returning_visitors += active_users
+
+# Calculate total visitors
+total_visitors = new_visitors + returning_visitors
+
+# Calculate percentages
+if total_visitors > 0:
+    new_visitor_percentage = (new_visitors / total_visitors) * 100
+    returning_visitor_percentage = (returning_visitors / total_visitors) * 100
+else:
+    new_visitor_percentage = 0
+    returning_visitor_percentage = 0
+
+result = f"New Visitors: {new_visitors}\nReturning Visitors: {returning_visitors}\nNew Visitors: {new_visitor_percentage:.2f}%\nReturning Visitors: {returning_visitor_percentage:.2f}%"
+print(result)

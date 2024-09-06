@@ -1,4 +1,5 @@
 import os, time
+import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from langchain import hub
@@ -217,12 +218,106 @@ def get_total_page_views(start_date: str, end_date: str):
         # Log the exception or handle it as needed
         print(f"An error occurred: {e}")
         return 0
+    
+@tool
+def get_comperhensive_report(start_date: str, end_date: str):
+    """
+    Retrieves a comprehensive report based on the specified start and end dates.
+    Args:
+        start_date (str): The start date of the report in the format "YYYY-MM-DD".
+        end_date (str): The end date of the report in the format "YYYY-MM-DD".
+    Returns:
+        pandas.DataFrame: A DataFrame containing the report data with dimensions and metrics.
+    Raises:
+        None
+    Example:
+        start_date = "2022-01-01"
+        end_date = "2022-01-31"
+        report = get_comperhensive_report(start_date, end_date)
+    """
+    
+    request3 = RunReportRequest(
+    property=f"properties/{PROPERTY_ID}",
+    dimensions=[
+        Dimension(name="audienceId"),
+        Dimension(name="eventName"),
+    ],
+    metrics=[
+        Metric(name="eventCount")
+    ],
+    date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+    )
 
+    response3 = client.run_report(request3)
 
+    result_dict = {}
+    for dimensionHeader in response3.dimension_headers:
+        result_dict[dimensionHeader.name] = []
+    for metricHeader in response3.metric_headers:
+        result_dict[metricHeader.name] = []
+    for rowIdx, row in enumerate(response3.rows):
+        for i, dimension_value in enumerate(row.dimension_values):
+            dimension_name = response3.dimension_headers[i].name
+            result_dict[dimension_name].append(dimension_value.value)
+        for i, metric_value in enumerate(row.metric_values):
+            metric_name = response3.metric_headers[i].name
+            result_dict[metric_name].append(metric_value.value)
+    return pd.DataFrame(result_dict)
+
+@tool
+def get_new_vs_returning_visitors(start_date: str, end_date: str):
+    """
+    This tool fetches data about new and returning visitors from Google Analytics for the 
+    specified date range. It calculates and returns the total number of new and returning visitors, 
+    along with the percentage of each category relative to the total number of visitors.
+    Args:
+        start_date (str): The start date of the report in the format "YYYY-MM-DD".
+        end_date (str): The end date of the report in the format "YYYY-MM-DD".
+    Returns:
+        str: A formatted string showing the count and percentage of new and returning visitors.
+    """
+    request = RunReportRequest(
+        property=f"properties/{PROPERTY_ID}",
+        dimensions=[
+            Dimension(name="newVsReturning")
+        ],
+        metrics=[
+            Metric(name="activeUsers")
+        ],
+        date_ranges=[
+            DateRange(start_date=start_date, end_date=end_date)
+        ]
+    )
+
+    response = client.run_report(request)
+
+    new_visitors = 0
+    returning_visitors = 0
+
+    for row in response.rows:
+        visitor_type = row.dimension_values[0].value
+        active_users = int(row.metric_values[0].value)
+        
+        if visitor_type == "new":
+            new_visitors += active_users
+        elif visitor_type == "returning":
+            returning_visitors += active_users
+
+    total_visitors = new_visitors + returning_visitors
+
+    if total_visitors > 0:
+        new_visitor_percentage = (new_visitors / total_visitors) * 100
+        returning_visitor_percentage = (returning_visitors / total_visitors) * 100
+    else:
+        new_visitor_percentage = 0
+        returning_visitor_percentage = 0
+
+    result = f"New Visitors: {new_visitors}\nReturning Visitors: {returning_visitors}\nNew Visitors: {new_visitor_percentage:.2f}%\nReturning Visitors: {returning_visitor_percentage:.2f}%"
+    return result
 
 def initialize_langchain_agent(llm):    
 
-    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views]
+    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors]
     prompt = hub.pull("hwchase17/structured-chat-agent")
     agent = create_structured_chat_agent(llm, tools, prompt)
     agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
@@ -235,7 +330,6 @@ def get_agent():
 
 
 agent_executor = get_agent()
-
 
 chat_history = []
 
