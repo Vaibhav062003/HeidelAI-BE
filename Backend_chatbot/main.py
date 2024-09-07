@@ -323,7 +323,6 @@ def initialize_langchain_agent(llm):
     agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
     return agent_executor
 
-
 def get_agent():
     llm = initialize_llm()
     return initialize_langchain_agent(llm)

@@ -485,47 +485,9 @@ async def websocket_endpoint(websocket: WebSocket, agent=Depends(get_agent)):
     else:
         username = 'noToken'
 
-
-    # Extract token from headers
-    # try:
-    #     auth_message = await websocket.receive_text()
-    #     print("auth_message received")
-    #     auth_data = json.loads(auth_message)
-        
-    #     if 'token' in auth_data:
-    #         
-    #         token = auth_data['token']
-    #         token_data = decode_jwt_token(token)
-    #         if token_data:
-    #             username = token_data.get('userName')
-    #             userEmail = token_data.get('userEmail')
-    #             print("Username: ", username)
-    #             print("UserEmail: ", userEmail)
-    #         else:
-    #             username = 'Unknown'
-    #             userEmail = 'Unknown'
-    #             print("Invalid Token")
-    #     else:
-    #         username = 'noToken'
-    #         userEmail = 'noToken'
-    #         print("No Token")
-    
-    # except json.JSONDecodeError:
-    #     # Handle case where received message is not JSON
-    #     username = 'noToken2'
-    #     userEmail = 'noToken2'
-    #     print("token is not json")
-    #     pass
-
-    # except WebSocketDisconnect:
-    #     # Handle WebSocket disconnect
-    #     username = 'noToken2'
-    #     userEmail = 'noToken2'
-    #     print("Error: WebSocket disconnected")
-    #     pass
-
     try:
-
+        output = agent("The customer you are talking to has provided their name as: " + username)
+        print(output)
         while True:
             data = await websocket.receive_text()
             print("Input: ", data)
