@@ -319,6 +319,9 @@ def initialize_langchain_agent(llm):
 
     tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors]
     prompt = hub.pull("hwchase17/structured-chat-agent")
+    # print(prompt)
+    custom_instructions = "Always use the 'get_date_range' tool to get the start and end dates for other tools. For example, you can use 'get_date_range(\"last week\")' to get the date range for the previous week."
+    modified_prompt = prompt + "\n\n" + custom_instructions
     agent = create_structured_chat_agent(llm, tools, prompt)
     agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
     return agent_executor
