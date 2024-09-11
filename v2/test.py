@@ -100,7 +100,9 @@ def fetch_product_data(client_id: str, query: str, category: str, price: int = 0
         "name": product['name'],
         "price": product['price'],
         "permalink": product['permalink'],
-        "image_link": product['images']
+        "image_link": product['images'],
+        "on_sale": product['on_sale'],
+        "regular_price": product['regular_price'],
         }
         product_list.append(product_dict)
 
@@ -268,3 +270,5 @@ while True:
     print(response_data)
     products_space = []
     print(f"time_taken {toc - tic:0.4f} seconds")
+
+"Logitech G413 TKL SE Wired Mechanical Gaming Keyboard"
