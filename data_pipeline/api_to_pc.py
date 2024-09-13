@@ -1,14 +1,20 @@
 from woocommerce import API
 import pandas as pd
-import re, time, requests, csv
+import re, time, requests, csv, os
+from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
 
+load_dotenv()
+
+CONSUMER_KEY = os.getenv("CONSUMER_KEY")
+CONSUMER_SECRET = os.getenv("CONSUMER_SECRET")
+
 wcapi = API(
     url="https://egeniestores.com",
-    consumer_key="ck_2e64bab6083458e84ca5cbd23cd7ad8b7b13e44e",
-    consumer_secret="cs_82e3b74d0f3fa69589323b9be8aeecc11291a20f",
+    consumer_key=CONSUMER_KEY,
+    consumer_secret=CONSUMER_SECRET,
     wp_api=True,
     version="wc/v3"
 )
@@ -20,6 +26,7 @@ def fetch_all_products():
     while True:
         try:
             response = wcapi.get("products", params={"per_page": per_page, "page": page})
+            print(response.status_code)
             productss = response.json()
             products.extend(productss)
         
@@ -44,6 +51,7 @@ attributes = [
 
 # Create a list to hold the extracted data
 extracted_data = []
+print(products)
 
 for product in products:
     if(not product['purchasable']):
@@ -89,7 +97,7 @@ model = SentenceTransformer('all-MiniLM-L6-v2')
 def upsert_data_to_pinecone():
     pc = Pinecone(api_key="84641b3f-7be7-4a15-aa8e-91552da0ca04")
 
-    index_name = "products"
+    index_name = "products-test"
 
     if index_name in pc.list_indexes().names():
         print("Index already exists. Deleting...")
@@ -119,6 +127,10 @@ def upsert_data_to_pinecone():
     
     index = pc.Index(index_name)
 
+    device = [825, 801, 762, 746, 498 ,489 ,470 ,464 ,407, 295, 221, 201, 25]
+    custom = [386, 335, 175, 168]
+    accessories = [813, 729, 699 ,688 ,640 ,640 ,624 ,609 ,601 ,575 ,564, 209]
+
     products = []
     with open('products.csv', mode='r', encoding='utf-8') as file:
         csv_reader = csv.DictReader(file)
@@ -127,7 +139,7 @@ def upsert_data_to_pinecone():
 
     print(f"Creating vector embeddings for {len(products)} products and upserting data...")
     for product in products:
-        combined_description = f"{product['id']} {product['name']} {product['description']} {product['slug']} {product['price']} {product['categories']}"
+        combined_description = f"{product['name']} {product['description']} {product['slug']} {product['price']} {product['categories']}"
 
         vector = model.encode(combined_description)  
 
@@ -137,16 +149,22 @@ def upsert_data_to_pinecone():
             'slug': product['slug'],
             'permalink': product['permalink'],
             'description': product['description'],
-            'sku': product['sku'],
             'price': int(product['price']),
             'regular_price': product['regular_price'],
             'sale_price': product['sale_price'],
             'on_sale': product['on_sale'],
             'purchasable': product['purchasable'],
             'stock_quantity': int(product['stock_quantity']),
-            'categories': product['categories'],
-            'image_url': product['images']
+            'images': product['images']
         }
+
+        if int(product['id']) in device:
+            metadata['category'] = 'device'
+        elif int(product['id']) in custom:
+            metadata['category'] = 'custom'
+        elif int(product['id']) in accessories:
+            metadata['category'] = 'accessories'
+
         index.upsert([(str(product['id']), vector, metadata)])
 
     print("Upserted data into pinecone.")
