@@ -21,7 +21,7 @@ model = SentenceTransformer('all-MiniLM-L6-v2')
 def initialize_pinecone():
     pc = Pinecone(api_key="84641b3f-7be7-4a15-aa8e-91552da0ca04")
 
-    index_name = "egenie-test"
+    index_name = "products-test"
     
     index = pc.Index(index_name)
     return index

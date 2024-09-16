@@ -23,7 +23,7 @@ websocket_product_data = {}
 def initialize_pinecone():
     pc = Pinecone(api_key="84641b3f-7be7-4a15-aa8e-91552da0ca04")
 
-    index_name = "egenie-test"
+    index_name = "products-test"
     
     index = pc.Index(index_name)
     return index
@@ -113,7 +113,9 @@ def fetch_product_data(query_str: str) -> str:
         "name": product['name'],
         "price": product['price'],
         "permalink": product['permalink'],
-        "image_link": product['images']
+        "image_link": product['images'],
+        "on_sale": product['on_sale'],
+        "regular_price": product['regular_price']
         }
         product_list.append(product_dict)
 
