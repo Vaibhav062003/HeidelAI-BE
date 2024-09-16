@@ -1,7 +1,9 @@
-import random, string, secrets, os, httpx, jwt, time, json
+import random, requests, string, secrets, os, httpx, jwt, time, json
+import hmac
+import hashlib
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import PlainTextResponse,JSONResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
@@ -26,6 +28,11 @@ DB_URI = os.getenv("DB_URI")
 GKEY = os.getenv("GKEY")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 SECRET_KEY = os.getenv("SECRET_KEY")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+VERSION = os.getenv("VERSION")
+APP_SECRET = os.getenv("APP_SECRET")
+VERIFY_TOKEN = "12345"
 
 gkey = GKEY
 BEARER_TOKEN = BEARER_TOKEN
@@ -443,6 +450,30 @@ def create_jwt_token(userName):
 
 
 
+def validate_signature(payload, signature):
+    # Hash the payload with the app secret
+    expected_signature = hmac.new(
+        bytes(APP_SECRET, 'latin-1'),
+        msg=payload.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    # Compare signatures to ensure they match
+    return hmac.compare_digest(f"sha256={expected_signature}", signature)
+
+# Middleware or decorator to validate signature for POST requests
+async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
+    # Get the request payload
+    body = await request.body()
+    payload = body.decode('utf-8')
+
+    if not x_hub_signature_256:
+        raise HTTPException(status_code=403, detail="Signature missing")
+
+    if not validate_signature(payload, x_hub_signature_256):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+
 @app.post("/get-name")
 async def get_name(name_input: NameInput):
     name = name_input.name
@@ -558,3 +589,59 @@ async def websocket_endpoint(websocket: WebSocket, agent=Depends(get_agent)):
 @app.get("/")
 async def get():
     return JSONResponse(content={"message": "WebSocket endpoint is ready. Connect to /ws for WebSocket communication."})
+
+
+@app.get("/webhook")
+async def verify_webhook(request: Request):
+    # This is for the webhook verification (GET request)
+    args = request.query_params
+    if args.get("hub.verify_token") == VERIFY_TOKEN:
+        return PlainTextResponse(content=str(args.get("hub.challenge")))
+    return {"status": "Verification failed"}
+
+
+@app.post("/webhook")
+async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
+    # First, validate the signature
+    await signature_required(request, x_hub_signature_256)
+    
+    # Process the incoming message (if the signature is valid)
+    payload = await request.json()
+    print("Incoming webhook payload:", json.dumps(payload, indent=2))
+
+    # Handle incoming messages
+    if "entry" in payload and len(payload["entry"]) > 0:
+        for entry in payload["entry"]:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+                if messages:
+                    for message in messages:
+                        sender = message["from"]
+                        message_text = message["text"]["body"]
+
+                        output = agent(message_text)
+                        response = output['output']
+                        # Send a reply to the sender
+                        await send_message(sender, response)
+    
+    return {"status": "ok"}
+
+async def send_message(recipient, message_text):
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+
+    headers = {
+        "Authorization" : "Bearer " + ACCESS_TOKEN,
+        "Content-Type" : "application/json",
+    }
+    data = {
+        "messaging_product": "whatsapp",
+        "to": recipient,
+        "type": "text",
+        "text": {
+            "body": message_text
+        }
+    }
+
+    response = requests.post(url, headers=headers, json=data)
+    print(f"Response: {response.status_code}, {response.json()}")
