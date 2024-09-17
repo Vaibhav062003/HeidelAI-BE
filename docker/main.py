@@ -591,6 +591,42 @@ async def get():
     return JSONResponse(content={"message": "WebSocket endpoint is ready. Connect to /ws for WebSocket communication."})
 
 
+def download_and_upload_image(image_url, phone_number_id, access_token):
+    # Step 1: Download the image
+    save_path = "downloaded_image.jpg"  # You can customize this path if needed
+    response = requests.get(image_url)
+    
+    if response.status_code == 200:
+        # Save the image to the local file system
+        with open(save_path, 'wb') as file:
+            file.write(response.content)
+        print(f"Image downloaded successfully to {save_path}")
+    else:
+        print(f"Failed to download image. Status code: {response.status_code}")
+        return None
+
+    # Step 2: Upload the image to the WhatsApp API
+    url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    data = {
+        'messaging_product': 'whatsapp'
+    }
+    files = {
+        'file': (os.path.basename(save_path), open(save_path, 'rb'), 'image/jpeg')  # Adjust MIME type if necessary
+    }
+
+    upload_response = requests.post(url, headers=headers, data=data, files=files)
+
+    if upload_response.status_code == 200:
+        media_id = upload_response.json().get('id')
+        print(f"Image uploaded successfully. Media ID: {media_id}")
+        return media_id
+    else:
+        print(f"Failed to upload image. Status code: {upload_response.status_code}, Response: {upload_response.text}")
+        return None
+
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     # This is for the webhook verification (GET request)
@@ -607,7 +643,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
     # Process the incoming message (if the signature is valid)
     payload = await request.json()
-    print("Incoming webhook payload:", json.dumps(payload, indent=2))
+    # print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
     # Handle incoming messages
     if "entry" in payload and len(payload["entry"]) > 0:
@@ -620,10 +656,40 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         sender = message["from"]
                         message_text = message["text"]["body"]
 
+                        client_id = sender
+
+                        message_text = f"client_id: {client_id}: " + message_text
+
                         output = agent(message_text)
                         response = output['output']
-                        # Send a reply to the sender
-                        await send_message(sender, response)
+
+                        products_space = websocket_product_data.get(client_id)
+
+                        print("Product Space: ", products_space)    
+                        if products_space:
+                            response_data = {
+                                "type": "products",
+                                "message": response,
+                                "products": products_space
+                            }
+                            websocket_product_data[client_id] = []
+                        else:
+                            response_data = {
+                                "type": "message",
+                                "message": response
+                            }
+
+                        # Convert the dictionary to JSON
+                        response_json = response_data
+
+                        if response_json["type"] == "message":                 
+                            # Send a reply to the sender
+                            await send_message(sender, response_json["message"])
+
+                        elif response_json["type"] == "products":
+                            message = response_json["message"]
+                            products = response_json["products"]
+                            await send_carousel(sender, message, products)
     
     return {"status": "ok"}
 
@@ -645,3 +711,262 @@ async def send_message(recipient, message_text):
 
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
+
+def send_carousel(sender, message, products):
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+    
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    
+    # Building the carousel template with response variable and product details
+    data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": sender,
+        "type": "template",
+        "template": {
+            "name": "carousel_template_test_v38",
+            "language": {
+            "code": "en_US"
+            },
+            "components": [
+
+            {
+                "type": "body",
+                "parameters": [
+                {
+                    "type": "text",
+                    "text": "products"
+                }
+                ]
+            },
+            {
+                "type": "carousel",
+                "cards": [
+                {
+                    "card_index": 0,
+                    "components": [
+                    {
+                        "type": "header",
+                        "parameters": [
+                        {
+                            "type": "image",
+                            "image": {
+                            "id": download_and_upload_image(products[0]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
+                            }
+                        }
+                        ]
+                    },
+
+                    {
+                        "type": "body",
+                        "parameters" : [
+                        {
+                            "type": "text",
+                            "text": f'*{products[0]["name"][:50]}*'
+                        },
+                        {
+                            "type": "text",
+                            "text": f'*Rs. {products[0]["price"]}*'
+                        },
+                        ]
+                    },
+
+                    {
+                        "type": "button",
+                        "sub_type": "quick_reply",
+                        "index": "0",
+                        "parameters": [
+                            {
+                                "type": "payload",
+                                "payload": "macbook-pro"
+                            }
+                        ]
+                    }
+                    ]
+                },
+                
+                {
+                    "card_index": 1,
+                    "components": [
+                    {
+                        "type": "header",
+                        "parameters": [
+                        {
+                            "type": "image",
+                            "image": {
+                            "id": download_and_upload_image(products[1]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
+                            }
+                        }
+                        ]
+                    },
+
+                    {
+                        "type": "body",
+                        "parameters" : [
+                        {
+                            "type": "text",
+                            "text": f'*{products[1]["name"][:50]}*'
+                        },
+                        {
+                            "type": "text",
+                            "text": f'*Rs. {products[1]["price"]}*'
+                        },
+                        ]
+                    },
+
+                    {
+                        "type": "button",
+                        "sub_type": "quick_reply",
+                        "index": "0",
+                        "parameters": [
+                            {
+                                "type": "payload",
+                                "payload": "macbook-pro"
+                            }
+                        ]
+                    }
+                    ]
+                },
+                
+                {
+                    "card_index": 2,
+                    "components": [
+                    {
+                        "type": "header",
+                        "parameters": [
+                        {
+                            "type": "image",
+                            "image": {
+                            "id": download_and_upload_image(products[2]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
+                            }
+                        }
+                        ]
+                    },
+
+                    {
+                        "type": "body",
+                        "parameters" : [
+                        {
+                            "type": "text",
+                            "text": f'*{products[2]["name"][:50]}*'
+                        },
+                        {
+                            "type": "text",
+                            "text": f'*Rs. {products[2]["price"]}*'
+                        },
+                        ]
+                    },
+
+                    {
+                        "type": "button",
+                        "sub_type": "quick_reply",
+                        "index": "0",
+                        "parameters": [
+                            {
+                                "type": "payload",
+                                "payload": "macbook-pro"
+                            }
+                        ]
+                    }
+                    ]
+                },
+                
+                {
+                    "card_index": 3,
+                    "components": [
+                    {
+                        "type": "header",
+                        "parameters": [
+                        {
+                            "type": "image",
+                            "image": {
+                            "id": download_and_upload_image(products[3]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
+                            }
+                        }
+                        ]
+                    },
+
+                    {
+                        "type": "body",
+                        "parameters" : [
+                        {
+                            "type": "text",
+                            "text": f'*{products[3]["name"][:50]}*'
+                        },
+                        {
+                            "type": "text",
+                            "text": f'*Rs. {products[3]["price"]}*'
+                        },
+                        ]
+                    },
+
+                    {
+                        "type": "button",
+                        "sub_type": "quick_reply",
+                        "index": "0",
+                        "parameters": [
+                            {
+                                "type": "payload",
+                                "payload": "macbook-pro"
+                            }
+                        ]
+                    }
+                    ]
+                },
+                
+                {
+                    "card_index": 4,
+                    "components": [
+                    {
+                        "type": "header",
+                        "parameters": [
+                        {
+                            "type": "image",
+                            "image": {
+                            "id": download_and_upload_image(products[4]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
+                            }
+                        }
+                        ]
+                    },
+
+                    {
+                        "type": "body",
+                        "parameters" : [
+                        {
+                            "type": "text",
+                            "text": f'*{products[4]["name"][:50]}*'
+                        },
+                        {
+                            "type": "text",
+                            "text": f'*Rs. {products[4]["price"]}*'
+                        },
+                        ]
+                    },
+
+                    {
+                        "type": "button",
+                        "sub_type": "quick_reply",
+                        "index": "0",
+                        "parameters": [
+                            {
+                                "type": "payload",
+                                "payload": "macbook-pro"
+                            }
+                        ]
+                    }
+                    ]
+                },
+                
+                ]
+            }
+
+            ]
+        }
+    }
+
+    response = requests.post(url, headers=headers, data=json.dumps(data))
+    print(f"Response: {response.status_code}, {response.json()}")
+

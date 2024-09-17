@@ -10,6 +10,20 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERSION = os.getenv("VERSION")
 sahil = "+919511907785"
 vipul = "+918408062973"
+rounak = "+917972510629"
+"""
++919067891206 done
++919822191206 done
++919881138781 done
++447342144289 done
++917776836496 done
++917769867116 done
++919653489239 done
++919834580609 done
++918080194685 done
++919767755287 done
++917498591820 done
+"""
 
 def send_carousel_message():
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
@@ -23,7 +37,7 @@ def send_carousel_message():
     data = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
-        "to": vipul,
+        "to": rounak,
         "type": "template",
         "template": {
             "name": "carousel_template_media_cards_v2",

@@ -260,6 +260,8 @@ while True:
         }
 
     toc = time.perf_counter()
-    print(response_data)
+    response_json = response_data
+    print(response_json["products"][0]["name"][:50])
     products_space = []
     print(f"time_taken {toc - tic:0.4f} seconds")
+    

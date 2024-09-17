@@ -72,6 +72,49 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     
     return {"status": "ok"}
 
+"""
+Incoming webhook payload: {
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "389116497625642",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "918788424068",
+              "phone_number_id": "423792927480992"
+            },
+            "contacts": [
+              {
+                "profile": {
+                  "name": "Rounak"
+                },
+                "wa_id": "917972510629"
+              }
+            ],
+            "messages": [
+              {
+                "from": "917972510629",
+                "id": "wamid.HBgMOTE3OTcyNTEwNjI5FQIAEhgWM0VCMDRCRjYzN0FGMzYwQ0JGNjAxMAA=",
+                "timestamp": "1726516892",
+                "text": {
+                  "body": "hey"
+                },
+                "type": "text"
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}
+"""
+
+
 async def send_message(recipient, message_text):
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
 
