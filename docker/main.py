@@ -604,7 +604,7 @@ async def verify_webhook(request: Request):
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
     # First, validate the signature
     await signature_required(request, x_hub_signature_256)
-    
+
     # Process the incoming message (if the signature is valid)
     payload = await request.json()
     print("Incoming webhook payload:", json.dumps(payload, indent=2))

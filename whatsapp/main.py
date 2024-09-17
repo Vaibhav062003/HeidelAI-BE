@@ -1,6 +1,8 @@
-from fastapi import FastAPI, Request
-import json, requests, os
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import PlainTextResponse
+import json, requests, os, hmac, hashlib
 from dotenv import load_dotenv
+
 
 app = FastAPI()
 
@@ -9,22 +11,50 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERSION = os.getenv("VERSION")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+APP_SECRET = os.getenv("APP_SECRET")
+
+def validate_signature(payload, signature):
+    # Hash the payload with the app secret
+    expected_signature = hmac.new(
+        bytes(APP_SECRET, 'latin-1'),
+        msg=payload.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    # Compare signatures to ensure they match
+    return hmac.compare_digest(f"sha256={expected_signature}", signature)
+
+# Middleware or decorator to validate signature for POST requests
+async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
+    # Get the request payload
+    body = await request.body()
+    payload = body.decode('utf-8')
+
+    if not x_hub_signature_256:
+        raise HTTPException(status_code=403, detail="Signature missing")
+
+    if not validate_signature(payload, x_hub_signature_256):
+        raise HTTPException(status_code=403, detail="Invalid signature")
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
+    # This is for the webhook verification (GET request)
     args = request.query_params
     if args.get("hub.verify_token") == VERIFY_TOKEN:
-        return args.get("hub.challenge")  # Respond with hub.challenge to verify webhook
+        return PlainTextResponse(content=str(args.get("hub.challenge")))
     return {"status": "Verification failed"}
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    payload = await request.json()
 
-    # Log incoming message payload for debugging
+@app.post("/webhook")
+async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
+    # First, validate the signature
+    await signature_required(request, x_hub_signature_256)
+    
+    # Process the incoming message (if the signature is valid)
+    payload = await request.json()
     print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
-    # Check if the webhook contains a message event
+    # Handle incoming messages
     if "entry" in payload and len(payload["entry"]) > 0:
         for entry in payload["entry"]:
             for change in entry.get("changes", []):
@@ -32,13 +62,14 @@ async def webhook(request: Request):
                 messages = value.get("messages", [])
                 if messages:
                     for message in messages:
-                        # Extract the sender's phone number and the message text
                         sender = message["from"]
                         message_text = message["text"]["body"]
-                        
-                        # Send a reply
-                        await send_message(sender, "Thanks for your message!")
 
+                        response = message_text.uppercase()
+
+                        # Send a reply to the sender
+                        await send_message(sender, response)
+    
     return {"status": "ok"}
 
 async def send_message(recipient, message_text):
