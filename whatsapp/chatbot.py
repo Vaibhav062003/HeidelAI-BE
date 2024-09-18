@@ -1,14 +1,25 @@
 import time, os
+from pinecone import Pinecone
+from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
 from langchain_core.tools import tool
-from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain.agents import AgentExecutor, create_structured_chat_agent
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_google_firestore import FirestoreChatMessageHistory
 from sentence_transformers import SentenceTransformer
-from pinecone import Pinecone
+from google.oauth2 import service_account
+from google.cloud import firestore
+from langchain_google_firestore import FirestoreChatMessageHistory
+
+# Define the path to your service account JSON file
+SERVICE_ACCOUNT_FILE = 'whatsapp-chatbot-history-cf43052a413d.json'
+
+# Load the credentials from the JSON file
+credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
+
+# Initialize Firestore using the credentials
+db = firestore.Client(credentials=credentials)
 
 load_dotenv()
 
@@ -121,11 +132,20 @@ def fetch_product_data(client_id: str, query: str, category: str, price: int = 0
 
     return product_string
 
+flag = False
+
 def get_session_history(session_id: str) -> FirestoreChatMessageHistory:
-    
+
+    global flag
+
     chat_history = FirestoreChatMessageHistory(
-        session_id=session_id, collection="HistoryMessages"
+        session_id=session_id, collection="HistoryMessages", client=db
     )
+
+    print(chat_history)
+    
+    if len(chat_history.messages) > 20:
+        flag = True
 
     return chat_history
 
@@ -287,3 +307,18 @@ while True:
     )
 
     print(response["output"])
+
+    if flag:
+        doc_ref = db.collection("HistoryMessages").document("ron-test")
+        print("one")
+        # Fetch the document
+        doc = doc_ref.get()
+        
+        if doc.exists:
+            messages = doc.to_dict().get('messages', [])
+            print(f"Original messages count: {len(messages)}")
+            excess_count = len(messages) - 15
+            messages = messages[excess_count:] 
+            
+            doc_ref.update({'messages': messages})
+            print("Document updated with trimmed messages.")
