@@ -68,21 +68,47 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         for entry in payload["entry"]:
             for change in entry.get("changes", []):
                 value = change.get("value", {})
+
+                statuses = value.get("statuses", [])
+                if statuses:
+                    for status in statuses:
+                        message_status = status["status"]
+                        recipient_id = status["recipient_id"]
+                        print("Message Status: ", message_status, ", Recipient ID: ", recipient_id)
+
+                contacts = value.get("contacts", [])
+                if contacts:
+                    for contact in contacts:
+                        sender_name = contact["profile"]["name"]
+                        # print("Sender name: ", sender_name)
+
                 messages = value.get("messages", [])
                 if messages:
                     for message in messages:
                         sender = message["from"]
-                        message_text = message["text"]["body"]
 
-                        client_id = sender
+                        if message["type"] == "text":
+                          message_text = message["text"]["body"]
+                          print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", message_text)
 
-                        message_text = f"client_id: {client_id}: " + message_text
-                        response = message_text.Upper()
-                        # output = agent(message_text)
-                        # response = output['output']
-                        await send_message(sender, response)
+                       
+                          response = message_text.upper()
+                          # output = agent(message_text)
+                          # response = output['output']
+                          await send_message(sender, response)
 
+                          print("Message sent to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
 
+                        elif message["type"] == "button":
+                            payload = message["button"]["payload"]
+                            print("Button Payload: ", payload)
+                            # output = agent(payload)
+                            # response = output['output']
+                            response = "This functionality is not available yet."
+                            await send_message(sender, response)
+                            print("Message sent to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
+
+                        # message_text = f"client_id: {client_id}: " + message_text
                         # products_space = websocket_product_data.get(client_id)
 
                         # print("Product Space: ", products_space)    
@@ -389,3 +415,92 @@ def send_carousel(sender, message, products):
 
     response = requests.post(url, headers=headers, data=json.dumps(data))
     print(f"Response: {response.status_code}, {response.json()}")
+
+
+"""
+Incoming webhook payload: {
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "389116497625642",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "918788424068",
+              "phone_number_id": "423792927480992"
+            },
+            "contacts": [
+              {
+                "profile": {
+                  "name": "Rounak"
+                },
+                "wa_id": "917972510629"
+              }
+            ],
+            "messages": [
+              {
+                "from": "917972510629",
+                "id": "wamid.HBgMOTE3OTcyNTEwNjI5FQIAEhgWM0VCMDdBNDAzMDQwM0FBMTM1OENEMQA=",
+                "timestamp": "1726662604",
+                "text": {
+                  "body": "okay"
+                },
+                "type": "text"
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}
+
+
+Incoming webhook payload: {
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "389116497625642",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "918788424068",
+              "phone_number_id": "423792927480992"
+            },
+            "contacts": [
+              {
+                "profile": {
+                  "name": "Rounak"
+                },
+                "wa_id": "917972510629"
+              }
+            ],
+            "messages": [
+              {
+                "context": {
+                  "from": "918788424068",
+                  "id": "wamid.HBgMOTE3OTcyNTEwNjI5FQIAERgSMDFERjRCNDYxNzQ2NUVENkZFAA=="
+                },
+                "from": "917972510629",
+                "id": "wamid.HBgMOTE3OTcyNTEwNjI5FQIAEhgWM0VCMEQ2NTZEMzI0QTE3NThDOEYwQwA=",
+                "timestamp": "1726662764",
+                "type": "button",
+                "button": {
+                  "payload": "macbook-pro",
+                  "text": "Know more."
+                }
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}
+"""
