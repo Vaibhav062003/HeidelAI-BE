@@ -71,7 +71,6 @@ company_info_policies_tool = Tool(
     description="Fetches both company information and policies for Egenie4u."
 )
 
-
 def fetch_product_data(query_str: str) -> str:
     """
     Searches the vector database for products based on the user's query and returns their metadata.
@@ -189,8 +188,6 @@ search_product_tool = Tool(
     ]
 )
 
-
-
 def initialize_langchain_agent(llm1):
 
     tools = [search_product_tool, company_info_policies_tool]
@@ -251,9 +248,6 @@ def initialize_langchain_agent(llm1):
     conversational_agent.agent.llm_chain.prompt.messages[0].prompt.template = system
     return conversational_agent
 
-
-
-
 def initialize_database():
     db_uri = DB_URI
 
@@ -286,8 +280,6 @@ def initialize_database():
         connection.execute(text(create_table_users))
     
     return engine
-
-
 
 def get_agent():
     llm1 = initialize_first_llm()
@@ -351,23 +343,6 @@ class OtpInput(BaseModel):
     name : str
     email: str
 
-
-
-
-# def verify_jwt_token(authorization: str = Header(...)) -> str:
-#     try:
-#         token = authorization.split(" ")[1]  # Get the token from the "Bearer" prefix
-#         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-#         return payload
-#     except jwt.ExpiredSignatureError:
-#         raise HTTPException(status_code=401, detail="Token expired")
-#     except jwt.InvalidTokenError:
-#         raise HTTPException(status_code=401, detail="Invalid token")
-
-# @app.get("/protected-route")
-# async def protected_route(token: str = Depends(verify_jwt_token)):
-#     return {"success": True, "message": f"Access granted for {token}"}
-
 def store_user_in_db(userName, max_retries=3, retry_delay=2):
     insert_query = text("""
     INSERT INTO users_v1_05 (userName)
@@ -392,86 +367,12 @@ def store_user_in_db(userName, max_retries=3, retry_delay=2):
     if retries == max_retries:
         print("Failed to insert data after multiple retries.")
 
-# @app.post("/send-mail-otp")
-# async def send_otp(email_input: EmailInput):
-#     url = 'https://api.fazpass.com/v1/otp/request'
-#     payload = {'email': email_input.email, 'gateway_key': gkey}
-#     headers = {
-#         'Authorization': f'Bearer {BEARER_TOKEN}'
-#     }
-    
-#     async with httpx.AsyncClient() as client:
-#         response = await client.post(url, json=payload, headers=headers)
-#         if response.status_code == 200:
-#             return response.json()
-#         else:
-            # raise HTTPException(status_code=response.status_code, detail=response.text)
-
-
-
-# @app.post("/verify-mail-otp")
-# async def send_otp(otp_input: OtpInput):
-#     userName = otp_input.name
-#     userEmail = otp_input.email
-
-#     store_user_in_db(userName, userEmail)
-
-#     url = 'https://api.fazpass.com/v1/otp/verify'
-#     payload = {'otp_id': otp_input.otp_id, 'otp' : otp_input.otp}
-#     headers = {
-#         'Authorization': f'Bearer {BEARER_TOKEN}'
-#     }
-    
-#     async with httpx.AsyncClient() as client:
-#         response = await client.post(url, json=payload, headers=headers)
-#         if response.status_code == 200:
-#             # Create a JWT token with the payload and secret key
-#             # token_payload = {'otp_id': otp_input.otp_id, 'otp': otp_input.otp}
-#             # token = jwt.encode(token_payload, SECRET_KEY, algorithm="HS256")
-
-#             token = create_jwt_token(userName, userEmail, otp_input.otp_id, otp_input.otp)
-
-#             # Get the response data from the OTP verification API
-#             response_data = response.json()
-
-#             # Include the JWT token in the response
-#             response_data['token'] = token
-
-#             return response_data
-#         else:
-#             raise HTTPException(status_code=response.status_code, detail=response.text)
-
 def create_jwt_token(userName):
     token_payload = {
         'userName': userName
     }
     token = jwt.encode(token_payload, SECRET_KEY, algorithm="HS256")
     return token
-
-
-
-def validate_signature(payload, signature):
-    # Hash the payload with the app secret
-    expected_signature = hmac.new(
-        bytes(APP_SECRET, 'latin-1'),
-        msg=payload.encode('utf-8'),
-        digestmod=hashlib.sha256
-    ).hexdigest()
-    
-    # Compare signatures to ensure they match
-    return hmac.compare_digest(f"sha256={expected_signature}", signature)
-
-# Middleware or decorator to validate signature for POST requests
-async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
-    # Get the request payload
-    body = await request.body()
-    payload = body.decode('utf-8')
-
-    if not x_hub_signature_256:
-        raise HTTPException(status_code=403, detail="Signature missing")
-
-    if not validate_signature(payload, x_hub_signature_256):
-        raise HTTPException(status_code=403, detail="Invalid signature")
 
 
 @app.post("/get-name")
@@ -483,12 +384,6 @@ async def get_name(name_input: NameInput):
 
     return response_data
 
-# def extract_token_from_headers(headers):
-#     # Extract the token from the 'Authorization' header
-#     authorization = headers.get('Authorization', '')
-#     if authorization.startswith('Bearer '):
-#         return authorization.split(' ')[1]
-#     return None
 
 def decode_jwt_token(token):
     try:
@@ -591,41 +486,28 @@ async def get():
     return JSONResponse(content={"message": "WebSocket endpoint is ready. Connect to /ws for WebSocket communication."})
 
 
-def download_and_upload_image(image_url, phone_number_id, access_token):
-    # Step 1: Download the image
-    save_path = "downloaded_image.jpg"  # You can customize this path if needed
-    response = requests.get(image_url)
+def validate_signature(payload, signature):
+    # Hash the payload with the app secret
+    expected_signature = hmac.new(
+        bytes(APP_SECRET, 'latin-1'),
+        msg=payload.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
     
-    if response.status_code == 200:
-        # Save the image to the local file system
-        with open(save_path, 'wb') as file:
-            file.write(response.content)
-        print(f"Image downloaded successfully to {save_path}")
-    else:
-        print(f"Failed to download image. Status code: {response.status_code}")
-        return None
+    # Compare signatures to ensure they match
+    return hmac.compare_digest(f"sha256={expected_signature}", signature)
 
-    # Step 2: Upload the image to the WhatsApp API
-    url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
-    headers = {
-        "Authorization": f"Bearer {access_token}"
-    }
-    data = {
-        'messaging_product': 'whatsapp'
-    }
-    files = {
-        'file': (os.path.basename(save_path), open(save_path, 'rb'), 'image/jpeg')  # Adjust MIME type if necessary
-    }
+# Middleware or decorator to validate signature for POST requests
+async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
+    # Get the request payload
+    body = await request.body()
+    payload = body.decode('utf-8')
 
-    upload_response = requests.post(url, headers=headers, data=data, files=files)
+    if not x_hub_signature_256:
+        raise HTTPException(status_code=403, detail="Signature missing")
 
-    if upload_response.status_code == 200:
-        media_id = upload_response.json().get('id')
-        print(f"Image uploaded successfully. Media ID: {media_id}")
-        return media_id
-    else:
-        print(f"Failed to upload image. Status code: {upload_response.status_code}, Response: {upload_response.text}")
-        return None
+    if not validate_signature(payload, x_hub_signature_256):
+        raise HTTPException(status_code=403, detail="Invalid signature")
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -643,7 +525,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
     # Process the incoming message (if the signature is valid)
     payload = await request.json()
-    # print("Incoming webhook payload:", json.dumps(payload, indent=2))
+    print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
     # Handle incoming messages
     if "entry" in payload and len(payload["entry"]) > 0:
@@ -656,40 +538,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         sender = message["from"]
                         message_text = message["text"]["body"]
 
-                        client_id = sender
+                        response = message_text.Upper()
 
-                        message_text = f"client_id: {client_id}: " + message_text
-
-                        output = agent(message_text)
-                        response = output['output']
-
-                        products_space = websocket_product_data.get(client_id)
-
-                        print("Product Space: ", products_space)    
-                        if products_space:
-                            response_data = {
-                                "type": "products",
-                                "message": response,
-                                "products": products_space
-                            }
-                            websocket_product_data[client_id] = []
-                        else:
-                            response_data = {
-                                "type": "message",
-                                "message": response
-                            }
-
-                        # Convert the dictionary to JSON
-                        response_json = response_data
-
-                        if response_json["type"] == "message":                 
-                            # Send a reply to the sender
-                            await send_message(sender, response_json["message"])
-
-                        elif response_json["type"] == "products":
-                            message = response_json["message"]
-                            products = response_json["products"]
-                            await send_carousel(sender, message, products)
+                        await send_message(sender, response)
     
     return {"status": "ok"}
 
@@ -712,261 +563,80 @@ async def send_message(recipient, message_text):
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
 
-def send_carousel(sender, message, products):
-    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
-    
+
+
+# Commented Code -------------------
+
+"""
+def verify_jwt_token(authorization: str = Header(...)) -> str:
+    try:
+        token = authorization.split(" ")[1]  # Get the token from the "Bearer" prefix
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+@app.get("/protected-route")
+async def protected_route(token: str = Depends(verify_jwt_token)):
+    return {"success": True, "message": f"Access granted for {token}"}
+
+@app.post("/send-mail-otp")
+async def send_otp(email_input: EmailInput):
+    url = 'https://api.fazpass.com/v1/otp/request'
+    payload = {'email': email_input.email, 'gateway_key': gkey}
     headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json",
+        'Authorization': f'Bearer {BEARER_TOKEN}'
     }
     
-    # Building the carousel template with response variable and product details
-    data = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": sender,
-        "type": "template",
-        "template": {
-            "name": "carousel_template_test_v38",
-            "language": {
-            "code": "en_US"
-            },
-            "components": [
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
 
-            {
-                "type": "body",
-                "parameters": [
-                {
-                    "type": "text",
-                    "text": "products"
-                }
-                ]
-            },
-            {
-                "type": "carousel",
-                "cards": [
-                {
-                    "card_index": 0,
-                    "components": [
-                    {
-                        "type": "header",
-                        "parameters": [
-                        {
-                            "type": "image",
-                            "image": {
-                            "id": download_and_upload_image(products[0]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
-                            }
-                        }
-                        ]
-                    },
 
-                    {
-                        "type": "body",
-                        "parameters" : [
-                        {
-                            "type": "text",
-                            "text": f'*{products[0]["name"][:50]}*'
-                        },
-                        {
-                            "type": "text",
-                            "text": f'*Rs. {products[0]["price"]}*'
-                        },
-                        ]
-                    },
+@app.post("/verify-mail-otp")
+async def send_otp(otp_input: OtpInput):
+    userName = otp_input.name
+    userEmail = otp_input.email
 
-                    {
-                        "type": "button",
-                        "sub_type": "quick_reply",
-                        "index": "0",
-                        "parameters": [
-                            {
-                                "type": "payload",
-                                "payload": "macbook-pro"
-                            }
-                        ]
-                    }
-                    ]
-                },
-                
-                {
-                    "card_index": 1,
-                    "components": [
-                    {
-                        "type": "header",
-                        "parameters": [
-                        {
-                            "type": "image",
-                            "image": {
-                            "id": download_and_upload_image(products[1]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
-                            }
-                        }
-                        ]
-                    },
+    store_user_in_db(userName, userEmail)
 
-                    {
-                        "type": "body",
-                        "parameters" : [
-                        {
-                            "type": "text",
-                            "text": f'*{products[1]["name"][:50]}*'
-                        },
-                        {
-                            "type": "text",
-                            "text": f'*Rs. {products[1]["price"]}*'
-                        },
-                        ]
-                    },
-
-                    {
-                        "type": "button",
-                        "sub_type": "quick_reply",
-                        "index": "0",
-                        "parameters": [
-                            {
-                                "type": "payload",
-                                "payload": "macbook-pro"
-                            }
-                        ]
-                    }
-                    ]
-                },
-                
-                {
-                    "card_index": 2,
-                    "components": [
-                    {
-                        "type": "header",
-                        "parameters": [
-                        {
-                            "type": "image",
-                            "image": {
-                            "id": download_and_upload_image(products[2]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
-                            }
-                        }
-                        ]
-                    },
-
-                    {
-                        "type": "body",
-                        "parameters" : [
-                        {
-                            "type": "text",
-                            "text": f'*{products[2]["name"][:50]}*'
-                        },
-                        {
-                            "type": "text",
-                            "text": f'*Rs. {products[2]["price"]}*'
-                        },
-                        ]
-                    },
-
-                    {
-                        "type": "button",
-                        "sub_type": "quick_reply",
-                        "index": "0",
-                        "parameters": [
-                            {
-                                "type": "payload",
-                                "payload": "macbook-pro"
-                            }
-                        ]
-                    }
-                    ]
-                },
-                
-                {
-                    "card_index": 3,
-                    "components": [
-                    {
-                        "type": "header",
-                        "parameters": [
-                        {
-                            "type": "image",
-                            "image": {
-                            "id": download_and_upload_image(products[3]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
-                            }
-                        }
-                        ]
-                    },
-
-                    {
-                        "type": "body",
-                        "parameters" : [
-                        {
-                            "type": "text",
-                            "text": f'*{products[3]["name"][:50]}*'
-                        },
-                        {
-                            "type": "text",
-                            "text": f'*Rs. {products[3]["price"]}*'
-                        },
-                        ]
-                    },
-
-                    {
-                        "type": "button",
-                        "sub_type": "quick_reply",
-                        "index": "0",
-                        "parameters": [
-                            {
-                                "type": "payload",
-                                "payload": "macbook-pro"
-                            }
-                        ]
-                    }
-                    ]
-                },
-                
-                {
-                    "card_index": 4,
-                    "components": [
-                    {
-                        "type": "header",
-                        "parameters": [
-                        {
-                            "type": "image",
-                            "image": {
-                            "id": download_and_upload_image(products[4]["image_link"], PHONE_NUMBER_ID, ACCESS_TOKEN)
-                            }
-                        }
-                        ]
-                    },
-
-                    {
-                        "type": "body",
-                        "parameters" : [
-                        {
-                            "type": "text",
-                            "text": f'*{products[4]["name"][:50]}*'
-                        },
-                        {
-                            "type": "text",
-                            "text": f'*Rs. {products[4]["price"]}*'
-                        },
-                        ]
-                    },
-
-                    {
-                        "type": "button",
-                        "sub_type": "quick_reply",
-                        "index": "0",
-                        "parameters": [
-                            {
-                                "type": "payload",
-                                "payload": "macbook-pro"
-                            }
-                        ]
-                    }
-                    ]
-                },
-                
-                ]
-            }
-
-            ]
-        }
+    url = 'https://api.fazpass.com/v1/otp/verify'
+    payload = {'otp_id': otp_input.otp_id, 'otp' : otp_input.otp}
+    headers = {
+        'Authorization': f'Bearer {BEARER_TOKEN}'
     }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, headers=headers)
+        if response.status_code == 200:
+            # Create a JWT token with the payload and secret key
+            # token_payload = {'otp_id': otp_input.otp_id, 'otp': otp_input.otp}
+            # token = jwt.encode(token_payload, SECRET_KEY, algorithm="HS256")
 
-    response = requests.post(url, headers=headers, data=json.dumps(data))
-    print(f"Response: {response.status_code}, {response.json()}")
+            token = create_jwt_token(userName, userEmail, otp_input.otp_id, otp_input.otp)
 
+            # Get the response data from the OTP verification API
+            response_data = response.json()
+
+            # Include the JWT token in the response
+            response_data['token'] = token
+
+            return response_data
+        else:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+
+
+def extract_token_from_headers(headers):
+    # Extract the token from the 'Authorization' header
+    authorization = headers.get('Authorization', '')
+    if authorization.startswith('Bearer '):
+        return authorization.split(' ')[1]
+    return None
+    
+"""

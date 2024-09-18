@@ -54,7 +54,7 @@ def send_carousel_message():
                         {
                             "type": "image",
                             "image": {
-                            "id": "1331403771024048"
+                            "link": "https://egeniestores.com/wp-content/uploads/2024/05/61aHJIjnH6L._SL1500_.jpg"
                             }
                         }
                         ]
