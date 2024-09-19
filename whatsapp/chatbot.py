@@ -153,7 +153,6 @@ def initialize_langchain_agent(llm: int):
         - If a user asks for product recommendations without specifying a budget, proceed without asking for one. Use `0` as the budget when fetching products.
 
         # Instructions:
-        - **Do not reintroduce yourself** after the initial greeting in a session.
         - Always prioritize the current user message over any chat history.
         - **Do not mention** any internal tools or processes.
         - Use the tool `fetch_product_data` to find products, and filter by category (device, custom, accessories) and price.
@@ -177,7 +176,7 @@ def initialize_langchain_agent(llm: int):
         2. **Action**: Based on the evaluation, either reset the context or continue the conversation without asking unnecessary questions.
 
         - When in doubt, always prioritize the **current message** over any previous context.
-        - Reset ongoing tasks if a fresh greeting is detected, and reintroduce yourself as "Talkative from Egenie4u."
+        - If a fresh greeting is detected, reintroduce yourself as "Talkative from Egenie4u."
         
         - Respond to the human as helpfully and accurately as possible. You have access to the following tools:
 
@@ -215,7 +214,6 @@ def initialize_langchain_agent(llm: int):
         }}
 
         Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation'''
-
 
     human = '''
     {input}
