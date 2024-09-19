@@ -56,6 +56,10 @@ def create_carousel():
                         {
                         "type": "spm",
                         "text": "View"
+                        },
+                        {
+                        "type": "quick_reply",
+                        "text": "Know more"
                         }
                     ]
                     }

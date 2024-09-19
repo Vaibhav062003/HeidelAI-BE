@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+processed_message_ids = set()
+
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERSION = os.getenv("VERSION")
@@ -61,7 +63,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
     # Process the incoming message (if the signature is valid)
     payload = await request.json()
-    print("Incoming webhook payload:", json.dumps(payload, indent=2))
+    # print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
     # Handle incoming messages
     if "entry" in payload and len(payload["entry"]) > 0:
@@ -85,8 +87,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                 messages = value.get("messages", [])
                 if messages:
                     for message in messages:
-                        sender = message["from"]
+                        message_id = message["id"]
 
+                        if message_id in processed_message_ids:
+                            print("Duplicate message, skipping processing.")
+                            continue
+
+                        processed_message_ids.add(message_id)
+
+                        sender = message["from"]
+                        
                         if message["type"] == "text":
                           message_text = message["text"]["body"]
                           print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", message_text)
@@ -106,9 +116,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # response = output['output']
 
                             await send_product(sender, payload)
-                            response = "This functionality is not available yet."
-                            await send_message(sender, response)
-                            print("Message sent to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
+                            
 
                         # message_text = f"client_id: {client_id}: " + message_text
                         # products_space = websocket_product_data.get(client_id)
@@ -420,11 +428,47 @@ def send_carousel(sender, message, products):
 
 
 def send_product(sender, payload):
-    
+    product = {}
 
     if payload == "MRX33HN/A_201":
         product = {
-            "name" : "Apple MacBook Pro (14-Inch, Apple M3 Pro Chip, 11-Core CPU, 14-Core GPU, 18GB Unified Memory, 512GB SSD, macOS, Space Black) ",
+            "name" : "*Apple MacBook Pro* (14-Inch, Apple M3 Pro Chip, 11-Core CPU, 14-Core GPU, 18GB Unified Memory, 512GB SSD, macOS, Space Black) ",
+            "price" : "₹185,000",
+            "regular_price":"₹199,000",
+            "discount" : "7%",
+            "stock_quantity" : "3"
+
+        }
+    elif payload == "82JQ00JCIN_470":
+        product = {
+            "name" : "*Lenovo Legion 5 Pro* AMD Ryzen 7 5800H QHD Gaming Laptop(16GB/1TB SSD/RTX 3060 6GB /165Hz/Win11/Office 2021/RGB Backlit/3mnth Xbox Game Pass/Storm Grey/2.45Kg), 82JQ00JCIN",
+            "price" : "₹86,700",
+            "regular_price":"₹199,000",
+            "discount" : "7%",
+            "stock_quantity" : "3"
+
+        }
+    elif payload == "FA506ICB-HN075W_3780":
+        product = {
+            "name" : "*ASUS TUF Gaming A15* FHD 144Hz, AMD Ryzen 7 4800H, RTX 3050 4GB(16GB/512GB SSD/Win 11//90 Whr./1 Year McAfee/Graphite Black",
+            "price" : "₹185,000",
+            "regular_price":"₹199,000",
+            "discount" : "7%",
+            "stock_quantity" : "3"
+
+        }
+    elif payload == "wc_post_id_801":
+        product = {
+            "name" : "*Lenovo LOQ 2024* Intel Core i5-13450HX 15.6 (39.6cm) 144Hz 300Nits FHD Gaming Laptop (24GB/512GB SSD/Win 11/NVIDIA RTX 3050 6GB Graphics/100% sRGB/Office 21/3 Month Game Pass/Grey/2.4Kg)",
+            "price" : "₹185,000",
+            "regular_price":"₹199,000",
+            "discount" : "7%",
+            "stock_quantity" : "3"
+
+        }
+    elif payload == "wc_post_id_407":
+        product = {
+            "name" : "*SONY PLAYSTATION 5* Disc Version (825 GB)",
             "price" : "₹185,000",
             "regular_price":"₹199,000",
             "discount" : "7%",
@@ -438,50 +482,44 @@ def send_product(sender, payload):
         "Content-Type" : "application/json",
     }
     data = {
-        "name": "single_product_v1",
-        "language": "en_US",
-        "category": "marketing",
-        "components": [
-            {
-            "type": "header",
-            "format": "product"
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": sender,
+        "type": "template",
+        "template": {
+            "name": "single_product_v2",
+            "language": {
+            "code": "en_US"
             },
+            "components": [
             {
-            "type": "body",
-            "text": "The {{1}} \n Highlights: \n - EMI Available! \n - Get GST invoice and save up to 28%% on business purchases \n - Free Shipping all over India",
-            "example": {
-                "body_text": [
-                [
-                    "Apple MacBook Pro (14-Inch, Apple M3 Pro Chip, 11-Core CPU, 14-Core GPU, 18GB Unified Memory, 512GB SSD, macOS, Space Black)"
-                ]
-                ]
-            }
-            },
-            {
-            "type": "footer",
-            "text": "Hurry, only {{1}} left",
-            "example": {
-                "body_text": [
-                [
-                    "3"
-                ]
-                ]
-            }
-            },
-            {
-            "type": "buttons",
-            "buttons": [
+                "type": "header",
+                "parameters": [
                 {
-                "type": "spm",
-                "text": "View"
+                    "type": "product",
+                    "product": {
+                    "product_retailer_id": payload,
+                    "catalog_id": "759103595212051"
+                    }
                 }
-            ]
+                ]
+            },
+            {
+                "type": "body",
+                "parameters": [
+                    {
+                    "type":"text",
+                    "text": f"{product['name']}"
+                    }
+                ]
             }
-        ]
+            ]
+        }
     }
 
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
+    print(f"Message sent to {sender} with product {product['name'][:10]}")
 
 
 """

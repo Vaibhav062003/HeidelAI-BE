@@ -24,7 +24,7 @@ def send_carousel_message():
     data = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
-        "to": rounak,
+        "to": "+918815785354",
         "type": "template",
         "template": {
             "name": "carousel_template_test_v38",
