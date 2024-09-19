@@ -187,7 +187,6 @@ def get_agent(session_id: str):
     llm = initialize_llm()
     return initialize_langchain_agent(llm, session_id)
 
-
 agent_executor = get_agent("test")
 
 first_prompt = """
