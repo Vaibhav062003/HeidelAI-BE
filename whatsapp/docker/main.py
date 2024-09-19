@@ -343,11 +343,14 @@ async def verify_webhook(request: Request):
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
     global flag
     global search_term
+    global websocket_product_data
     # First, validate the signature
     await signature_required(request, x_hub_signature_256)
 
     # Remove expired message IDs
     remove_expired_message_ids()
+
+
 
     # Process the incoming message (if the signature is valid)
     payload = await request.json()
@@ -401,15 +404,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             products_space = websocket_product_data.get(client_id)
 
+                            print("Products space 2: ",products_space)
+
                             if products_space:
-                                await send_message(sender, "Please give me a minute...")
+                                print("Came in if")
+                                await send_message(sender, "Please give me a minute.")
                                 await send_carousel(sender, search_term, products_space)
                                 search_term = ""
-                                websocket_product_data[client_id] = []
+                                del websocket_product_data[client_id] 
                             else:
+                                print("Came in else")
                                 await send_message(sender, response['output'])
 
-                            products_space = []
+                            print("Products space 3: ", products_space)
 
                             if flag:
                                 flag = False
