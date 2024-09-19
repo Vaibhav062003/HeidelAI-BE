@@ -1,4 +1,5 @@
 import time, requests, os, json, hmac, hashlib
+from asyncio import Lock
 from pinecone import Pinecone
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -48,6 +49,7 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 websocket_product_data = {}
 flag = False
 search_term = ""
+websocket_data_lock = Lock()
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -350,8 +352,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     # Remove expired message IDs
     remove_expired_message_ids()
 
-
-
     # Process the incoming message (if the signature is valid)
     payload = await request.json()
     print("Incoming webhook payload:", json.dumps(payload, indent=2))
@@ -402,19 +402,21 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 config={"configurable": {"session_id": client_id}},
                             )
 
-                            products_space = websocket_product_data.get(client_id)
+                            async with websocket_data_lock:
+                                print("websocket_product_data 1: ", websocket_product_data)
+                                products_space = websocket_product_data.get(client_id)
+                                print("Products space 2: ", products_space)
 
-                            print("Products space 2: ",products_space)
-
-                            if products_space:
-                                print("Came in if")
-                                await send_message(sender, "Please give me a minute.")
-                                await send_carousel(sender, search_term, products_space)
-                                search_term = ""
-                                del websocket_product_data[client_id] 
-                            else:
-                                print("Came in else")
-                                await send_message(sender, response['output'])
+                                if products_space:
+                                    print("Came in if")
+                                    await send_message(sender, "Please give me a minute.")
+                                    del websocket_product_data[client_id] 
+                                    await send_carousel(sender, search_term, products_space)
+                                    search_term = ""
+                                    print("websocket_product_data 2: ", websocket_product_data) 
+                                else:
+                                    print("Came in else")
+                                    await send_message(sender, response['output'])
 
                             print("Products space 3: ", products_space)
 
