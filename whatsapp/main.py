@@ -104,6 +104,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             print("Button Payload: ", payload)
                             # output = agent(payload)
                             # response = output['output']
+
+                            await send_product(sender, payload)
                             response = "This functionality is not available yet."
                             await send_message(sender, response)
                             print("Message sent to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
@@ -414,6 +416,71 @@ def send_carousel(sender, message, products):
     }
 
     response = requests.post(url, headers=headers, data=json.dumps(data))
+    print(f"Response: {response.status_code}, {response.json()}")
+
+
+def send_product(sender, payload):
+    
+
+    if payload == "MRX33HN/A_201":
+        product = {
+            "name" : "Apple MacBook Pro (14-Inch, Apple M3 Pro Chip, 11-Core CPU, 14-Core GPU, 18GB Unified Memory, 512GB SSD, macOS, Space Black) ",
+            "price" : "₹185,000",
+            "regular_price":"₹199,000",
+            "discount" : "7%",
+            "stock_quantity" : "3"
+
+        }
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+
+    headers = {
+        "Authorization" : "Bearer " + ACCESS_TOKEN,
+        "Content-Type" : "application/json",
+    }
+    data = {
+        "name": "single_product_v1",
+        "language": "en_US",
+        "category": "marketing",
+        "components": [
+            {
+            "type": "header",
+            "format": "product"
+            },
+            {
+            "type": "body",
+            "text": "The {{1}} \n Highlights: \n - EMI Available! \n - Get GST invoice and save up to 28%% on business purchases \n - Free Shipping all over India",
+            "example": {
+                "body_text": [
+                [
+                    "Apple MacBook Pro (14-Inch, Apple M3 Pro Chip, 11-Core CPU, 14-Core GPU, 18GB Unified Memory, 512GB SSD, macOS, Space Black)"
+                ]
+                ]
+            }
+            },
+            {
+            "type": "footer",
+            "text": "Hurry, only {{1}} left",
+            "example": {
+                "body_text": [
+                [
+                    "3"
+                ]
+                ]
+            }
+            },
+            {
+            "type": "buttons",
+            "buttons": [
+                {
+                "type": "spm",
+                "text": "View"
+                }
+            ]
+            }
+        ]
+    }
+
+    response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
 
 

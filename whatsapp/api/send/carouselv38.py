@@ -54,7 +54,7 @@ def send_carousel_message():
                         {
                             "type": "image",
                             "image": {
-                            "link": "https://egeniestores.com/wp-content/uploads/2024/05/61aHJIjnH6L._SL1500_.jpg"
+                            "link": "https://egeniestores.com/wp-content/uploads/2024/04/7ebc8d65-d257-42f0-85f4-cdd1993033cd23021130-300x300-1.jpg"
                             }
                         }
                         ]
@@ -81,7 +81,7 @@ def send_carousel_message():
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "macbook-pro"
+                                "payload": "MRX33HN/A_201"
                             }
                         ]
                     }
@@ -123,7 +123,7 @@ def send_carousel_message():
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "legion-5-pro"
+                                "payload": "82JQ00JCIN_470"
                             }
                         ]
                     }
@@ -165,7 +165,7 @@ def send_carousel_message():
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "asus-tuf-gaming-a15"
+                                "payload": "FA506ICB-HN075W_3780"
                             }
                         ]
                     }
@@ -207,7 +207,7 @@ def send_carousel_message():
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "legion-loq-2024"
+                                "payload": "wc_post_id_801"
                             }
                         ]
                     }
@@ -249,7 +249,7 @@ def send_carousel_message():
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "sony-ps-5"
+                                "payload": "wc_post_id_407"
                             }
                         ]
                     }
