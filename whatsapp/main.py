@@ -109,6 +109,35 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                           print("Message sent to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
 
+                            # message_text = f"client_id: {client_id}: " + message_text
+                            # products_space = websocket_product_data.get(client_id)
+
+                            # print("Product Space: ", products_space)    
+                            # if products_space:
+                            #     response_data = {
+                            #         "type": "products",
+                            #         "message": response,
+                            #         "products": products_space
+                            #     }
+                            #     websocket_product_data[client_id] = []
+                            # else:
+                            #     response_data = {
+                            #         "type": "message",
+                            #         "message": response
+                            #     }
+
+                            # Convert the dictionary to JSON
+                            # response_json = response_data
+
+                            # if response_json["type"] == "message":                 
+                            #     # Send a reply to the sender
+                            #     await send_message(sender, response_json["message"])
+
+                            # elif response_json["type"] == "products":
+                            #     message = response_json["message"]
+                            #     products = response_json["products"]
+                            #     await send_carousel(sender, message, products)
+
                         elif message["type"] == "button":
                             payload = message["button"]["payload"]
                             print("Button Payload: ", payload)
@@ -118,34 +147,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             await send_product(sender, payload)
                             
 
-                        # message_text = f"client_id: {client_id}: " + message_text
-                        # products_space = websocket_product_data.get(client_id)
 
-                        # print("Product Space: ", products_space)    
-                        # if products_space:
-                        #     response_data = {
-                        #         "type": "products",
-                        #         "message": response,
-                        #         "products": products_space
-                        #     }
-                        #     websocket_product_data[client_id] = []
-                        # else:
-                        #     response_data = {
-                        #         "type": "message",
-                        #         "message": response
-                        #     }
-
-                        # Convert the dictionary to JSON
-                        # response_json = response_data
-
-                        # if response_json["type"] == "message":                 
-                        #     # Send a reply to the sender
-                        #     await send_message(sender, response_json["message"])
-
-                        # elif response_json["type"] == "products":
-                        #     message = response_json["message"]
-                        #     products = response_json["products"]
-                        #     await send_carousel(sender, message, products)
     
     return {"status": "ok"}
 

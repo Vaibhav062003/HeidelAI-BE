@@ -442,9 +442,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # output = agent(payload)
                             # response = output['output']
                             await send_message(sender, "This functionality is in development.")
+                            print("Sender clicked Know More")
+                            print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
 
                             # await send_product(sender, payload)
-                            
+                        elif message["type"] == "order":
+                            response = "This feature is in development and is not available yet."
+                            await send_message(sender, response)
+                            print("Sender sent cart")
+                            print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
 
     return {"status": "ok"}
 
@@ -467,7 +473,7 @@ async def send_message(recipient, message_text):
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
 
-def send_carousel(sender: str, search_term: str, products):
+async def send_carousel(sender: str, search_term: str, products):
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
     
     headers = {
@@ -726,7 +732,7 @@ def send_carousel(sender: str, search_term: str, products):
     print(f"Response: {response.status_code}, {response.json()}")
     print(f"Sent products to {sender}")
 
-def send_product(sender, payload):
+async def send_product(sender, payload):
     product = {}
 
     if payload == "MRX33HN/A_201":
@@ -819,3 +825,56 @@ def send_product(sender, payload):
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
     print(f"Message sent to {sender} with product {product['name'][:10]}")
+
+"""
+User sent cart then payload is:
+
+Incoming webhook payload: {
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "389116497625642",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "918788424068",
+              "phone_number_id": "423792927480992"
+            },
+            "contacts": [
+              {
+                "profile": {
+                  "name": "Rounak"
+                },
+                "wa_id": "917972510629"
+              }
+            ],
+            "messages": [
+              {
+                "from": "917972510629",
+                "id": "wamid.HBgMOTE3OTcyNTEwNjI5FQIAEhgUM0E3QTFCQkY3NEQ1OUYwNTBCRTMA",
+                "timestamp": "1726773211",
+                "type": "order",
+                "order": {
+                  "catalog_id": "759103595212051",
+                  "text": "",
+                  "product_items": [
+                    {
+                      "product_retailer_id": "MRX33HN/A_201",
+                      "quantity": 1,
+                      "item_price": 185000,
+                      "currency": "INR"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}
+"""
