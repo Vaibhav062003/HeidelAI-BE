@@ -38,12 +38,12 @@ def upload_image_to_whatsapp(phone_number_id, access_token, file_path):
 load_dotenv()
 # Replace these values with your actual data
 image_url = "https://egeniestores.com/wp-content/uploads/2024/04/original-imaghyykrhvewh4y.jpeg"
-save_path = "downloaded_image.jpg"  # Local path where the image will be saved
+save_path = "egenie.jpeg"  # Local path where the image will be saved
 access_token = os.getenv("ACCESS_TOKEN")
 phone_number_id = os.getenv("PHONE_NUMBER_ID")  # Your WhatsApp business phone number ID
 
 # Download the image
-download_image(image_url, save_path)
+# download_image(image_url, save_path)
 
 # Upload the image to WhatsApp API
 media_id = upload_image_to_whatsapp(phone_number_id, access_token, save_path)
