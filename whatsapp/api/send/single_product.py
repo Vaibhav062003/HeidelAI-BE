@@ -38,7 +38,7 @@ def send_carousel_message():
                 {
                     "type": "product",
                     "product": {
-                    "product_retailer_id": "MRX33HN/A_201",
+                    "product_retailer_id": "407",
                     "catalog_id": "759103595212051"
                     }
                 }

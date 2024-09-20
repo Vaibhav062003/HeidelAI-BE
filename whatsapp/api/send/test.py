@@ -108,4 +108,4 @@ def send_product(sender, payload):
     print(f"Message sent to {sender} with product {product['name'][:10]}")
 
 
-send_product(anushka,"82JQ00JCIN_470" )
+send_product(rounak,"82JQ00JCIN_470" )

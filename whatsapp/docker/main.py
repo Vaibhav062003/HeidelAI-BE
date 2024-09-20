@@ -422,7 +422,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             if flag:
                                 flag = False
-                                doc_ref = db.collection("HistoryMessages").document("ron-test")
+                                doc_ref = db.collection("HistoryMessages").document(client_id)
                                 doc = doc_ref.get()
                                 
                                 if doc.exists:
@@ -443,7 +443,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # response = output['output']
                             await send_message(sender, "This functionality is in development.")
                             print("Sender clicked Know More")
-                            print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
+                            print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: This functionality is in development. ")
 
                             # await send_product(sender, payload)
                         elif message["type"] == "order":
