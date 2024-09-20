@@ -12,7 +12,7 @@ sahil = "+919511907785"
 vipul = "+918408062973"
 rounak = "+917972510629"
 
-def send_carousel_message():
+def send_introduction():
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
     
     headers = {
@@ -51,6 +51,6 @@ def send_carousel_message():
     return response
 
 
-response = send_carousel_message()
+response = send_introduction()
 print(response.status_code)
 print(response.json())

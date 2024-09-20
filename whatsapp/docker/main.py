@@ -394,6 +394,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             user_input = message["text"]["body"]
                             print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", user_input)
 
+                            if user_input == "Hi":
+                                await send_introduction(sender)
+                                print("Introduction sent to Name: ", sender_name, ", Number: ",sender )
+                                continue
+    
+
                             client_id = sender
                             user_input = f"(client_id: {client_id}): " + user_input
 
@@ -472,6 +478,45 @@ async def send_message(recipient, message_text):
 
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
+
+async def send_introduction(recipient):
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+    
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    
+    # Building the carousel template with response variable and product details
+    data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "template",
+        "template": {
+            "name": "introduce_yourself",
+            "language": {
+            "code": "en"
+            },
+            "components": [
+            {
+                "type": "header",
+                "parameters": [
+                {
+                    "type": "image",
+                    "image": {
+                        "id": "1251499229323459"
+                    }
+                }
+                ]
+            }
+            ]
+        }
+    }
+
+    response = requests.post(url, headers=headers, data=json.dumps(data))
+    print(f"Response: {response.status_code}, {response.json()}")
+
 
 async def send_carousel(sender: str, search_term: str, products):
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
