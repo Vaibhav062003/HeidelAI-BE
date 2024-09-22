@@ -8,11 +8,12 @@ load_dotenv()
 # Meta access token and catalog ID
 access_token = os.getenv("ACCESS_TOKEN")
 catalog_id = os.getenv("CATALOG_ID")
+version = os.getenv("VERSION")
 
 # Function to fetch all products and return their retailer IDs
 def fetch_all_products():
     products = []
-    url = f"https://graph.facebook.com/{os.getenv('VERSION')}/{catalog_id}/products?limit=25"  # Adjust version as needed
+    url = f"https://graph.facebook.com/{version}/{catalog_id}/products?limit=25"  # Adjust version as needed
 
     headers = {
         "Authorization": f"Bearer {access_token}",
