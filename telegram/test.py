@@ -27,7 +27,7 @@ EXPIRY_TIME_SECONDS = 86400
 load_dotenv()
 
 
-BOT_USERNAME = os.getenv('BOT_USERNAME2')
+BOT_USERNAME = os.getenv('USERNAME2')
 TOKEN = os.getenv('TOKEN2')
 
 # Define the path to your service account JSON file
@@ -503,11 +503,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if message_type == 'group':
         if BOT_USERNAME in text:
-            new_text = text.replace(f'@{BOT_USERNAME}', '').strip()
+            username = "@" + BOT_USERNAME
+            new_text = text.replace(username, '').strip()
+            print("New text: ", new_text)
             response = await handle_response(new_text, client_id)
         else:
             return
-        
     else:
         response = await handle_response(text, client_id)
 

@@ -1,4 +1,4 @@
-import os, json, requests, re
+import os, json, requests, re, time
 from bs4 import BeautifulSoup
 from woocommerce import API
 from dotenv import load_dotenv
@@ -74,43 +74,165 @@ for product in products:
     # product['images'] = product['images'][0]['src'] if product['images'] else None
     cleaned_products.append(product)
     
+# https://developers.facebook.com/docs/marketing-api/catalog/reference/#optional-fields
+print(f"{len(cleaned_products)} products fetched")
+# temp = json.dumps(cleaned_products[2], indent=2)
 
-# print(cleaned_products)
-temp = json.dumps(cleaned_products[2], indent=2)
+# filename = "output2.json"
 
-filename = "output2.json"
+# with open(filename, "w") as file:
+#     file.write(temp)
 
-with open(filename, "w") as file:
-    file.write(temp)
+# print(f"Data successfully saved to {filename}")
 
-print(f"Data successfully saved to {filename}")
+for i, product in enumerate(products):
 
-# for product in products:
+    if len(product['images']) == 0  or not product['price']:
+        continue
 
-#     batch_data = {
-#         "access_token": access_token,
-#         "item_type": "PRODUCT_ITEM",
-#         "requests": [
-#             {
-#                 "method": "CREATE",
-#                 "data": {
-#                     "id": product['id'],
-#                     "brand": "Sony",
-#                     "title": "SONY PLAYSTATION 5 Disc Version (825 GB)",
-#                     "description": "Brace yourself for a whole new world of possibilities as the PS5 unleashes unparalleled power and innovation. Get ready to elevate your gaming experience to new heights with the Sony PlayStation 5 Console. Unleash the power of play, immerse yourself in stunning visuals, and explore a world of endless possibilities. With the PS5, gaming will never be the same again.",
-#                     "price": "54990 INR",
-#                     "sale_price": "51500 INR",
-#                     "image_link": "https://egeniestores.com/wp-content/uploads/2024/04/original-imaghyykrhvewh4y.jpeg",
-#                     "link": "https://egeniestores.com/product/sony-playstation-5-disc-version-825-gb/",
-#                     "availability": "in stock",
+    if (not product['stock_quantity'] or product['stock_quantity'] <= 0):
+        availability = "out of stock"
+    else:
+        availability = "in stock"
 
-#                     "origin_country" : "IN",
-#                     "condition": "new",
-#                     "status" : "active"
-#                 }
-#             },
-#         ]
-#     }
+    if (product['sale_price'] and product['regular_price']):
+        # print(f"Product {i}: ")
+        # print("id: ", product['id'])
+        # print("title: ", product['name'])
+        # print("price: ", f"{product['regular_price']} INR")
+        # print("sale_price: ", f"{product['sale_price']} INR")
+        # # print("image: ", image)
+        # print("images: ", ', '.join(image['src'] for image in product['images']))
+        # print("link: ", product['permalink'])
+        # print("availability: ", availability)
+        # print("\n\n")
+        batch_data = {
+            "access_token": access_token,
+            "item_type": "PRODUCT_ITEM",
+            "requests": [
+                {
+                    "method": "CREATE",
+                    "data": {
+                        "id": str(product['id']), 
+                        "brand": "Egenie",
+                        "title": product['name'][:65],
+                        "description": product['description'],
+                        "price": f"{product['regular_price']} INR",
+                        "sale_price": f"{product['sale_price']} INR",
+                        "image_link": product['images'][0]['src'],
+                        "additional_image_link" : ', '.join(image['src'] for image in product['images']),
+                        "link": product['permalink'],
+                        "availability": availability,
+                        
+                        "google_product_category" : "222",
+                        "origin_country" : "IN",
+                        "condition": "new",
+                        "status" : "active"
+                    }
+                },
+            ]
+        }
+    
+    else:
+        # print("All prices available")
+        # print(f"Product {i}: ")
+        # print("id: ", product['id'])
+        # print("title: ", product['name'])
+        # print("price: ", f"{product['price']} INR")
+        # # print("image: ", image)
+        # print("images: ", ', '.join(image['src'] for image in product['images']))
+        # print("link: ", product['permalink'])
+        # print("availability: ", availability)
+        # print("\n\n")
+
+        batch_data = {
+            "access_token": access_token,
+            "item_type": "PRODUCT_ITEM",
+            "requests": [
+                {
+                    "method": "CREATE",
+                    "data": {
+                        "id": str(product['id']), 
+                        "brand": "Egenie",
+                        "title": product['name'][:65],
+                        "description": product['description'],
+                        "price": f"{product['price']} INR",
+                        "image_link": product['images'][0]['src'],
+                        "additional_image_link" : ', '.join(image['src'] for image in product['images']),
+                        "link": product['permalink'],
+                        "availability": availability,
+                        
+                        "google_product_category" : "222",
+                        "origin_country" : "IN",
+                        "condition": "new",
+                        "status" : "active"
+                    }
+                },
+            ]
+        }
+    """
+    Check Status Response JSON: {'data': [{'handle': 'AczCMfwr3QDvV5-LYIBnHLlVlWD-XIwyozFZ-DoMc4l_QQ9Mg0egdACfy6otFtlom2uU-qKEkIyHPbPl1l2tD6Te', 'status': 'finished', 'errors_total_count': 1, 'errors': [{'line': 1, 'id': '699', 'message': 'These attributes are invalid and need to be updated in the feed file: The id information under  is invalid. Review for more details'}], 'warnings': [{'line': 1, 'id': '699', 'message': 'अज्ञात त्रुटी: Make item title easier to read by keeping it under 65 charact  ters in length.'}], 'ids_of_invalid_requests': []}]}
+    
+    """
+
+    upload_response = requests.post(upload_url, json=batch_data)
+
+    # Handle upload response
+    print(f"Insert Response for Product ID {product['id']} - Status Code:", upload_response.status_code)
+    upload_json = upload_response.json()
+    print("insert Response JSON:", upload_json)
+    print("\n\n")
+    # Check if the insert was successful and get the handle
+    if upload_response.status_code == 200:
+        handle = upload_json.get('handles', [None])[0]
+        if handle:
+            print(f"insertion request for Product ID {product['id']} submitted successfully.")
+            print("\n\n")
+            # Check status for insertion
+            def check_status(handle):
+                url = f"https://graph.facebook.com/v20.0/{catalog_id}/check_batch_request_status"
+                params = {
+                    'access_token': access_token,
+                    'handle': handle
+                }
+                response = requests.get(url, params=params)
+                return response
+
+            # Check status every 10 seconds until finished
+            while True:
+                status_response = check_status(handle)
+                print(f"Check Status Response for Product ID {product['id']} - Status Code: {status_response.status_code}")
+                status_json = status_response.json()
+                print(f"Check Status Response JSON:", status_json)
+                print("\n\n")
+                
+                if status_response.status_code == 200:
+                    status_data = status_json.get('data', [])
+                    if status_data:
+                        status = status_data[0].get('status')
+                        if status == 'finished':
+                            print(f"Batch processing for Product ID {product['id']} completed successfully.")
+                            print("\n\n")
+                            break
+                        elif status in ['started', 'scheduled', 'dispatched']:
+                            print(f"Batch processing for Product ID {product['id']} is still in progress.")
+                            print("\n\n")
+                        elif status == 'canceled':
+                            print(f"Batch processing for Product ID {product['id']} was canceled.")
+                            print("\n\n")
+                            break
+                        elif status == 'error':
+                            print(f"An error occurred during batch processing for Product ID {product['id']}.")
+                            print("\n\n")
+                            break
+                    else:
+                        print("No status data available.")
+                else:
+                    print("Error checking status.")
+                time.sleep(8)
+    else:
+        print(f"Failed to submit insertion request for Product ID {product['id']}.")
+        print("\n\n")
 
 # upload_response = requests.post(upload_url, json=batch_data)
 # print("Upload Response Status Code:", upload_response.status_code)

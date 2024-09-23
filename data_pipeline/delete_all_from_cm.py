@@ -45,10 +45,6 @@ upload_url = f"https://graph.facebook.com/v20.0/{catalog_id}/items_batch"
 
 # Loop through each retailer ID to delete products
 for retailer_id in retailer_ids:
-    # Skip the retailer ID that should not be deleted
-    if retailer_id == "wc_post_id_25":
-        print(f"Skipping deletion for Retailer ID: {retailer_id}")
-        continue
 
     batch_data = {
         "access_token": access_token,

@@ -108,11 +108,11 @@
   "menu_order": 0,
   "price_html": "<ins><span class=\"woocommerce-Price-amount amount\"><bdi><span class=\"woocommerce-Price-currencySymbol\">&#8377;</span>28,650</bdi></span></ins> <del aria-hidden=\"true\"><span class=\"woocommerce-Price-amount amount\"><bdi><span class=\"woocommerce-Price-currencySymbol\">&#8377;</span>35,990</bdi></span></del>",
   "related_ids": [
-    729,
-    801,
+    640,
+    489,
+    564,
     762,
-    25,
-    470
+    624
   ],
   "meta_data": [
     {
@@ -295,7 +295,7 @@
       }
     },
     {
-      "id": 7179,
+      "id": 7386,
       "key": "_wc_gla_mc_status",
       "value": "approved"
     }
