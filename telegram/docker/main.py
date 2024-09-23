@@ -1,6 +1,6 @@
 from telegram import InputMediaPhoto, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-
+import telegram
 import time, requests, os, json, hmac, hashlib
 from asyncio import Lock
 from pinecone import Pinecone
@@ -31,7 +31,7 @@ BOT_USERNAME = os.getenv('USERNAME')
 print("\u001b[32mBot Username:\u001b[0m ", BOT_USERNAME)
 TOKEN = os.getenv('TOKEN')
 print("\u001b[32mToken:\u001b[0m ", TOKEN)
-
+bot = telegram.Bot(token=TOKEN)
 # Define the path to your service account JSON file
 SERVICE_ACCOUNT_FILE = 'whatsapp-chatbot-history-cf43052a413d.json'
 
@@ -316,59 +316,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
-
-
-# async def carousel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     # Define the keyboard with buttons to simulate next/previous
-#     keyboard = [
-#         [InlineKeyboardButton("Next Item", callback_data="next_item")]
-#     ]
-#     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-#     # Send the first "card" with the inline keyboard
-#     await update.message.reply_photo(
-#         photo="downloaded_image.jpg",  # Replace with the first item image URL
-#         caption="This is the first item of the carousel",
-#         reply_markup=reply_markup
-#     )
-
-# async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     query = update.callback_query
-#     await query.answer()  # Acknowledge the callback
-    
-#     # Handle the "Next Item" button press
-#     if query.data == "next_item":
-#         keyboard = [
-#             [InlineKeyboardButton("Previous Item", callback_data="previous_item"),
-#              InlineKeyboardButton("Next Item", callback_data="next_item")]
-#         ]
-#         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-#         # Edit the message with the new image and text (simulate next item)
-#         await query.edit_message_media(
-#             media=InputMediaPhoto("https://egeniestores.com/wp-content/uploads/2024/04/81njZjDqc6L._SL1500_.jpg")
-#         )
-#         await query.edit_message_caption(
-#             caption="This is the next item of the carousel",  # Replace with next item caption
-#             reply_markup=reply_markup
-#         )
-    
-#     # Handle the "Previous Item" button press if needed
-#     if query.data == "previous_item":
-#         keyboard = [
-#             [InlineKeyboardButton("Next Item", callback_data="next_item")]
-#         ]
-#         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-#         # Edit the message with the new image and text (simulate next item)
-#         await query.edit_message_media(
-#             media=InputMediaPhoto("https://egeniestores.com/wp-content/uploads/2024/04/71atfTZpTaL._SL1500_.jpg")
-#         )
-#         await query.edit_message_caption(
-#             caption="This is the first item of the carousel",  # Replace with next item caption
-#             reply_markup=reply_markup
-#         )
-
 async def send_carousel(update: Update, context: ContextTypes.DEFAULT_TYPE, products_space):
     # Define the keyboard with buttons to simulate next/previous
     try:
@@ -476,6 +423,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def send_message(text, chat_id):
+    async with bot:
+        await bot.send_message(text=text, chat_id=chat_id)
+
+async def show_typing(chat_id):
+    async with bot:
+        await bot.send_chat_action(chat_id=chat_id, action=telegram.constants.ChatAction.TYPING)
 
 
 async def handle_response(text, client_id):
@@ -504,6 +458,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.chat.id
     print("First User ID: ", user_id)
     client_id = str(user_id)
+    # await bot.send_chat_action(chat_id=client_id, action=telegram.constants.ChatAction.TYPING)
+    await show_typing(client_id)
     if websocket_product_data.get(client_id):
         del websocket_product_data[client_id]
     
@@ -526,6 +482,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if products_space:
             # await update.message.reply_text(response)
             print("came here?")
+            await send_message(text=response, chat_id=user_id)
             await send_carousel(update, context, products_space)
             search_term = ""
              
@@ -558,10 +515,41 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# @app.on_event("startup")
+# async def startup_event():
+#     # Your existing logic from `if __name__ == '__main__':`
+#     print("\u001b[33mStarting bot...\u001b[0m")
+#     app = Application.builder().token(TOKEN).build()
 
+#     # Commands
+#      # Register existing /start command
+#     app.add_handler(CommandHandler('start', start_command))
+
+#     # Register the new /carousel command
+#     # app.add_handler(CommandHandler('carousel', carousel_command))
+
+#     # Register button handler for inline keyboard button clicks
+#     app.add_handler(CallbackQueryHandler(button_handler))
+
+#     # Messages
+#     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+#     # Errors
+#     app.add_error_handler(error)
+
+#     print("\u001b[32mPolling...\u001b[0m")
+#     app.run_polling(poll_interval=1)
+
+# # Define your routes below as usual
+
+# @app.get("/")
+# async def read_root():
+#     return {"message": "Hello, World!"}
 
 
 if __name__ == '__main__':
+    import uvicorn
+
     print("\u001b[33mStarting bot...\u001b[0m")
     app = Application.builder().token(TOKEN).build()
 
@@ -583,3 +571,5 @@ if __name__ == '__main__':
 
     print("\u001b[32mPolling...\u001b[0m")
     app.run_polling(poll_interval=1)
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

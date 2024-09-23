@@ -1,4 +1,5 @@
 from telegram import InputMediaPhoto, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 import time, requests, os, json, hmac, hashlib
@@ -29,6 +30,8 @@ load_dotenv()
 
 BOT_USERNAME = os.getenv('USERNAME2')
 TOKEN = os.getenv('TOKEN2')
+
+bot = telegram.Bot(token=TOKEN)
 
 # Define the path to your service account JSON file
 SERVICE_ACCOUNT_FILE = 'whatsapp-chatbot-history-cf43052a413d.json'
@@ -468,7 +471,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def send_message(text, chat_id):
+    async with bot:
+        await bot.send_message(text=text, chat_id=chat_id)
 
+async def show_typing(chat_id):
+    async with bot:
+        await bot.send_chat_action(chat_id=chat_id, action=telegram.constants.ChatAction.TYPING)
 
 async def handle_response(text, client_id):
     user_id = str(client_id)
@@ -490,11 +499,12 @@ async def handle_response(text, client_id):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global flag
 
-
     message_type = update.message.chat.type
     text = update.message.text
     user_id = update.message.chat.id
+    client_id = str(user_id)
     print("First User ID: ", user_id)
+    await show_typing(client_id)
     client_id = str(user_id)
     if websocket_product_data.get(client_id):
         del websocket_product_data[client_id]
@@ -518,6 +528,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if products_space:
             # await update.message.reply_text(response)
+            # bot =  update.message.get_bot
+            # chat_id = update.message.chat_id    
+            # await bot.send_message(chat_id=chat_id, text=response)
+            await send_message(text=response, chat_id=user_id)
             print("came here?")
             await send_carousel(update, context, products_space)
             search_term = ""

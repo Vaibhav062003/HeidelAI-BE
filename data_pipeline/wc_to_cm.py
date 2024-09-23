@@ -74,7 +74,6 @@ for product in products:
     # product['images'] = product['images'][0]['src'] if product['images'] else None
     cleaned_products.append(product)
     
-# https://developers.facebook.com/docs/marketing-api/catalog/reference/#optional-fields
 print(f"{len(cleaned_products)} products fetched")
 # temp = json.dumps(cleaned_products[2], indent=2)
 
@@ -170,10 +169,6 @@ for i, product in enumerate(products):
                 },
             ]
         }
-    """
-    Check Status Response JSON: {'data': [{'handle': 'AczCMfwr3QDvV5-LYIBnHLlVlWD-XIwyozFZ-DoMc4l_QQ9Mg0egdACfy6otFtlom2uU-qKEkIyHPbPl1l2tD6Te', 'status': 'finished', 'errors_total_count': 1, 'errors': [{'line': 1, 'id': '699', 'message': 'These attributes are invalid and need to be updated in the feed file: The id information under  is invalid. Review for more details'}], 'warnings': [{'line': 1, 'id': '699', 'message': 'अज्ञात त्रुटी: Make item title easier to read by keeping it under 65 charact  ters in length.'}], 'ids_of_invalid_requests': []}]}
-    
-    """
 
     upload_response = requests.post(upload_url, json=batch_data)
 
