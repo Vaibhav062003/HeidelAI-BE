@@ -14,7 +14,6 @@ from langchain_google_firestore import FirestoreChatMessageHistory
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
-import time
 from collections import OrderedDict
 
 # Regular dictionary to store processed message IDs with their timestamps
@@ -47,9 +46,11 @@ PINECONE_INDEX = os.getenv("PINECONE_INDEX")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
 websocket_product_data = {}
+api_product_data = {}
 flag = False
 search_term = ""
 websocket_data_lock = Lock()
+api_data_lock = Lock()
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -339,6 +340,7 @@ async def verify_webhook(request: Request):
     if args.get("hub.verify_token") == VERIFY_TOKEN:
         return PlainTextResponse(content=str(args.get("hub.challenge")))
     return {"status": "Verification failed"}
+
 
 
 @app.post("/webhook")
@@ -870,6 +872,10 @@ async def send_product(sender, payload):
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
     print(f"Message sent to {sender} with product {product['name'][:10]}")
+
+
+
+
 
 """
 User sent cart then payload is:
