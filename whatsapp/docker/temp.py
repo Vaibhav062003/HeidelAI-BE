@@ -47,7 +47,7 @@ def initialize_llm():
 def fetch_company_info(dummy: str) -> str:
     """
     Fetches both company information and policies for Egenie4u.
-
+    Use this tool if the user asks for contact information or company policies.
     Returns:
         str: A confirmation of the products displayed to the user.
     """
@@ -62,6 +62,11 @@ def fetch_company_info(dummy: str) -> str:
     - Wide range of products, including high-end gaming PCs, consoles, and computer peripherals.
     - Regular promotions and discounts on popular items.
     - Commitment to customer satisfaction and after-sales support.
+
+    For more information, contact us at:
+    Contact Number: +918408062973
+    Address: 9, 257/b, Tiranga Bhavan, Opposite Dagduseth Ganapati Mandir, Pune - 411002
+    GST Number: 27BCLPM6314F1ZK
     """
 
 @tool
