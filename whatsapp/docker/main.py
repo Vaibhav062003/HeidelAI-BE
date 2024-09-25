@@ -136,6 +136,7 @@ def fetch_product_data(client_id: str, query: str, category: str, price: int = 0
     for product in product_data:
         product_string += f"Name: {product['name']}, Price: {product['price']}\n"
         product_dict = {
+        "id": product['product_id'],
         "name": product['name'],
         "price": product['price'],
         "permalink": product['permalink'],
@@ -341,13 +342,14 @@ async def verify_webhook(request: Request):
         return PlainTextResponse(content=str(args.get("hub.challenge")))
     return {"status": "Verification failed"}
 
-
+temp = []
 
 @app.post("/webhook")
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
     global flag
     global search_term
     global websocket_product_data
+    global temp
     # First, validate the signature
     await signature_required(request, x_hub_signature_256)
 
@@ -392,6 +394,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                         sender = message["from"]
                         
+                        
+
                         if message["type"] == "text":
                             user_input = message["text"]["body"]
                             print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", user_input)
@@ -413,6 +417,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             async with websocket_data_lock:
                                 print("websocket_product_data 1: ", websocket_product_data)
                                 products_space = websocket_product_data.get(client_id)
+                                temp = websocket_product_data.get(client_id) 
+                                
+
                                 print("Products space 2: ", products_space)
 
                                 if products_space:
@@ -447,16 +454,33 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         elif message["type"] == "button":
                             payload = message["button"]["payload"]
                             print("Button Payload: ", payload)
+
+                            payload = payload.split("_")
+                            print("Payload: ", payload)
+
+
                             # output = agent(payload)
                             # response = output['output']
-                            await send_message(sender, "This functionality is in development.")
+                            # await send_message(sender, "This functionality is in development.")
                             print("Sender clicked Know More")
-                            print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: This functionality is in development. ")
+                            await send_product(sender, payload, temp)
+                            # print("Sent message to Name: ", sender_name, ", Number: ", sender, "")
 
                             # await send_product(sender, payload)
                         elif message["type"] == "order":
-                            response = "This feature is in development and is not available yet."
+                            response = f"Hey {sender_name},Thank you for trying to place and order with us. \n\n We're sorry this feature is not available yet."
                             await send_message(sender, response)
+
+                            product_items = message["order"]["product_items"]
+
+                            for product in product_items:
+                                product_id = product["product_retailer_id"]
+                                quantity = product["quantity"]
+                                item_price = product["item_price"]
+                                currency = product["currency"]
+
+                                print(f"Product ID: {product_id}, Quantity: {quantity}, Price: {item_price}, Currency: {currency}")
+
                             print("Sender sent cart")
                             print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
 
@@ -589,7 +613,7 @@ async def send_carousel(sender: str, search_term: str, products):
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "macbook-pro"
+                                "payload": f"{str(int(products[0]['id']))}_0"
                             }
                         ]
                     }
@@ -632,7 +656,7 @@ async def send_carousel(sender: str, search_term: str, products):
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "macbook-pro"
+                                "payload": f"{str(int(products[1]['id']))}_1"
                             }
                         ]
                     }
@@ -675,7 +699,7 @@ async def send_carousel(sender: str, search_term: str, products):
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "macbook-pro"
+                                "payload": f"{str(int(products[2]['id']))}_2"
                             }
                         ]
                     }
@@ -718,7 +742,7 @@ async def send_carousel(sender: str, search_term: str, products):
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "macbook-pro"
+                                "payload": f"{str(int(products[3]['id']))}_3"
                             }
                         ]
                     }
@@ -761,7 +785,7 @@ async def send_carousel(sender: str, search_term: str, products):
                         "parameters": [
                             {
                                 "type": "payload",
-                                "payload": "macbook-pro"
+                                "payload": f"{str(int(products[4]['id']))}_4"
                             }
                         ]
                     }
@@ -779,54 +803,9 @@ async def send_carousel(sender: str, search_term: str, products):
     print(f"Response: {response.status_code}, {response.json()}")
     print(f"Sent products to {sender}")
 
-async def send_product(sender, payload):
-    product = {}
+async def send_product(sender, payload, product):
+    index = int(payload[1])
 
-    if payload == "MRX33HN/A_201":
-        product = {
-            "name" : "*Apple MacBook Pro* (14-Inch, Apple M3 Pro Chip, 11-Core CPU, 14-Core GPU, 18GB Unified Memory, 512GB SSD, macOS, Space Black) ",
-            "price" : "₹185,000",
-            "regular_price":"₹199,000",
-            "discount" : "7%",
-            "stock_quantity" : "3"
-
-        }
-    elif payload == "82JQ00JCIN_470":
-        product = {
-            "name" : "*Lenovo Legion 5 Pro* AMD Ryzen 7 5800H QHD Gaming Laptop(16GB/1TB SSD/RTX 3060 6GB /165Hz/Win11/Office 2021/RGB Backlit/3mnth Xbox Game Pass/Storm Grey/2.45Kg), 82JQ00JCIN",
-            "price" : "₹86,700",
-            "regular_price":"₹199,000",
-            "discount" : "7%",
-            "stock_quantity" : "3"
-
-        }
-    elif payload == "FA506ICB-HN075W_3780":
-        product = {
-            "name" : "*ASUS TUF Gaming A15* FHD 144Hz, AMD Ryzen 7 4800H, RTX 3050 4GB(16GB/512GB SSD/Win 11//90 Whr./1 Year McAfee/Graphite Black",
-            "price" : "₹185,000",
-            "regular_price":"₹199,000",
-            "discount" : "7%",
-            "stock_quantity" : "3"
-
-        }
-    elif payload == "wc_post_id_801":
-        product = {
-            "name" : "*Lenovo LOQ 2024* Intel Core i5-13450HX 15.6 (39.6cm) 144Hz 300Nits FHD Gaming Laptop (24GB/512GB SSD/Win 11/NVIDIA RTX 3050 6GB Graphics/100% sRGB/Office 21/3 Month Game Pass/Grey/2.4Kg)",
-            "price" : "₹185,000",
-            "regular_price":"₹199,000",
-            "discount" : "7%",
-            "stock_quantity" : "3"
-
-        }
-    elif payload == "wc_post_id_407":
-        product = {
-            "name" : "*SONY PLAYSTATION 5* Disc Version (825 GB)",
-            "price" : "₹185,000",
-            "regular_price":"₹199,000",
-            "discount" : "7%",
-            "stock_quantity" : "3"
-
-        }
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
 
     headers = {
@@ -850,7 +829,7 @@ async def send_product(sender, payload):
                 {
                     "type": "product",
                     "product": {
-                    "product_retailer_id": payload,
+                    "product_retailer_id": payload[0],
                     "catalog_id": "759103595212051"
                     }
                 }
@@ -861,7 +840,7 @@ async def send_product(sender, payload):
                 "parameters": [
                     {
                     "type":"text",
-                    "text": f"{product['name']}"
+                    "text": f"{product[index]['name']}"
                     }
                 ]
             }
@@ -871,7 +850,7 @@ async def send_product(sender, payload):
 
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
-    print(f"Message sent to {sender} with product {product['name'][:10]}")
+    print(f"Message sent to {sender} with product {product[index]['name'][:10]}")
 
 
 
@@ -928,4 +907,12 @@ Incoming webhook payload: {
     }
   ]
 }
+"""
+
+
+
+# FLOW JSON
+"""
+{"version":"3.1","screens":[{"id":"RECOMMEND","title":"Contact Details","data":{},"layout":{"type":"SingleColumnLayout","children":[{"type":"Form","name":"flow_path","children":[{"type":"TextSubheading","text":"Full name"},{"type":"TextInput","label":"Eg. Steve Jobs","name":"TextInput_3be76e","required":true,"input-type":"text","helper-text":""},{"type":"TextSubheading","text":"Contact Information"},{"type":"TextInput","label":"Email address","name":"TextInput_863f4d","required":true,"input-type":"email","helper-text":""},{"type":"TextCaption","text":"We'll use this email to send you details and updates about your order."},{"type":"Footer","label":"Continue","on-click-action":{"name":"navigate","next":{"type":"screen","name":"screen_xdycdl"},"payload":{"screen_0_TextInput_0":"${form.TextInput_3be76e}","screen_0_TextInput_1":"${form.TextInput_863f4d}"}}}]}]}},{"id":"screen_xdycdl","title":"Delivery Details","data":{"screen_0_TextInput_0":{"type":"string","__example__":"Example"},"screen_0_TextInput_1":{"type":"string","__example__":"Example"}},"terminal":true,"layout":{"type":"SingleColumnLayout","children":[{"type":"Form","name":"flow_path","children":[{"type":"TextSubheading","text":"Shipping Address"},{"type":"TextCaption","text":"Enter the address where you want your order delivered.\nNote: This address will be used for billing."},{"type":"Dropdown","label":"Country","required":true,"name":"Dropdown_057767","data-source":[{"id":"0_India","title":"India"}]},{"type":"TextArea","label":"Address","required":true,"name":"TextArea_72d055"},{"type":"TextInput","label":"State","name":"TextInput_1a72ca","required":true,"input-type":"text","helper-text":""},{"type":"TextInput","label":"City","name":"TextInput_064ada","required":true,"input-type":"text"},{"type":"TextInput","label":"PIN Code","name":"TextInput_e94033","required":true,"input-type":"number"},{"type":"Footer","label":"Submit","on-click-action":{"name":"complete","payload":{"screen_1_Dropdown_0":"${form.Dropdown_057767}","screen_1_TextArea_1":"${form.TextArea_72d055}","screen_1_TextInput_2":"${form.TextInput_1a72ca}","screen_1_TextInput_3":"${form.TextInput_064ada}","screen_1_TextInput_4":"${form.TextInput_e94033}","screen_0_TextInput_0":"${data.screen_0_TextInput_0}","screen_0_TextInput_1":"${data.screen_0_TextInput_1}"}}}]}]}}]}
+
 """
