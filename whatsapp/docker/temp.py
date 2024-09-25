@@ -6,19 +6,22 @@ from langchain.agents import AgentExecutor, create_structured_chat_agent
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
-from langchain_core.prompts.chat import ChatPromptTemplate, MessagesPlaceholder
 from sentence_transformers import SentenceTransformer
 from google.oauth2 import service_account
 from google.cloud import firestore
 from langchain_google_firestore import FirestoreChatMessageHistory
+from langchain import hub
+# from langchain.prompts import PromptTemplate
+# from langchain_core.prompts.chat import ChatPromptTemplate, MessagesPlaceholder
 
 load_dotenv()
 
 SERVICE_ACCOUNT_FILE = 'whatsapp-chatbot-history-cf43052a413d.json'
 
+LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
 credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
 
-db = firestore.Client(credentials=credentials)
+client = firestore.Client(credentials=credentials)
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL")
@@ -127,7 +130,7 @@ def get_session_history(session_id: str) -> FirestoreChatMessageHistory:
     global flag
 
     chat_history = FirestoreChatMessageHistory(
-        session_id=session_id, collection="HistoryMessages", client=db
+        session_id=session_id, collection="HistoryMessages", client=client
     )
     
     if len(chat_history.messages) > 20:
@@ -137,7 +140,9 @@ def get_session_history(session_id: str) -> FirestoreChatMessageHistory:
 
     return chat_history
 
+
 def initialize_langchain_agent(llm: int):    
+    tools = [fetch_product_data, fetch_company_info]
 
     system = '''
     # Context:
@@ -177,6 +182,14 @@ def initialize_langchain_agent(llm: int):
     
     - Respond to the human as helpfully and accurately as possible. You have access to the following tools:
 
+    # Memory:
+    - Remember the client's name after they mention it for the first time.
+    - Once you have introduced yourself as Talkative, an AI-powered marketing and customer support agent for Egenie4u, **DO NOT** reintroduce yourself in subsequent responses within the same session.
+    
+    TOOLS:
+
+    Respond to the human as helpfully and accurately as possible. You have access to the following tools:
+
     {tools}
 
     Use a json blob to specify a tool by providing an action key (tool name) and an action_input key (tool input).
@@ -186,61 +199,83 @@ def initialize_langchain_agent(llm: int):
     Provide only ONE action per $JSON_BLOB, as shown:
 
     ```
+
     {{
+
     "action": $TOOL_NAME,
+
     "action_input": $INPUT
+
     }}
+
     ```
 
     Follow this format:
 
     Question: input question to answer
+
     Thought: consider previous and subsequent steps
+
     Action:
+
     ```
+
     $JSON_BLOB
+
     ```
+
     Observation: action result
+
     ... (repeat Thought/Action/Observation N times)
+
     Thought: I know what to respond
+
     Action:
+
     ```
+
     {{
+
     "action": "Final Answer",
+
     "action_input": "Final response to human"
+
     }}
 
     Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation
-    '''
 
-    human = '''
+    Previous conversation history:
+
     {chat_history}
 
-    {input}
+    New input: {input}
 
     {agent_scratchpad}
+    '''
 
-    (reminder to respond in a JSON blob no matter what)'''
+    # prompt = ChatPromptTemplate.from_messages(
+    #     [
+    #         ("system", system),   
+    #         MessagesPlaceholder("chat_history"),
+    #         ("human", "{input}")      
+    #     ]
+    # )
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system),
-            MessagesPlaceholder("chat_history"),
-            ("human", human)
-        ]
-    )
-
-    tools = [fetch_product_data, fetch_company_info]
+    prompt = hub.pull("customer-structured-chat-agent-prompt")
 
     agent = create_structured_chat_agent(llm, tools, prompt)
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+    agent_executor = AgentExecutor.from_agent_and_tools(
+                                    agent=agent, 
+                                    tools=tools, 
+                                    verbose=True, 
+                                    handle_parsing_errors=True)
 
     agent_with_chat_history = RunnableWithMessageHistory(
         agent_executor,
         get_session_history,
         input_messages_key="input",
         history_messages_key="chat_history",
-        agent_scratchpad_key="agent_scratchpad",
     )
 
     return agent_with_chat_history
