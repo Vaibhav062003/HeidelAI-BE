@@ -294,6 +294,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     for message in messages:
                         message_id = message["id"]
 
+                        await mark_read(message_id)
+
                         # Check if message ID is already processed
                         if message_id in processed_message_ids:
                             print("Duplicate message, skipping processing.")
@@ -365,6 +367,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             payload = message["button"]["payload"]
                             print("Button Payload: ", payload)
 
+                            
+
                             payload = payload.split("_")
                             print("Payload: ", payload)
 
@@ -393,40 +397,58 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             print("Sender sent cart")
 
-                            await get_details(sender)
+                            await get_details(sender, again=False)
 
                             # print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
 
                         elif message["type"] == "interactive":
                             print("Name: ", sender_name, ", Number: ",sender ,", sent details")
                             print("Sender clicked on interactive message")
-                            response_json_str = message["interactive"]["nfm_reply"]["response_json"]
+                            interactive_type = message["interactive"]["type"]
 
-                            # Parse the JSON string into a Python dictionary
-                            response_json = json.loads(response_json_str)
+                            if interactive_type == "nfm_reply":
+                                # Extract the JSON string from the message 
+                                response_json_str = message["interactive"]["nfm_reply"]["response_json"]
 
-                            # Print the parsed JSON
-                            print(response_json)
-                            # {'pin_code': '411058', 'full_name': 'Rounak longani', 'flow_token': 'AQAAAAACS5FpgQ_cAAAAAD0QI3s.', 'state': 'Maharashtra ', 'email': 'Rounaklongani@gmail.com', 'city': 'Pune', 'country': '0_India', 'address': 'Hahsjs'}
-                            
-                            # Extract the user's details from the parsed JSON
-                            full_name = response_json['full_name']
-                            number = response_json['flow_token']
-                            email = response_json['email']
-                            parse_country = response_json['country']
-                            parse_country = parse_country.split("_")
-                            country = parse_country[1]
-                            pin_code = response_json['pin_code']
-                            address = response_json['address']
-                            state = response_json['state']
-                            city = response_json['city']
-                            gst_number = response_json.get('gst_number', 'N/A')
+                                # Parse the JSON string into a Python dictionary
+                                response_json = json.loads(response_json_str)
 
-                            print(f"Full Name: {full_name}, Email: {email}, Number: {number},Country: {country}, Pin Code: {pin_code}, Address: {address}, State: {state}, City: {city}, GST Number: {gst_number}")
+                                # Print the parsed JSON
+                                print(response_json)
+                                # {'pin_code': '411058', 'full_name': 'Rounak longani', 'flow_token': 'AQAAAAACS5FpgQ_cAAAAAD0QI3s.', 'state': 'Maharashtra ', 'email': 'Rounaklongani@gmail.com', 'city': 'Pune', 'country': '0_India', 'address': 'Hahsjs'}
 
-                            await send_message(sender, "Got your responses. Thank you!\n\nThis functionality is still in development.")
+                                await confirm_address(sender, response_json)
+
+                            elif interactive_type == "button_reply":
+                                payload = message["interactive"]["button_reply"]["id"]
+                                print("Reply Payload: ", payload)
+                                if payload == "info_correct":
+                                    print("Info is correct")
+                                    await get_payment(sender, sender_name)
+                                elif payload == "info_incorrect":
+                                    print("Info is incorrect")
+                                    await get_details(sender, again=True)
+
+                            # await send_message(sender, "Got your responses. Thank you!\n\nThis functionality is still in development.")
 
     return {"status": "ok"}
+
+async def mark_read(message_id):
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+    
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}"
+    }
+    
+    # Building the carousel template with response variable and product details
+    data = {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": message_id
+    }
+    
+    response = requests.put(url, headers=headers, data=json.dumps(data))
+    print(f"Response: {response.status_code}, {response.json()}")
 
 async def send_message(recipient, message_text):
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
@@ -469,7 +491,6 @@ async def send_introduction(recipient, name):
     
     response = requests.post(url, headers=headers, data=json.dumps(data))
     print(f"Response: {response.status_code}, {response.json()}")
-
 
 async def send_carousel(sender: str, search_term: str, products):
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
@@ -766,46 +787,412 @@ async def send_product(sender, payload):
     print(f"Response: {response.status_code}, {response.json()}")
     print(f"Message sent to {sender} with product {name}")
 
-async def get_details(sender):
+async def get_details(sender, again: bool):
+    print(again)
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
     
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    
-    # Building the carousel template with response variable and product details
-    data = {
-        "recipient_type": "individual",
-        "messaging_product": "whatsapp",
-        "to": sender,
-        "type": "interactive",
-        "interactive": {
-            "type": "flow",
-            "header": {
-                "type": "text",
-                "text": "Complete your order"
-            },
-            "body": {
-                "text": "Thanks for sending your us cart! 📦🤩\n\nBefore we can proceed, we just need a few more details about *your address* so we know exactly where to deliver your order.\n\nLet's get this sorted and your items will be on their way!🚀"
-            },
-            "action": {
-                "name": "flow",
-                "parameters": {
-                    "flow_message_version": "3",
-                    "flow_token": str(sender),
-                    "flow_id": "865084025738121",
-                    "flow_cta": "Enter details",
-                    "flow_action": "navigate",
-                    "flow_action_payload": {
-                    "screen": "contact_details"
+
+    if again:
+        print("Again")
+        data = {
+            "recipient_type": "individual",
+            "messaging_product": "whatsapp",
+            "to": sender,
+            "type": "interactive",
+            "interactive": {
+                "type": "flow",
+                "header": {
+                    "type": "text",
+                    "text": "Details Correction"
+                },
+                "body": {
+                    "text": "Please enter correct details."
+                },
+                "action": {
+                    "name": "flow",
+                    "parameters": {
+                        "flow_message_version": "3",
+                        "flow_token": str(sender),
+                        "flow_id": "2947209285433068",
+                        "flow_cta": "Enter details",
+                        "flow_action": "navigate",
+                        "flow_action_payload": {
+                        "screen": "contact_details"
+                        }
                     }
                 }
             }
         }
-        }
+    else:
+        print("First time")
+        # Building the carousel template with response variable and product details
+        data = {
+            "recipient_type": "individual",
+            "messaging_product": "whatsapp",
+            "to": sender,
+            "type": "interactive",
+            "interactive": {
+                "type": "flow",
+                "header": {
+                    "type": "text",
+                    "text": "Complete your order"
+                },
+                "body": {
+                    "text": "Thanks for sending your us cart! 📦🤩\n\nBefore we can proceed, we just need a few more details about *your address* so we know exactly where to deliver your order.\n\nLet's get this sorted and your items will be on their way!🚀"
+                },
+                "action": {
+                    "name": "flow",
+                    "parameters": {
+                        "flow_message_version": "3",
+                        "flow_token": str(sender),
+                        "flow_id": "2947209285433068",
+                        "flow_cta": "Enter details",
+                        "flow_action": "navigate",
+                        "flow_action_payload": {
+                        "screen": "contact_details"
+                        }
+                    }
+                }
+            }
+            }
     
     response = requests.post(url, headers=headers, data=json.dumps(data))
+    print(f"Response: {response.status_code}, {response.json()}")
+
+async def confirm_address(sender, response_json):
+    full_name = response_json['full_name']
+    number = response_json['flow_token']
+    email = response_json['email']
+    parse_country = response_json['country']
+    parse_country = parse_country.split("_")
+    country = parse_country[1]
+    pin_code = response_json['pin_code']
+    address = response_json['address']
+    state = response_json['state']
+    city = response_json['city']
+    gst_number = response_json.get('gst_number', 'N/A')
+    billing_address = response_json.get('billing_address', 'none')
+    billing_state = response_json.get('billing_state', 'none')
+    billing_city = response_json.get('billing_city', 'none')
+    billing_pincode = response_json.get('billing_pincode', 'none')
+
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+
+    headers = {
+        "Authorization" : "Bearer " + ACCESS_TOKEN,
+        "Content-Type" : "application/json",
+    }
+    if gst_number == 'N/A' and billing_address != 'none':
+        # shipping + billing
+        data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": sender,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "header" : {
+                "type":"text",
+                "text":"Address Confirmation"
+            },
+            "body": {
+                "text": "Did we get it right?🤔 Please confirm whether this info is correct \n\n"
+                        "*Contact Details* \n"
+                            f"Name : {full_name}\n"
+                            f"Email : {email} "
+                        "\n\n*Shipping Address* \n"
+                            f"Address: {address}\n"
+                            f"State: {state}\n"
+                            f"City: {city}\n"
+                            f"PIN Code: {pin_code}"
+                        "\n\n*Billing Address* \n"
+                            f"Address: {billing_address}\n"
+                            f"State: {billing_state}\n"
+                            f"City: {billing_city}\n"
+                            f"PIN Code: {billing_pincode}\n"
+            },
+            "footer" : {
+                "text":"Only use the buttons to reply👇"
+            },
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": "info_correct",
+                            "title": "Yes"
+                        }
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": "info_incorrect",
+                            "title": "No"
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    elif billing_address == 'none' and gst_number != 'N/A':
+        # shipping + gst
+        data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": sender,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "header" : {
+                "type":"text",
+                "text":"Address Confirmation"
+            },
+            "body": {
+                "text": "Did we get it right?🤔 Please confirm whether this info is correct \n\n"
+                        "*Contact Details* \n"
+                            f"Name : {full_name}\n"
+                            f"Email : {email} "
+                        "\n\n*Shipping + Billing Address* \n"
+                            f"Address: {address}\n"
+                            f"State: {state}\n"
+                            f"City: {city}\n"
+                            f"PIN Code: {pin_code}"
+                        "\n\n*Business Details* \n"
+                            f"GST Number: {gst_number}\n"
+            },
+            "footer" : {
+                "text":"Only use the buttons to reply👇"
+            },
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": "info_correct",
+                            "title": "Yes"
+                        }
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": "info_incorrect",
+                            "title": "No"
+                        }
+                    }
+                ]
+            }
+        }
+    }
+    elif billing_address == 'none' and gst_number == 'N/A':
+        # shipping
+        data = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": sender,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "header" : {
+                    "type":"text",
+                    "text":"Address Confirmation"
+                },
+                "body": {
+                    "text": "Did we get it right?🤔 Please confirm whether this info is correct \n\n"
+                            "*Contact Details* \n"
+                            f"Name : {full_name}\n"
+                            f"Email : {email} "
+                        "\n\n*Shipping + Billing Address* \n"
+                            f"Address: {address}\n"
+                            f"State: {state}\n"
+                            f"City: {city}\n"
+                            f"PIN Code: {pin_code}\n"
+                },
+                "footer" : {
+                    "text":"Only use the buttons to reply👇"
+                },
+                "action": {
+                    "buttons": [
+                        {
+                            "type": "reply",
+                            "reply": {
+                                "id": "info_correct",
+                                "title": "Yes"
+                            }
+                        },
+                        {
+                            "type": "reply",
+                            "reply": {
+                                "id": "info_incorrect",
+                                "title": "No"
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    else:
+        # billing + shipping + gst
+        data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": sender,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "header" : {
+                "type":"text",
+                "text":"Address Confirmation"
+            },
+            "body": {
+                "text": "Did we get it right?🤔 Please confirm whether this info is correct \n\n"
+                        "*Contact Details* \n"
+                            f"Name : {full_name}\n"
+                            f"Email : {email} "
+                        "\n\n*Shipping Address* \n"
+                            f"Address: {address}\n"
+                            f"State: {state}\n"
+                            f"City: {city}\n"
+                            f"PIN Code: {pin_code}"
+                        "\n\n*Billing Address* \n"
+                            f"Address: {billing_address}\n"
+                            f"State: {billing_state}\n"
+                            f"City: {billing_city}\n"
+                            f"PIN Code: {billing_pincode}"
+                        "\n\n*Business Details* \n"
+                            f"GST Number: {gst_number}\n"
+            },
+            "footer" : {
+                "text":"Only use the buttons to reply👇"
+            },
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": "info_correct",
+                            "title": "Yes"
+                        }
+                    },
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": "info_incorrect",
+                            "title": "No"
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+
+    response = requests.post(url, headers=headers, json=data)
+    print(f"Response: {response.status_code}, {response.json()}")
+
+async def get_payment(sender, sender_name):
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+
+    headers = {
+        "Authorization" : "Bearer " + ACCESS_TOKEN,
+        "Content-Type" : "application/json",
+    }
+    data = {
+    "messaging_product": "whatsapp",
+    "recipient_type": "individual",
+    "to": sender,
+    "type": "interactive",
+    "interactive": {
+        "type": "order_details",
+        "header": {
+            "type": "text",
+            "text": "Complete your order"
+        },
+        "body": {
+            "text": f"{sender_name}, you are one step away!😎\n\nComplete your payment and confirm your order with us.📦 \n\nTo contact us regarding any queries please reply with *Live agent*"
+        },
+        "action": {
+            "name": "review_and_pay",
+            "parameters": {
+                "reference_id": "123456789",
+                "type": "physical-goods",
+                "beneficiaries" : [
+                    {
+                        "name":"Rounak Longani",
+                        "address_line1":"Flat number 22, 4A Veena, Naadbrahma Society, Warje, Pune",
+                        "city":"Pune",
+                        "state":"Maharashtra",
+                        "country":"India",
+                        "postal_code":"411058"
+                    }
+                ],
+                "payment_type": "upi",
+                "payment_configuration": "egenieupi",
+                "currency": "INR",
+                "total_amount": {
+                    "value": 100,
+                    "offset": 100
+                },
+                "order": {
+                    "status": "pending",
+                    "items": [
+                        {
+                            "name": "Samsung Galaxy",
+                            "amount": {
+                                "value": 1500,
+                                "offset": 100
+                            },
+                            "sale_amount": {
+                                "value": 1000,
+                                "offset": 100
+                            },
+                            "quantity": 1,
+                            "country_of_origin":"IN",
+                            "image" : {
+                                "link" : "https://egeniestores.com/wp-content/uploads/2024/04/81njZjDqc6L._SL1500_.jpg"
+                            }
+                        },
+                        {
+                            "name": "SONY Playstation 5",
+                            "amount": {
+                                "value": 1500,
+                                "offset": 100
+                            },
+                            "sale_amount": {
+                                "value": 1000,
+                                "offset": 100
+                            },
+                            "quantity": 1,
+                            "country_of_origin":"IN",
+                            "image" : {
+                                "link" : "https://egeniestores.com/wp-content/uploads/2024/04/original-imaghyykrhvewh4y-600x558.jpeg"
+                            }
+                        }
+                    ],
+                    "subtotal": {
+                        "value": 2000,
+                        "offset": 100
+                    },
+                    "tax": {
+                        "value": 100,
+                        "offset": 100
+                    },
+                    "discount": {
+                        "value": 2000,
+                        "offset": 100
+                    }
+                    
+
+                }
+            }
+        }
+    }
+}
+
+    response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
 
 """
