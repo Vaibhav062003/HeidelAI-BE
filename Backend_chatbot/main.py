@@ -1,10 +1,12 @@
-import os, time
+import os, time, requests
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from langchain import hub
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_community.chat_message_histories import ChatMessageHistory
+# from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain.agents import AgentExecutor, create_structured_chat_agent
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
@@ -20,14 +22,15 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL")
 PROPERTY_ID = os.getenv("PROPERTY_ID")
+LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'credentials.json'
+CLARITY_TOKEN = os.getenv("CLARITY_TOKEN")
 
 client = BetaAnalyticsDataClient()
 
 def initialize_llm():
     llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0)
     return llm
-
 
 @tool
 def get_date_range(date_range: str):
@@ -92,7 +95,6 @@ def get_date_range(date_range: str):
 
     return selected_range
 
-
 @tool
 def top_n_most_visited_pages(n : int) -> list:
     """
@@ -152,8 +154,6 @@ def get_active_users(start_date: str, end_date: str) -> int:
     except Exception as e:
         print(f"An error occurred: {e}")
         return 0
-
-
 
 @tool
 def get_device_model_data(n : int = 10):
@@ -227,19 +227,12 @@ def get_comperhensive_report(start_date: str, end_date: str):
         start_date (str): The start date of the report in the format "YYYY-MM-DD".
         end_date (str): The end date of the report in the format "YYYY-MM-DD".
     Returns:
-        pandas.DataFrame: A DataFrame containing the report data with dimensions and metrics.
-    Raises:
-        None
-    Example:
-        start_date = "2022-01-01"
-        end_date = "2022-01-31"
-        report = get_comperhensive_report(start_date, end_date)
+        str: A formatted string containing the report data.
     """
     
     request3 = RunReportRequest(
     property=f"properties/{PROPERTY_ID}",
     dimensions=[
-        Dimension(name="audienceId"),
         Dimension(name="eventName"),
     ],
     metrics=[
@@ -250,19 +243,77 @@ def get_comperhensive_report(start_date: str, end_date: str):
 
     response3 = client.run_report(request3)
 
-    result_dict = {}
-    for dimensionHeader in response3.dimension_headers:
-        result_dict[dimensionHeader.name] = []
-    for metricHeader in response3.metric_headers:
-        result_dict[metricHeader.name] = []
-    for rowIdx, row in enumerate(response3.rows):
-        for i, dimension_value in enumerate(row.dimension_values):
-            dimension_name = response3.dimension_headers[i].name
-            result_dict[dimension_name].append(dimension_value.value)
-        for i, metric_value in enumerate(row.metric_values):
-            metric_name = response3.metric_headers[i].name
-            result_dict[metric_name].append(metric_value.value)
-    return pd.DataFrame(result_dict)
+    result = ""
+
+    for row in response3.rows:
+        event_name = row.dimension_values[0].value
+        event_count = row.metric_values[0].value
+        if event_name == "scroll":
+            result += f"{event_name}: {event_count} times\n"  # Add "times" for scroll event
+        else:
+            result += f"{event_name}: {event_count}\n"
+
+    params = {"numOfDays": "3", "dimension1": "PopularPages"}
+    headers = {
+    "Authorization": f"Bearer {CLARITY_TOKEN}",
+    "Content-type": "application/json"
+    }
+    response = requests.get("https://www.clarity.ms/export-data/api/v1/project-live-insights",
+    params=params,
+    headers=headers,
+    )
+
+    data = response.json() 
+
+    for metric in data:
+        metric_name = metric.get('metricName', 'Unknown Metric')
+        information = metric.get('information', [{}])
+
+        if len(information) == 1:
+            information = information[0]
+            if metric_name == "DeadClickCount":
+                result += f"**Dead Click Count:**\n"
+                result += f"Sessions with Dead Clicks Percentage: {information.get('sessionsWithMetricPercentage', 'N/A')}%\n"
+                result += f"Sessions without Dead Clicks Percentage: {information.get('sessionsWithoutMetricPercentage', 'N/A')}%\n"
+                result += f"Total Dead Clicks: {information.get('subTotal', 'N/A')}\n\n"
+
+            elif metric_name == "ScrollDepth":
+                result += f"**Average Scroll Depth:**\n"
+                result += f"Average Scroll Depth: {information.get('averageScrollDepth', 'N/A')}%\n\n"
+
+            elif metric_name == "Traffic":
+                result += f"**Traffic Metrics:**\n"
+                result += f"Total Session Count: {information.get('totalSessionCount', 'N/A')}\n"
+                result += f"Total Bot Session Count: {information.get('totalBotSessionCount', 'N/A')}\n"
+                result += f"Distinct User Count: {information.get('distinctUserCount', 'N/A')}\n"
+                result += f"Pages Per Session Percentage: {information.get('pagesPerSessionPercentage', 'N/A'):.2f}%\n\n"
+
+            elif metric_name == "EngagementTime":
+                result += f"**Engagement Time:**\n"
+                result += f"Total Time: {information.get('totalTime', 'N/A')} seconds\n"
+                result += f"Active Time: {information.get('activeTime', 'N/A')} seconds\n\n"
+
+        elif len(information) > 1:
+
+            if metric_name == "PageTitle":
+                result += f"**Page Titles:**\n"
+                for entry in information:
+                    if isinstance(entry, dict):
+                        result += f"Page Title: {entry.get('name', 'N/A')} - Sessions Count: {entry.get('sessionsCount', 'N/A')}\n"
+                    else:
+                        result += f"Unexpected data format in PageTitle.\n"
+                result += "\n"
+
+            elif metric_name == "PopularPages":
+                result += f"**Popular Pages:**\n"
+                for entry in information:
+                    if isinstance(entry, dict):
+                        result += f"URL: {entry.get('url', 'N/A')} - Visits Count: {entry.get('visitsCount', 'N/A')}\n"
+                    else:
+                        result += f"Unexpected data format in PopularPages.\n"
+                result += "\n"
+
+    return result
 
 @tool
 def get_new_vs_returning_visitors(start_date: str, end_date: str):
@@ -317,40 +368,55 @@ def get_new_vs_returning_visitors(start_date: str, end_date: str):
 
 def initialize_langchain_agent(llm):    
 
+    memory = ChatMessageHistory(session_id="admin")
+    
     tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors]
-    prompt = hub.pull("hwchase17/structured-chat-agent")
-    # print(prompt)
-    custom_instructions = "Always use the 'get_date_range' tool to get the start and end dates for other tools. For example, you can use 'get_date_range(\"last week\")' to get the date range for the previous week."
-    modified_prompt = prompt + "\n\n" + custom_instructions
+    prompt = hub.pull("admin-structured-chat-agent-prompt")
     agent = create_structured_chat_agent(llm, tools, prompt)
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-    return agent_executor
+
+    agent_executor = AgentExecutor.from_agent_and_tools(
+        agent=agent, 
+        tools=tools, 
+        verbose=True)
+    
+    agent_with_chat_history = RunnableWithMessageHistory(
+        agent_executor,
+        lambda session_id: memory,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+    )
+    
+    return agent_with_chat_history
 
 def get_agent():
     llm = initialize_llm()
     return initialize_langchain_agent(llm)
 
-
 agent_executor = get_agent()
 
 chat_history = []
 
-def add_to_chat_history(user_message, ai_response):
-    chat_history.append(HumanMessage(content=user_message))
-    chat_history.append(AIMessage(content=ai_response))
+# def add_to_chat_history(user_message, ai_response):
+#     chat_history.append(HumanMessage(content=user_message))
+#     chat_history.append(AIMessage(content=ai_response))
 
 while True:
     user_input = input("User: ")
     tic = time.perf_counter()
     response = agent_executor.invoke(
-        {
-            "input": user_input,
-            "chat_history": chat_history,
-        }
+        {"input": user_input},
+        config={"configurable": {"session_id": "admin"}},
     )
+
+    # response = agent_executor.invoke(
+    #     {
+    #         "input": user_input,
+    #         "chat_history": chat_history,
+    #     }
+    # )
     toc = time.perf_counter()
     print(response['output'])
-    add_to_chat_history(user_input, response["output"])
+    # add_to_chat_history(user_input, response["output"])
     print(f"time_taken {toc - tic:0.4f} seconds")
 
 

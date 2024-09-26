@@ -1,0 +1,107 @@
+*User:* heyy
+*AI:* Hey there! 👋 How can I help you today?
+time_taken 2.1885 seconds
+
+
+*User:* Get the start and end dates for the last week.
+*AI:* There were 88 active users last week.
+time_taken 4.2086 seconds
+
+
+*User:* Show me the top 5 most visited pages
+*AI:* The top 5 most visited pages last week were:
+1. Laptops - Egenie Stores
+2. PreBuilt PC's - Egenie Stores
+3. Consoles Archives - Egenie Stores
+4. PC Components - Egenie Stores
+5. Gaming Laptops Archives - Egenie Stores
+time_taken 2.8431 seconds
+
+
+*User:* How many active users were there from last month?
+*AI:* There were 1692 active users last month.
+time_taken 4.4333 seconds
+
+
+*User:* Show me the top 10 device models used by users.
+*AI:* The top 10 device models used by users last month were:
+
+1. (not set): 1530
+2. A063: 20
+3. SM-S918B: 17
+4. CPH2487: 15
+5. SM-S911B: 14
+6. Redmi Note 9 Pro: 10
+7. 22041216I: 9
+8. DN2101: 9
+9. HD1901: 9
+10. SM-G781B: 9
+time_taken 3.7356 seconds
+
+
+*User:* How many page views did the website get this year?
+*AI:* The website got 15522 page views this year.
+time_taken 3.9157 seconds
+
+
+*User:* Show the breakdown of new vs returning visitors for this month
+*AI:* This month, there were 1656 new visitors and 69 returning visitors. This means 96% of visitors were new, 
+while 4% were returning.
+time_taken 3.4049 seconds
+
+
+*User:* Generate a comprehensive report for the last month.
+*AI:* Here is a comprehensive report for the last month:
+
+Page Views: 11496
+User Engagement: 8271
+Session Starts: 2313
+First Visits: 2103
+Scrolls: 1154
+Form Starts: 452
+Form Submits: 429
+View Search Results: 285
+Clicks: 11
+
+Dead Click Count:
+Sessions with Dead Clicks Percentage: 9.43%
+Sessions without Dead Clicks Percentage: 90.57%
+Total Dead Clicks: 33
+
+Average Scroll Depth:
+Average Scroll Depth: 53.96%
+
+Traffic Metrics:
+Total Session Count: 53
+Total Bot Session Count: 4
+Distinct User Count: 49
+Pages Per Session Percentage: 2.54%
+
+Engagement Time:
+Total Time: 233 seconds
+Active Time: 69 seconds
+
+Page Titles:
+Home - Egenie4u - Sessions Count: 32
+Lenovo LOQ 2024 Intel i5-13450HX - Egenie Stores - Sessions Count: 6
+Lenovo Legion 5 Pro - Egenie Stores - Sessions Count: 3
+Checkout - Egenie Stores - Sessions Count: 3
+PreBuilt PC's - Egenie Stores - Sessions Count: 2
+Apple MacBook Pro 2023 - Egenie Stores - Sessions Count: 2
+Cosmic Byte Stellaris Controller - Egenie Stores - Sessions Count: 2
+SONY PLAYSTATION 5 Disc Version (825 GB) - Egenie Stores - Sessions Count: 2
+Hades - The Infernal Gaming Beast by egenie4u! - Egenie Stores - Sessions Count: 2
+Laptops - Egenie Stores - Sessions Count: 2
+
+Popular Pages:
+https://egeniestores.com/ - Visits Count: 38
+https://egeniestores.com/product/lenovo-loq-2024-intel-core-i5-13450hx/ - Visits Count: 6
+https://egeniestores.com/laptops/ - Visits Count: 5
+https://egeniestores.com/product/sony-playstation-5-disc-version-825-gb/ - Visits Count: 4
+https://egeniestores.com/product/lenovo-legion-5-pro/ - Visits Count: 3
+https://egeniestores.com/checkout/ - Visits Count: 3
+https://egeniestores.com/computer-peripherals/ - Visits Count: 2
+https://egeniestores.com/product-category/consoles/ - Visits Count: 2
+https://egeniestores.com/product/apple-macbook-pro-2023/ - Visits Count: 2
+https://egeniestores.com/product/hades-the-infernal-gaming-beast/ - Visits Count: 2
+time_taken 9.9523 seconds

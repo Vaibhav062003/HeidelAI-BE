@@ -5,7 +5,7 @@ load_dotenv()
 
 CLARITY_TOKEN = os.getenv("CLARITY_TOKEN")
 
-params = {"numOfDays": "3", "dimension1": "PopularPages"}
+params = {"numOfDays": "30", "dimension1": "PopularPages"}
 headers = {
    "Authorization": f"Bearer {CLARITY_TOKEN}",
    "Content-type": "application/json"
