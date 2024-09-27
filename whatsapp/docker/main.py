@@ -434,10 +434,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     return {"status": "ok"}
 
 async def mark_read(message_id):
+    print("Message ID: ", message_id)
+    print("Entered mark_read")
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
     
     headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}"
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
     }
     
     # Building the carousel template with response variable and product details
@@ -447,7 +450,7 @@ async def mark_read(message_id):
         "message_id": message_id
     }
     
-    response = requests.put(url, headers=headers, data=json.dumps(data))
+    response = requests.post(url, headers=headers, data=json.dumps(data))
     print(f"Response: {response.status_code}, {response.json()}")
 
 async def send_message(recipient, message_text):
@@ -1194,6 +1197,67 @@ async def get_payment(sender, sender_name):
 
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
+
+# recieved  payment
+"""
+Incoming webhook payload: {
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "389116497625642",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "918788424068",
+              "phone_number_id": "423792927480992"
+            },
+            "statuses": [
+              {
+                "id": "wamid.HBgMOTE3OTcyNTEwNjI5FQIAEhgKMTMzMjkxOTg3MgA=",
+                "status": "captured",
+                "timestamp": "1727439107",
+                "recipient_id": "917972510629",
+                "type": "payment",
+                "payment": {
+                  "reference_id": "123456789",
+                  "amount": {
+                    "value": 100,
+                    "offset": 100
+                  },
+                  "currency": "INR",
+                  "transaction": {
+                    "id": "order_P2BafH9GcXfe2G",
+                    "type": "razorpay",
+                    "status": "success",
+                    "created_timestamp": 1727439107,
+                    "updated_timestamp": 1727439107,
+                    "amount": {
+                      "value": 100,
+                      "offset": 100
+                    },
+                    "currency": "INR",
+                    "method": {
+                      "type": "upi"
+                    }
+                  },
+                  "receipt": "receipt-value",
+                  "notes": {
+                    "key1": "value1"
+                  }
+                }
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}
+"""
+
 
 """
 User sent details:
