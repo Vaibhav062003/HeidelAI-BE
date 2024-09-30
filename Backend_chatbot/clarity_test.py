@@ -5,7 +5,7 @@ load_dotenv()
 
 CLARITY_TOKEN = os.getenv("CLARITY_TOKEN")
 
-params = {"numOfDays": "30", "dimension1": "PopularPages"}
+params = {"numOfDays": "3", "dimension1": "PopularPages"}
 headers = {
    "Authorization": f"Bearer {CLARITY_TOKEN}",
    "Content-type": "application/json"
@@ -16,9 +16,10 @@ response = requests.get("https://www.clarity.ms/export-data/api/v1/project-live-
 )
 
 print(response.status_code)
+print(response.text)
 
 def format_clarity_metrics(data):
-    # Initialize the result string
+    
     result = ""
 
     # Iterate through the data and format it
