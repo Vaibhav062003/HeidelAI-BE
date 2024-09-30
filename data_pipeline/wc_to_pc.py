@@ -157,6 +157,7 @@ for product in products:
 #             'purchasable': product['purchasable'],
 #             'stock_quantity': int(product['stock_quantity']),
 #             'images': product['images']
+#             'images': product['images']
 #         }
 
 #         if int(product['id']) in device:
@@ -166,7 +167,7 @@ for product in products:
 #         elif int(product['id']) in accessories:
 #             metadata['category'] = 'accessories'
 
-#         index.upsert([(str(product['id']), vector, metadata)])
+        # index.upsert([(str(product['id']), vector, metadata)])
 
 #     print("Upserted data into pinecone.")
 #     return index

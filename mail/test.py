@@ -1,14 +1,15 @@
+from email.utils import formataddr
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 import os
 
-my_email = 'marketing@egeniestores.com'
-password_key = '92,?,PhOsTuoinDwinEuRTHRIgHTChIlliCla'
+my_email = 'egeniestores@gmail.com'
+password_key = 'pfyzlqfugzzlxctv'
 
 # SMTP Server and port no for GMAIL.com (or replace with your mail server details)
-server = "mail.egeniestores.com"
+server = "smtp.gmail.com"
 port = 465
 
 try:
@@ -21,8 +22,8 @@ try:
 
     # Creating email message
     message = MIMEMultipart("alternative")
-    message["From"] = my_email
-    message["To"] = "rounaklongani@gmail.com"
+    message["From"] = formataddr(("Egenie Stores",f"{my_email}"))
+    message["To"] = "vmunot23@gmail.com"
     message["Subject"] = "Test Email with Image"
 
     # Add text to the email
@@ -38,7 +39,7 @@ try:
         message.attach(MIMEImage(grade_card_img, name=os.path.basename(grade_card_path)))
 
     # Send the email
-    my_server.sendmail(from_addr=my_email, to_addrs="rounaklongani@gmail.com", msg=message.as_string())
+    my_server.sendmail(from_addr=my_email, to_addrs="vmunot23@gmail.com", msg=message.as_string())
 
     print("Email sent successfully!")
 
