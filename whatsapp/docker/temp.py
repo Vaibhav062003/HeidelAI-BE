@@ -49,7 +49,7 @@ def fetch_company_info(dummy: str) -> str:
     Fetches both company information and policies for Egenie4u.
     Use this tool if the user asks for contact information or company policies.
     Returns:
-        str: A confirmation of the products displayed to the user.
+        str: A string containing company's information.
     """
     return """
     Egenie4u Policies:
