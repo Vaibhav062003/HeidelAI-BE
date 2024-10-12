@@ -598,20 +598,6 @@ async def websocket_endpoint(websocket: WebSocket):
     websocket_id = str(id(websocket))
     agent = await get_agent(websocket_id)
 
-    # Extract token from headers
-    token = extract_token_from_headers(websocket.headers)
-    if token:
-        token_data = decode_jwt_token(token)
-        if token_data:
-            username = token_data.get('userName', 'Unknown')
-            userEmail = token_data.get('userEmail', 'Unknown')
-        else:
-            username = 'Unknown'
-            userEmail = 'Unknown'
-    else:
-        username = 'Unknown'
-        userEmail = 'Unknown'
-
     # user_id = generate_user_id()
     try:
         while True:
