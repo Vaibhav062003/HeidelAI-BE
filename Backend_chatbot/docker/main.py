@@ -596,7 +596,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
     websocket_id = str(id(websocket))
-    agent = await get_agent(websocket_id)
+    agent = get_agent(websocket_id)
 
     # user_id = generate_user_id()
     try:
