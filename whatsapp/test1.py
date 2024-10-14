@@ -21,21 +21,21 @@ def get_and_trim_session_history(session_id: str):
         print(f"Original messages count: {len(messages)}")
         
         # Check if the number of messages exceeds 20
-        if len(messages) > 20:
-            excess_count = len(messages) - 20
-            messages = messages[excess_count:]  # Keep only the last 20 messages
-            print(f"Trimmed messages count: {len(messages)}")
+        # if len(messages) > 20:
+        #     excess_count = len(messages) - 20
+        #     messages = messages[excess_count:]  # Keep only the last 20 messages
+        #     print(f"Trimmed messages count: {len(messages)}")
             
-            # Update the document with the trimmed list of messages
-            doc_ref.update({'messages': messages})
-            print("Document updated with trimmed messages.")
-        else:
-            print("No trimming needed. Message count is within limit.")
+        #     # Update the document with the trimmed list of messages
+        #     doc_ref.update({'messages': messages})
+        #     print("Document updated with trimmed messages.")
+        # else:
+        #     print("No trimming needed. Message count is within limit.")
     else:
         print("Document does not exist.")
     
     return doc_ref
 
 # Example usage
-session_id = "ron-test"
+session_id = "919511907785"
 doc_ref = get_and_trim_session_history(session_id)
