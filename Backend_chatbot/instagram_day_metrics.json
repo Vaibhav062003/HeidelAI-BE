@@ -1,0 +1,68 @@
+{
+    "data": [
+        {
+            "name": "impressions",
+            "period": "day",
+            "title": "Impressions",
+            "description": "The number of times that your posts, stories, reels, videos and live videos were on screen, including in ads.",
+            "total_value": {
+                "value": 9768
+            },
+            "id": "17841438674306985/insights/impressions/day"
+        },
+        {
+            "name": "reach",
+            "period": "day",
+            "title": "Accounts reached",
+            "description": "The number of unique accounts that have seen your content, at least once, including in ads. Content includes posts, stories, reels, videos and live videos. Reach is different from impressions, which may include multiple views of your content by the same accounts. This metric is estimated and in development.",
+            "total_value": {
+                "value": 8538
+            },
+            "id": "17841438674306985/insights/reach/day"
+        },
+        {
+            "name": "profile_views",
+            "period": "day",
+            "title": "Profile visits",
+            "description": "The number of times that your profile was visited.",
+            "total_value": {
+                "value": 58
+            },
+            "id": "17841438674306985/insights/profile_views/day"
+        },
+        {
+            "name": "website_clicks",
+            "period": "day",
+            "title": "Website link taps",
+            "description": "The number of times that the link to your website was tapped.",
+            "total_value": {
+                "value": 6
+            },
+            "id": "17841438674306985/insights/website_clicks/day"
+        },
+        {
+            "name": "total_interactions",
+            "period": "day",
+            "title": "Content interactions",
+            "description": "The total number of post interactions, story interactions, reels interactions, video interactions and live video interactions, including any interactions on boosted content.",
+            "total_value": {
+                "value": 114
+            },
+            "id": "17841438674306985/insights/total_interactions/day"
+        },
+        {
+            "name": "profile_links_taps",
+            "period": "day",
+            "title": "Profile links taps",
+            "description": "The number of taps on your business address, call button, email button and text button.",
+            "total_value": {
+                "value": 0
+            },
+            "id": "17841438674306985/insights/profile_links_taps/day"
+        }
+    ],
+    "paging": {
+        "previous": "https://graph.facebook.com/v20.0/17841438674306985/insights?access_token=EAAHPjYclZCTEBOwlVfBmImkiiWapZAMKJlkgpsNJZAuNUBsuQzDvp3u6lgChedfpsnYJ0GYtx1nV2ZBcJqM5iuzfJsg2FCdEw1z9bGijpxYBeWu8BxZAUbX5Cbb9KV9507IJ3F4epuJFpGZBAiyrPRjF5l5w9BgKN4ZASL90Q1iNRQ5NYGKWi0qNZAGo7NSGa7OIN7XCWgZDZD&metric=impressions%2Creach%2Cprofile_views%2Cwebsite_clicks%2C+website_clicks%2C+total_interactions%2C+profile_views%2C+profile_links_taps&metric_type=total_value&period=day&since=1728755969&until=1728928769",
+        "next": "https://graph.facebook.com/v20.0/17841438674306985/insights?access_token=EAAHPjYclZCTEBOwlVfBmImkiiWapZAMKJlkgpsNJZAuNUBsuQzDvp3u6lgChedfpsnYJ0GYtx1nV2ZBcJqM5iuzfJsg2FCdEw1z9bGijpxYBeWu8BxZAUbX5Cbb9KV9507IJ3F4epuJFpGZBAiyrPRjF5l5w9BgKN4ZASL90Q1iNRQ5NYGKWi0qNZAGo7NSGa7OIN7XCWgZDZD&metric=impressions%2Creach%2Cprofile_views%2Cwebsite_clicks%2C+website_clicks%2C+total_interactions%2C+profile_views%2C+profile_links_taps&metric_type=total_value&period=day&since=1729101571&until=1729274371"
+    }
+}

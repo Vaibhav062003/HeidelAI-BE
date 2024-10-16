@@ -1,0 +1,42 @@
+{
+    "data": [
+        {
+            "name": "follower_count",
+            "period": "day",
+            "values": [
+                {
+                    "value": 0,
+                    "end_time": "2024-10-15T07:00:00+0000"
+                },
+                {
+                    "value": 0,
+                    "end_time": "2024-10-16T07:00:00+0000"
+                }
+            ],
+            "title": "Follower count",
+            "description": "The total number of unique accounts following this profile",
+            "id": "17841438674306985/insights/follower_count/day"
+        },
+        {
+            "name": "phone_call_clicks",
+            "period": "day",
+            "values": [
+                {
+                    "value": 0,
+                    "end_time": "2024-10-15T07:00:00+0000"
+                },
+                {
+                    "value": 0,
+                    "end_time": "2024-10-16T07:00:00+0000"
+                }
+            ],
+            "title": "Phone call clicks",
+            "description": "The total number of taps on the call link in this profile",
+            "id": "17841438674306985/insights/phone_call_clicks/day"
+        }
+    ],
+    "paging": {
+        "previous": "https://graph.facebook.com/v20.0/17841438674306985/insights?access_token=EAAHPjYclZCTEBOwlVfBmImkiiWapZAMKJlkgpsNJZAuNUBsuQzDvp3u6lgChedfpsnYJ0GYtx1nV2ZBcJqM5iuzfJsg2FCdEw1z9bGijpxYBeWu8BxZAUbX5Cbb9KV9507IJ3F4epuJFpGZBAiyrPRjF5l5w9BgKN4ZASL90Q1iNRQ5NYGKWi0qNZAGo7NSGa7OIN7XCWgZDZD&metric=follower_count%2C+phone_call_clicks&period=day&since=1728758629&until=1728931429",
+        "next": "https://graph.facebook.com/v20.0/17841438674306985/insights?access_token=EAAHPjYclZCTEBOwlVfBmImkiiWapZAMKJlkgpsNJZAuNUBsuQzDvp3u6lgChedfpsnYJ0GYtx1nV2ZBcJqM5iuzfJsg2FCdEw1z9bGijpxYBeWu8BxZAUbX5Cbb9KV9507IJ3F4epuJFpGZBAiyrPRjF5l5w9BgKN4ZASL90Q1iNRQ5NYGKWi0qNZAGo7NSGa7OIN7XCWgZDZD&metric=follower_count%2C+phone_call_clicks&period=day&since=1729104231&until=1729277031"
+    }
+}
