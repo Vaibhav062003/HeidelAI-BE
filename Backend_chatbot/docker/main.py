@@ -24,6 +24,10 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 
+import json
+from google.cloud import firestore
+from google.oauth2 import service_account
+
 # Load the environment variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -40,6 +44,12 @@ os.environ["LANGCHAIN_PROJECT"] =os.getenv("LANGCHAIN_PROJECT")
 
 # Initialize the GA4 client
 client = BetaAnalyticsDataClient()
+
+# Load the credentials from the JSON file
+credentials = service_account.Credentials.from_service_account_file(os.getenv("SERVICE_ACCOUNT_FILE"))
+
+# Initialize Firestore using the credentials
+db = firestore.Client(credentials=credentials)
 
 
 def initialize_llm() -> ChatGoogleGenerativeAI:
@@ -381,11 +391,69 @@ def get_new_vs_returning_visitors(start_date: str, end_date: str):
     result = f"New Visitors: {new_visitors}\nReturning Visitors: {returning_visitors}\nNew Visitors: {new_visitor_percentage:.2f}%\nReturning Visitors: {returning_visitor_percentage:.2f}%"
     return result
 
+@tool
+def get_customer_chatbot_conversations(dummy: str) -> str:
+    """
+    Gets the customer chatbot conversations from the Firestore database.
+    Analyse the conversations and return a detailed analysis on what can be improved.
+    args:
+        dummy (str): A dummy argument to trigger the tool.
+    returns:
+        str: User's conversations with customer/sales chatbot.
+    """
+
+    # Reference to the "HistoryMessages" collection
+    collection_ref = db.collection("HistoryMessages")
+    
+    limit=100
+
+    # Query all documents in the collection
+    docs = collection_ref.stream()
+
+    combined_messages = []
+    
+    # Iterate through each document in the collection
+    for doc in docs:
+        doc_data = doc.to_dict()
+        messages = doc_data.get('messages', [])
+
+        combined_messages.append("\nUser history:")
+
+        # Process each message (decode and extract content and type)
+        for message in messages:
+            if isinstance(message, bytes):
+                try:
+                    # Decode bytes to string and load JSON
+                    message_str = message.decode('utf-8')
+                    message_data = json.loads(message_str)
+                    
+                    # Extract content and sender type
+                    content = message_data.get('content', '')
+                    sender_type = message_data.get('type', '')  # 'human' or 'ai'
+                    
+                    # Append the formatted message
+                    combined_messages.append(f"{sender_type}: {content}")
+                except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                    print(f"Error decoding message: {e}")
+                    continue
+
+        # Check if we've reached the limit of 100 messages
+        if len(combined_messages) >= limit:
+            combined_messages = combined_messages[:limit]  # Trim to the first 100 messages
+            break
+
+    # Join the messages into a single string with line breaks
+    combined_string = "\n".join(combined_messages)
+    
+    print(f"Combined messages count: {len(combined_messages)}")
+    
+    return combined_string
+
 def initialize_langchain_agent(llm: ChatGoogleGenerativeAI , id: str) -> RunnableWithMessageHistory:    
 
     memory = ChatMessageHistory(session_id=id)
     
-    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors]
+    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations]
     prompt = hub.pull("admin-structured-chat-agent-prompt")
     agent = create_structured_chat_agent(llm, tools, prompt)
 
