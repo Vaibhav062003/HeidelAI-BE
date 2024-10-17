@@ -119,3 +119,31 @@ time_taken 9.9523 seconds
 4. **Promote Popular Pages:** The data shows that certain pages are consistently attracting more visitors. Consider promoting these pages through social media, email marketing, or other channels to drive more traffic and engagement.
 
 5. **Analyze User Behavior:**  The comprehensive report provides valuable insights into user behavior.  Use this data to understand how users are interacting with your website and identify areas for improvement. For example, if users are frequently clicking on a specific product but not completing a purchase, you might need to optimize the product page or checkout process. 
+
+Instagram Metrics:
+
+Impressions: 10293
+Description: The number of times that your posts, stories, reels, videos and live videos were on screen, including in ads.
+
+Accounts reached: 8870
+Description: The number of unique accounts that have seen your content, at least once, including in ads. Content includes posts, stories, reels, videos and live videos. Reach is different from impressions, which may include multiple views of your content by the same accounts. This metric is estimated and in development.
+
+Profile visits: 79
+Description: The number of times that your profile was visited.
+
+Content interactions: 135  Description: The total number of post interactions, story interactions, reels interactions, video interactions and live video interactions, including any interactions on boosted content.
+
+Profile links taps: 0
+Description: The number of taps on your business address, call button, email button and text button.
+
+Website link taps: 9
+Description: The number of times that the link to your website was tapped.
+
+Accounts engaged (accounts_engaged): 125
+Description: The number of accounts that have interacted with your content, including in ads. Content includes posts, stories, reels, videos and live videos. Interactions can include actions such as likes, saves, comments, shares or replies. These metrics are estimated and in development.
+
+Saves (saves): 4
+Description: The number of saves of your content minus the number of unsaves.
+
+Shares (shares): 3
+Description: The number of shares of your posts, stories, reels, videos and live videos.

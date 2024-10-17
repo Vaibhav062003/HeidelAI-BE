@@ -10,16 +10,13 @@ access_token = os.getenv("ACCESS_TOKEN")
 url = f'https://graph.facebook.com/{instagram_account_id}/insights'
 
 # Define the metrics you want to retrieve
-# 'impressions', 'reach', 'engagement', and 'follower_count' are common metrics for eCommerce
 
 #follower_count
-#phone_call_clicks
 
 #reached_audience_demographics
-
 params = {
-    'metric': 'reached_audience_demographics',
-    'period': 'lifetime',  
+    'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
+    'period': 'day',  
     'access_token': access_token,
     'metric_type': 'total_value'
 }
@@ -27,15 +24,18 @@ params = {
 # Make the request to fetch insights
 response = requests.get(url, params=params)
 
-# Check if the request was successful
 if response.status_code == 200:
     # Parse the response JSON
     data = response.json()
-    print("Instagram Metrics: ", data)
     
-    with open('instagram_metrics.json', 'w') as json_file:
-        json.dump(data, json_file, indent=4)
-    print("Data saved to instagram_metrics.json")
+    # Create a formatted string to print the metrics
+    metrics_str = "Instagram Metrics:\n"
+    for item in data['data']:
+        metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
+        metrics_str += f"  Description: {item['description']}\n"
+    
+    # Print the formatted string
+    print(metrics_str)
 
 else:
     # If the request was not successful, print the error
@@ -46,8 +46,7 @@ else:
 impressions, 
 reach, 
 follower_count, 
-email_contacts, 
-phone_call_clicks, 
+email_contacts,  
 text_message_clicks, 
 get_directions_clicks, 
 website_clicks, 
@@ -75,12 +74,41 @@ threads_follower_demographics
 
 1.
 params = {
-    'metric': 'impressions,reach,profile_views,website_clicks, website_clicks, total_interactions, profile_views, profile_links_taps',
-    'period': 'day',  # or 'week', depending on your needs
-    'access_token': ACCESS_TOKEN,
+    'metric': 'follower_count, impressions, reach, profile_views, total_interactions, profile_links_taps, phone_call_clicks, text_message_clicks, website_clicks, accounts_engaged, saved, shares',
+    'period': 'day',  
+    'access_token': access_token,
     'metric_type': 'total_value'
 }
 
+without metric_type = 'total_value'
+params = {
+    'metric': 'email_contacts, follower_count, phone_call_clicks, text_message_clicks, website_clicks, accounts_engaged, saved, shares',
+    'period': 'day',  
+    'access_token': access_token,
+}
+
 2.
+params = {
+    'metric': 'impressions, reach',
+    'period': 'week',  
+    'access_token': access_token,
+    'metric_type': 'total_value'
+}
+
+3.
+params = {
+    'metric': 'impressions, reach',
+    'period': 'week',  
+    'access_token': access_token,
+    'metric_type': 'total_value'
+}
+
+4.
+params = {
+    'metric': 'online_followers',
+    'period': 'lifetime',  
+    'access_token': access_token,
+    'metric_type': 'total_value'
+}
 
 """
