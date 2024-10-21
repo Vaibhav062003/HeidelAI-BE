@@ -31,8 +31,9 @@ if response.status_code == 200:
     # Create a formatted string to print the metrics
     metrics_str = "Instagram Metrics:\n"
     for item in data['data']:
-        metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
-        metrics_str += f"  Description: {item['description']}\n"
+        metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
+        # metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
+        # metrics_str += f"  Description: {item['description']}\n"
     
     # Print the formatted string
     print(metrics_str)
@@ -112,3 +113,15 @@ params = {
 }
 
 """
+# Instagram Metrics:
+# Impressions (impressions): 24443
+# Accounts reached (reach): 18581
+# Profile visits (profile_views): 454
+# Content interactions (total_interactions): 156   
+# Profile links taps (profile_links_taps): 0
+# Website link taps (website_clicks): 132
+# Accounts engaged (accounts_engaged): 168
+# Saves (saves): 9
+#   Description: The number of saves of your content minus the number of unsaves.
+# Shares (shares): 10
+#   Description: The number of shares of your posts, stories, reels, videos and live videos.
