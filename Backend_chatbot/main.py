@@ -29,6 +29,9 @@ LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'credentials.json'
 CLARITY_TOKEN = os.getenv("CLARITY_TOKEN")
 
+instagram_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
+access_token = os.getenv("ACCESS_TOKEN")
+
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
@@ -43,7 +46,7 @@ credentials = service_account.Credentials.from_service_account_file(os.getenv("S
 db = firestore.Client(credentials=credentials)
 
 def initialize_llm():
-    llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0)
+    llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0, )
     return llm
 
 @tool
@@ -113,7 +116,6 @@ def get_date_range(date_range: str):
 def top_n_most_visited_pages(n : int = 10) -> list:
     """
     Fetches the top n most visited pages of the website.
-    Default to top 10.
 
     Args:
         n (int): The number of pages to fetch.
@@ -149,8 +151,7 @@ def get_active_users(start_date: str, end_date: str) -> int:
         end_date (str): The end date for the query in 'YYYY-MM-DD' format.
 
     Returns:
-        int: The number of active users for the specified date range.
-             Returns 0 if no data is found or if an error occurs.
+        int: number of active users.
     """
     try:
         client = BetaAnalyticsDataClient()
@@ -173,12 +174,9 @@ def get_active_users(start_date: str, end_date: str) -> int:
 @tool
 def get_device_model_data(n : int = 10):
     """
-    Fetches the data for device models used by users for the current day from Google Analytics 4.
-    Default to top 10 device models.
+    Fetches the data for device models
     args:
-        int: The number of devices to return, default = 10
-    Returns:
-        dict: A dictionary where keys are device models and values are the number of active users for each model.
+        int: The number of devices to return.
     """
     client = BetaAnalyticsDataClient()
 
@@ -195,25 +193,28 @@ def get_device_model_data(n : int = 10):
 
     response = client.run_report(request)
 
-    device_data = {row.dimension_values[0].value: int(row.metric_values[0].value) for row in response.rows}
+    # Format the data as a string
+    device_data_str = "\n".join(
+    
+    f"{row.dimension_values[0].value} - {row.metric_values[0].value}"
 
-    return device_data
+    for row in response.rows
+    )
+    device_data_str = "Device Model - Active Users\n" + device_data_str
+
+    return device_data_str
 
 @tool
 def get_total_page_views(start_date: str, end_date: str):
     """
-    Fetches the total number of page views from Google Analytics 4 for a specified date range.
+    Fetches the total number of page views
 
     Args:
         start_date (str): The start date for the query in 'YYYY-MM-DD' format.
         end_date (str): The end date for the query in 'YYYY-MM-DD' format.
 
     Returns:
-        int: The total number of page views recorded between the start date and end date.
-
-    Example:
-        get_total_page_views("2024-08-01", "2024-08-31")
-        1500
+        int: The total number of page views.
     """
     try:
         pageviews_request = RunReportRequest(
@@ -234,15 +235,13 @@ def get_total_page_views(start_date: str, end_date: str):
         print(f"An error occurred: {e}")
         return 0
     
-@tool
+@tool("get_comperhensive_report", return_direct=True)
 def get_comperhensive_report(start_date: str, end_date: str):
     """
     Retrieves a comprehensive report based on the specified start and end dates.
     Args:
         start_date (str): The start date of the report in the format "YYYY-MM-DD".
         end_date (str): The end date of the report in the format "YYYY-MM-DD".
-    Returns:
-        str: A formatted string containing the report data.
     """
     
     request3 = RunReportRequest(
@@ -287,17 +286,17 @@ def get_comperhensive_report(start_date: str, end_date: str):
         if len(information) == 1:
             information = information[0]
             if metric_name == "DeadClickCount":
-                result += f"**Dead Click Count:**\n"
-                result += f"Sessions with Dead Clicks Percentage: {information.get('sessionsWithMetricPercentage', 'N/A')}%\n"
-                result += f"Sessions without Dead Clicks Percentage: {information.get('sessionsWithoutMetricPercentage', 'N/A')}%\n"
+                # result += f"**Dead Click Count:**\n"
+                # result += f"Sessions with Dead Clicks Percentage: {information.get('sessionsWithMetricPercentage', 'N/A')}%\n"
+                # result += f"Sessions without Dead Clicks Percentage: {information.get('sessionsWithoutMetricPercentage', 'N/A')}%\n"
                 result += f"Total Dead Clicks: {information.get('subTotal', 'N/A')}\n\n"
 
             elif metric_name == "ScrollDepth":
-                result += f"**Average Scroll Depth:**\n"
+                # result += f"**Average Scroll Depth:**\n"
                 result += f"Average Scroll Depth: {information.get('averageScrollDepth', 'N/A')}%\n\n"
 
             elif metric_name == "Traffic":
-                result += f"**Traffic Metrics:**\n"
+                # result += f"**Traffic Metrics:**\n"
                 result += f"Total Session Count: {information.get('totalSessionCount', 'N/A')}\n"
                 result += f"Total Bot Session Count: {information.get('totalBotSessionCount', 'N/A')}\n"
                 result += f"Distinct User Count: {information.get('distinctUserCount', 'N/A')}\n"
@@ -311,36 +310,32 @@ def get_comperhensive_report(start_date: str, end_date: str):
         elif len(information) > 1:
 
             if metric_name == "PageTitle":
-                result += f"**Page Titles:**\n"
+                result += f"Page Titles - Session Count\n"
                 for entry in information:
                     if isinstance(entry, dict):
-                        result += f"Page Title: {entry.get('name', 'N/A')} - Sessions Count: {entry.get('sessionsCount', 'N/A')}\n"
-                    else:
-                        result += f"Unexpected data format in PageTitle.\n"
+                        result += f"{entry.get('name', 'N/A')} - {entry.get('sessionsCount', 'N/A')}\n"
+                    # else:
+                    #     result += f"Unexpected data format in PageTitle.\n"
                 result += "\n"
 
-            elif metric_name == "PopularPages":
-                result += f"**Popular Pages:**\n"
-                for entry in information:
-                    if isinstance(entry, dict):
-                        result += f"URL: {entry.get('url', 'N/A')} - Visits Count: {entry.get('visitsCount', 'N/A')}\n"
-                    else:
-                        result += f"Unexpected data format in PopularPages.\n"
-                result += "\n"
+            # elif metric_name == "PopularPages":
+            #     result += f"**Popular Pages:**\n"
+            #     for entry in information:
+            #         if isinstance(entry, dict):
+            #             result += f"URL: {entry.get('url', 'N/A')} - Visits Count: {entry.get('visitsCount', 'N/A')}\n"
+            #         # else:
+            #             # result += f"Unexpected data format in PopularPages.\n"
+            #     # result += "\n"
 
     return result
 
 @tool
 def get_new_vs_returning_visitors(start_date: str, end_date: str):
     """
-    This tool fetches data about new and returning visitors from Google Analytics for the 
-    specified date range. It calculates and returns the total number of new and returning visitors, 
-    along with the percentage of each category relative to the total number of visitors.
+    This tool fetches data about new and returning visitors
     Args:
         start_date (str): The start date of the report in the format "YYYY-MM-DD".
         end_date (str): The end date of the report in the format "YYYY-MM-DD".
-    Returns:
-        str: A formatted string showing the count and percentage of new and returning visitors.
     """
     request = RunReportRequest(
         property=f"properties/{PROPERTY_ID}",
@@ -384,7 +379,7 @@ def get_new_vs_returning_visitors(start_date: str, end_date: str):
 @tool
 def get_customer_chatbot_conversations(dummy: str) -> str:
     """
-    Gets the customer chatbot conversations from the Firestore database.
+    Gets the customer chatbot conversations.
     Analyse the conversations and return a detailed analysis on what can be improved.
     args:
         dummy (str): A dummy argument to trigger the tool.
@@ -439,11 +434,45 @@ def get_customer_chatbot_conversations(dummy: str) -> str:
     
     return combined_string
 
+@tool
+def get_instagram_insights(dummy: str) -> str:
+    """
+    Fetches Egenie's instagram account insights.
+    """
+    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+
+    params = {
+        'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
+        'period': 'day',  
+        'access_token': access_token,
+        'metric_type': 'total_value'
+    }
+
+    # Make the request to fetch insights
+    response = requests.get(url, params=params)
+
+    if response.status_code == 200:
+        # Parse the response JSON
+        data = response.json()
+        
+        # Create a formatted string to print the metrics
+        metrics_str = "Instagram Metrics:\n"
+        for item in data['data']:
+            metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
+
+        return metrics_str
+
+    else:
+        # If the request was not successful, print the error
+        print(f"Error: {response.status_code}")
+        print(response.json())
+        return "Error fetching Instagram insights"
+
 def initialize_langchain_agent(llm, id):    
 
     memory = ChatMessageHistory(session_id=id)
     
-    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations]
+    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_instagram_insights]
     prompt = hub.pull("admin-structured-chat-agent-prompt")
     agent = create_structured_chat_agent(llm, tools, prompt)
 
