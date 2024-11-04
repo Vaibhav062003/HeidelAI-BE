@@ -23,7 +23,7 @@ try:
     # Creating email message
     message = MIMEMultipart("alternative")
     message["From"] = formataddr(("Egenie Stores",f"{my_email}"))
-    message["To"] = "vmunot23@gmail.com"
+    message["To"] = "rounaklongani@gmail.com"
     message["Subject"] = "Test Email with Image"
 
     # Add text to the email
@@ -39,7 +39,7 @@ try:
         message.attach(MIMEImage(grade_card_img, name=os.path.basename(grade_card_path)))
 
     # Send the email
-    my_server.sendmail(from_addr=my_email, to_addrs="vmunot23@gmail.com", msg=message.as_string())
+    my_server.sendmail(from_addr=my_email, to_addrs="rounaklongani@gmail.com", msg=message.as_string())
 
     print("Email sent successfully!")
 

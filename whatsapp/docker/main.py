@@ -487,7 +487,7 @@ async def send_introduction(recipient, name):
         "to": recipient,
         "type": "image",
         "image": {
-            "id": "1251499229323459",
+            "link": "https://egeniestores.com/wp-content/uploads/egenie.jpeg",
             "caption" : f"Hi {name}!👋 I'm *Talkative*, an AI-powered agent for eGenie Stores. I'm here to help you find the perfect tech products for your needs. \n \n✅ *Whether you're looking for:* \n  - A new phone\n  - A powerful gaming laptop\n  - A custom-built PC \n\nI can help you find the *best* options for your budget and preferences.🎉 \n\nFeel free to ask me any questions you may have about our *services* or *policies* , and I'll be happy to assist!📕"
         }
     }

@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy the requirements file and install dependencies
 COPY requirements.txt .
+RUN pip install huggingface_hub==0.24.2
 RUN pip install --no-cache-dir torch==2.3.1+cpu torchvision==0.18.1+cpu torchaudio==2.3.1+cpu --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
     
