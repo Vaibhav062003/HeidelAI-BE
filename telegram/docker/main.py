@@ -20,39 +20,56 @@ from google.cloud import firestore
 from langchain_google_firestore import FirestoreChatMessageHistory
 from collections import OrderedDict
 
-TOKEN = os.getenv('TOKEN')
-URL = "egenie-telegram-test.koyeb.app"
-BOT_USERNAME = os.getenv('BOT_USERNAME')
 
+# Regular dictionary to store processed message IDs with their timestamps
+processed_message_ids = OrderedDict()
+EXPIRY_TIME_SECONDS = 86400 
+
+load_dotenv()
+
+
+BOT_USERNAME = os.getenv('USERNAME')
+print("\u001b[32mBot Username:\u001b[0m ", BOT_USERNAME)
+TOKEN = os.getenv('TOKEN')
+print("\u001b[32mToken:\u001b[0m ", TOKEN)
+bot = telegram.Bot(token=TOKEN)
+# Define the path to your service account JSON file
 SERVICE_ACCOUNT_FILE = 'whatsapp-chatbot-history-cf43052a413d.json'
 
+# Load the credentials from the JSON file
 credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
 
+# Initialize Firestore using the credentials
 db = firestore.Client(credentials=credentials)
-
-bot = telegram.Bot(token=TOKEN)
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-api_product_data = {}
+websocket_product_data = {}
 flag = False
-api_data_lock = Lock()
+search_term = ""
+websocket_data_lock = Lock()
 
+print("\u001b[33mDownloading Sentence Transformer Model...\u001b[0m")
 model = SentenceTransformer('all-MiniLM-L6-v2')
+print("\u001b[32mSentence Transformer Model Downloaded Successfully.\u001b[0m")
 
 def initialize_pinecone():
+    print("\u001b[33mInitializing Pinecone...\u001b[0m")
     pc = Pinecone(api_key=PINECONE_API_KEY)
 
     index_name = PINECONE_INDEX
     
     index = pc.Index(index_name)
+    print("\u001b[32mInitialized Pinecone Successfully.\u001b[0m")
     return index
 
 def initialize_llm():
+    print("\u001b[33mInitializing LLM...\u001b[0m")
     llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0)
+    print("\u001b[32mInitialized LLM Successfully.\u001b[0m")
     return llm
 
 @tool
@@ -91,7 +108,10 @@ def fetch_product_data(client_id: str, query: str, category: str, price: int = 0
         str: A confirmation of the products displayed to the user.
     """
 
-    global api_product_data 
+    global websocket_product_data 
+    global search_term 
+
+    search_term = query
 
     filters = {
         "category": category,
@@ -127,7 +147,7 @@ def fetch_product_data(client_id: str, query: str, category: str, price: int = 0
         "permalink": product['permalink'],
         "image_link": product['images'],
         "on_sale": product['on_sale'],
-        "regular_price": product['regular_price'],
+        "regular_price": product['regular_price']
         }
         product_list.append(product_dict)
 
@@ -149,7 +169,7 @@ def get_session_history(session_id: str) -> FirestoreChatMessageHistory:
     return chat_history
 
 def initialize_langchain_agent(llm: int):    
-
+    print("\u001b[33mInitializing Langchain Agent...\u001b[0m")
     system = '''
         # Context:
         - Your Role: You are "Talkative," a marketing and customer support agent for Egenie4u, an e-commerce platform in India. Your role is non-negotiable, and you will only assist with product-related queries.
@@ -224,14 +244,18 @@ def initialize_langchain_agent(llm: int):
         Begin! Reminder to ALWAYS respond with a valid json blob of a single action. Use tools if necessary. Respond directly if appropriate. Format is Action:```$JSON_BLOB```then Observation'''
 
     human = '''
-    Old_messages: {chat_history}
-
-    Latest user message: {input}
+    {input}
 
     {agent_scratchpad}
 
     (reminder to respond in a JSON blob no matter what)'''
     
+        # {chat_history}
+
+        # {input}
+
+        # {agent_scratchpad}
+        # (reminder to respond in a JSON blob no matter what)
 
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -257,7 +281,7 @@ def initialize_langchain_agent(llm: int):
     input_messages_key="input",
     history_messages_key="chat_history",
     )
-
+    print("\u001b[32mInitialized Langchain Agent Successfully.\u001b[0m")
     return agent_with_chat_history
 
 index = initialize_pinecone()
@@ -268,17 +292,13 @@ def get_agent():
 
 agent_executor = get_agent()
 
-# ----------------- FastAPI -----------------
 
-app_api = FastAPI()
+app = FastAPI()
 
-app_api.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://egeniestores.com", "http://localhost"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+bot = telegram.Bot(token=TOKEN)
+
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send an image with a caption
@@ -293,7 +313,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
-async def send_carousel(update: Update, context: ContextTypes.DEFAULT_TYPE, products_space):
+async def send_carousel(update: Update, products_space):
     # Define the keyboard with buttons to simulate next/previous
     try:
         keyboard = [
@@ -324,7 +344,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Extract the current index from the callback data
     data = query.data.split('_')
-    print("Data: ", data)
+    print("Data: ", data) #['next','item','0']
     action = data[0]
     index = int(data[2]) if len(data) > 2 else None
     
@@ -400,6 +420,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+
+
+async def handle_response(text, client_id):
+    user_id = str(client_id)
+    user_input = f"(client_id: {user_id}): " + text
+
+    try:
+        agent_reply = agent_executor.invoke(
+            {"input": user_input},
+            config={"configurable": {"session_id": user_id}},
+        )
+
+        return agent_reply['output']
+    except Exception as e:
+        print("Error during agent invocation:", e)
+        return "An error occurred while processing your request."
+
+
+
+
 async def send_message(text, chat_id):
     async with bot:
         await bot.send_message(text=text, chat_id=chat_id)
@@ -408,10 +449,6 @@ async def show_typing(chat_id):
     async with bot:
         await bot.send_chat_action(chat_id=chat_id, action=telegram.constants.ChatAction.TYPING)
 
-
-async def handle_response(text, client_id):
-    user_id = str(client_id)
-    user_input = f"(client_id: {user_id}): " + text
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global flag
@@ -440,8 +477,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await handle_response(text, client_id)
 
 
+    async with websocket_data_lock:
+        products_space = websocket_product_data.get(client_id)
+        print(products_space)
+
+        if products_space:
+            # await update.message.reply_text(response)
+            print("came here?")
+            await send_message(text=response, chat_id=user_id)
+            await send_carousel(update, products_space)
+            search_term = ""
+             
+        else:
+            print("are there no products space")
+            await update.message.reply_text(response)
+
+    print("Products space 3: ", products_space)
+
+    if flag:
+        flag = False
+        doc_ref = db.collection("HistoryMessages").document(client_id)
+        doc = doc_ref.get()
+        
+        if doc.exists:
+            messages = doc.to_dict().get('messages', [])
+            print(f"Original messages count: {len(messages)}")
+            excess_count = len(messages) - 15
+            messages = messages[excess_count:] 
+            
+            doc_ref.update({'messages': messages})
+            print("Document updated with trimmed messages.")
+
     print('Bot:', response)
-    # del websocket_product_data[client_id]
+# del websocket_product_data[client_id]
 
 
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -473,60 +541,3 @@ if __name__ == '__main__':
     app.run_polling(poll_interval=1)
 
 
-   
-# API to send response
-@app.post('/generate_response')
-async def generate_response( user_input: str, client_id: str):
-    global api_product_data
-    global flag
-
-    user_input = f"(client_id: {client_id}): " + user_input
-
-    response = agent_executor.invoke(
-        {"input": user_input},
-        config={"configurable": {"session_id": client_id}},
-    )
-
-    async with api_data_lock:
-        print("api_product_data 1: ", websocket_product_data)
-        products_space = api_product_data.get(client_id)
-        print("Products space 2: ", products_space)
-
-        if products_space:
-            del api_product_data[client_id] 
-
-            response = response['output']
-            print("api_product_data 2: ", api_product_data) 
-
-            response_json = {
-                "type" : "products",
-                "response": response,
-                "products": products_space
-            }
-        else:
-            print("Came in else")
-
-            response = response['output']
-
-            response_json = {
-                "type" : "message",
-                "response": response
-            }
-
-    print("Products space 3: ", products_space)
-
-    if flag:
-        flag = False
-        doc_ref = db.collection("HistoryMessages").document(client_id)
-        doc = doc_ref.get()
-        
-        if doc.exists:
-            messages = doc.to_dict().get('messages', [])
-            print(f"Original messages count: {len(messages)}")
-            excess_count = len(messages) - 15
-            messages = messages[excess_count:] 
-            
-            doc_ref.update({'messages': messages})
-            print("Document updated with trimmed messages.")
-
-    return response_json

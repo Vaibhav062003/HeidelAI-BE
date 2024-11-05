@@ -522,9 +522,11 @@ async def webhook_handler(request: Request):
 
     print('Bot:', response)
 
+
+
 @app.get("/set_webhook")
 async def set_webhook():
-    s = bot.setWebhook(f'https://{URL}/webhook')
+    s = bot.setWebhook(f'http://localhost:8000/webhook')
     if s:
         return PlainTextResponse(content="webhook setup ok")
     else:
