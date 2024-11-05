@@ -20,6 +20,8 @@ from langchain import hub
 processed_message_ids = OrderedDict()
 EXPIRY_TIME_SECONDS = 86400 
 
+address_details = []
+
 load_dotenv()
 
 
@@ -209,7 +211,6 @@ app.add_middleware(
 )
 
 def remove_expired_message_ids():
-
     current_time = time.time()
     expired_ids = []
 
@@ -396,7 +397,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 print(f"Product ID: {product_id}, Quantity: {quantity}, Price: {item_price}, Currency: {currency}")
 
                             print("Sender sent cart")
-
+                            add_order_details(sender, product_items)
                             await get_details(sender, again=False)
 
                             # print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
@@ -405,7 +406,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             print("Name: ", sender_name, ", Number: ",sender ,", sent details")
                             print("Sender clicked on interactive message")
                             interactive_type = message["interactive"]["type"]
-
+                            
                             if interactive_type == "nfm_reply":
                                 # Extract the JSON string from the message 
                                 response_json_str = message["interactive"]["nfm_reply"]["response_json"]
@@ -413,13 +414,17 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 # Parse the JSON string into a Python dictionary
                                 response_json = json.loads(response_json_str)
 
+                                # Add the sender details to the address details list
+                                add_address_details(sender, response_json)
+                                print(address_details)
                                 # Print the parsed JSON
-                                print(response_json)
+                                # print(response_json)
                                 # {'pin_code': '411058', 'full_name': 'Rounak longani', 'flow_token': 'AQAAAAACS5FpgQ_cAAAAAD0QI3s.', 'state': 'Maharashtra ', 'email': 'Rounaklongani@gmail.com', 'city': 'Pune', 'country': '0_India', 'address': 'Hahsjs'}
 
                                 await confirm_address(sender, response_json)
 
                             elif interactive_type == "button_reply":
+                                
                                 payload = message["interactive"]["button_reply"]["id"]
                                 print("Reply Payload: ", payload)
                                 if payload == "info_correct":
@@ -427,6 +432,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     await get_payment(sender, sender_name)
                                 elif payload == "info_incorrect":
                                     print("Info is incorrect")
+                                    delete_address_details(sender)
                                     await get_details(sender, again=True)
 
                             # await send_message(sender, "Got your responses. Thank you!\n\nThis functionality is still in development.")
@@ -820,7 +826,7 @@ async def get_details(sender, again: bool):
                     "parameters": {
                         "flow_message_version": "3",
                         "flow_token": str(sender),
-                        "flow_id": "2947209285433068",
+                        "flow_id": "1253252929429522",
                         "flow_cta": "Enter details",
                         "flow_action": "navigate",
                         "flow_action_payload": {
@@ -852,7 +858,7 @@ async def get_details(sender, again: bool):
                     "parameters": {
                         "flow_message_version": "3",
                         "flow_token": str(sender),
-                        "flow_id": "2947209285433068",
+                        "flow_id": "1253252929429522",
                         "flow_cta": "Enter details",
                         "flow_action": "navigate",
                         "flow_action_payload": {
@@ -1097,6 +1103,80 @@ async def confirm_address(sender, response_json):
     print(f"Response: {response.status_code}, {response.json()}")
 
 async def get_payment(sender, sender_name):
+    order_id = generate_order_id()
+    details = get_sender_details(sender)
+
+    if details is None:
+        print("Details not found for sender")
+        await send_message(sender, "Sorry, we could not find your address details. Please try again.")
+        return
+    
+    items = []
+
+    for product in details["order_details"]:
+        product_id = product["product_retailer_id"]
+        quantity = product["quantity"]
+        item_price = product["item_price"]
+        # currency = product["currency"]
+        # print(f"Product ID: {product_id}, Quantity: {quantity}, Price: {item_price}, Currency: {currency}")
+
+        url1 = f"https://graph.facebook.com/v20.0/759103595212051/products"
+        params1 = {
+            "filter" : json.dumps({
+                "retailer_id" : { "eq" :  product_id }
+            }),
+            "fields" : "id",
+            "access_token" : {ACCESS_TOKEN}
+        }
+
+        response = requests.get(url1, params=params1)
+        response = response.json()
+        # print(response)
+        if len(response['data']) == 0:
+            print("Product not found")
+            await send_message(sender, "Sorry, we could not find the product details. Please try again.")
+            return
+
+        product_cat_id = response['data'][0]['id']
+
+        url = f"https://graph.facebook.com/{product_cat_id}"
+
+        params = {
+            "access_token": ACCESS_TOKEN,
+            "fields": "name, price, image_url"
+        }
+
+        response = requests.get(url, params=params)
+        response = response.json()
+        price = response['price']
+        clean_price = price.replace("₹", "").replace(",", "")
+        clean_price = int(float(clean_price))
+        product_details = {
+            "name":response['name'],
+            "amount": {
+                "value": int(f"{clean_price}00"),
+                "offset": 100
+            },
+            "sale_amount": {
+                "value": int(f"{item_price}00"),
+                "offset": 100
+            },
+            "quantity": int(quantity),
+            "country_of_origin":"IN",
+            "image" : {
+                "link" : response['image_url']
+            }
+        }
+
+        items.append(product_details)
+
+    print(f"Items: {items}")
+
+    sum = 0
+    for item in items:
+        sum += (int(item['quantity']) * int(item['sale_amount']['value']))
+
+
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
 
     headers = {
@@ -1120,71 +1200,38 @@ async def get_payment(sender, sender_name):
         "action": {
             "name": "review_and_pay",
             "parameters": {
-                "reference_id": "123456789",
+                "reference_id": str(order_id),
                 "type": "physical-goods",
                 "beneficiaries" : [
                     {
-                        "name":"Rounak Longani",
-                        "address_line1":"Flat number 22, 4A Veena, Naadbrahma Society, Warje, Pune",
-                        "city":"Pune",
-                        "state":"Maharashtra",
+                        "name":f"{details['address']['full_name']}",
+                        "address_line1":f"{details['address']['address']}",
+                        "city":f"{details['address']['city']}",
+                        "state":f"{details['address']['state']}",
                         "country":"India",
-                        "postal_code":"411058"
+                        "postal_code":f"{details['address']['pin_code']}",
                     }
                 ],
                 "payment_type": "upi",
                 "payment_configuration": "egenieupi",
                 "currency": "INR",
                 "total_amount": {
-                    "value": 100,
+                    "value": int(sum),
                     "offset": 100
                 },
                 "order": {
                     "status": "pending",
-                    "items": [
-                        {
-                            "name": "Samsung Galaxy",
-                            "amount": {
-                                "value": 1500,
-                                "offset": 100
-                            },
-                            "sale_amount": {
-                                "value": 1000,
-                                "offset": 100
-                            },
-                            "quantity": 1,
-                            "country_of_origin":"IN",
-                            "image" : {
-                                "link" : "https://egeniestores.com/wp-content/uploads/2024/04/81njZjDqc6L._SL1500_.jpg"
-                            }
-                        },
-                        {
-                            "name": "SONY Playstation 5",
-                            "amount": {
-                                "value": 1500,
-                                "offset": 100
-                            },
-                            "sale_amount": {
-                                "value": 1000,
-                                "offset": 100
-                            },
-                            "quantity": 1,
-                            "country_of_origin":"IN",
-                            "image" : {
-                                "link" : "https://egeniestores.com/wp-content/uploads/2024/04/original-imaghyykrhvewh4y-600x558.jpeg"
-                            }
-                        }
-                    ],
+                    "items": items,
                     "subtotal": {
-                        "value": 2000,
+                        "value": int(sum),
                         "offset": 100
                     },
                     "tax": {
-                        "value": 100,
+                        "value": 0,
                         "offset": 100
                     },
                     "discount": {
-                        "value": 2000,
+                        "value": 0,
                         "offset": 100
                     }
                     
@@ -1198,6 +1245,84 @@ async def get_payment(sender, sender_name):
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
 
+def generate_order_id():
+    # File to store the last used order ID
+    file_path = "last_order_id.txt"
+    
+    # Check if the file exists
+    if os.path.exists(file_path):
+        # Read the last order ID
+        with open(file_path, "r") as file:
+            last_order_id = int(file.read())
+    else:
+        # Start from 1000 if the file does not exist
+        last_order_id = 1000
+    
+    # Increment the order ID
+    new_order_id = last_order_id + 1
+
+    # Save the new order ID to the file
+    with open(file_path, "w") as file:
+        file.write(str(new_order_id))
+    
+    # Return the new order ID
+    return new_order_id
+
+def add_order_details(sender, product_items):
+    # Check if sender already exists in address_details
+    sender_entry = next((entry for entry in address_details if entry["sender_id"] == sender), None)
+    
+    if sender_entry:
+        # If sender already exists, just update the order details
+        sender_entry["order_details"] = product_items
+        print(f"Updated order details for sender: {sender}")
+    else:
+        # If sender does not exist, create a new entry with order details and placeholder for address
+        address_details.append({
+            "sender_id": sender,
+            "order_details": product_items,
+            "address": None  # Placeholder for address
+        })
+        print(f"Added new entry with order details for sender: {sender}")
+
+def add_address_details(sender, address_info):
+    # Find the existing entry for the sender
+    sender_entry = next((entry for entry in address_details if entry["sender_id"] == sender), None)
+    
+    if sender_entry:
+        # Update the address details for the existing sender
+        sender_entry["address"] = address_info
+        print(f"Added address details for sender: {sender}")
+    else:
+        address_details.append({
+                "sender_id": sender,
+                "order_details": None,  # Placeholder for order details
+                "address": address_info
+            })
+        print(f"Added new entry with address details for sender: {sender}")
+
+def delete_address_details(sender):
+    # Find the existing entry for the sender
+    sender_entry = next((entry for entry in address_details if entry["sender_id"] == sender), None)
+    
+    if sender_entry:
+        # Set the address to None, effectively removing address details
+        sender_entry["address"] = None
+        print(f"Address details removed for sender: {sender}")
+    else:
+        print(f"No details found for sender: {sender}")
+
+def get_sender_details(sender):
+    # Find the entry for the sender
+    sender_entry = next((entry for entry in address_details if entry["sender_id"] == sender), None)
+    
+    if sender_entry:
+        # Return the full details of the sender
+        print(f"Details for sender {sender}: {sender_entry}")
+        return sender_entry
+    else:
+        print(f"No details found for sender: {sender}")
+        return None
 # recieved  payment
 """
 Incoming webhook payload: {
