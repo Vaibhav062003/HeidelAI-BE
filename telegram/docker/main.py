@@ -313,6 +313,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Send an image with a caption
+    await update.message.reply_photo(
+        photo="help.png",  # Replace with your image URL or local path
+        caption=(
+            "Looking for a guide on how to use the bot❓\n"
+            "I'm an AI-powered chatbot which can browse and search products from our website for you \n \n"
+            "Send messages and freely chat with me like you would with your friend! \n \n"
+            "Use /start to get started 🥰"
+        )
+    )
+
 async def send_carousel(update: Update, products_space):
     # Define the keyboard with buttons to simulate next/previous
     try:
@@ -524,6 +536,8 @@ if __name__ == '__main__':
     # Commands
      # Register existing /start command
     app.add_handler(CommandHandler('start', start_command))
+     # Register existing /help command
+    app.add_handler(CommandHandler('help', help_command))
 
     # Register the new /carousel command
     # app.add_handler(CommandHandler('carousel', carousel_command))
