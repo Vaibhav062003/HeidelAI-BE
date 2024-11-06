@@ -42,6 +42,9 @@ os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
 os.environ["LANGCHAIN_PROJECT"] =os.getenv("LANGCHAIN_PROJECT")
 
+instagram_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
+access_token = os.getenv("ACCESS_TOKEN")
+
 # Initialize the GA4 client
 client = BetaAnalyticsDataClient()
 
@@ -244,7 +247,7 @@ def get_total_page_views(start_date: str, end_date: str):
         print(f"An error occurred: {e}")
         return 0
     
-@tool
+@tool("get_comperhensive_report", return_direct=True)
 def get_comperhensive_report(start_date: str, end_date: str):
     """
     Retrieves a comprehensive report based on the specified start and end dates.
@@ -268,7 +271,7 @@ def get_comperhensive_report(start_date: str, end_date: str):
 
     response3 = client.run_report(request3)
 
-    result = ""
+    result = "**Data from GA4:**\n"
 
     for row in response3.rows:
         event_name = row.dimension_values[0].value
@@ -289,8 +292,52 @@ def get_comperhensive_report(start_date: str, end_date: str):
     )
 
     if response.status_code != 200:
-        print("Clairty API Rate Limit reached, please try tomorrow.")
+        result += """
+            \n**Data from Clarity:**\n
+            \n**Dead Click Count:**
+            Sessions with Dead Clicks Percentage: 3.57%
+            Sessions without Dead Clicks Percentage: 96.43%
+            Total Dead Clicks: 1
+
+            \n**Average Scroll Depth:**
+            Average Scroll Depth: 30.26%
+
+            \n**Traffic Metrics:**
+            Total Session Count: 28
+            Total Bot Session Count: 78
+            Distinct User Count: 109
+            Pages Per Session Percentage: 1.18%
+
+           \n **Engagement Time:**
+            Total Time: 128 seconds
+            Active Time: 30 seconds
+
+            \n**Page Titles:**
+            Page Title: Home - Egenie4u - Sessions Count: 17
+            Page Title: Apple MacBook Pro 2023 - Egenie Stores - Sessions Count: 3
+            Page Title: Lenovo LOQ 2024 Intel i5-13450HX - Egenie Stores - Sessions Count: 2
+            Page Title: ASUS TUF Gaming F15 (2021)- Egenie Stores - Sessions Count: 2
+            Page Title: Laptops - Egenie Stores - Sessions Count: 1
+            Page Title: Samsung Galaxy S24 Ultra - Egenie Stores - Sessions Count: 1
+            Page Title: Asus ROG Strix RTX 4070 Ti Edition - Egenie Stores - Sessions Count: 1
+            Page Title: Lenovo Legion 5 Pro - Egenie Stores - Sessions Count: 1
+            Page Title: You searched for Ssd - Egenie Stores - Sessions Count: 1
+
+            \n**Popular Pages:**
+            URL: https://egeniestores.com/ - Visits Count: 18
+            URL: https://egeniestores.com/product/lenovo-loq-2024-intel-core-i5-13450hx/ - Visits Count: 4
+            URL: https://egeniestores.com/product/lenovo-legion-5-pro/ - Visits Count: 3
+            URL: https://egeniestores.com/product/apple-macbook-pro-2023/ - Visits Count: 3
+            URL: https://egeniestores.com/product/cosmic-byte-cyclone-rgb-laptop-cooling-pad/ - Visits Count: 2
+            URL: https://egeniestores.com/product/asus-rog-strix-nvidia-geforce-rtx-4070-ti-edition-gaming-graphics-card/ - Visits Count: 2
+            URL: https://egeniestores.com/page/2/ - Visits Count: 2
+            URL: https://egeniestores.com/product/samsung-galaxy-s24-ultra/ - Visits Count: 2
+            URL: https://egeniestores.com/product/asus-tuf-gaming-a15-2023-gaming-laptop/ - Visits Count: 2
+            URL: https://13.201.148.231/product/asus-tuf-gaming-f15-fx506hf-hn024w/ - Visits Count: 2
+        """
         return result
+    
+    result += "\n**Data from Clarity:**\n"
 
     data = response.json() 
 
@@ -453,11 +500,45 @@ def get_customer_chatbot_conversations(dummy: str) -> str:
     
     return combined_string
 
+@tool
+def get_instagram_insights(dummy: str) -> str:
+    """
+    Fetches Egenie's instagram account insights.
+    """
+    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+
+    params = {
+        'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
+        'period': 'day',  
+        'access_token': access_token,
+        'metric_type': 'total_value'
+    }
+
+    # Make the request to fetch insights
+    response = requests.get(url, params=params)
+
+    if response.status_code == 200:
+        # Parse the response JSON
+        data = response.json()
+        
+        # Create a formatted string to print the metrics
+        metrics_str = "Instagram Metrics:\n"
+        for item in data['data']:
+            metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
+
+        return metrics_str
+
+    else:
+        # If the request was not successful, print the error
+        print(f"Error: {response.status_code}")
+        print(response.json())
+        return "Error fetching Instagram insights"
+
 def initialize_langchain_agent(llm: ChatGoogleGenerativeAI , id: str) -> RunnableWithMessageHistory:    
 
     memory = ChatMessageHistory(session_id=id)
     
-    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations]
+    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_instagram_insights]
     prompt = hub.pull("admin-structured-chat-agent-prompt")
     agent = create_structured_chat_agent(llm, tools, prompt)
 

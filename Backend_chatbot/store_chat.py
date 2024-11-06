@@ -13,7 +13,7 @@ db = firestore.Client(credentials=credentials)
 
 def get_combined_session_history():
     # Reference to the "HistoryMessages" collection
-    collection_ref = db.collection("ChatHistory")
+    collection_ref = db.collection("HistoryMessages")
     
     # Query all documents in the collection
     docs = collection_ref.stream()
@@ -47,7 +47,7 @@ def get_combined_session_history():
                     continue
 
     # Save the user chats to a JSON file
-    with open('heidelmedia_chat_history.json', 'w') as f:
+    with open('chat_history.json', 'w') as f:
         json.dump(user_chats, f, indent=4)
 
     print(f"User chat history saved successfully to user_chat_history.json with {len(user_chats)} users.")
