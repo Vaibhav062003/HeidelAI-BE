@@ -288,6 +288,10 @@ def get_comperhensive_report(start_date: str, end_date: str):
     headers=headers,
     )
 
+    if response.status_code != 200:
+        print("Clairty API Rate Limit reached, please try tomorrow.")
+        return result
+
     data = response.json() 
 
     for metric in data:

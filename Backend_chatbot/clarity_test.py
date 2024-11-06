@@ -75,6 +75,9 @@ def format_clarity_metrics(data):
 
 data = response.json()  
 
+with open('clarity.json', 'w') as f:
+        json.dump(data, f, indent=4)
+
 formatted_string = format_clarity_metrics(data)
 print(formatted_string)
 

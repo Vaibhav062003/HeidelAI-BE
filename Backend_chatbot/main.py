@@ -257,7 +257,7 @@ def get_comperhensive_report(start_date: str, end_date: str):
 
     response3 = client.run_report(request3)
 
-    result = ""
+    result = "**Data from GA4:**\n"
 
     for row in response3.rows:
         event_name = row.dimension_values[0].value
@@ -277,7 +277,9 @@ def get_comperhensive_report(start_date: str, end_date: str):
     headers=headers,
     )
 
-    data = response.json() 
+    result += "\n**Data from Clarity (Last 72 hours):**\n"
+
+    data = response.json()
 
     for metric in data:
         metric_name = metric.get('metricName', 'Unknown Metric')
