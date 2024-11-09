@@ -1,15 +1,14 @@
-import os
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from telegram import InputMediaPhoto, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from dotenv import load_dotenv
-from telegram import InputMediaPhoto, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import  ContextTypes
-
-import telegram
-import os
+import os, json, telegram
+from fastapi import Depends, FastAPI, Request, Header, HTTPException
+from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+from google.cloud import firestore
+from langchain_google_firestore import FirestoreChatMessageHistory
 from asyncio import Lock
 from pinecone import Pinecone
-from dotenv import load_dotenv
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentExecutor, create_structured_chat_agent
@@ -19,17 +18,7 @@ from sentence_transformers import SentenceTransformer
 from google.oauth2 import service_account
 from google.cloud import firestore
 from langchain_google_firestore import FirestoreChatMessageHistory
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
 from collections import OrderedDict
-import telegram
-import telegram.ext
-load_dotenv()
-
-TOKEN = os.getenv('TOKEN')
-URL = "egenie-telegram-test.koyeb.app"
-BOT_USERNAME = os.getenv('BOT_USERNAME')
 
 
 # Regular dictionary to store processed message IDs with their timestamps
@@ -39,9 +28,9 @@ EXPIRY_TIME_SECONDS = 86400
 load_dotenv()
 
 
-BOT_USERNAME = os.getenv('USERNAME')
+BOT_USERNAME = os.getenv('USERNAME2')
 print("\u001b[32mBot Username:\u001b[0m ", BOT_USERNAME)
-TOKEN = os.getenv('TOKEN')
+TOKEN = os.getenv('TOKEN2')
 print("\u001b[32mToken:\u001b[0m ", TOKEN)
 bot = telegram.Bot(token=TOKEN)
 # Define the path to your service account JSON file
@@ -324,12 +313,24 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Send an image with a caption
+    await update.message.reply_photo(
+        photo="help.png",  # Replace with your image URL or local path
+        caption=(
+            "Looking for a guide on how to use the bot❓\n"
+            "I'm an AI-powered chatbot which can browse and search products from our website for you \n \n"
+            "Send messages and freely chat with me like you would with your friend! \n \n"
+            "Use /start to get started 🥰"
+        )
+    )
+
 async def send_carousel(update: Update, products_space):
     # Define the keyboard with buttons to simulate next/previous
     try:
         keyboard = [
             [
-                InlineKeyboardButton("Know more", callback_data="know_more"),
+                InlineKeyboardButton("Know more", callback_data="know_more_0"),
                 InlineKeyboardButton("Next Item ⏭️", callback_data="next_item_0")
             ]
         ]
@@ -343,7 +344,25 @@ async def send_carousel(update: Update, products_space):
     except Exception as e:
         print("Error :", e)
 
-async def button_handler(update: Update):
+async def send_product(update: Update, products_space, index):
+    try:
+        keyboard = [
+            [
+                InlineKeyboardButton("Buy now", callback_data="buy_0")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        # Send the first "card" with the inline keyboard
+        await update.message.reply_photo(
+            photo=products_space[index]['image_link'],  # Replace with the first item image URL
+            caption= f"*{products_space[index]['name']}* \n\n ~199000~ *183000* \n\n *Key Highlights:* \nEMI Available! \nGet GST Invoice and save upto 28% on business purchases \nFree shipping all over India " ,  # Replace with the first item caption
+            reply_markup=reply_markup,
+            parse_mode="MarkdownV2"
+        )
+    except Exception as e:
+        print("Error :", e)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global websocket_product_data
 
     query = update.callback_query
@@ -385,7 +404,7 @@ async def button_handler(update: Update):
         keyboard = [
             [
                 InlineKeyboardButton("⏮️", callback_data=f"previous_item_{index}"),
-                InlineKeyboardButton("Know more", callback_data=f"know_more"),
+                InlineKeyboardButton("Know more", callback_data=f"know_more_{index}"),
                 InlineKeyboardButton("⏭️", callback_data=f"next_item_{index}")
             ]
         ]
@@ -408,7 +427,7 @@ async def button_handler(update: Update):
         keyboard = [
             [
                 InlineKeyboardButton("⏮️", callback_data=f"previous_item_{index}"),
-                InlineKeyboardButton("Know more", callback_data=f"know_more"),
+                InlineKeyboardButton("Know more", callback_data=f"know_more_{index}"),
                 InlineKeyboardButton("⏭️", callback_data=f"next_item_{index}")
             ]
         ]
@@ -426,9 +445,54 @@ async def button_handler(update: Update):
     # Handle the "Know more" button press
     elif action == "know":
         # Implement the logic to handle the "Know more" action
-        
-        await query.message.reply_text(f"This functionality is under development.")
+        index = int(data[2]) if len(data) > 2 else None
+        print("INdex",index)
+        data = query.data.split("-")
+        print("data",data)
+        keyboard = [
+            [
+                InlineKeyboardButton("Buy now", callback_data="buy_0")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        name = products_space[index]['name']
+        name = name.replace(")",r"\)")
+        name = name.replace("(",r"\(")
+        name = name.replace("-",r"\-")
+        print(name)
 
+        if products_space[index]['on_sale'] == 'True':
+            sale_price = products_space[index]['price']
+            regular_price = products_space[index]['regular_price']
+            async with bot:
+                await bot.send_photo(
+                    chat_id=user_id, 
+                    photo=products_space[index]['image_link'], 
+                    caption=f"*{name}* \n\n *₹{int(float(sale_price))}* ~₹{int(float(regular_price))}~  \n\n🎉*Key Highlights:* \n \- EMI Available\!✅ \n \- Get GST Invoice and save upto 28\% on business purchases \n \- Free shipping all over India🚚 \n\nCheckout this product on our website [here]({products_space[index]['permalink']}) \n\nTo contact us, simply reply with _Live Agent_",
+                    reply_markup=reply_markup,
+                    parse_mode="MarkdownV2"
+                    )
+        elif products_space[index]['on_sale'] == 'False':
+            print("here false")
+            price = products_space[index]['regular_price']
+            print(f"*{name}* \n\n *₹{int(float(price))}*  \n\n🎉*Key Highlights:* \n \- EMI Available\!✅ \n \- Get GST Invoice and save upto 28\% on business purchases \n \- Free shipping all over India🚚 \n\nCheckout this product on our website [here]({products_space[index]['permalink']}) \n\nTo contact us, simply reply with _Live Agent_")
+            async with bot:
+                await bot.send_photo(
+                    chat_id=user_id, 
+                    photo=products_space[index]['image_link'], 
+                    caption=f"*{name}* \n\n *₹{int(float(price))}*  \n\n🎉*Key Highlights:* \n \- EMI Available\!✅ \n \- Get GST Invoice and save upto 28\% on business purchases \n \- Free shipping all over India🚚 \n\nCheckout this product on our website [here]({products_space[index]['permalink']}) \n\nTo contact us, simply reply with _Live Agent_",
+                    reply_markup=reply_markup,
+                    parse_mode="MarkdownV2"
+                    )        
+        
+
+        # Send the first "card" with the inline keyboard
+        # await update.message.reply_photo(
+        #     photo=products_space[index]['image_link'],  # Replace with the first item image URL
+        #     caption= f"*{products_space[index]['name']}* \n\n ~199000~ *183000* \n\n *Key Highlights:* \nEMI Available! \nGet GST Invoice and save upto 28% on business purchases \nFree shipping all over India " ,  # Replace with the first item caption
+        #     reply_markup=reply_markup,
+        #     parse_mode="MarkdownV2"
+        # )
 
 
 
@@ -461,11 +525,9 @@ async def show_typing(chat_id):
         await bot.send_chat_action(chat_id=chat_id, action=telegram.constants.ChatAction.TYPING)
 
 
-@app.post("/webhook")
-async def webhook_handler(request: Request):
-    # Retrieve the message in JSON and then transform it to Telegram object
-    update = telegram.Update.de_json(await request.json())
-    # context = telegram.ext.CallbackContext
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global flag
+
 
     message_type = update.message.chat.type
     text = update.message.text
@@ -488,6 +550,7 @@ async def webhook_handler(request: Request):
         
     else:
         response = await handle_response(text, client_id)
+
 
     async with websocket_data_lock:
         products_space = websocket_product_data.get(client_id)
@@ -521,17 +584,37 @@ async def webhook_handler(request: Request):
             print("Document updated with trimmed messages.")
 
     print('Bot:', response)
+# del websocket_product_data[client_id]
+
+
+async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f'Update {update} caused error {context.error}')
 
 
 
-@app.get("/set_webhook")
-async def set_webhook():
-    s = bot.setWebhook(f'http://localhost:8000/webhook')
-    if s:
-        return PlainTextResponse(content="webhook setup ok")
-    else:
-        return PlainTextResponse(content="webhook setup failed")
+if __name__ == '__main__':
+    print("\u001b[33mStarting bot...\u001b[0m")
+    app = Application.builder().token(TOKEN).build()
 
-@app.get("/")
-async def index():
-    return PlainTextResponse(content='active hai telegram fastapi app')
+    # Commands
+     # Register existing /start command
+    app.add_handler(CommandHandler('start', start_command))
+     # Register existing /help command
+    app.add_handler(CommandHandler('help', help_command))
+
+    # Register the new /carousel command
+    # app.add_handler(CommandHandler('carousel', carousel_command))
+
+    # Register button handler for inline keyboard button clicks
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Errors
+    app.add_error_handler(error)
+
+    print("\u001b[32mPolling...\u001b[0m")
+    app.run_polling(poll_interval=1)
+
+

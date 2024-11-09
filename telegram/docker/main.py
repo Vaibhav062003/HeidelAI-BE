@@ -427,6 +427,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle the "Know more" button press
     elif action == "know":
         # Implement the logic to handle the "Know more" action
+        print(index)
         
         await query.message.reply_text(f"This functionality is under development.")
 
