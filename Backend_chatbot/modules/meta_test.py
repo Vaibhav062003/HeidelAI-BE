@@ -5,6 +5,7 @@ load_dotenv()
 
 instagram_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
 access_token = os.getenv("ACCESS_TOKEN")
+secret_token = os.getenv("SECRET_TOKEN")
 
 # The URL for the API request
 url = f'https://graph.facebook.com/{instagram_account_id}/insights'
@@ -18,6 +19,7 @@ params = {
     'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
     'period': 'day',  
     'access_token': access_token,
+    # 'appsecret_proof': secret_token,
     'metric_type': 'total_value'
 }
 
@@ -42,6 +44,7 @@ else:
     # If the request was not successful, print the error
     print(f"Error: {response.status_code}")
     print(response.json())
+
 
 """
 impressions, 
