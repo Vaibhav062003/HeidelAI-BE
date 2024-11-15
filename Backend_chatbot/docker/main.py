@@ -544,7 +544,8 @@ def initialize_langchain_agent(llm: ChatGoogleGenerativeAI , id: str) -> Runnabl
 
     agent_executor = AgentExecutor.from_agent_and_tools(
         agent=agent, 
-        tools=tools, 
+        tools=tools,
+        handle_parsing_errors=True, 
         verbose=True)
     
     agent_with_chat_history = RunnableWithMessageHistory(

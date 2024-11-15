@@ -436,51 +436,92 @@ def get_customer_chatbot_conversations(dummy: str) -> str:
     
     return combined_string
 
-@tool
-def get_instagram_insights(dummy: str) -> str:
-    """
-    Fetches Egenie's instagram account insights.
-    """
-    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+# @tool
+# def get_social_insights(dummy: str) -> str:
+#     """
+#     Fetches Egenie's instagram account insights.
+#     """
+#     print("in")
+#     url = f'https://graph.facebook.com/{instagram_account_id}/insights'
 
-    params = {
-        'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
-        'period': 'day',  
-        'access_token': access_token,
-        'metric_type': 'total_value'
-    }
+#     params = {
+#         'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
+#         'period': 'day',  
+#         'access_token': access_token,
+#         'metric_type': 'total_value'
+#     }
 
-    # Make the request to fetch insights
-    response = requests.get(url, params=params)
+#     # Make the request to fetch insights
+#     response = requests.get(url, params=params)
 
-    if response.status_code == 200:
-        # Parse the response JSON
-        data = response.json()
+#     if response.status_code == 200:
+#         # Parse the response JSON
+#         data = response.json()
         
-        # Create a formatted string to print the metrics
-        metrics_str = "Instagram Metrics:\n"
-        for item in data['data']:
-            metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
+#         # Create a formatted string to print the metrics
+#         metrics_str = "Instagram Metrics:\n"
+#         for item in data['data']:
+#             metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
 
-        return metrics_str
+#         return metrics_str
 
-    else:
-        # If the request was not successful, print the error
-        print(f"Error: {response.status_code}")
-        print(response.json())
-        return "Error fetching Instagram insights"
+#     else:
+#         # If the request was not successful, print the error
+#         print(f"Error: {response.status_code}")
+#         print(response.json())
+#         return "Error fetching Instagram insights"
+    
+@tool
+def get_social_insights(dummy: dict) -> str:
+    """
+    Fetches Egenie's Instagram account insights.
+    Args:
+        dummy (dict): placeholder parameter to maintain consistency with tool schema.
+    Returns:
+        str: Formatted Instagram metrics
+    """
+    try:
+        url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+        params = {
+            'metric': 'impressions,reach,profile_views,total_interactions,profile_links_taps,website_clicks,accounts_engaged,saves,shares',
+            'period': 'day',  
+            'metric_type': 'total_value',
+            'access_token': access_token
+        }
+
+        print("Calling Instagram API...")  # Debug print
+        response = requests.get(url, params=params)
+        print(f"Response status: {response.status_code}")  # Debug print
+
+        if response.status_code == 200:
+            data = response.json()
+            metrics_str = "Instagram Metrics:\n"
+            for item in data['data']:
+                metrics_str += f"{item['title']}: {item['total_value']['value']}\n"
+            return metrics_str
+        else:
+            error_msg = f"Error: {response.status_code}"
+            print(error_msg)  # Debug print
+            return error_msg
+
+    except Exception as e:
+        error_msg = f"Error fetching Instagram insights: {str(e)}"
+        print(error_msg)  # Debug print
+        return error_msg
+
 
 def initialize_langchain_agent(llm, id):    
 
     memory = ChatMessageHistory(session_id=id)
     
-    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_instagram_insights]
+    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_social_insights]
     prompt = hub.pull("admin-structured-chat-agent-prompt")
     agent = create_structured_chat_agent(llm, tools, prompt)
 
     agent_executor = AgentExecutor.from_agent_and_tools(
         agent=agent, 
         tools=tools, 
+        handle_parsing_errors=True,
         verbose=True)
     
     agent_with_chat_history = RunnableWithMessageHistory(
@@ -506,34 +547,34 @@ chat_history = []
 #     chat_history.append(AIMessage(content=ai_response))
 
 while True:
-    bot = input("Bot 1 or 2? -")
+    # bot = input("Bot 1 or 2? -")
 
-    if bot == "1":   
-        user_input = input("User: ")
-        tic = time.perf_counter()
-        response = agent_executor1.invoke(
-            {"input": user_input,
-            "date": datetime.now().strftime('%Y-%m-%d'),},
-            config={"configurable": {"session_id": "admin1"}},
-        )
+    # if bot == "1":   
+    user_input = input("User: ")
+    tic = time.perf_counter()
+    response = agent_executor1.invoke(
+        {"input": user_input,
+        "date": datetime.now().strftime('%Y-%m-%d'),},
+        config={"configurable": {"session_id": "admin1"}},
+    )
 
-        toc = time.perf_counter()
-        print(response['output'])
-        # add_to_chat_history(user_input, response["output"])
-        print(f"time_taken {toc - tic:0.4f} seconds")
+    toc = time.perf_counter()
+    print(response['output'])
+    # add_to_chat_history(user_input, response["output"])
+    print(f"time_taken {toc - tic:0.4f} seconds")
 
-    else:
-        user_input = input("User: ")
-        tic = time.perf_counter()
-        response = agent_executor2.invoke(
-            {"input": user_input,
-            "date": datetime.now().strftime('%Y-%m-%d'),},
-            config={"configurable": {"session_id": "admin2"}},
-        )
+    # else:
+    #     user_input = input("User: ")
+    #     tic = time.perf_counter()
+    #     response = agent_executor2.invoke(
+    #         {"input": user_input,
+    #         "date": datetime.now().strftime('%Y-%m-%d'),},
+    #         config={"configurable": {"session_id": "admin2"}},
+    #     )
 
-        toc = time.perf_counter()
-        print(response['output'])
-        # add_to_chat_history(user_input, response["output"])
-        print(f"time_taken {toc - tic:0.4f} seconds")
+    # toc = time.perf_counter()
+    # print(response['output'])
+    # add_to_chat_history(user_input, response["output"])
+    # print(f"time_taken {toc - tic:0.4f} seconds")
 
 
