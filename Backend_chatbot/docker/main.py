@@ -501,7 +501,7 @@ def get_customer_chatbot_conversations(dummy: str) -> str:
     return combined_string
 
 @tool
-def get_instagram_insights(dummy: str) -> str:
+def get_social_insights(dummy: dict) -> str:
     """
     Fetches Egenie's Instagram account insights. Returns a JSON string containing formatted metrics. 
     This tool accepts a dummy dictionary as input, which is not used. Pass an empty dictionary ({}) as input.
@@ -526,21 +526,24 @@ def get_instagram_insights(dummy: str) -> str:
         metrics_str = "Instagram Metrics:\n"
         for item in data['data']:
             metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
-
+            # metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
+            # metrics_str += f"  Description: {item['description']}\n"
+        
+        # Print the formatted string
+        print(metrics_str)
         return metrics_str
 
     else:
         # If the request was not successful, print the error
         print(f"Error: {response.status_code}")
         print(response.json())
-        return "Error fetching Instagram insights"
 
 def initialize_langchain_agent(llm: ChatGoogleGenerativeAI , id: str) -> RunnableWithMessageHistory:    
 
     memory = ChatMessageHistory(session_id=id)
     
-    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_instagram_insights]
-    prompt = hub.pull("admin-chatbot")
+    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_social_insights]
+    prompt = hub.pull("admin-bot")
     agent = create_structured_chat_agent(llm, tools, prompt)
 
     agent_executor = AgentExecutor.from_agent_and_tools(
