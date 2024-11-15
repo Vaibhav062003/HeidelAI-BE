@@ -8,78 +8,78 @@ access_token = os.getenv("ACCESS_TOKEN")
 secret_token = os.getenv("SECRET_TOKEN")
 
 # The URL for the API request
-# url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+url = f'https://graph.facebook.com/{instagram_account_id}/insights'
 
-# # Define the metrics you want to retrieve
+# Define the metrics you want to retrieve
 
-# #follower_count
+#follower_count
 
-# #reached_audience_demographics
-# params = {
-#     'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
-#     'period': 'day',  
-#     'access_token': access_token,
-#     # 'appsecret_proof': secret_token,
-#     'metric_type': 'total_value'
-# }
+#reached_audience_demographics
+params = {
+    'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
+    'period': 'day',  
+    'access_token': access_token,
+    # 'appsecret_proof': secret_token,
+    'metric_type': 'total_value'
+}
 
-# # Make the request to fetch insights
-# response = requests.get(url, params=params)
+# Make the request to fetch insights
+response = requests.get(url, params=params)
 
-# if response.status_code == 200:
-#     # Parse the response JSON
-#     data = response.json()
+if response.status_code == 200:
+    # Parse the response JSON
+    data = response.json()
     
-#     # Create a formatted string to print the metrics
-#     metrics_str = "Instagram Metrics:\n"
-#     for item in data['data']:
-#         metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
-#         # metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
-#         # metrics_str += f"  Description: {item['description']}\n"
+    # Create a formatted string to print the metrics
+    metrics_str = "Instagram Metrics:\n"
+    for item in data['data']:
+        metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
+        # metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
+        # metrics_str += f"  Description: {item['description']}\n"
     
-#     # Print the formatted string
-#     print(metrics_str)
+    # Print the formatted string
+    print(metrics_str)
 
-# else:
-#     # If the request was not successful, print the error
-#     print(f"Error: {response.status_code}")
-#     print(response.json())
-def get_instagram_insights() -> str:
-    """
-    Fetches Egenie's instagram account insights.
-    """
-    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+else:
+    # If the request was not successful, print the error
+    print(f"Error: {response.status_code}")
+    print(response.json())
 
-    params = {
-        'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
-        'period': 'day',  
-        'access_token': access_token,
-        'metric_type': 'total_value'
-    }
-    print("calling api")
-    # Make the request to fetch insights
-    response = requests.get(url, params=params)
+# def get_instagram_insights() -> str:
+#     """
+#     Fetches Egenie's instagram account insights.
+#     """
+#     try:
+#         url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+#         params = {
+#             'metric': 'impressions,reach,profile_views,total_interactions,profile_links_taps,website_clicks,accounts_engaged,saves,shares',
+#             'period': 'day',  
+#             'metric_type': 'total_value',
+#             'access_token': access_token
+#         }
 
-    print("done")
-    if response.status_code == 200:
-        # Parse the response JSON
-        data = response.json()
-        
-        # Create a formatted string to print the metrics
-        metrics_str = "Instagram Metrics:\n"
-        for item in data['data']:
-            metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
+#         print("Calling Instagram API...")  # Debug print
+#         response = requests.get(url, params=params)
+#         print(f"Response status: {response.status_code}")  # Debug print
 
-        print(metrics_str)
-        return metrics_str
+#         if response.status_code == 200:
+#             data = response.json()
+#             metrics_str = "Instagram Metrics:\n"
+#             for item in data['data']:
+#                 metrics_str += f"{item['title']}: {item['total_value']['value']}\n"
+#             return metrics_str
+#         else:
+#             error_msg = f"Error: {response.status_code}"
+#             print(error_msg)  # Debug print
+#             return error_msg
 
-    else:
-        # If the request was not successful, print the error
-        print(f"Error: {response.status_code}")
-        print(response.json())
-        return "Error fetching Instagram insights"
+#     except Exception as e:
+#         error_msg = f"Error fetching Instagram insights: {str(e)}"
+#         print(error_msg)  # Debug print
+#         return error_msg
+
     
-get_instagram_insights()
+# get_instagram_insights()
 
 """
 impressions, 

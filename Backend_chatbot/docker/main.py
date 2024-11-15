@@ -503,7 +503,8 @@ def get_customer_chatbot_conversations(dummy: str) -> str:
 @tool
 def get_instagram_insights(dummy: str) -> str:
     """
-    Fetches Egenie's instagram account insights.
+    Fetches Egenie's Instagram account insights. Returns a JSON string containing formatted metrics. 
+    This tool accepts a dummy dictionary as input, which is not used. Pass an empty dictionary ({}) as input.
     """
     url = f'https://graph.facebook.com/{instagram_account_id}/insights'
 
@@ -539,7 +540,7 @@ def initialize_langchain_agent(llm: ChatGoogleGenerativeAI , id: str) -> Runnabl
     memory = ChatMessageHistory(session_id=id)
     
     tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_instagram_insights]
-    prompt = hub.pull("admin-structured-chat-agent-prompt")
+    prompt = hub.pull("admin-chatbot")
     agent = create_structured_chat_agent(llm, tools, prompt)
 
     agent_executor = AgentExecutor.from_agent_and_tools(

@@ -474,40 +474,40 @@ def get_customer_chatbot_conversations(dummy: str) -> str:
 @tool
 def get_social_insights(dummy: dict) -> str:
     """
-    Fetches Egenie's Instagram account insights.
-    Args:
-        dummy (dict): placeholder parameter to maintain consistency with tool schema.
-    Returns:
-        str: Formatted Instagram metrics
+    Fetches Egenie's Instagram account insights. Returns a JSON string containing formatted metrics. 
+    This tool accepts a dummy dictionary as input, which is not used. Pass an empty dictionary ({}) as input.
     """
-    try:
-        url = f'https://graph.facebook.com/{instagram_account_id}/insights'
-        params = {
-            'metric': 'impressions,reach,profile_views,total_interactions,profile_links_taps,website_clicks,accounts_engaged,saves,shares',
-            'period': 'day',  
-            'metric_type': 'total_value',
-            'access_token': access_token
-        }
+    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
 
-        print("Calling Instagram API...")  # Debug print
-        response = requests.get(url, params=params)
-        print(f"Response status: {response.status_code}")  # Debug print
+    params = {
+        'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
+        'period': 'day',  
+        'access_token': access_token,
+        'metric_type': 'total_value'
+    }
 
-        if response.status_code == 200:
-            data = response.json()
-            metrics_str = "Instagram Metrics:\n"
-            for item in data['data']:
-                metrics_str += f"{item['title']}: {item['total_value']['value']}\n"
-            return metrics_str
-        else:
-            error_msg = f"Error: {response.status_code}"
-            print(error_msg)  # Debug print
-            return error_msg
+    # Make the request to fetch insights
+    response = requests.get(url, params=params)
 
-    except Exception as e:
-        error_msg = f"Error fetching Instagram insights: {str(e)}"
-        print(error_msg)  # Debug print
-        return error_msg
+    if response.status_code == 200:
+        # Parse the response JSON
+        data = response.json()
+        
+        # Create a formatted string to print the metrics
+        metrics_str = "Instagram Metrics:\n"
+        for item in data['data']:
+            metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
+            # metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
+            # metrics_str += f"  Description: {item['description']}\n"
+        
+        # Print the formatted string
+        print(metrics_str)
+        return metrics_str
+
+    else:
+        # If the request was not successful, print the error
+        print(f"Error: {response.status_code}")
+        print(response.json())
 
 
 def initialize_langchain_agent(llm, id):    
@@ -515,7 +515,8 @@ def initialize_langchain_agent(llm, id):
     memory = ChatMessageHistory(session_id=id)
     
     tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_social_insights]
-    prompt = hub.pull("admin-structured-chat-agent-prompt")
+    # prompt = hub.pull("admin-structured-chat-agent-prompt")
+    prompt = hub.pull("admin-bot")
     agent = create_structured_chat_agent(llm, tools, prompt)
 
     agent_executor = AgentExecutor.from_agent_and_tools(
