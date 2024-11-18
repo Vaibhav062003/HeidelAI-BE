@@ -14,7 +14,7 @@ url = f'https://graph.facebook.com/{instagram_account_id}/insights'
 
 #follower_count
 
-#reached_audience_demographics
+# reached_audience_demographics
 params = {
     'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
     'period': 'day',  
@@ -32,13 +32,14 @@ if response.status_code == 200:
     
     # Create a formatted string to print the metrics
     metrics_str = "Instagram Metrics:\n"
-    for item in data['data']:
-        metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
+    # for item in data['data']:
+    #     metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
         # metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
         # metrics_str += f"  Description: {item['description']}\n"
     
     # Print the formatted string
     print(metrics_str)
+    print(data)
 
 else:
     # If the request was not successful, print the error
@@ -80,36 +81,31 @@ else:
 
     
 # get_instagram_insights()
-
+'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares, engaged_audience_demographics, reached_audience_demographics, ',
 """
-impressions, 
-reach, 
-follower_count, 
-email_contacts,  
-text_message_clicks, 
-get_directions_clicks, 
-website_clicks, 
-profile_views, 
-online_followers, 
-accounts_engaged, 
-total_interactions, 
+impressions -, 
+reach - , 
+website_clicks - , 
+accounts_engaged - , 
+total_interactions - , 
+engaged_audience_demographics - , 
+reached_audience_demographics - , 
+profile_links_taps - , 
+
+follows_and_unfollows, 
+views
+follower_demographics, 
 likes, 
-comments, 
+replies, 
 shares, 
 saves, 
-replies, 
-engaged_audience_demographics, 
-reached_audience_demographics, 
-follower_demographics, 
-follows_and_unfollows, 
-profile_links_taps, 
-views, 
-threads_likes, 
-threads_replies, 
-reposts, 
-quotes, 
-threads_followers, 
-threads_follower_demographics
+comments, 
+online_followers, 
+profile_views, 
+text_message_clicks, 
+get_directions_clicks, 
+email_contacts,  
+follower_count,
 
 1.
 params = {

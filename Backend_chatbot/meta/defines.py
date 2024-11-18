@@ -20,6 +20,7 @@ def getCreds() :
 	creds['endpoint_base'] = creds['graph_domain'] + creds['graph_version'] + '/' # base endpoint with domain and version
 	creds['instagram_account_id'] = os.getenv('INSTAGRAM_ACCOUNT_ID') # users instagram account id
 	creds['page_id'] = os.getenv('FB_PAGE_ID') # users page id
+	creds['debug'] = 'no'
 
 	return creds
 

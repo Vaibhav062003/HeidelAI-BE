@@ -526,15 +526,11 @@ def get_social_insights(dummy: dict) -> str:
         metrics_str = "Instagram Metrics:\n"
         for item in data['data']:
             metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
-            # metrics_str += f"{item['title']} ({item['name']}): {item['total_value']['value']}\n"
-            # metrics_str += f"  Description: {item['description']}\n"
         
         # Print the formatted string
-        print(metrics_str)
+        # print(metrics_str)
         return metrics_str
-
     else:
-        # If the request was not successful, print the error
         print(f"Error: {response.status_code}")
         print(response.json())
 
