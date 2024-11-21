@@ -1,4 +1,4 @@
-from telegram import InputMediaPhoto, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import InputMediaPhoto, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, LabeledPrice
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from dotenv import load_dotenv
 import os, json, telegram
@@ -451,7 +451,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("data",data)
         keyboard = [
             [
-                InlineKeyboardButton("Buy now", callback_data="buy_0")
+                InlineKeyboardButton("Buy now", callback_data=f"buy_{index}")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -459,6 +459,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = name.replace(")",r"\)")
         name = name.replace("(",r"\(")
         name = name.replace("-",r"\-")
+        name = name.replace(".",r"\.")
         print(name)
 
         if products_space[index]['on_sale'] == 'True':
@@ -484,16 +485,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=reply_markup,
                     parse_mode="MarkdownV2"
                     )        
-        
 
-        # Send the first "card" with the inline keyboard
-        # await update.message.reply_photo(
-        #     photo=products_space[index]['image_link'],  # Replace with the first item image URL
-        #     caption= f"*{products_space[index]['name']}* \n\n ~199000~ *183000* \n\n *Key Highlights:* \nEMI Available! \nGet GST Invoice and save upto 28% on business purchases \nFree shipping all over India " ,  # Replace with the first item caption
-        #     reply_markup=reply_markup,
-        #     parse_mode="MarkdownV2"
-        # )
-
+    elif action == "buy":
+        index = int(data[1]) if len(data) > 1 else None
+        # await bot.send_message(chat_id=user_id, text=f"You can buy this product from our website [here]({products_space[index]['permalink']})", parse_mode="MarkdownV2")
+        message = await bot.send_invoice(chat_id=user_id, title=products_space[index]['name'], description="EMI Available! Get GST Invoice and save upto 28% on business purchases", payload="payload", provider_token="5339121570:TEST:fab5a9c7-8f95-4471-8195-f7dd4ad6894d",start_parameter="start_parameter", currency="INR", prices=[LabeledPrice(label="Price", amount=100)])
 
 
 

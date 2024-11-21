@@ -262,14 +262,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     global search_term
     global websocket_product_data
     # First, validate the signature
+    payload = await request.json()
+    print("Incoming webhook payload:", json.dumps(payload, indent=2))
     await signature_required(request, x_hub_signature_256)
 
     # Remove expired message IDs
     remove_expired_message_ids()
 
     # Process the incoming message (if the signature is valid)
-    payload = await request.json()
-    print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
     # Handle incoming messages
     if "entry" in payload and len(payload["entry"]) > 0:
