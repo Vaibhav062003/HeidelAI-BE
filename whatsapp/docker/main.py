@@ -928,7 +928,7 @@ async def send_ig_carousel(id, products):
 
         response = requests.get(url1, params=params1)
         response = response.json()
-        # print(response)
+        print(response)
         if len(response['data']) == 0:
             print("Product not found")
             await send_ig_message(id, "Sorry, we could not find the product details. Please try again.")
@@ -938,7 +938,7 @@ async def send_ig_carousel(id, products):
 
         elements.append({ "id" : product_cat_id })
 
-
+    print(elements)
     url = f"https://graph.facebook.com/{IG_VERSION}/{IG_ID}/messages"
     
     headers = {
