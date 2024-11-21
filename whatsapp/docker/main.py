@@ -24,6 +24,9 @@ address_details = []
 
 load_dotenv()
 
+IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
+IG_ID = os.getenv("IG_ID")
+IG_VERSION = os.getenv("IG_VERSION")
 
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -48,6 +51,7 @@ PINECONE_INDEX = os.getenv("PINECONE_INDEX")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
 websocket_product_data = {}
+websocket_product_data_ig = {}
 flag = False
 search_term = ""
 websocket_data_lock = Lock()
@@ -109,6 +113,7 @@ def fetch_product_data(client_id: str, query: str, category: str, price: int = 0
     """
 
     global websocket_product_data 
+    global websocket_product_data_ig 
     global search_term 
 
     search_term = query
@@ -154,6 +159,8 @@ def fetch_product_data(client_id: str, query: str, category: str, price: int = 0
 
     websocket_product_data[client_id] = product_list
     print("Lenght: ", len(websocket_product_data[client_id]))
+    websocket_product_data_ig[client_id] = product_list
+    print("Lenght: ", len(websocket_product_data_ig[client_id]))
     return product_string
 
 def get_session_history(session_id: str) -> FirestoreChatMessageHistory:
@@ -253,187 +260,287 @@ async def verify_webhook(request: Request):
     if args.get("hub.verify_token") == VERIFY_TOKEN:
         return PlainTextResponse(content=str(args.get("hub.challenge")))
     return {"status": "Verification failed"}
-
-
+"""
+Incoming webhook payload: {
+  "object": "instagram",
+  "entry": [
+    {
+      "time": 1732191852352,
+      "id": "17841438674306985",
+      "messaging": [
+        {
+          "sender": {
+            "id": "2989171314563378"
+          },
+          "recipient": {
+            "id": "17841438674306985"
+          },
+          "timestamp": 1732191851589,
+          "message": {
+            "mid": "aWdfZAG1faXRlbToxOklHTWVzc2FnZAUlEOjE3ODQxNDM4Njc0MzA2OTg1OjM0MDI4MjM2Njg0MTcxMDMwMTI0NDI1ODY5MzQ2MTMzOTk3NjI1NTozMTk1MzI5OTc3MjgyNzk4ODA5ODgxMjUxMzI0MjU3ODk0NAZDZD",
+            "text": "Hi"
+          }
+        }
+      ]
+    }
+  ]
+}
+"""
 
 @app.post("/webhook")
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
     global flag
     global search_term
     global websocket_product_data
-    # First, validate the signature
-    payload = await request.json()
-    print("Incoming webhook payload:", json.dumps(payload, indent=2))
-    await signature_required(request, x_hub_signature_256)
+    global websocket_product_data_ig
 
     # Remove expired message IDs
     remove_expired_message_ids()
 
-    # Process the incoming message (if the signature is valid)
 
-    # Handle incoming messages
-    if "entry" in payload and len(payload["entry"]) > 0:
-        for entry in payload["entry"]:
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
+    # First, validate the signature
+    payload = await request.json()
+    print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
-                statuses = value.get("statuses", [])
-                if statuses:
-                    for status in statuses:
-                        message_status = status["status"]
-                        recipient_id = status["recipient_id"]
-                        print("Message Status: ", message_status, ", Recipient ID: ", recipient_id)
 
-                contacts = value.get("contacts", [])
-                if contacts:
-                    for contact in contacts:
-                        sender_name = contact["profile"]["name"]
-                        # print("Sender name: ", sender_name)
+    if payload["object"] == "instagram":
+        if "entry" in payload and len(payload["entry"]) > 0:
+            for entry in payload["entry"]:
+                
+                for message in entry.get("messaging", []):
+                    ig_message_id = message["message"]["mid"]
+                    
+                    if ig_message_id in processed_message_ids:
+                        print("Duplicate message, skipping processing.")
+                        continue
+                    
+                    # Add message ID with the current timestamp
+                    processed_message_ids[ig_message_id] = time.time()
 
-                messages = value.get("messages", [])
-                if messages:
-                    for message in messages:
-                        message_id = message["id"]
+                    sender_id = message["sender"]["id"]
+                    recipient_id = message["recipient"]["id"]
+                    message_text = message["message"]["text"]
 
-                        await mark_read(message_id)
+                    print(f"Message Received from {sender_id}, Message: {message_text}")
+                    
 
-                        # Check if message ID is already processed
-                        if message_id in processed_message_ids:
-                            print("Duplicate message, skipping processing.")
-                            continue
+                    if message_text == "Hi":
+                        res = await send_ig_introduction(sender_id)
+                        processed_message_ids[res['message_id']] = time.time()
+                        print(f"Introduction sent to {sender_id}")
+                        continue
+
+                    user_input = f"(client_id: {sender_id}): " + message_text
+
+                    response = agent_executor.invoke(
+                        {"input": user_input},
+                        config={"configurable": {"session_id": sender_id}},
+                    )
+
+
+                    async with websocket_data_lock:
+                        print("websocket_product_data_ig 1: ", websocket_product_data_ig)
+                        products_space = websocket_product_data_ig.get(sender_id)
+                        print("Products space 2: ", products_space)
+
+                        if products_space:
+                            print("Came in if")
+                            del websocket_product_data_ig[sender_id] 
+                            res = await send_ig_carousel(sender_id, products_space)
+                            processed_message_ids[res['message_id']] = time.time()
+                            res2 = await send_ig_message(sender_id, response['output'])
+                            processed_message_ids[res2['message_id']] = time.time()
+                            search_term = ""
+                            print("websocket_product_data_ig 2: ", websocket_product_data_ig) 
+                        else:
+                            print("Came in else")
+                            res = await send_ig_message(sender_id, response['output'])
+                            processed_message_ids[res['message_id']] = time.time()
+
+                    print(f"Message sent to {sender_id}, Response: {response['output']}")
+
+                    if flag:
+                        flag = False
+                        doc_ref = client.collection("HistoryMessages").document(sender_id)
+                        doc = doc_ref.get()
                         
-                        # Add message ID with the current timestamp
-                        processed_message_ids[message_id] = time.time()
+                        if doc.exists:
+                            messages = doc.to_dict().get('messages', [])
+                            print(f"Original messages count: {len(messages)}")
+                            excess_count = len(messages) - 15
+                            messages = messages[excess_count:] 
+                            
+                            doc_ref.update({'messages': messages})
+                            print("Document updated with trimmed messages.")
+    else:
+        await signature_required(request, x_hub_signature_256)
 
-                        sender = message["from"]
-                        
-                        
 
-                        if message["type"] == "text":
-                            user_input = message["text"]["body"]
-                            print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", user_input)
+        # Process the incoming message (if the signature is valid)
 
-                            if user_input == "Hi":
-                                await send_introduction(sender, sender_name)
-                                print("Introduction sent to Name: ", sender_name, ", Number: ",sender )
+        # Handle incoming messages
+        if "entry" in payload and len(payload["entry"]) > 0:
+            for entry in payload["entry"]:
+                for change in entry.get("changes", []):
+                    value = change.get("value", {})
+
+                    statuses = value.get("statuses", [])
+                    if statuses:
+                        for status in statuses:
+                            message_status = status["status"]
+                            recipient_id = status["recipient_id"]
+                            print("Message Status: ", message_status, ", Recipient ID: ", recipient_id)
+
+                    contacts = value.get("contacts", [])
+                    if contacts:
+                        for contact in contacts:
+                            sender_name = contact["profile"]["name"]
+                            # print("Sender name: ", sender_name)
+
+                    messages = value.get("messages", [])
+                    if messages:
+                        for message in messages:
+                            message_id = message["id"]
+
+                            await mark_read(message_id)
+
+                            # Check if message ID is already processed
+                            if message_id in processed_message_ids:
+                                print("Duplicate message, skipping processing.")
                                 continue
-    
+                            
+                            # Add message ID with the current timestamp
+                            processed_message_ids[message_id] = time.time()
 
-                            client_id = sender
-                            user_input = f"(client_id: {client_id}): " + user_input
+                            sender = message["from"]
+                            
+                            
 
-                            response = agent_executor.invoke(
-                                {"input": user_input},
-                                config={"configurable": {"session_id": client_id}},
-                            )
+                            if message["type"] == "text":
+                                user_input = message["text"]["body"]
+                                print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", user_input)
 
-                            async with websocket_data_lock:
-                                print("websocket_product_data 1: ", websocket_product_data)
-                                products_space = websocket_product_data.get(client_id)
-                                
+                                if user_input == "Hi":
+                                    await send_introduction(sender, sender_name)
+                                    print("Introduction sent to Name: ", sender_name, ", Number: ",sender )
+                                    continue
+        
 
-                                print("Products space 2: ", products_space)
+                                client_id = sender
+                                user_input = f"(client_id: {client_id}): " + user_input
 
-                                if products_space:
-                                    print("Came in if")
-                                    await send_message(sender, "Please give me a minute.")
-                                    del websocket_product_data[client_id] 
-                                    await send_carousel(sender, search_term, products_space)
-                                    search_term = ""
-                                    print("websocket_product_data 2: ", websocket_product_data) 
-                                else:
-                                    print("Came in else")
-                                    await send_message(sender, response['output'])
+                                response = agent_executor.invoke(
+                                    {"input": user_input},
+                                    config={"configurable": {"session_id": client_id}},
+                                )
 
-                            print("Products space 3: ", products_space)
-
-                            if flag:
-                                flag = False
-                                doc_ref = client.collection("HistoryMessages").document(client_id)
-                                doc = doc_ref.get()
-                                
-                                if doc.exists:
-                                    messages = doc.to_dict().get('messages', [])
-                                    print(f"Original messages count: {len(messages)}")
-                                    excess_count = len(messages) - 15
-                                    messages = messages[excess_count:] 
+                                async with websocket_data_lock:
+                                    print("websocket_product_data 1: ", websocket_product_data)
+                                    products_space = websocket_product_data.get(client_id)
                                     
-                                    doc_ref.update({'messages': messages})
-                                    print("Document updated with trimmed messages.")
 
-                            print("Message sent to Name: ", sender_name, ", Number: ", sender, ", Response: ", response['output'])
+                                    print("Products space 2: ", products_space)
 
-                        elif message["type"] == "button":
-                            print("Name: ", sender_name, ", Number: ",sender ,", clicked on know more")
-                            payload = message["button"]["payload"]
-                            print("Button Payload: ", payload)
+                                    if products_space:
+                                        print("Came in if")
+                                        await send_message(sender, "Please give me a minute.")
+                                        del websocket_product_data[client_id] 
+                                        await send_carousel(sender, search_term, products_space)
+                                        search_term = ""
+                                        print("websocket_product_data 2: ", websocket_product_data) 
+                                    else:
+                                        print("Came in else")
+                                        await send_message(sender, response['output'])
 
-                            
+                                print("Products space 3: ", products_space)
 
-                            payload = payload.split("_")
-                            print("Payload: ", payload)
+                                if flag:
+                                    flag = False
+                                    doc_ref = client.collection("HistoryMessages").document(client_id)
+                                    doc = doc_ref.get()
+                                    
+                                    if doc.exists:
+                                        messages = doc.to_dict().get('messages', [])
+                                        print(f"Original messages count: {len(messages)}")
+                                        excess_count = len(messages) - 15
+                                        messages = messages[excess_count:] 
+                                        
+                                        doc_ref.update({'messages': messages})
+                                        print("Document updated with trimmed messages.")
 
+                                print("Message sent to Name: ", sender_name, ", Number: ", sender, ", Response: ", response['output'])
 
-                            # output = agent(payload)
-                            # response = output['output']
-                            # await send_message(sender, "This functionality is in development.")
-                            print("Sender clicked Know More")
-                            await send_product(sender, payload)
-                            # print("Sent message to Name: ", sender_name, ", Number: ", sender, "")
+                            elif message["type"] == "button":
+                                print("Name: ", sender_name, ", Number: ",sender ,", clicked on know more")
+                                payload = message["button"]["payload"]
+                                print("Button Payload: ", payload)
 
-                            # await send_product(sender, payload)
-                        elif message["type"] == "order":
-                            # response = f"Hey {sender_name},Thank you for trying to place and order with us. \n\n We're sorry this feature is not available yet."
-                            # await send_message(sender, response)
-
-                            product_items = message["order"]["product_items"]
-
-                            for product in product_items:
-                                product_id = product["product_retailer_id"]
-                                quantity = product["quantity"]
-                                item_price = product["item_price"]
-                                currency = product["currency"]
-
-                                print(f"Product ID: {product_id}, Quantity: {quantity}, Price: {item_price}, Currency: {currency}")
-
-                            print("Sender sent cart")
-                            add_order_details(sender, product_items)
-                            await get_details(sender, again=False)
-
-                            # print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
-
-                        elif message["type"] == "interactive":
-                            print("Name: ", sender_name, ", Number: ",sender ,", sent details")
-                            print("Sender clicked on interactive message")
-                            interactive_type = message["interactive"]["type"]
-                            
-                            if interactive_type == "nfm_reply":
-                                # Extract the JSON string from the message 
-                                response_json_str = message["interactive"]["nfm_reply"]["response_json"]
-
-                                # Parse the JSON string into a Python dictionary
-                                response_json = json.loads(response_json_str)
-
-                                # Add the sender details to the address details list
-                                add_address_details(sender, response_json)
-                                print(address_details)
-                                # Print the parsed JSON
-                                # print(response_json)
-                                # {'pin_code': '411058', 'full_name': 'Rounak longani', 'flow_token': 'AQAAAAACS5FpgQ_cAAAAAD0QI3s.', 'state': 'Maharashtra ', 'email': 'Rounaklongani@gmail.com', 'city': 'Pune', 'country': '0_India', 'address': 'Hahsjs'}
-
-                                await confirm_address(sender, response_json)
-
-                            elif interactive_type == "button_reply":
                                 
-                                payload = message["interactive"]["button_reply"]["id"]
-                                print("Reply Payload: ", payload)
-                                if payload == "info_correct":
-                                    print("Info is correct")
-                                    await get_payment(sender, sender_name)
-                                elif payload == "info_incorrect":
-                                    print("Info is incorrect")
-                                    delete_address_details(sender)
-                                    await get_details(sender, again=True)
+
+                                payload = payload.split("_")
+                                print("Payload: ", payload)
+
+
+                                # output = agent(payload)
+                                # response = output['output']
+                                # await send_message(sender, "This functionality is in development.")
+                                print("Sender clicked Know More")
+                                await send_product(sender, payload)
+                                # print("Sent message to Name: ", sender_name, ", Number: ", sender, "")
+
+                                # await send_product(sender, payload)
+                            elif message["type"] == "order":
+                                # response = f"Hey {sender_name},Thank you for trying to place and order with us. \n\n We're sorry this feature is not available yet."
+                                # await send_message(sender, response)
+
+                                product_items = message["order"]["product_items"]
+
+                                for product in product_items:
+                                    product_id = product["product_retailer_id"]
+                                    quantity = product["quantity"]
+                                    item_price = product["item_price"]
+                                    currency = product["currency"]
+
+                                    print(f"Product ID: {product_id}, Quantity: {quantity}, Price: {item_price}, Currency: {currency}")
+
+                                print("Sender sent cart")
+                                add_order_details(sender, product_items)
+                                await get_details(sender, again=False)
+
+                                # print("Sent message to Name: ", sender_name, ", Number: ", sender, ", Response: ", response)
+
+                            elif message["type"] == "interactive":
+                                print("Name: ", sender_name, ", Number: ",sender ,", sent details")
+                                print("Sender clicked on interactive message")
+                                interactive_type = message["interactive"]["type"]
+                                
+                                if interactive_type == "nfm_reply":
+                                    # Extract the JSON string from the message 
+                                    response_json_str = message["interactive"]["nfm_reply"]["response_json"]
+
+                                    # Parse the JSON string into a Python dictionary
+                                    response_json = json.loads(response_json_str)
+
+                                    # Add the sender details to the address details list
+                                    add_address_details(sender, response_json)
+                                    print(address_details)
+                                    # Print the parsed JSON
+                                    # print(response_json)
+                                    # {'pin_code': '411058', 'full_name': 'Rounak longani', 'flow_token': 'AQAAAAACS5FpgQ_cAAAAAD0QI3s.', 'state': 'Maharashtra ', 'email': 'Rounaklongani@gmail.com', 'city': 'Pune', 'country': '0_India', 'address': 'Hahsjs'}
+
+                                    await confirm_address(sender, response_json)
+
+                                elif interactive_type == "button_reply":
+                                    
+                                    payload = message["interactive"]["button_reply"]["id"]
+                                    print("Reply Payload: ", payload)
+                                    if payload == "info_correct":
+                                        print("Info is correct")
+                                        await get_payment(sender, sender_name)
+                                    elif payload == "info_incorrect":
+                                        print("Info is incorrect")
+                                        delete_address_details(sender)
+                                        await get_details(sender, again=True)
 
                             # await send_message(sender, "Got your responses. Thank you!\n\nThis functionality is still in development.")
 
@@ -478,6 +585,27 @@ async def send_message(recipient, message_text):
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
 
+async def send_ig_message(id, message_text):
+    url = f"https://graph.facebook.com/{VERSION}/{IG_ID}/messages"
+
+    headers = {
+        "Authorization" : "Bearer " + IG_ACCESS_TOKEN,
+        "Content-Type" : "application/json",
+    }
+    data = {
+        "recipient":{
+            "id":f"{id}"
+        },
+        "message":{
+            "text":f"{message_text}"
+        }
+    }
+
+
+    response = requests.post(url, headers=headers, json=data)
+    print(f"Response: {response.status_code}, {response.json()}")
+    return response.json()
+
 async def send_introduction(recipient, name):
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
     
@@ -500,6 +628,29 @@ async def send_introduction(recipient, name):
     
     response = requests.post(url, headers=headers, data=json.dumps(data))
     print(f"Response: {response.status_code}, {response.json()}")
+
+async def send_ig_introduction(id):
+    url = f"https://graph.facebook.com/{IG_VERSION}/{IG_ID}/messages"
+    
+    headers = {
+        "Authorization": f"Bearer {IG_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    
+    # Building the carousel template with response variable and product details
+    data = {
+        "recipient":{
+            "id":f"{id}"
+        },
+        "message":{
+            "text" :f"Hi!👋 I'm Talkative, an AI-powered agent for eGenie Stores. I'm here to help you find the perfect tech products for your needs. \n \n✅ Whether you're looking for: \n  - A new phone\n  - A powerful gaming laptop\n  - A custom-built PC \n\nI can help you find the best options for your budget and preferences.🎉 \n\nFeel free to ask me any questions you may have about our services or policies , and I'll be happy to assist!📕"
+
+        }
+    }
+    
+    response = requests.post(url, headers=headers, data=json.dumps(data))
+    print(f"Response: {response.status_code}, {response.json()}")
+    return response.json()
 
 async def send_carousel(sender: str, search_term: str, products):
     url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
@@ -759,6 +910,61 @@ async def send_carousel(sender: str, search_term: str, products):
     response = requests.post(url, headers=headers, data=json.dumps(data))
     print(f"Response: {response.status_code}, {response.json()}")
     print(f"Sent products to {sender}")
+
+async def send_ig_carousel(id, products):
+    elements = []
+
+    for product in products:
+        product_id = int(product["id"])
+
+        url1 = f"https://graph.facebook.com/v20.0/759103595212051/products"
+        params1 = {
+            "filter" : json.dumps({
+                "retailer_id" : { "eq" :  str(product_id) }
+            }),
+            "fields" : "id",
+            "access_token" : {ACCESS_TOKEN}
+        }
+
+        response = requests.get(url1, params=params1)
+        response = response.json()
+        # print(response)
+        if len(response['data']) == 0:
+            print("Product not found")
+            await send_ig_message(id, "Sorry, we could not find the product details. Please try again.")
+            return
+
+        product_cat_id = response['data'][0]['id']
+
+        elements.append({ "id" : product_cat_id })
+
+
+    url = f"https://graph.facebook.com/{IG_VERSION}/{IG_ID}/messages"
+    
+    headers = {
+        "Authorization": f"Bearer {IG_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    
+    # Building the carousel template with response variable and product details
+    data = {
+            "recipient":{
+                "id":f"{id}"
+        },
+        "message":{
+            "attachment":{
+            "type":"template",
+            "payload": {
+                "template_type": "product",
+                "elements": elements
+            }
+            }
+        }
+        }
+
+    response = requests.post(url, headers=headers, data=json.dumps(data))
+    print(f"Response: {response.status_code}, {response.json()}")
+    return response.json()
 
 async def send_product(sender, payload):
     index = int(payload[1])
@@ -1177,7 +1383,7 @@ async def get_payment(sender, sender_name):
         sum += (int(item['quantity']) * int(item['sale_amount']['value']))
 
 
-    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/{IG_VERSION}/{PHONE_NUMBER_ID}/messages"
 
     headers = {
         "Authorization" : "Bearer " + ACCESS_TOKEN,
