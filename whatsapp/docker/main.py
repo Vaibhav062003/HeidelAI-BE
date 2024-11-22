@@ -16,6 +16,12 @@ from fastapi.responses import PlainTextResponse
 from collections import OrderedDict
 from langchain import hub
 
+# from datetime import datetime
+# from pytz import timezone
+
+# from custom_mail_service import send_email
+# india_time = datetime.now(timezone('Asia/Kolkata')).strftime("%Y-%m-%d %H:%M:%S")
+# send_email("rounaklongani@gmail.com", "Egenie - Koyeb" ,"Service was redepolyed", f"Koyeb of egeniesales20@gmail.com was redeployed at {india_time}")
 
 
 # Regular dictionary to store processed message IDs with their timestamps
@@ -58,6 +64,10 @@ search_term = ""
 websocket_data_lock = Lock()
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+
+
 
 """DB FUNCTIONS BELOW"""
 
