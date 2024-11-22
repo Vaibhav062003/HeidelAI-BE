@@ -1,10 +1,10 @@
 import os, time, requests
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
 from langchain import hub
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.chat_message_histories import ChatMessageHistory
-# from langchain_core.messages import AIMessage, HumanMessage
+from defines import getCreds, getMediaInsights, getUserMedia, getMostRecentMediaByType, demographics_insights
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain.agents import AgentExecutor, create_structured_chat_agent
@@ -235,7 +235,8 @@ def get_total_page_views(start_date: str, end_date: str):
         print(f"An error occurred: {e}")
         return 0
     
-@tool("get_comperhensive_report", return_direct=True)
+# @tool("get_comperhensive_report", return_direct=True)
+@tool
 def get_comperhensive_report(start_date: str, end_date: str):
     """
     Retrieves a comprehensive report based on the specified start and end dates.
@@ -294,11 +295,9 @@ def get_comperhensive_report(start_date: str, end_date: str):
                 result += f"Total Dead Clicks: {information.get('subTotal', 'N/A')}\n\n"
 
             elif metric_name == "ScrollDepth":
-                # result += f"**Average Scroll Depth:**\n"
                 result += f"Average Scroll Depth: {information.get('averageScrollDepth', 'N/A')}%\n\n"
 
             elif metric_name == "Traffic":
-                # result += f"**Traffic Metrics:**\n"
                 result += f"Total Session Count: {information.get('totalSessionCount', 'N/A')}\n"
                 result += f"Total Bot Session Count: {information.get('totalBotSessionCount', 'N/A')}\n"
                 result += f"Distinct User Count: {information.get('distinctUserCount', 'N/A')}\n"
@@ -316,8 +315,6 @@ def get_comperhensive_report(start_date: str, end_date: str):
                 for entry in information:
                     if isinstance(entry, dict):
                         result += f"{entry.get('name', 'N/A')} - {entry.get('sessionsCount', 'N/A')}\n"
-                    # else:
-                    #     result += f"Unexpected data format in PageTitle.\n"
                 result += "\n"
 
             # elif metric_name == "PopularPages":
@@ -381,7 +378,7 @@ def get_new_vs_returning_visitors(start_date: str, end_date: str):
 @tool
 def get_customer_chatbot_conversations(dummy: str) -> str:
     """
-    Gets the customer chatbot conversations.
+    Returns the customer chatbot conversations.
     Analyse the conversations and return a detailed analysis on what can be improved.
     args:
         dummy (str): A dummy argument to trigger the tool.
@@ -436,81 +433,99 @@ def get_customer_chatbot_conversations(dummy: str) -> str:
     
     return combined_string
 
-# @tool
-# def get_social_insights(dummy: str) -> str:
-#     """
-#     Fetches Egenie's instagram account insights.
-#     """
-#     print("in")
-#     url = f'https://graph.facebook.com/{instagram_account_id}/insights'
-
-#     params = {
-#         'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
-#         'period': 'day',  
-#         'access_token': access_token,
-#         'metric_type': 'total_value'
-#     }
-
-#     # Make the request to fetch insights
-#     response = requests.get(url, params=params)
-
-#     if response.status_code == 200:
-#         # Parse the response JSON
-#         data = response.json()
-        
-#         # Create a formatted string to print the metrics
-#         metrics_str = "Instagram Metrics:\n"
-#         for item in data['data']:
-#             metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
-
-#         return metrics_str
-
-#     else:
-#         # If the request was not successful, print the error
-#         print(f"Error: {response.status_code}")
-#         print(response.json())
-#         return "Error fetching Instagram insights"
-    
 @tool
 def get_social_insights(dummy: dict) -> str:
     """
     Fetches Egenie's Instagram account insights. Returns a JSON string containing formatted metrics. 
     This tool accepts a dummy dictionary as input, which is not used. Pass an empty dictionary ({}) as input.
     """
-    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+    url = f"https://graph.facebook.com/v21.0/{instagram_account_id}/insights"
 
-    params = {
-        'metric': 'impressions, reach, profile_views, total_interactions, profile_links_taps, website_clicks, accounts_engaged, saves, shares',
-        'period': 'day',  
+    base_params = {
+        'metric': 'impressions, reach, total_interactions, profile_links_taps, accounts_engaged, saves, shares',
+        'period': 'day',
         'access_token': access_token,
-        'metric_type': 'total_value'
+        'metric_type': 'total_value',
     }
 
-    # Make the request to fetch insights
-    response = requests.get(url, params=params)
+    response = requests.get(url, params=base_params)
 
     if response.status_code == 200:
-        # Parse the response JSON
+
         data = response.json()
         
         # Create a formatted string to print the metrics
         metrics_str = "Instagram Metrics:\n"
         for item in data['data']:
             metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
-        
-        # Print the formatted string
-        # print(metrics_str)
+
         return metrics_str
     else:
         print(f"Error: {response.status_code}")
         print(response.json())
 
+@tool
+def get_demographics_insights(dummy: str) -> str:
+    """
+    Fetches Egenie's Instagram account demographics insights. Returns a JSON string containing formatted metrics. 
+    """
+    data = demographics_insights()
+    return data
+
+@tool
+def instagram_media_insights(dummy: str) -> str:
+    """
+    Fetches insights for the most recent Instagram image and reel posts.
+    """
+    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
+
+    # Fetch user media
+    params = getCreds()  # Fetch credentials
+    response = getUserMedia(params)  # Get all media
+    media_data = response['json_data']['data']  # Extract media list
+
+    # Separate media by type
+    most_recent_image = getMostRecentMediaByType(media_data, 'IMAGE')
+    most_recent_reel = getMostRecentMediaByType(media_data, 'VIDEO')
+
+    post_insigths = ""
+
+    # Print details for the most recent image
+    if most_recent_image:
+        post_insigths += "MOST RECENT IMAGE POST\n"
+        # post_insigths += f"Link to post: {most_recent_image['permalink']}"
+        post_insigths += f"Caption: {most_recent_image.get('caption', 'No caption')}\n"
+        post_insigths += f"Posted at: {most_recent_image['timestamp']}\n"
+        params['latest_media_id'] = most_recent_image['id']
+        params['metric'] = 'follows,impressions,reach,saved,comments,shares,profile_visits,profile_activity'
+        params['breakdown'] = 'action_type'
+        image_insights = getMediaInsights(params)
+        
+        post_insigths += "\nIMAGE POST INSIGHTS\n"
+        for insight in image_insights['json_data']['data']:
+            post_insigths += f"{insight['title']}: {insight['values'][0]['value']}\n"
+
+    # Print details for the most recent reel
+    if most_recent_reel:
+        post_insigths += "\nMOST RECENT REEL POST\n"
+        # post_insigths += f"Link to post: {most_recent_reel['permalink']}\n"
+        post_insigths += f"Caption: {most_recent_reel.get('caption', 'No caption')}\n"
+        post_insigths += f"Posted at: {most_recent_reel['timestamp']}\n"
+        params['latest_media_id'] = most_recent_reel['id']
+        params['metric'] = 'saved,comments,shares,reach,plays,ig_reels_avg_watch_time'
+        reel_insights = getMediaInsights(params)
+        
+        post_insigths += "\nREEL POST INSIGHTS\n"
+        for insight in reel_insights['json_data']['data']:
+            post_insigths += f"{insight['title']}: {insight['values'][0]['value']}\n"
+
+    return post_insigths
 
 def initialize_langchain_agent(llm, id):    
 
     memory = ChatMessageHistory(session_id=id)
     
-    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_social_insights]
+    tools = [top_n_most_visited_pages, get_active_users, get_device_model_data, get_date_range, get_total_page_views, get_comperhensive_report, get_new_vs_returning_visitors, get_customer_chatbot_conversations, get_social_insights, get_demographics_insights, instagram_media_insights]
     # prompt = hub.pull("admin-structured-chat-agent-prompt")
     prompt = hub.pull("admin-bot")
     agent = create_structured_chat_agent(llm, tools, prompt)
@@ -534,22 +549,13 @@ def get_agent(id: str):
     llm = initialize_llm()
     return initialize_langchain_agent(llm, id)
 
-agent_executor1 = get_agent("admin1")
-agent_executor2 = get_agent("admin2")
-
-chat_history = []
-
-# def add_to_chat_history(user_message, ai_response):
-#     chat_history.append(HumanMessage(content=user_message))
-#     chat_history.append(AIMessage(content=ai_response))
+agent_executor = get_agent("admin1")
 
 while True:
-    # bot = input("Bot 1 or 2? -")
-
-    # if bot == "1":   
+  
     user_input = input("User: ")
     tic = time.perf_counter()
-    response = agent_executor1.invoke(
+    response = agent_executor.invoke(
         {"input": user_input,
         "date": datetime.now().strftime('%Y-%m-%d'),},
         config={"configurable": {"session_id": "admin1"}},
@@ -557,21 +563,7 @@ while True:
 
     toc = time.perf_counter()
     print(response['output'])
-    # add_to_chat_history(user_input, response["output"])
     print(f"time_taken {toc - tic:0.4f} seconds")
 
-    # else:
-    #     user_input = input("User: ")
-    #     tic = time.perf_counter()
-    #     response = agent_executor2.invoke(
-    #         {"input": user_input,
-    #         "date": datetime.now().strftime('%Y-%m-%d'),},
-    #         config={"configurable": {"session_id": "admin2"}},
-    #     )
-
-    # toc = time.perf_counter()
-    # print(response['output'])
-    # add_to_chat_history(user_input, response["output"])
-    # print(f"time_taken {toc - tic:0.4f} seconds")
 
 
