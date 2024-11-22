@@ -16,6 +16,8 @@ from fastapi.responses import PlainTextResponse
 from collections import OrderedDict
 from langchain import hub
 
+
+
 # Regular dictionary to store processed message IDs with their timestamps
 processed_message_ids = OrderedDict()
 EXPIRY_TIME_SECONDS = 86400 
@@ -43,7 +45,6 @@ credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCO
 # Initialize Firestore using the credentials
 client = firestore.Client(credentials=credentials)
 
-load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL")
@@ -57,6 +58,115 @@ search_term = ""
 websocket_data_lock = Lock()
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
+
+"""DB FUNCTIONS BELOW"""
+
+# Database initialisation to insert connversations
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
+
+DB_URI = os.getenv("DB_URI")
+
+def initialize_database():
+    db_uri = DB_URI
+
+    # Create the SQLAlchemy engine
+    engine = create_engine(db_uri, pool_pre_ping=True)
+    
+    # Create whatsapp table if it doesn't exist
+    create_table_query = """
+    CREATE TABLE IF NOT EXISTS whatsapp (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        query TEXT,
+        response TEXT,
+        time_taken TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+
+    # Create instagram table if it doesn't exist
+    create_table_users = """
+    CREATE TABLE IF NOT EXISTS instagram (
+        id SERIAL PRIMARY KEY,
+        username TEXT,
+        query TEXT,
+        response TEXT,
+        time_taken TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+
+    with engine.connect() as connection:
+        connection.execute(text(create_table_query))
+        connection.execute(text(create_table_users))
+    
+    return engine
+
+engine = initialize_database()
+
+# function to store the message into whatsapp db
+def insert_into_whatsapp( name, query, response, time_taken, max_retries=3, retry_delay=2):
+    insert_query = text("""
+    INSERT INTO whatsapp (name, query, response, time_taken)
+    VALUES (:name, :query, :response, :time_taken)
+    """)
+    
+    retries = 0
+    while retries < max_retries:
+        try:
+            with engine.connect() as connection:
+                connection.execute(insert_query, {
+                    'name': name,
+                    'query': query,
+                    'response': response,
+                    'time_taken': time_taken
+                })
+            print("Data inserted successfully.")
+            break  # Exit the loop if the query succeeds
+        except OperationalError as e:
+            if 'SSL SYSCALL error: EOF detected' in str(e):
+                retries += 1
+                print(f"SSL SYSCALL error detected. Retrying {retries}/{max_retries}...")
+                time.sleep(retry_delay)  # Wait before retrying
+            else:
+                raise e  # Re-raise if it's not the specific error we're handling
+
+    if retries == max_retries:
+        print("Failed to insert data after multiple retries.")
+
+# function to store the message into instagram db
+def insert_into_instagram( username, query, response, time_taken, max_retries=3, retry_delay=2):
+    insert_query = text("""
+    INSERT INTO instagram (username, query, response, time_taken)
+    VALUES (:username, :query, :response, :time_taken)
+    """)
+    
+    retries = 0
+    while retries < max_retries:
+        try:
+            with engine.connect() as connection:
+                connection.execute(insert_query, {
+                    'username': username,
+                    'query': query,
+                    'response': response,
+                    'time_taken': time_taken
+                })
+            print("Data inserted successfully.")
+            break  # Exit the loop if the query succeeds
+        except OperationalError as e:
+            if 'SSL SYSCALL error: EOF detected' in str(e):
+                retries += 1
+                print(f"SSL SYSCALL error detected. Retrying {retries}/{max_retries}...")
+                time.sleep(retry_delay)  # Wait before retrying
+            else:
+                raise e  # Re-raise if it's not the specific error we're handling
+
+    if retries == max_retries:
+        print("Failed to insert data after multiple retries.")
+
+"""DB FUNCTIONS ABOVE"""
+
 
 def initialize_pinecone():
     pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -287,6 +397,8 @@ Incoming webhook payload: {
 }
 """
 
+sender_name = ""
+
 @app.post("/webhook")
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
     global flag
@@ -308,6 +420,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
             for entry in payload["entry"]:
                 
                 for message in entry.get("messaging", []):
+                    if "read" in message:
+                        print("Message read event")
+                        continue
+
                     ig_message_id = message["message"]["mid"]
                     
                     if ig_message_id in processed_message_ids:
@@ -321,7 +437,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     recipient_id = message["recipient"]["id"]
                     message_text = message["message"]["text"]
 
-                    print(f"Message Received from {sender_id}, Message: {message_text}")
+                    user_details = await get_ig_username(sender_id)
+
+                    username = user_details.get('username')
+                    name = user_details.get('name')
+
+                    user = name + " - @" + username
+
+                    print(f"Message Received from {user}, Message: {message_text}")
                     
 
                     if message_text == "Hi":
@@ -332,6 +455,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     user_input = f"(client_id: {sender_id}): " + message_text
 
+                    tic = time.perf_counter()
                     response = agent_executor.invoke(
                         {"input": user_input},
                         config={"configurable": {"session_id": sender_id}},
@@ -349,12 +473,28 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             res = await send_ig_carousel(sender_id, products_space)
                             processed_message_ids[res['message_id']] = time.time()
                             res2 = await send_ig_message(sender_id, response['output'])
+
+                            toc = time.perf_counter()
+                            print(f"Response took {toc - tic:0.4f} seconds")    
+                            time_taken = round(toc - tic, 4)
+
+
+
+                            insert_into_instagram(user, message_text, response['output'], time_taken)
+
                             processed_message_ids[res2['message_id']] = time.time()
                             search_term = ""
                             print("websocket_product_data_ig 2: ", websocket_product_data_ig) 
                         else:
                             print("Came in else")
                             res = await send_ig_message(sender_id, response['output'])
+
+                            toc = time.perf_counter()
+                            print(f"Response took {toc - tic:0.4f} seconds")
+                            time_taken = round(toc - tic, 4)
+
+                            insert_into_instagram(user, message_text, response['output'], time_taken)
+
                             processed_message_ids[res['message_id']] = time.time()
 
                     print(f"Message sent to {sender_id}, Response: {response['output']}")
@@ -375,9 +515,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     else:
         await signature_required(request, x_hub_signature_256)
 
-
+        global sender_name
         # Process the incoming message (if the signature is valid)
-
+        
         # Handle incoming messages
         if "entry" in payload and len(payload["entry"]) > 0:
             for entry in payload["entry"]:
@@ -394,6 +534,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     contacts = value.get("contacts", [])
                     if contacts:
                         for contact in contacts:
+                            
                             sender_name = contact["profile"]["name"]
                             # print("Sender name: ", sender_name)
 
@@ -429,6 +570,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 client_id = sender
                                 user_input = f"(client_id: {client_id}): " + user_input
 
+                                # John Doe - +91 9900990099
+                                whatsapp_user = sender_name + " - +" + client_id[:2] + " " + client_id[2:]
+
+                                tic = time.perf_counter()
+
                                 response = agent_executor.invoke(
                                     {"input": user_input},
                                     config={"configurable": {"session_id": client_id}},
@@ -446,11 +592,24 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         await send_message(sender, "Please give me a minute.")
                                         del websocket_product_data[client_id] 
                                         await send_carousel(sender, search_term, products_space)
+
+                                        toc = time.perf_counter()
+                                        print(f"Response took {toc - tic:0.4f} seconds")
+                                        time_taken = round(toc - tic, 4)
+
+                                        insert_into_whatsapp(whatsapp_user, message['text']['body'], response['output'], time_taken)
+
                                         search_term = ""
                                         print("websocket_product_data 2: ", websocket_product_data) 
                                     else:
                                         print("Came in else")
                                         await send_message(sender, response['output'])
+
+                                        toc = time.perf_counter()
+                                        print(f"Response took {toc - tic:0.4f} seconds")
+                                        time_taken = round(toc - tic, 4)
+
+                                        insert_into_whatsapp(whatsapp_user, message['text']['body'], response['output'], time_taken)
 
                                 print("Products space 3: ", products_space)
 
@@ -545,6 +704,22 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # await send_message(sender, "Got your responses. Thank you!\n\nThis functionality is still in development.")
 
     return {"status": "ok"}
+
+
+async def get_ig_username(sender_id):
+    url = f"https://graph.facebook.com/{VERSION}/{sender_id}"
+    headers = {
+        "Content-Type" : "application/json"
+    }
+    params = {
+        "fields" : "username, name",
+        "access_token" : IG_ACCESS_TOKEN
+    }
+
+    response = requests.get(url, headers=headers, params=params)
+    print(f"Response: {response.status_code}, {response.json()}")
+    response = response.json()
+    return response
 
 async def mark_read(message_id):
     print("Message ID: ", message_id)
