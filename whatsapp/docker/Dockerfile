@@ -20,6 +20,9 @@ RUN pip install --no-cache-dir torch==2.3.1+cpu torchvision==0.18.1+cpu torchaud
     
 RUN pip install langchainhub==0.1.21
 
+RUN pip install flask==3.0.3
+RUN pip install plotly==5.24.1
+
 # Start a new stage from the slim image
 FROM python:3.11-slim
 

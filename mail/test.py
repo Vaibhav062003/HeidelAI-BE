@@ -30,16 +30,18 @@ try:
     text = "Hello, this is a test message"
     message.attach(MIMEText(text, "plain"))
 
-    # Image path
-    grade_card_path = 'egenie.jpeg'
+    # # Image path
+    # grade_card_path = 'egenie.jpeg'
 
-    # Attach image to the email
-    with open(grade_card_path, 'rb') as img_file:
-        grade_card_img = img_file.read()
-        message.attach(MIMEImage(grade_card_img, name=os.path.basename(grade_card_path)))
+    # # Attach image to the email
+    # with open(grade_card_path, 'rb') as img_file:
+    #     grade_card_img = img_file.read()
+    #     message.attach(MIMEImage(grade_card_img, name=os.path.basename(grade_card_path)))
 
     # Send the email
-    my_server.sendmail(from_addr=my_email, to_addrs="rounaklongani@gmail.com", msg=message.as_string())
+    email_list = ["coderron579@gmail.com"]
+    email_list.append("rounaklongani@gmail.com")
+    my_server.sendmail(from_addr=my_email, to_addrs=email_list,  msg=message.as_string())
 
     print("Email sent successfully!")
 
