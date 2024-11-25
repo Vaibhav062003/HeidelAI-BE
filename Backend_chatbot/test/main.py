@@ -15,7 +15,8 @@ from google.analytics.data_v1beta.types import (
     Metric,     
     RunReportRequest,
 )
-
+from typing import Optional
+from pydantic import BaseModel, Field
 import json
 from google.cloud import firestore
 from google.oauth2 import service_account
@@ -48,6 +49,10 @@ db = firestore.Client(credentials=credentials)
 def initialize_llm():
     llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0, )
     return llm
+
+class ChatbotConversationsSchema(BaseModel):  # Correct schema, NO dummy arg.
+    # If you need ANY arguments, define them here. If not, leave it empty.
+    optional_arg: Optional[str] = Field(None, description="Optional argument (not used)") 
 
 @tool
 def getDateRange(date_range: str):
@@ -270,8 +275,8 @@ def fetechGoogleAnalyticsData(start_date: str, end_date: str):
 
     return output_string
 
-@tool    
-def fetchClarityData(dummy: str):
+@tool(args_schema=ChatbotConversationsSchema)    
+def fetchClarityData(optional_arg: Optional[str] = None) -> str:
     """
     Retrieves a data from Clarity of the last 3 days.
     """
@@ -329,8 +334,8 @@ def fetchClarityData(dummy: str):
 
     return result
 
-@tool
-def fetchChatbotConversations(dummy: str) -> str:
+@tool(args_schema=ChatbotConversationsSchema)  # Associate schema with tool
+def fetchChatbotConversations(optional_arg: Optional[str] = None) -> str:
     """
     Returns the customer chatbot conversations.
     """
@@ -382,8 +387,8 @@ def fetchChatbotConversations(dummy: str) -> str:
     
     return combined_string
 
-@tool
-def fetchInstagramAccountData(dummy: str) -> str:
+@tool(args_schema=ChatbotConversationsSchema)
+def fetchInstagramAccountData(optional_arg: Optional[str] = None) -> str:
     """
     Fetch Instagram account metrics like
     - Impressions
@@ -420,8 +425,8 @@ def fetchInstagramAccountData(dummy: str) -> str:
         print(f"Error: {response.status_code}")
         print(response.json())
 
-@tool
-def fetchDemographicsData(dummy: str) -> str:
+@tool(args_schema=ChatbotConversationsSchema)
+def fetchDemographicsData(optional_arg: Optional[str] = None) -> str:
     """
     Fetches Egenie's Instagram account demographics insights. 
     Returns a string containing formatted metrics. 
@@ -429,8 +434,8 @@ def fetchDemographicsData(dummy: str) -> str:
     data = demographics_insights()
     return data
 
-@tool
-def fetchInstagramMediaData(dummy: str) -> str:
+@tool(args_schema=ChatbotConversationsSchema)
+def fetchInstagramMediaData(optional_arg: Optional[str] = None) -> str:
     """
     Fetches insights for the most recent Instagram image and reel posts.
     """
