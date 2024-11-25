@@ -455,7 +455,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     user = name + " - @" + username
 
                     print(f"Message Received from {user}, Message: {message_text}")
-                    
+                    insert_into_instagram(user, message_text, "", 0) 
 
                     if message_text == "Hi":
                         res = await send_ig_introduction(sender_id)
