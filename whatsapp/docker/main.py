@@ -21,6 +21,17 @@ from typing import List, Optional
 from pydantic import BaseModel
 from pytz import timezone
 
+from fastapi import WebSocket, WebSocketDisconnect
+from typing import Dict
+
+# Store WebSocket connections
+connected_clients: Dict[str, WebSocket] = {}
+
+
+from fastapi import WebSocket
+
+
+
 # from datetime import datetime
 # from pytz import timezone
 
@@ -342,6 +353,7 @@ agent_executor = get_agent()
 
 app = FastAPI()
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://egeniestores.com", "http://localhost"],
@@ -349,6 +361,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket):
+    user_id = websocket.path_params["user_id"]  # Get user_id from path params
+
+    try:
+        await websocket.accept()
+        connected_clients[user_id] = websocket
+        
+        # Keep connection alive and listen for messages
+        while True:
+            # Wait for messages from client (optional if you only need server->client communication)
+            data = await websocket.receive_json()
+            if data.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+                
+    except WebSocketDisconnect:
+        if user_id in connected_clients:
+            del connected_clients[user_id]
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        if user_id in connected_clients:
+            del connected_clients[user_id]
 
 def remove_expired_message_ids():
     current_time = time.time()
@@ -419,7 +454,31 @@ Incoming webhook payload: {
   ]
 }
 """
-# Function to insert support requests into MongoDB
+async def check_live_agent_status(sender_id: str) -> bool:
+    """
+    Check if a user is currently in live agent mode
+    
+    Args:
+        sender_id (str): The WhatsApp ID of the sender
+        
+    Returns:
+        bool: True if user is in live agent mode, False otherwise
+    """
+    try:
+        # Check support_requests collection for active status
+        request = support_requests.find_one({
+            "user_id": sender_id,
+            "status": {"$in": ["pending", "active"]},  # Check for both pending and active states
+            "platform": "whatsapp"
+        })
+        
+        return bool(request)  # Returns True if request exists, False otherwise
+        
+    except Exception as e:
+        print(f"Error checking live agent status: {e}")
+        return False
+
+# Update handle_live_agent_request to set the status
 async def handle_live_agent_request(sender_id: str, sender_name: str):
     """Handle live agent request by storing user info and chat history in MongoDB"""
     
@@ -441,40 +500,84 @@ async def handle_live_agent_request(sender_id: str, sender_name: str):
         "user_name": sender_name,
         "status": "pending",  # pending, active, resolved
         "created_at": datetime.now(),
+        "updated_at": datetime.now(),
         "chat_history": formatted_messages,
-        "platform": "whatsapp"  # or "instagram"
+        "platform": "whatsapp"
     }
     
-    # Insert into MongoDB
     try:
-        result = support_requests.insert_one(support_request)
-        print(f"Support request created with ID: {result.inserted_id}")
+        # Check if there's an existing request
+        existing_request = support_requests.find_one({
+            "user_id": sender_id,
+            "status": {"$in": ["pending", "active"]}
+        })
+        
+        if existing_request:
+            # Update existing request
+            support_requests.update_one(
+                {"_id": existing_request["_id"]},
+                {
+                    "$set": {
+                        "status": "pending",
+                        "updated_at": datetime.now(),
+                        "chat_history": formatted_messages
+                    }
+                }
+            )
+        else:
+            # Insert new request
+            result = support_requests.insert_one(support_request)
+            print(f"Support request created with ID: {result.inserted_id}")
+        
         return True
     except Exception as e:
         print(f"Error creating support request: {e}")
         return False
 
+
+# Function to notify connected clients
+async def notify_client(client_id: str, message: dict):
+    if client_id in connected_clients:
+        try:
+            await connected_clients[client_id].send_json(message)
+        except Exception as e:
+            print(f"Error notifying client {client_id}: {e}")
+            # Remove dead connections
+            if client_id in connected_clients:
+                del connected_clients[client_id]
+
+
 # Function to whatsapp history into Mongo DB
-async def store_whatsapp_history(sender_id: str, sender_name: str, sender_message: str, bot_message: str, cart_data: List, address_data: List, carousel_data: List):
+async def store_whatsapp_history(sender_id: str, sender_name: str, sender_message: str, bot_message: str, 
+                                cart_data: List, address_data: List, carousel_data: List, message_id: Optional[str] = None):
     """Store WhatsApp chat history in MongoDB"""
     try:
         # Get current time in Indian timezone
         india_tz = timezone('Asia/Kolkata')
         current_time = datetime.now(india_tz)
 
-        # Format messages for chat history
-        new_message = [
-            {
+        # Format messages for chat history, only include non-empty messages
+        new_message = []
+        
+        if sender_message:
+            new_message.append({
                 "role": "user",
                 "content": sender_message,
-                "timestamp": current_time
-            },
-            {
+                "timestamp": current_time,
+                "id": None  # User messages don't have IDs
+            })
+            
+        if bot_message:
+            new_message.append({
                 "role": "assistant",
                 "content": bot_message,
-                "timestamp": current_time
-            }
-        ]
+                "timestamp": current_time,
+                "id": message_id  # Include message ID for admin/bot messages
+            })
+
+        # Skip if no messages to store
+        if not new_message:
+            return True
 
         # Check if document exists
         existing_doc = chat_history.find_one({"user_id": sender_id})
@@ -493,15 +596,11 @@ async def store_whatsapp_history(sender_id: str, sender_name: str, sender_messag
                 "last_updated": current_time
             }
 
-            # Update cart data if provided
+            # Update additional data if provided
             if cart_data:
                 update_data["cart_data"] = cart_data
-
-            # Update address data if provided
             if address_data:
                 update_data["address_data"] = address_data
-
-            # Update carousel data if provided
             if carousel_data:
                 update_data["carousel_data"] = carousel_data
 
@@ -524,6 +623,37 @@ async def store_whatsapp_history(sender_id: str, sender_name: str, sender_messag
             chat_history.insert_one(new_doc)
 
         print(f"Successfully stored/updated chat history for user: {sender_id} in MongoDB")
+
+        # Notify via WebSocket if client is connected
+        if sender_id in connected_clients:
+            try:
+                # Send WebSocket notifications for non-empty messages
+                if sender_message:
+                    await connected_clients[sender_id].send_json({
+                        "type": "new_message",
+                        "message": {
+                            "role": "human",
+                            "content": sender_message,
+                            "timestamp": current_time.isoformat(),
+                            "id": None
+                        }
+                    })
+                if bot_message:
+                    await connected_clients[sender_id].send_json({
+                        "type": "new_message",
+                        "message": {
+                            "role": "assistant",
+                            "content": bot_message,
+                            "timestamp": current_time.isoformat(),
+                            "id": message_id
+                        }
+                    })
+            except Exception as ws_error:
+                print(f"WebSocket send error: {ws_error}")
+                # Remove dead connections
+                if sender_id in connected_clients:
+                    del connected_clients[sender_id]
+
         return True
 
     except Exception as e:
@@ -695,6 +825,21 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 user_input = message["text"]["body"]
                                 print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", user_input)
 
+                                # Check if user is already in live agent mode
+                                is_live = await check_live_agent_status(sender)
+                                if is_live:
+                                    # Only store the message and notify frontend
+                                    await store_whatsapp_history(
+                                        sender_id=sender,
+                                        sender_name=sender_name,
+                                        sender_message=user_input,
+                                        bot_message="",
+                                        cart_data=[],
+                                        address_data=[],
+                                        carousel_data=[]
+                                    )
+                                    return {"status": "ok"}
+
                                 if user_input == "Hi":
                                     await send_introduction(sender, sender_name)
                                     await store_whatsapp_history(sender, sender_name, user_input, f"Hi {sender_name}!👋 I'm *Talkative*, an AI-powered agent for eGenie Stores. I'm here to help you find the perfect tech products for your needs. \n \n✅ *Whether you're looking for:* \n  - A new phone\n  - A powerful gaming laptop\n  - A custom-built PC \n\nI can help you find the *best* options for your budget and preferences.🎉 \n\nFeel free to ask me any questions you may have about our *services* or *policies* , and I'll be happy to assist!📕", [], [], [])
@@ -709,7 +854,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         response = "We're sorry, there was an error processing your live support request. Please try again later."
                                     await send_message(sender, response)
                                     await store_whatsapp_history(sender, sender_name, user_input, response, [], [], [])
-                                    return
+                                    return {"status": "ok"}
+
+
+                                is_live = await check_live_agent_status(sender)
+                                if is_live:
+                                    # Store message and notify frontend only
+                                    await store_whatsapp_history(sender, sender_name, user_input, "", [], [], [])
+                                    return {"status": "ok"}
 
                                 client_id = sender
                                 format_user_input = f"(client_id: {client_id}): " + user_input
@@ -2038,6 +2190,99 @@ class Message(BaseModel):
     user_id: str
     message: str
 
+
+# Define the message model
+class ChatMessage(BaseModel):
+    user_id: str
+    message: str
+    message_id: Optional[str] = None
+
+@app.post("/api/chat_history/message")
+async def send_chat_message(message: ChatMessage):
+    try:
+        # Send message to WhatsApp
+        await send_message(message.user_id, message.message)
+        
+        # Store in chat history
+        await store_whatsapp_history(
+            sender_id=message.user_id,
+            sender_name="Admin",
+            sender_message="",
+            bot_message=message.message,
+            message_id=message.message_id,  # Pass the message ID
+            cart_data=[],
+            address_data=[],
+            carousel_data=[]
+        )
+        
+        return {"status": "success", "message": "Message sent successfully"}
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/chat_history")
+async def get_chat_history():
+    try:
+        conversations = list(chat_history.find(
+            {},
+            {'_id': 0}
+        ).sort('last_updated', -1).limit(50))
+        
+        return conversations
+    except Exception as e:
+        print(f"Error fetching chat history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat_history/{user_id}")
+async def get_user_chat(user_id: str):
+    try:
+        user_chat = chat_history.find_one(
+            {'user_id': user_id},
+            {'_id': 0}
+        )
+        
+        if not user_chat:
+            raise HTTPException(status_code=404, detail="Chat history not found")
+            
+        return user_chat
+    except Exception as e:
+        print(f"Error fetching user chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat_history/{user_id}/new")
+async def get_new_messages(user_id: str, since: str):
+    try:
+        # Convert the since parameter to timezone-aware datetime
+        since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+        
+        # Query MongoDB for new messages
+        user_chat = chat_history.find_one(
+            {
+                'user_id': user_id,
+                'chat_history': {
+                    '$elemMatch': {
+                        'timestamp': {'$gt': since_dt}
+                    }
+                }
+            },
+            {'_id': 0, 'chat_history': 1}
+        )
+        
+        if not user_chat:
+            return []
+            
+        # Filter messages after the since timestamp
+        new_messages = [
+            msg for msg in user_chat['chat_history']
+            if msg.get('timestamp') and msg['timestamp'] > since_dt
+        ]
+        
+        return new_messages
+    except Exception as e:
+        print(f"Error fetching new messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/conversations")
 async def get_conversations():
     try:
@@ -2119,3 +2364,4 @@ async def send_message_from_api(message: Message):
     except Exception as e:
         print(f"Error sending message: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
