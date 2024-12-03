@@ -15,6 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from collections import OrderedDict
 from langchain import hub
+from pymongo import MongoClient
+from datetime import datetime
+from typing import List, Optional
+from pydantic import BaseModel
+from pytz import timezone
 
 # from datetime import datetime
 # from pytz import timezone
@@ -22,6 +27,14 @@ from langchain import hub
 # from custom_mail_service import send_email
 # india_time = datetime.now(timezone('Asia/Kolkata')).strftime("%Y-%m-%d %H:%M:%S")
 # send_email("rounaklongani@gmail.com", "Egenie - Koyeb" ,"Service was redepolyed", f"Koyeb of egeniesales20@gmail.com was redeployed at {india_time}")
+
+# Add MongoDB connection for whatsapp support requests
+MONGODB_URI = os.getenv("MONGODB_URI")
+mongo_client = MongoClient(MONGODB_URI)
+db = mongo_client['Cluster0']  # database name
+support_requests = db['support_requests']  # collection name
+chat_history = db['chat_history']  # collection name
+
 
 
 # Regular dictionary to store processed message IDs with their timestamps
@@ -406,6 +419,116 @@ Incoming webhook payload: {
   ]
 }
 """
+# Function to insert support requests into MongoDB
+async def handle_live_agent_request(sender_id: str, sender_name: str):
+    """Handle live agent request by storing user info and chat history in MongoDB"""
+    
+    # Get chat history from Firestore
+    chat_history = get_session_history(sender_id)
+    
+    # Format messages for MongoDB
+    formatted_messages = []
+    for msg in chat_history.messages:
+        formatted_messages.append({
+            "role": msg.type,
+            "content": msg.content,
+            "timestamp": msg.additional_kwargs.get("timestamp", datetime.now())
+        })
+    
+    # Create support request document
+    support_request = {
+        "user_id": sender_id,
+        "user_name": sender_name,
+        "status": "pending",  # pending, active, resolved
+        "created_at": datetime.now(),
+        "chat_history": formatted_messages,
+        "platform": "whatsapp"  # or "instagram"
+    }
+    
+    # Insert into MongoDB
+    try:
+        result = support_requests.insert_one(support_request)
+        print(f"Support request created with ID: {result.inserted_id}")
+        return True
+    except Exception as e:
+        print(f"Error creating support request: {e}")
+        return False
+
+# Function to whatsapp history into Mongo DB
+async def store_whatsapp_history(sender_id: str, sender_name: str, sender_message: str, bot_message: str, cart_data: List, address_data: List, carousel_data: List):
+    """Store WhatsApp chat history in MongoDB"""
+    try:
+        # Get current time in Indian timezone
+        india_tz = timezone('Asia/Kolkata')
+        current_time = datetime.now(india_tz)
+
+        # Format messages for chat history
+        new_message = [
+            {
+                "role": "user",
+                "content": sender_message,
+                "timestamp": current_time
+            },
+            {
+                "role": "assistant",
+                "content": bot_message,
+                "timestamp": current_time
+            }
+        ]
+
+        # Check if document exists
+        existing_doc = chat_history.find_one({"user_id": sender_id})
+
+        if existing_doc:
+            # Update existing document
+            existing_messages = existing_doc.get('chat_history', [])
+            updated_messages = existing_messages + new_message
+
+            # Keep only the last 20 messages
+            if len(updated_messages) > 20:
+                updated_messages = updated_messages[-20:]
+
+            update_data = {
+                "chat_history": updated_messages,
+                "last_updated": current_time
+            }
+
+            # Update cart data if provided
+            if cart_data:
+                update_data["cart_data"] = cart_data
+
+            # Update address data if provided
+            if address_data:
+                update_data["address_data"] = address_data
+
+            # Update carousel data if provided
+            if carousel_data:
+                update_data["carousel_data"] = carousel_data
+
+            chat_history.update_one(
+                {"user_id": sender_id},
+                {"$set": update_data}
+            )
+        else:
+            # Create new document
+            new_doc = {
+                "user_id": sender_id,
+                "user_name": sender_name,
+                "chat_history": new_message,
+                "cart_data": cart_data if cart_data else [],
+                "address_data": address_data if address_data else [],
+                "carousel_data": carousel_data if carousel_data else [],
+                "created_at": current_time,
+                "last_updated": current_time
+            }
+            chat_history.insert_one(new_doc)
+
+        print(f"Successfully stored/updated chat history for user: {sender_id} in MongoDB")
+        return True
+
+    except Exception as e:
+        print(f"Error storing chat history: {e}")
+        return False
 
 sender_name = ""
 
@@ -455,7 +578,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     user = name + " - @" + username
 
                     print(f"Message Received from {user}, Message: {message_text}")
-                    insert_into_instagram(user, message_text, "", 0) 
 
                     if message_text == "Hi":
                         res = await send_ig_introduction(sender_id)
@@ -523,6 +645,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             doc_ref.update({'messages': messages})
                             print("Document updated with trimmed messages.")
     else:
+        # Payload is WhatsApp
+
         await signature_required(request, x_hub_signature_256)
 
         global sender_name
@@ -573,12 +697,22 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 if user_input == "Hi":
                                     await send_introduction(sender, sender_name)
+                                    await store_whatsapp_history(sender, sender_name, user_input, f"Hi {sender_name}!👋 I'm *Talkative*, an AI-powered agent for eGenie Stores. I'm here to help you find the perfect tech products for your needs. \n \n✅ *Whether you're looking for:* \n  - A new phone\n  - A powerful gaming laptop\n  - A custom-built PC \n\nI can help you find the *best* options for your budget and preferences.🎉 \n\nFeel free to ask me any questions you may have about our *services* or *policies* , and I'll be happy to assist!📕", [], [], [])
                                     print("Introduction sent to Name: ", sender_name, ", Number: ",sender )
                                     continue
         
+                                if user_input.lower() == "live agent":
+                                    success = await handle_live_agent_request(sender, sender_name)
+                                    if success:
+                                        response = "Thank you for requesting live support. Our team has been notified and will get back to you shortly."
+                                    else:
+                                        response = "We're sorry, there was an error processing your live support request. Please try again later."
+                                    await send_message(sender, response)
+                                    await store_whatsapp_history(sender, sender_name, user_input, response, [], [], [])
+                                    return
 
                                 client_id = sender
-                                user_input = f"(client_id: {client_id}): " + user_input
+                                format_user_input = f"(client_id: {client_id}): " + user_input
 
                                 # John Doe - +91 9900990099
                                 whatsapp_user = sender_name + " - +" + client_id[:2] + " " + client_id[2:]
@@ -586,7 +720,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 tic = time.perf_counter()
 
                                 response = agent_executor.invoke(
-                                    {"input": user_input},
+                                    {"input": format_user_input},
                                     config={"configurable": {"session_id": client_id}},
                                 )
 
@@ -607,6 +741,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         print(f"Response took {toc - tic:0.4f} seconds")
                                         time_taken = round(toc - tic, 4)
 
+                                        await store_whatsapp_history(sender, sender_name, user_input, f"Here are some {search_term} that you might be interested in.", [], [], products_space)
                                         insert_into_whatsapp(whatsapp_user, message['text']['body'], response['output'], time_taken)
 
                                         search_term = ""
@@ -619,6 +754,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         print(f"Response took {toc - tic:0.4f} seconds")
                                         time_taken = round(toc - tic, 4)
 
+                                        await store_whatsapp_history(sender, sender_name, user_input, response['output'], [], [], [])
                                         insert_into_whatsapp(whatsapp_user, message['text']['body'], response['output'], time_taken)
 
                                 print("Products space 3: ", products_space)
@@ -655,6 +791,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 # await send_message(sender, "This functionality is in development.")
                                 print("Sender clicked Know More")
                                 await send_product(sender, payload)
+                                product_name = payload[2]
+                                await store_whatsapp_history(sender, sender_name, "Know More", f"*{product_name}* \n\n🎉 *Key Highlights:* \n  - EMI Available! ✅ \n  - Get GST invoice and save up to 28% on business purchases \n  - Free Shipping all over India 🚚\n\nTo contact us, simply type 'Live Agent'", [], [], [payload[0]])
                                 # print("Sent message to Name: ", sender_name, ", Number: ", sender, "")
 
                                 # await send_product(sender, payload)
@@ -673,6 +811,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     print(f"Product ID: {product_id}, Quantity: {quantity}, Price: {item_price}, Currency: {currency}")
 
                                 print("Sender sent cart")
+                                await store_whatsapp_history(sender, sender_name,"Sender sent cart" , "Thanks for sending your us cart! 📦🤩\n\nBefore we can proceed, we just need a few more details about *your address* so we know exactly where to deliver your order.\n\nLet's get this sorted and your items will be on their way!🚀", product_items,[], [])
                                 add_order_details(sender, product_items)
                                 await get_details(sender, again=False)
 
@@ -706,6 +845,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     if payload == "info_correct":
                                         print("Info is correct")
                                         await get_payment(sender, sender_name)
+                                        details = get_sender_details(sender)
+                                        await store_whatsapp_history(sender, sender_name, "Sender send address", "", [], details, [])
                                     elif payload == "info_incorrect":
                                         print("Info is incorrect")
                                         delete_address_details(sender)
@@ -1631,7 +1772,7 @@ async def get_payment(sender, sender_name):
             }
         }
     }
-}
+    }
 
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
@@ -1890,3 +2031,91 @@ Incoming webhook payload: {
 {"version":"3.1","screens":[{"id":"RECOMMEND","title":"Contact Details","data":{},"layout":{"type":"SingleColumnLayout","children":[{"type":"Form","name":"flow_path","children":[{"type":"TextSubheading","text":"Full name"},{"type":"TextInput","label":"Eg. Steve Jobs","name":"TextInput_3be76e","required":true,"input-type":"text","helper-text":""},{"type":"TextSubheading","text":"Contact Information"},{"type":"TextInput","label":"Email address","name":"TextInput_863f4d","required":true,"input-type":"email","helper-text":""},{"type":"TextCaption","text":"We'll use this email to send you details and updates about your order."},{"type":"Footer","label":"Continue","on-click-action":{"name":"navigate","next":{"type":"screen","name":"screen_xdycdl"},"payload":{"screen_0_TextInput_0":"${form.TextInput_3be76e}","screen_0_TextInput_1":"${form.TextInput_863f4d}"}}}]}]}},{"id":"screen_xdycdl","title":"Delivery Details","data":{"screen_0_TextInput_0":{"type":"string","__example__":"Example"},"screen_0_TextInput_1":{"type":"string","__example__":"Example"}},"terminal":true,"layout":{"type":"SingleColumnLayout","children":[{"type":"Form","name":"flow_path","children":[{"type":"TextSubheading","text":"Shipping Address"},{"type":"TextCaption","text":"Enter the address where you want your order delivered.\nNote: This address will be used for billing."},{"type":"Dropdown","label":"Country","required":true,"name":"Dropdown_057767","data-source":[{"id":"0_India","title":"India"}]},{"type":"TextArea","label":"Address","required":true,"name":"TextArea_72d055"},{"type":"TextInput","label":"State","name":"TextInput_1a72ca","required":true,"input-type":"text","helper-text":""},{"type":"TextInput","label":"City","name":"TextInput_064ada","required":true,"input-type":"text"},{"type":"TextInput","label":"PIN Code","name":"TextInput_e94033","required":true,"input-type":"number"},{"type":"Footer","label":"Submit","on-click-action":{"name":"complete","payload":{"screen_1_Dropdown_0":"${form.Dropdown_057767}","screen_1_TextArea_1":"${form.TextArea_72d055}","screen_1_TextInput_2":"${form.TextInput_1a72ca}","screen_1_TextInput_3":"${form.TextInput_064ada}","screen_1_TextInput_4":"${form.TextInput_e94033}","screen_0_TextInput_0":"${data.screen_0_TextInput_0}","screen_0_TextInput_1":"${data.screen_0_TextInput_1}"}}}]}]}}]}
 
 """
+
+
+
+class Message(BaseModel):
+    user_id: str
+    message: str
+
+@app.get("/api/conversations")
+async def get_conversations():
+    try:
+        conversations = list(support_requests.find(
+            {},
+            {'_id': 0}
+        ).sort('created_at', -1).limit(50))
+        
+        # Format the response
+        return [
+            {
+                'user_id': conv['user_id'],
+                'user_name': conv['user_name'],
+                'status': conv['status'],
+                'created_at': conv['created_at'],
+                'chat_history': conv['chat_history'][-1:],  # Get only last message
+                'platform': conv['platform']
+            }
+            for conv in conversations
+        ]
+    except Exception as e:
+        print(f"Error fetching conversations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversations/{user_id}")
+async def get_conversation(user_id: str):
+    try:
+        conversation = support_requests.find_one(
+            {'user_id': user_id},
+            {'_id': 0}
+        )
+        
+        if not conversation:
+            print(f"Conversation not found for user_id: {user_id}")
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+        return conversation
+    except Exception as e:
+        print(f"Error fetching conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/conversations/message")
+async def send_message_from_api(message: Message):
+    try:
+        result = support_requests.update_one(
+            {'user_id': message.user_id},
+            {'$push': {
+                'chat_history': {
+                    'role': 'assistant',
+                    'content': message.message,
+                    'timestamp': datetime.utcnow()
+                }
+            }}
+        )
+        # Send message to WhatsApp user
+        
+        url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "messaging_product": "whatsapp",
+            "to": message.user_id,
+            "type": "text",
+            "text": {"body": message.message}
+        }
+        
+        response = requests.post(url, headers=headers, json=data)
+        if not response.ok:
+            print(f"Error sending WhatsApp message: {response.text}")
+            raise HTTPException(status_code=500, detail="Failed to send WhatsApp message")
+        
+        if result.modified_count == 0:
+            print(f"Conversation not found for user_id: {message.user_id}")
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+        return {"success": True}
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
