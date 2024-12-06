@@ -21,6 +21,8 @@ import json
 from google.cloud import firestore
 from google.oauth2 import service_account
 
+from facebook_business.api import FacebookAdsApi
+from facebook_business.adobjects.adaccount import AdAccount
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -31,7 +33,12 @@ os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'credentials.json'
 CLARITY_TOKEN = os.getenv("CLARITY_TOKEN")
 
 instagram_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
-access_token = os.getenv("ACCESS_TOKEN")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+APP_ID = os.getenv('APP_ID')
+APP_SECRET = os.getenv('SECRET_TOKEN')
+AD_ACCOUNT_ID = os.getenv('AD_ACCOUNT_ID')
+
+FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
 
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
@@ -50,9 +57,38 @@ def initialize_llm():
     llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0, )
     return llm
 
-class ZeroArgSchema(BaseModel):  # Correct schema, NO dummy arg.
-    # If you need ANY arguments, define them here. If not, leave it empty.
-    optional_arg: Optional[str] = Field(None, description="Optional argument (not used)") 
+class PopulateArgSchema(BaseModel):
+    input_arg: Optional[str] = Field(
+        default="", 
+        description="An empty string provided as input, used internally within the function."
+    )
+
+def format_insights_as_natural_language(insights_data):
+    """Formats the insights data as a natural language string."""
+    output_string = ""
+
+    if not insights_data or not isinstance(insights_data, list):
+        return "No insights data available or data is not in the expected format."
+
+    for insight in insights_data:
+        for key, value in insight.items():
+          if isinstance(value, list):
+              for item in value:
+                  if isinstance(item, dict) and 'action_type' in item and 'value' in item:
+                        action_type = item['action_type']
+                        action_value = item['value']
+                        output_string += f"{action_type}: {action_value}\n"  # Correct formatting
+                  elif isinstance(item, dict):
+                        for sub_key, sub_value in item.items():
+                            output_string += f"  {sub_key}: {sub_value}\n"
+                  else:  # List of simple values
+                        output_string += f"  {key}: {', '.join(map(str, value))}\n"  # Correct formatting for simple lists
+                        break  
+          else:
+              output_string += f"{key}: {value}\n"
+        output_string += "--------------------\n"
+
+    return output_string
 
 @tool
 def getDateRange(date_range: str):
@@ -275,8 +311,8 @@ def fetechGoogleAnalyticsData(start_date: str, end_date: str):
 
     return output_string
 
-@tool(args_schema=ZeroArgSchema)    
-def fetchClarityData(optional_arg: Optional[str] = None) -> str:
+@tool(args_schema=PopulateArgSchema)    
+def fetchClarityData(input_arg: Optional[str] = "") -> str:
     """
     Retrieves a data from Clarity of the last 3 days.
     """
@@ -292,7 +328,7 @@ def fetchClarityData(optional_arg: Optional[str] = None) -> str:
         params=params,
         headers=headers,
     )
-    result = ""
+    result = input_arg
 
     if response.status_code != 200:
         return "API limit reached. Please try again later."
@@ -334,8 +370,8 @@ def fetchClarityData(optional_arg: Optional[str] = None) -> str:
 
     return result
 
-@tool(args_schema=ZeroArgSchema)  # Associate schema with tool
-def fetchChatbotConversations(optional_arg: Optional[str] = None) -> str:
+@tool(args_schema=PopulateArgSchema)  
+def fetchChatbotConversations(input_arg: Optional[str] = "") -> str:
     """
     Returns the customer chatbot conversations.
     """
@@ -347,6 +383,8 @@ def fetchChatbotConversations(optional_arg: Optional[str] = None) -> str:
 
     # Query all documents in the collection
     docs = collection_ref.stream()
+
+    combined_string = input_arg
 
     combined_messages = []
     
@@ -387,8 +425,8 @@ def fetchChatbotConversations(optional_arg: Optional[str] = None) -> str:
     
     return combined_string
 
-@tool(args_schema=ZeroArgSchema)
-def fetchInstagramAccountData(optional_arg: Optional[str] = None) -> str:
+@tool(args_schema=PopulateArgSchema)
+def fetchInstagramAccountData(input_arg: Optional[str] = "") -> str:
     """
     Fetch Instagram account metrics like
     - Impressions
@@ -405,7 +443,7 @@ def fetchInstagramAccountData(optional_arg: Optional[str] = None) -> str:
     base_params = {
         'metric': 'impressions, reach, total_interactions, profile_links_taps, accounts_engaged, saves, shares',
         'period': 'day',
-        'access_token': access_token,
+        'access_token': ACCESS_TOKEN,
         'metric_type': 'total_value',
     }
 
@@ -416,6 +454,7 @@ def fetchInstagramAccountData(optional_arg: Optional[str] = None) -> str:
         data = response.json()
         
         # Create a formatted string to print the metrics
+        metrics_str = input_arg
         metrics_str = "Instagram Metrics:\n"
         for item in data['data']:
             metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
@@ -425,21 +464,21 @@ def fetchInstagramAccountData(optional_arg: Optional[str] = None) -> str:
         print(f"Error: {response.status_code}")
         print(response.json())
 
-@tool(args_schema=ZeroArgSchema)
-def fetchDemographicsData(optional_arg: Optional[str] = None) -> str:
+@tool(args_schema=PopulateArgSchema)
+def fetchInstagramDemographicsData(input_arg: Optional[str] = "") -> str:
     """
     Fetches Egenie's Instagram account demographics insights. 
     Returns a string containing formatted metrics. 
     """
+    data = input_arg
     data = demographics_insights()
     return data
 
-@tool(args_schema=ZeroArgSchema)
-def fetchInstagramMediaData(optional_arg: Optional[str] = None) -> str:
+@tool(args_schema=PopulateArgSchema)
+def fetchInstagramMediaData(input_arg: Optional[str] = "") -> str:
     """
     Fetches insights for the most recent Instagram image and reel posts.
     """
-    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
 
     # Fetch user media
     params = getCreds()  # Fetch credentials
@@ -450,7 +489,7 @@ def fetchInstagramMediaData(optional_arg: Optional[str] = None) -> str:
     most_recent_image = getMostRecentMediaByType(media_data, 'IMAGE')
     most_recent_reel = getMostRecentMediaByType(media_data, 'VIDEO')
 
-    post_insigths = ""
+    post_insigths = input_arg
 
     # Print details for the most recent image
     if most_recent_image:
@@ -483,15 +522,51 @@ def fetchInstagramMediaData(optional_arg: Optional[str] = None) -> str:
 
     return post_insigths
 
+@tool(args_schema=PopulateArgSchema)
+def fetchMetaAdsData(input_ard: Optional[str] = "") -> str:
+    """
+    Retrieves maximum campaign insights.
+    """
+    campaign_id = "120213265876940368"  
+
+    try:
+        my_account = AdAccount(AD_ACCOUNT_ID)
+
+        campaign_insights = my_account.get_insights(
+            fields=[
+                'campaign_name', 'clicks', 'cpc', 'ctr', 'spend', 'reach', 'impressions',
+                'frequency', 'conversions', 'cost_per_conversion', 'conversion_values',
+                'website_ctr', 'video_play_actions', 'video_avg_time_watched_actions',
+                'objective', 'website_purchase_roas', 'cost_per_unique_click', 'actions',
+                'action_values', 'outbound_clicks', 'cost_per_unique_outbound_click',
+            ],
+            params={
+                "date_preset": "this_quarter",
+                "breakdowns": ["age", "gender"],
+                "level": "campaign",
+                'filtering': [{'field': 'campaign.id', 'operator': 'EQUAL', 'value': campaign_id}],
+                "limit": 1000
+            }
+        )
+        campaign_insights_data = [insight._json for insight in campaign_insights]
+
+        # Call the helper function to format data
+        natural_language_string = format_insights_as_natural_language(campaign_insights_data)
+        prompt = """Consolidate Data: Combine the top 10 data chunks, summing repeated metrics and using 0 for missing ones. \nAnalyze Performance: Determine which age/gender groups excel in various metrics (CTR, CPC, conversions, etc.). Don't just calculate; understand why they perform well.\nIdentify Key Audiences: Pinpoint the current top performers and explain what makes them valuable.\nExplore New Opportunities: Uncover hidden potential in underperforming or untapped segments. Who could be persuaded with the right approach?\nOptimize Strategy: Targeting: Refine targeting based on performance, but consider expanding beyond obvious winners.\nBudget: Distribute budget strategically, not just to the top performers. Where will each dollar have the most impact?\nMessaging: How can you tailor your message to resonate with different groups? Think beyond simple demographics; consider their motivations and interests.\nSet your behaviour to what to do next approach. To make it better.Perform the actions and give direct conclusions."""
+        return natural_language_string + prompt
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return f"Error retrieving insights: {e}"
+
 def initialize_langchain_agent(llm, id):    
 
     memory = ChatMessageHistory(session_id=id)
     
-    tools = [getDateRange, topNMostVisitedPages, fetchDeviceModelsData, fetechGoogleAnalyticsData, fetchClarityData, fetchChatbotConversations, fetchInstagramAccountData, fetchDemographicsData, fetchInstagramMediaData]
+    tools = [getDateRange, topNMostVisitedPages, fetchDeviceModelsData, fetechGoogleAnalyticsData, fetchClarityData, fetchChatbotConversations, fetchInstagramAccountData, fetchInstagramDemographicsData, fetchInstagramMediaData, fetchMetaAdsData]
     prompt = hub.pull("admin-structured-chat-agent-prompt")
-    # prompt = hub.pull("admin-bot")
     agent = create_structured_chat_agent(llm, tools, prompt)
-
+ 
     agent_executor = AgentExecutor.from_agent_and_tools(
         agent=agent, 
         tools=tools, 
