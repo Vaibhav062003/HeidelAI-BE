@@ -20,10 +20,10 @@ from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel
 from pytz import timezone
-
 from fastapi import WebSocket, WebSocketDisconnect
 from typing import Dict
 
+from send_mail import notify
 # Store WebSocket connections
 connected_clients: Dict[str, WebSocket] = {}
 
@@ -356,30 +356,33 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://egeniestores.com", "http://localhost"],
+    allow_origins=["https://egeniestores.com", "http://localhost", "http://wordpress.local", "http://wordpress.local:10004"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 @app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket):
-    user_id = websocket.path_params["user_id"]  # Get user_id from path params
-
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
     try:
         await websocket.accept()
         connected_clients[user_id] = websocket
+        print(f"Client connected: {user_id}")
         
-        # Keep connection alive and listen for messages
-        while True:
-            # Wait for messages from client (optional if you only need server->client communication)
-            data = await websocket.receive_json()
-            if data.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
+        try:
+            while True:
+                # Keep the connection alive and wait for messages
+                data = await websocket.receive_text()
+                # Handle any incoming messages if needed
+                print(f"Received message from {user_id}: {data}")
                 
-    except WebSocketDisconnect:
-        if user_id in connected_clients:
-            del connected_clients[user_id]
+        except WebSocketDisconnect:
+            print(f"Client disconnected: {user_id}")
+        finally:
+            # Clean up when the connection is closed
+            if user_id in connected_clients:
+                del connected_clients[user_id]
+                
     except Exception as e:
         print(f"WebSocket error: {e}")
         if user_id in connected_clients:
@@ -588,8 +591,8 @@ async def store_whatsapp_history(sender_id: str, sender_name: str, sender_messag
             updated_messages = existing_messages + new_message
 
             # Keep only the last 20 messages
-            if len(updated_messages) > 20:
-                updated_messages = updated_messages[-20:]
+            if len(updated_messages) > 40:
+                updated_messages = updated_messages[-40:]
 
             update_data = {
                 "chat_history": updated_messages,
@@ -853,6 +856,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     else:
                                         response = "We're sorry, there was an error processing your live support request. Please try again later."
                                     await send_message(sender, response)
+                                    customer_details = sender_name + " - " + sender
+                                    notify(customer_details, "egeniestore@gmail.com")
                                     await store_whatsapp_history(sender, sender_name, user_input, response, [], [], [])
                                     return {"status": "ok"}
 
@@ -998,7 +1003,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         print("Info is correct")
                                         await get_payment(sender, sender_name)
                                         details = get_sender_details(sender)
-                                        await store_whatsapp_history(sender, sender_name, "Sender send address", "", [], details, [])
+                                        await store_whatsapp_history(sender, sender_name, "Sender sent address", "", [], details, [])
                                     elif payload == "info_incorrect":
                                         print("Info is incorrect")
                                         delete_address_details(sender)
@@ -2365,3 +2370,76 @@ async def send_message_from_api(message: Message):
         print(f"Error sending message: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/products/details")
+async def get_product_details(payload: dict):
+    try:
+        # Validate required fields
+        product_id = payload.get("product_retailer_id")
+        quantity = payload.get("quantity")
+        item_price = payload.get("item_price")
+        
+        if not all([product_id, quantity, item_price]):
+            return {"error": "Missing required fields"}
+
+        # First API call to get product catalog ID
+        url1 = f"https://graph.facebook.com/v20.0/759103595212051/products"
+        params1 = {
+            "filter": json.dumps({
+                "retailer_id": {"eq": product_id}
+            }),
+            "fields": "id",
+            "access_token": ACCESS_TOKEN
+        }
+
+        response = requests.get(url1, params=params1)
+        response.raise_for_status()  # Raise exception for non-200 status codes
+        data = response.json()
+        
+        if not data.get('data') or len(data['data']) == 0:
+            return {"error": "Product not found"}
+
+        product_cat_id = data['data'][0]['id']
+
+        # Second API call to get product details
+        url = f"https://graph.facebook.com/{product_cat_id}"
+        params = {
+            "access_token": ACCESS_TOKEN,
+            "fields": "name,price,image_url"
+        }
+
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        product_data = response.json()
+
+        # Clean and format price
+        price = product_data.get('price', '0')
+        clean_price = int(float(price.replace("₹", "").replace(",", "")))
+
+        product_details = {
+            "name": product_data.get('name', ''),
+            "amount": {
+                "value": int(f"{clean_price}00"),
+                "offset": 100
+            },
+            "sale_amount": {
+                "value": int(f"{item_price}00"),
+                "offset": 100
+            },
+            "quantity": int(quantity),
+            "country_of_origin": "IN",
+            "image": {
+                "link": product_data.get('image_url', '')
+            }
+        }
+
+        return product_details
+
+    except requests.RequestException as e:
+        print(f"API request failed: {e}")
+        return {"error": "Failed to fetch product details"}
+    except (ValueError, KeyError) as e:
+        print(f"Data processing error: {e}")
+        return {"error": "Invalid data format"}
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return {"error": "An unexpected error occurred"}
