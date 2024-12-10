@@ -1,4 +1,4 @@
-from defines import getCreds, makeApiCall
+from Backend_chatbot.meta.meta_defines import getCreds, makeApiCall
 
 def getUserPages( params ) :
 	""" Get facebook pages for a user

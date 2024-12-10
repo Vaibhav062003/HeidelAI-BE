@@ -155,7 +155,7 @@ def format_metrics(data):
 def demographics_insights():
 	creds = getCreds()
 
-	url = f'https://graph.facebook.com/{creds['instagram_account_id']}/insights'
+	url = f"https://graph.facebook.com/{creds['instagram_account_id']}/insights"
 
 	# Base parameters for the API
 	base_params = {
