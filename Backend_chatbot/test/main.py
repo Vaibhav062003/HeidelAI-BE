@@ -309,7 +309,8 @@ def fetechGoogleAnalyticsData(start_date: str, end_date: str):
             metric_name = report3.metric_headers[i].name
             output_string += f"{metric_name}: {metric_value.value}\n"
 
-    return output_string
+    prompt = """\nRespond with an analysis of the data, focusing on:\nUser Engagement: Compare Page_view and User_engagement. Analyze scroll events and engagementRate.\nVisitor Behavior: Break down New Visitors and Returning Visitors percentages. Compare First_visit and Session_start.\nSession Metrics: Analyze averageSessionDuration and sessionsPerUser. Discuss sessions and activeUsers.\nConversion Metrics: Analyze Form_start vs. Form_submit. Discuss View_search_results and Click events. Comment on addToCarts, checkouts, and purchaserRate.\nOverall Insights: Summarize key findings. Provide actionable recommendations for enhancing user engagement and conversion rates."""
+    return output_string + prompt
 
 @tool(args_schema=PopulateArgSchema)    
 def fetchClarityData(input_arg: Optional[str] = "") -> str:
@@ -368,7 +369,8 @@ def fetchClarityData(input_arg: Optional[str] = "") -> str:
                 if isinstance(entry, dict):
                     result += f"\"{entry.get('name', 'N/A')}\" - {entry.get('sessionsCount', 'N/A')} sessions\n"
 
-    return result
+    prompt = """\nRespond with:\nAnalyze Total Dead Clicks and Sessions with Dead Clicks. What does this indicate about user navigation?\nDiscuss Scroll Count and Average Scroll Depth. What do these metrics suggest about user engagement?\nCompare Total Session Count and Total Bot Session Count. What does this tell you about real user activity?\nAnalyze Distinct User Count and Pages Per Session Percentage. What does this indicate about user behavior?\nCompare Total Time and Active Time. What does this suggest about user interaction?\nBreak down session counts by page titles. Identify the most and least visited pages. What does this tell you about user interests - and navigation patterns?"""
+    return result + prompt
 
 @tool(args_schema=PopulateArgSchema)  
 def fetchChatbotConversations(input_arg: Optional[str] = "") -> str:
@@ -423,7 +425,9 @@ def fetchChatbotConversations(input_arg: Optional[str] = "") -> str:
     
     print(f"Combined messages count: {len(combined_messages)}")
     
-    return combined_string
+    prompt = """\nAnalyze the data to provide insights on:\nCustomer Intent: What are customers frequently searching for?  Identify the primary goals or needs expressed by customers in their queries (e.g., product information, support, order status).\nPopular Products: Which product categories, specific products, or product features are mentioned most often? Quantify the frequency of product mentions.\nSearch Effectiveness: Are there repeated queries or signs of failed searches? Look for patterns indicating that customers are struggling to find what they need (e.g., many similar queries, queries followed by "not found" or frustration).\nCustomer Issues: Identify frustration patterns or common problems customers are experiencing. Look for keywords indicating negative sentiment, repeated queries, or requests for escalation. Analyze the types of issues faced (e.g., technical problems, product questions, navigation difficulties).\nBot Performance: How effectively is the bot answering queries? Assess the bot's ability to correctly interpret customer intent and provide helpful responses. Identify gaps in the bot's knowledge or areas where responses could be improved. Provide specific examples of successful and unsuccessful interactions."""
+
+    return combined_string + prompt
 
 @tool(args_schema=PopulateArgSchema)
 def fetchInstagramAccountData(input_arg: Optional[str] = "") -> str:
@@ -459,7 +463,8 @@ def fetchInstagramAccountData(input_arg: Optional[str] = "") -> str:
         for item in data['data']:
             metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
 
-        return metrics_str
+        prompt = """\nCompare Impressions and Accounts reached. What does this indicate about content visibility?\nAnalyze Content interactions and Accounts engaged. What does this suggest about user engagement?\nDiscuss Profile links taps, Saves, and Shares. What do these metrics tell you about user behavior and content value?\nSummarize key findings. Provide actionable recommendations to improve reach and engagement."""
+        return metrics_str + prompt
     else:
         print(f"Error: {response.status_code}")
         print(response.json())
@@ -472,7 +477,8 @@ def fetchInstagramDemographicsData(input_arg: Optional[str] = "") -> str:
     """
     data = input_arg
     data = demographics_insights()
-    return data
+    prompt = """\nAnalyze Country, City, Gender, and Age distributions. What do these metrics tell you about the follower base and engagement patterns?\nAnalyze Country, City, Gender, and Age distributions. How do these metrics compare with follower and engaged audience demographics?\nSummarize key findings. Provide actionable recommendations to improve audience targeting and engagement."""
+    return data + prompt
 
 @tool(args_schema=PopulateArgSchema)
 def fetchInstagramMediaData(input_arg: Optional[str] = "") -> str:
@@ -520,7 +526,8 @@ def fetchInstagramMediaData(input_arg: Optional[str] = "") -> str:
         for insight in reel_insights['json_data']['data']:
             post_insigths += f"{insight['title']}: {insight['values'][0]['value']}\n"
 
-    return post_insigths
+    prompt = """ \nFor Post: \nAnalyze Impressions, Accounts reached, and Profile visits. What do these metrics tell you about post visibility and engagement? \n Discuss Comments, Shares, and Saved. What does this indicate about user interaction and content value?\nFor Reels: \nCompare Accounts reached, Initial plays, and Reels average watch time. What does this suggest about reel engagement and watch duration?\nAnalyze Comments, Shares, and Saved. How do these metrics compare with the image post?\nOverall Insights:\nSummarize key findings. Provide actionable recommendations to improve post and reel performance\nEnsure you pass the correct date range to get meaningful insights."""
+    return post_insigths + prompt
 
 @tool(args_schema=PopulateArgSchema)
 def fetchMetaAdsData(input_ard: Optional[str] = "") -> str:
@@ -552,7 +559,7 @@ def fetchMetaAdsData(input_ard: Optional[str] = "") -> str:
 
         # Call the helper function to format data
         natural_language_string = format_insights_as_natural_language(campaign_insights_data)
-        prompt = """Consolidate Data: Combine the top 10 data chunks, summing repeated metrics and using 0 for missing ones. \nAnalyze Performance: Determine which age/gender groups excel in various metrics (CTR, CPC, conversions, etc.). Don't just calculate; understand why they perform well.\nIdentify Key Audiences: Pinpoint the current top performers and explain what makes them valuable.\nExplore New Opportunities: Uncover hidden potential in underperforming or untapped segments. Who could be persuaded with the right approach?\nOptimize Strategy: Targeting: Refine targeting based on performance, but consider expanding beyond obvious winners.\nBudget: Distribute budget strategically, not just to the top performers. Where will each dollar have the most impact?\nMessaging: How can you tailor your message to resonate with different groups? Think beyond simple demographics; consider their motivations and interests.\nSet your behaviour to what to do next approach. To make it better.Perform the actions and give direct conclusions."""
+        prompt = """Analyze Performance: Determine which age/gender groups excel in various metrics (CTR, CPC, conversions, etc.). Don't just calculate; understand why they perform well.\nIdentify Key Audiences: Pinpoint the current top performers and explain what makes them valuable.\nExplore New Opportunities: Uncover hidden potential in underperforming or untapped segments. Who could be persuaded with the right approach?\nOptimize Strategy: Targeting: Refine targeting based on performance, but consider expanding beyond obvious winners.\nBudget: Distribute budget strategically, not just to the top performers. Where will each dollar have the most impact?\nMessaging: How can you tailor your message to resonate with different groups? Think beyond simple demographics; consider their motivations and interests.\nSet your behaviour to what to do next approach. To make it better.Perform the actions and give direct conclusions."""
         return natural_language_string + prompt
 
     except Exception as e:
@@ -601,6 +608,3 @@ while True:
     toc = time.perf_counter()
     print(response['output'])
     print(f"time_taken {toc - tic:0.4f} seconds")
-
-
-

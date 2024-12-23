@@ -11,6 +11,8 @@ from langchain import hub
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 from datetime import datetime, timedelta
+from facebook_business.api import FacebookAdsApi
+from facebook_business.adobjects.adaccount import AdAccount
 from langchain_google_genai import ChatGoogleGenerativeAI
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from langchain_core.runnables.history import RunnableWithMessageHistory
@@ -24,6 +26,8 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 
+from typing import Optional
+from pydantic import BaseModel, Field
 from google.cloud import firestore
 from google.oauth2 import service_account
 
@@ -36,13 +40,18 @@ LANGCHAIN_API_KEY = os.getenv("LANGCHAIN_API_KEY")
 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'credentials.json'
 CLARITY_TOKEN = os.getenv("CLARITY_TOKEN")
 
+instagram_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+APP_ID = os.getenv('APP_ID')
+APP_SECRET = os.getenv('SECRET_TOKEN')
+AD_ACCOUNT_ID = os.getenv('AD_ACCOUNT_ID')
+
+FacebookAdsApi.init(APP_ID, APP_SECRET, ACCESS_TOKEN)
+
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
 os.environ["LANGCHAIN_PROJECT"] =os.getenv("LANGCHAIN_PROJECT")
-
-instagram_account_id = os.getenv("INSTAGRAM_ACCOUNT_ID")
-access_token = os.getenv("ACCESS_TOKEN")
 
 # Initialize the GA4 client
 client = BetaAnalyticsDataClient()
@@ -53,12 +62,43 @@ credentials = service_account.Credentials.from_service_account_file(os.getenv("S
 # Initialize Firestore using the credentials
 db = firestore.Client(credentials=credentials)
 
-
-def initialize_llm() -> ChatGoogleGenerativeAI:
-    llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0)
+def initialize_llm():
+    llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0, )
     return llm
 
-# Tools
+class PopulateArgSchema(BaseModel):
+    input_arg: Optional[str] = Field(
+        default="", 
+        description="An empty string provided as input, used internally within the function."
+    )
+
+def format_insights_as_natural_language(insights_data):
+    """Formats the insights data as a natural language string."""
+    output_string = ""
+
+    if not insights_data or not isinstance(insights_data, list):
+        return "No insights data available or data is not in the expected format."
+
+    for insight in insights_data:
+        for key, value in insight.items():
+          if isinstance(value, list):
+              for item in value:
+                  if isinstance(item, dict) and 'action_type' in item and 'value' in item:
+                        action_type = item['action_type']
+                        action_value = item['value']
+                        output_string += f"{action_type}: {action_value}\n"  # Correct formatting
+                  elif isinstance(item, dict):
+                        for sub_key, sub_value in item.items():
+                            output_string += f"  {sub_key}: {sub_value}\n"
+                  else:  # List of simple values
+                        output_string += f"  {key}: {', '.join(map(str, value))}\n"  # Correct formatting for simple lists
+                        break  
+          else:
+              output_string += f"{key}: {value}\n"
+        output_string += "--------------------\n"
+
+    return output_string
+
 @tool
 def getDateRange(date_range: str):
     """
@@ -278,10 +318,12 @@ def fetechGoogleAnalyticsData(start_date: str, end_date: str):
             metric_name = report3.metric_headers[i].name
             output_string += f"{metric_name}: {metric_value.value}\n"
 
-    return output_string
+    prompt = """\nRespond with an analysis of the data, focusing on:\nUser Engagement: Compare Page_view and User_engagement. Analyze scroll events and engagementRate.\nVisitor Behavior: Break down New Visitors and Returning Visitors percentages. Compare First_visit and Session_start.\nSession Metrics: Analyze averageSessionDuration and sessionsPerUser. Discuss sessions and activeUsers.\nConversion Metrics: Analyze Form_start vs. Form_submit. Discuss View_search_results and Click events. Comment on addToCarts, checkouts, and purchaserRate.\nOverall Insights: Summarize key findings. Provide actionable recommendations for enhancing user engagement and conversion rates."""
+    
+    return output_string + prompt
 
-@tool    
-def fetchClarityData(dummy: str):
+@tool(args_schema=PopulateArgSchema)    
+def fetchClarityData(input_arg: Optional[str] = "") -> str:
     """
     Retrieves a data from Clarity of the last 3 days.
     """
@@ -297,7 +339,7 @@ def fetchClarityData(dummy: str):
         params=params,
         headers=headers,
     )
-    result = ""
+    result = input_arg
 
     if response.status_code != 200:
         return "API limit reached. Please try again later."
@@ -337,10 +379,11 @@ def fetchClarityData(dummy: str):
                 if isinstance(entry, dict):
                     result += f"\"{entry.get('name', 'N/A')}\" - {entry.get('sessionsCount', 'N/A')} sessions\n"
 
-    return result
+    prompt = """\nRespond with:\nAnalyze Total Dead Clicks and Sessions with Dead Clicks. What does this indicate about user navigation?\nDiscuss Scroll Count and Average Scroll Depth. What do these metrics suggest about user engagement?\nCompare Total Session Count and Total Bot Session Count. What does this tell you about real user activity?\nAnalyze Distinct User Count and Pages Per Session Percentage. What does this indicate about user behavior?\nCompare Total Time and Active Time. What does this suggest about user interaction?\nBreak down session counts by page titles. Identify the most and least visited pages. What does this tell you about user interests - and navigation patterns?"""
+    return result + prompt
 
-@tool
-def fetchChatbotConversations(dummy: str) -> str:
+@tool(args_schema=PopulateArgSchema)  
+def fetchChatbotConversations(input_arg: Optional[str] = "") -> str:
     """
     Returns the customer chatbot conversations.
     """
@@ -352,6 +395,8 @@ def fetchChatbotConversations(dummy: str) -> str:
 
     # Query all documents in the collection
     docs = collection_ref.stream()
+
+    combined_string = input_arg
 
     combined_messages = []
     
@@ -390,10 +435,12 @@ def fetchChatbotConversations(dummy: str) -> str:
     
     print(f"Combined messages count: {len(combined_messages)}")
     
-    return combined_string
+    prompt = """\nAnalyze the data to provide insights on:\nCustomer Intent: What are customers frequently searching for?  Identify the primary goals or needs expressed by customers in their queries (e.g., product information, support, order status).\nPopular Products: Which product categories, specific products, or product features are mentioned most often? Quantify the frequency of product mentions.\nSearch Effectiveness: Are there repeated queries or signs of failed searches? Look for patterns indicating that customers are struggling to find what they need (e.g., many similar queries, queries followed by "not found" or frustration).\nCustomer Issues: Identify frustration patterns or common problems customers are experiencing. Look for keywords indicating negative sentiment, repeated queries, or requests for escalation. Analyze the types of issues faced (e.g., technical problems, product questions, navigation difficulties).\nBot Performance: How effectively is the bot answering queries? Assess the bot's ability to correctly interpret customer intent and provide helpful responses. Identify gaps in the bot's knowledge or areas where responses could be improved. Provide specific examples of successful and unsuccessful interactions."""
 
-@tool
-def fetchInstagramAccountData(dummy: str) -> str:
+    return combined_string + prompt
+
+@tool(args_schema=PopulateArgSchema)
+def fetchInstagramAccountData(input_arg: Optional[str] = "") -> str:
     """
     Fetch Instagram account metrics like
     - Impressions
@@ -410,7 +457,7 @@ def fetchInstagramAccountData(dummy: str) -> str:
     base_params = {
         'metric': 'impressions, reach, total_interactions, profile_links_taps, accounts_engaged, saves, shares',
         'period': 'day',
-        'access_token': access_token,
+        'access_token': ACCESS_TOKEN,
         'metric_type': 'total_value',
     }
 
@@ -421,30 +468,33 @@ def fetchInstagramAccountData(dummy: str) -> str:
         data = response.json()
         
         # Create a formatted string to print the metrics
+        metrics_str = input_arg
         metrics_str = "Instagram Metrics:\n"
         for item in data['data']:
             metrics_str += f"{item['title']} : {item['total_value']['value']}\n"
 
-        return metrics_str
+        prompt = """\nCompare Impressions and Accounts reached. What does this indicate about content visibility?\nAnalyze Content interactions and Accounts engaged. What does this suggest about user engagement?\nDiscuss Profile links taps, Saves, and Shares. What do these metrics tell you about user behavior and content value?\nSummarize key findings. Provide actionable recommendations to improve reach and engagement."""
+        return metrics_str + prompt
     else:
         print(f"Error: {response.status_code}")
         print(response.json())
 
-@tool
-def fetchDemographicsData(dummy: str) -> str:
+@tool(args_schema=PopulateArgSchema)
+def fetchInstagramDemographicsData(input_arg: Optional[str] = "") -> str:
     """
     Fetches Egenie's Instagram account demographics insights. 
     Returns a string containing formatted metrics. 
     """
+    data = input_arg
     data = demographics_insights()
-    return data
+    prompt = """\nAnalyze Country, City, Gender, and Age distributions. What do these metrics tell you about the follower base and engagement patterns?\nAnalyze Country, City, Gender, and Age distributions. How do these metrics compare with follower and engaged audience demographics?\nSummarize key findings. Provide actionable recommendations to improve audience targeting and engagement."""
+    return data + prompt
 
-@tool
-def fetchInstagramMediaData(dummy: str) -> str:
+@tool(args_schema=PopulateArgSchema)
+def fetchInstagramMediaData(input_arg: Optional[str] = "") -> str:
     """
     Fetches insights for the most recent Instagram image and reel posts.
     """
-    url = f'https://graph.facebook.com/{instagram_account_id}/insights'
 
     # Fetch user media
     params = getCreds()  # Fetch credentials
@@ -455,7 +505,7 @@ def fetchInstagramMediaData(dummy: str) -> str:
     most_recent_image = getMostRecentMediaByType(media_data, 'IMAGE')
     most_recent_reel = getMostRecentMediaByType(media_data, 'VIDEO')
 
-    post_insigths = ""
+    post_insigths = input_arg
 
     # Print details for the most recent image
     if most_recent_image:
@@ -486,20 +536,58 @@ def fetchInstagramMediaData(dummy: str) -> str:
         for insight in reel_insights['json_data']['data']:
             post_insigths += f"{insight['title']}: {insight['values'][0]['value']}\n"
 
-    return post_insigths
+    prompt = """ \nFor Post: \nAnalyze Impressions, Accounts reached, and Profile visits. What do these metrics tell you about post visibility and engagement? \n Discuss Comments, Shares, and Saved. What does this indicate about user interaction and content value?\nFor Reels: \nCompare Accounts reached, Initial plays, and Reels average watch time. What does this suggest about reel engagement and watch duration?\nAnalyze Comments, Shares, and Saved. How do these metrics compare with the image post?\nOverall Insights:\nSummarize key findings. Provide actionable recommendations to improve post and reel performance\nEnsure you pass the correct date range to get meaningful insights."""
+    return post_insigths + prompt
 
-def initialize_langchain_agent(llm: ChatGoogleGenerativeAI , id: str) -> RunnableWithMessageHistory:    
+@tool(args_schema=PopulateArgSchema)
+def fetchMetaAdsData(input_ard: Optional[str] = "") -> str:
+    """
+    Retrieves maximum campaign insights.
+    """
+    campaign_id = "120213265876940368"  
+
+    try:
+        my_account = AdAccount(AD_ACCOUNT_ID)
+
+        campaign_insights = my_account.get_insights(
+            fields=[
+                'campaign_name', 'clicks', 'cpc', 'ctr', 'spend', 'reach', 'impressions',
+                'frequency', 'conversions', 'cost_per_conversion', 'conversion_values',
+                'website_ctr', 'video_play_actions', 'video_avg_time_watched_actions',
+                'objective', 'website_purchase_roas', 'cost_per_unique_click', 'actions',
+                'action_values', 'outbound_clicks', 'cost_per_unique_outbound_click',
+            ],
+            params={
+                "date_preset": "this_quarter",
+                "breakdowns": ["age", "gender"],
+                "level": "campaign",
+                'filtering': [{'field': 'campaign.id', 'operator': 'EQUAL', 'value': campaign_id}],
+                "limit": 1000
+            }
+        )
+        campaign_insights_data = [insight._json for insight in campaign_insights]
+
+        # Call the helper function to format data
+        natural_language_string = format_insights_as_natural_language(campaign_insights_data)
+        prompt = """Analyze Performance: Determine which age/gender groups excel in various metrics (CTR, CPC, conversions, etc.). Don't just calculate; understand why they perform well.\nIdentify Key Audiences: Pinpoint the current top performers and explain what makes them valuable.\nExplore New Opportunities: Uncover hidden potential in underperforming or untapped segments. Who could be persuaded with the right approach?\nOptimize Strategy: Targeting: Refine targeting based on performance, but consider expanding beyond obvious winners.\nBudget: Distribute budget strategically, not just to the top performers. Where will each dollar have the most impact?\nMessaging: How can you tailor your message to resonate with different groups? Think beyond simple demographics; consider their motivations and interests.\nSet your behaviour to what to do next approach. To make it better.Perform the actions and give direct conclusions."""
+        return natural_language_string + prompt
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return f"Error retrieving insights: {e}"
+
+def initialize_langchain_agent(llm, id):    
 
     memory = ChatMessageHistory(session_id=id)
     
-    tools = [getDateRange, topNMostVisitedPages, fetchDeviceModelsData, fetechGoogleAnalyticsData, fetchClarityData, fetchChatbotConversations, fetchInstagramAccountData, fetchDemographicsData, fetchInstagramMediaData]
+    tools = [getDateRange, topNMostVisitedPages, fetchDeviceModelsData, fetechGoogleAnalyticsData, fetchClarityData, fetchChatbotConversations, fetchInstagramAccountData, fetchInstagramDemographicsData, fetchInstagramMediaData, fetchMetaAdsData]
     prompt = hub.pull("admin-structured-chat-agent-prompt")
     agent = create_structured_chat_agent(llm, tools, prompt)
-
+ 
     agent_executor = AgentExecutor.from_agent_and_tools(
         agent=agent, 
-        tools=tools,
-        handle_parsing_errors=True, 
+        tools=tools, 
+        handle_parsing_errors=True,
         verbose=True)
     
     agent_with_chat_history = RunnableWithMessageHistory(
@@ -511,7 +599,7 @@ def initialize_langchain_agent(llm: ChatGoogleGenerativeAI , id: str) -> Runnabl
     
     return agent_with_chat_history
 
-def get_agent(id: str) -> RunnableWithMessageHistory:
+def get_agent(id: str):
     llm = initialize_llm()
     return initialize_langchain_agent(llm, id)
 

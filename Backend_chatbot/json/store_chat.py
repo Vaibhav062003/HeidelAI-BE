@@ -47,7 +47,7 @@ def get_combined_session_history():
                     continue
 
     # Save the user chats to a JSON file
-    with open('chat_history.json', 'w') as f:
+    with open('chat_history_new.json', 'w') as f:
         json.dump(user_chats, f, indent=4)
 
     print(f"User chat history saved successfully to user_chat_history.json with {len(user_chats)} users.")
