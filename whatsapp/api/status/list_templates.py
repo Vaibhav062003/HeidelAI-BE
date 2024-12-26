@@ -11,7 +11,7 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 blank_message = "\u3164"
 
 def create_carousel():
-    url = f"https://graph.facebook.com/{BUSINESS_ACCOUNT_ID}/message_templates?fields=name,status&status=APPROVED"
+    url = f"https://graph.facebook.com/{BUSINESS_ACCOUNT_ID}/message_templates?fields=name,status,category,language"
 
     headers = {
         "Authorization": "Bearer " + ACCESS_TOKEN

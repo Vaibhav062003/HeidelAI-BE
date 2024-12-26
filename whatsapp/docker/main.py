@@ -65,6 +65,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERSION = os.getenv("VERSION")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 APP_SECRET = os.getenv("APP_SECRET")
+BUSINESS_ACCOUNT_ID = os.getenv("BUSINESS_ACCOUNT_ID")
 
 # Define the path to your service account JSON file
 SERVICE_ACCOUNT_FILE = 'whatsapp-chatbot-history-cf43052a413d.json'
@@ -849,7 +850,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     print("Introduction sent to Name: ", sender_name, ", Number: ",sender )
                                     continue
         
-                                if user_input.lower() == "live agent":
+                                if ("live agent" in user_input.lower() or
+                                "sales representative" in user_input.lower() or
+                                "human" in user_input.lower() or
+                                "customer support" in user_input.lower()):
                                     success = await handle_live_agent_request(sender, sender_name)
                                     if success:
                                         response = "Thank you for requesting live support. Our team has been notified and will get back to you shortly."
@@ -2443,3 +2447,67 @@ async def get_product_details(payload: dict):
     except Exception as e:
         print(f"Unexpected error: {e}")
         return {"error": "An unexpected error occurred"}
+    
+@app.post("/api/create_template")
+async def create_template(payload: dict):
+    name = payload.get("name")
+    language = payload.get("language")
+    category = payload.get("category")
+    header = payload.get("header")
+    body = payload.get("body")
+    footer = payload.get("footer")
+
+    url = f"https://graph.facebook.com/{BUSINESS_ACCOUNT_ID}/message_templates"
+
+    headers = {
+        "Authorization": "Bearer " + ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "name": name,
+        "language": "en_US",
+        "category": category,
+        "components": [
+            {
+             "type": "HEADER",
+             "format": "TEXT",
+             "text": header,
+            },
+            {
+            "type": "body",
+            "text": body,
+            },
+            
+            {
+            "type": "footer",
+            "text": footer
+            }
+        ]
+    }
+
+
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(data))
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx and 5xx)
+    except requests.exceptions.RequestException as e:
+        # Log or handle the error here
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return response.json()  # Return the JSON response from the Facebook API
+
+@app.get("/api/fetch_templates")
+async def create_template():
+    url = f"https://graph.facebook.com/{BUSINESS_ACCOUNT_ID}/message_templates?fields=name,status,category,language"
+    headers = {"Authorization": "Bearer " + ACCESS_TOKEN}
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching templates: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=500, detail="Invalid JSON response from Facebook API")
+
+    return {"status": "success", "data": data}
