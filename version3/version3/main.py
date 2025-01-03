@@ -114,4 +114,3 @@ while(True):
     #     images=["https://egeniestores.com/wp-content/uploads/2024/04/xps5-banner-desktop-new-1-1.jpg.pagespeed.ic.RD_KoqHfXI.webp"],
     #     stream=True,
     # )
-
