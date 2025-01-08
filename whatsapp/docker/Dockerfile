@@ -23,6 +23,7 @@ RUN pip install langchainhub==0.1.21
 RUN pip install flask==3.0.3
 RUN pip install "pymongo[srv]"
 RUN pip install pytz
+RUN pip uninstall bson
 
 # Start a new stage from the slim image
 FROM python:3.11-slim

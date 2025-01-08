@@ -1,4 +1,5 @@
 import time, requests, os, json, hmac, hashlib
+import uuid
 from asyncio import Lock
 from pinecone import Pinecone
 from dotenv import load_dotenv
@@ -22,6 +23,9 @@ from pydantic import BaseModel
 from pytz import timezone
 from fastapi import WebSocket, WebSocketDisconnect
 from typing import Dict
+from bson.objectid import ObjectId
+from enum import Enum
+
 
 from send_mail import notify
 # Store WebSocket connections
@@ -46,6 +50,12 @@ db = mongo_client['Cluster0']  # database name
 support_requests = db['support_requests']  # collection name
 chat_history = db['chat_history']  # collection name
 
+
+MONGODB_URI2 = os.getenv("MONGODB_URI2")
+mongo_client2 = MongoClient(MONGODB_URI2)
+db2 = mongo_client2['Cluster0']  # database name
+conversations_collection = db["conversations"]
+messages_collection = db["messages"]
 
 
 # Regular dictionary to store processed message IDs with their timestamps
@@ -357,7 +367,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://egeniestores.com", "http://localhost", "http://wordpress.local", "http://wordpress.local:10004"],
+    allow_origins=["https://egeniestores.com", "https://heidelai.com","http://localhost", "http://wordpress.local", "http://wordpress.local:10004", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -424,6 +434,186 @@ async def signature_required(request: Request, x_hub_signature_256: str = Header
 
     if not validate_signature(payload, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Invalid signature")
+
+
+
+active_connections: List[WebSocket] = []
+
+@app.websocket("/ws/conversations")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    try:
+        while True:
+            # Wait for any messages (optional)
+            data = await websocket.receive_text()
+            # Process message if needed
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        active_connections.remove(websocket)
+
+# Call this when a new message arrives
+async def broadcast_new_message(conversation):
+    message = {
+        "type": "new_message",
+        "conversation": conversation
+    }
+    for connection in active_connections:
+        try:
+            await connection.send_text(json.dumps(message))
+        except Exception as e:
+            print(f"Error sending message: {e}")
+
+
+
+class MessageRole(str, Enum):
+    CUSTOMER = "customer"
+    AI = "ai"
+    AGENT = "agent"
+    SYSTEM = "system"
+
+class Message2(BaseModel):
+    id: str
+    platform: str
+    conversation_id: str
+    content: str
+    sender_id: str
+    role: MessageRole
+    timestamp: datetime
+    status: str = "sent"
+
+class Conversation(BaseModel):
+    id: str
+    platform: str
+    customer_id: str
+    customer_name: str
+    last_message: str
+    timestamp: datetime
+    unread_count: int = 0
+    avatar_url: Optional[str] = None
+    is_ai_enabled: bool = True
+    assigned_agent_id: Optional[str] = None
+
+
+# WebSocket Manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, client_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+        print(f"Client connected: {client_id}")
+
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+            print(f"Client disconnected: {client_id}")
+
+    async def broadcast(self, message: dict):
+        disconnected_clients = []
+        for client_id, websocket in self.active_connections.items():
+            try:
+                await websocket.send_json(message)
+            except Exception as e:
+                print(f"Error broadcasting to {client_id}: {e}")
+                disconnected_clients.append(client_id)
+        
+        for client_id in disconnected_clients:
+            self.disconnect(client_id)
+
+# Initialize manager
+manager = ConnectionManager()
+
+@app.get("/conversations")
+async def get_conversations():
+    conversations = list(conversations_collection.find({}))
+    return [Conversation(**conv).dict() for conv in conversations]
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversations(conversation_id: str):
+    conversations = list(conversations_collection.find({"conversation_id": conversation_id}))
+    return [Conversation(**conv).dict() for conv in conversations]
+
+@app.get("/conversations/{conversation_id}/messages")
+async def get_messages(conversation_id: str):
+    messages = list(messages_collection.find({"conversation_id": conversation_id}))
+    return [Message2(**msg).dict() for msg in messages]
+
+
+async def create_or_update_conversation(platform, customer_id, customer_name, last_message) -> str:
+    conversation_id = f"{platform}_{customer_id}"
+    conversation = {
+        "id": conversation_id,
+        "platform": platform,
+        "customer_id": customer_id,
+        "customer_name": customer_name,
+        "last_message": last_message,
+        "timestamp": datetime.now(),
+        "unread_count": 1,
+        "is_ai_enabled": True,  # Default to AI enabled
+        "assigned_agent_id": None
+    }
+    
+    conversations_collection.update_one(
+        {"id": conversation_id},
+        {"$set": conversation},
+        upsert=True
+    )
+    return conversation_id
+
+async def store_message(
+    content: str,
+    conversation_id: str,
+    sender_id: str,
+    role: MessageRole,
+    platform: str
+) -> str:
+    message = {
+        "id": str(uuid.uuid4()),
+        "platform": platform,
+        "conversation_id": conversation_id,
+        "content": content,
+        "sender_id": sender_id,
+        "role": role,
+        "timestamp": datetime.now(),
+        "status": "sent"
+    }
+
+    await manager.broadcast({
+    "type": "new_message",
+    "message": {
+        "id": str(uuid.uuid4()),
+        "platform": platform,
+        "conversation_id": conversation_id,
+        "content": content,
+        "sender_id": sender_id,
+        "role": role,
+        "timestamp": datetime.now(),
+        "status": "sent"
+    }
+    })
+    
+    messages_collection.insert_one(message)
+    return message["id"]
+
+
+# Add WebSocket endpoint
+@app.websocket("/ws2/{client_id}")
+async def websocket_endpoint(websocket: WebSocket):
+    # Retrieve the path parameter from websocket.path_params
+    client_id = websocket.path_params["client_id"]
+    await manager.connect(client_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            print(f"Received message from {client_id}: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(client_id)
+
+
+
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -681,6 +871,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     payload = await request.json()
     print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
+   
 
     if payload["object"] == "instagram":
         if "entry" in payload and len(payload["entry"]) > 0:
@@ -712,6 +903,49 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     user = name + " - @" + username
 
                     print(f"Message Received from {user}, Message: {message_text}")
+
+                     # Create or update conversation
+                    conversation_id = await create_or_update_conversation("instagram", username, name, message_text)
+                    
+                    
+                    # Check if conversation exists
+                    existing_conversation = conversations_collection.find_one({"id": conversation_id})
+                    
+                    conversation = conversations_collection.find_one({"id": conversation_id})
+
+                    
+                    message_id = await store_message(
+                        content=message_text,
+                        conversation_id=conversation_id,
+                        sender_id=username,
+                        role=MessageRole.CUSTOMER,
+                        platform="instagram"
+                    )
+
+                    
+                    
+
+                    # Broadcast appropriate event based on whether it's new or updated
+                    if not existing_conversation:
+                        await manager.broadcast({
+                            "type": "new_conversation",
+                            "conversation": conversation
+                        })
+                    else:
+                        await manager.broadcast({
+                            "type": "conversation_updated",
+                            "conversation": conversation
+                        })
+
+                    await manager.broadcast({
+                        "type": "new_message",
+                        "platform": "whatsapp",
+                        "message": {
+                            "sender_id": sender,
+                            "content": user_input,
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    })
 
                     if message_text == "Hi":
                         res = await send_ig_introduction(sender_id)
@@ -829,6 +1063,25 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 user_input = message["text"]["body"]
                                 print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", user_input)
 
+                                # Create or update conversation
+                                conversation_id = await create_or_update_conversation("whatsapp", sender, sender_name, user_input)
+                                
+                                # Check if conversation exists
+                                existing_conversation = conversations_collection.find_one({"id": conversation_id})
+                                
+                                conversation = conversations_collection.find_one({"id": conversation_id})
+
+                                message_id = await store_message(
+                                    content=user_input,
+                                    conversation_id=conversation_id,
+                                    sender_id=sender,
+                                    role=MessageRole.CUSTOMER,
+                                    platform="whatsapp"
+                                )
+
+                                broadcast_new_message(conversation)
+
+                               
                                 # Check if user is already in live agent mode
                                 is_live = await check_live_agent_status(sender)
                                 if is_live:
@@ -870,6 +1123,32 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 if is_live:
                                     # Store message and notify frontend only
                                     await store_whatsapp_history(sender, sender_name, user_input, "", [], [], [])
+                                    # Broadcast appropriate event based on whether it's new or updated
+                                    if not existing_conversation:
+                                        await manager.broadcast({
+                                            "type": "new_conversation",
+                                            "conversation": conversation
+                                        })
+                                    else:
+                                        await manager.broadcast({
+                                            "type": "conversation_updated",
+                                            "conversation": conversation
+                                        })
+
+                                    await manager.broadcast({
+                                        "type": "new_message",
+                                        "platform": "whatsapp",
+                                        "message": {
+                                            "id" : message_id,
+                                            "conversation_id": conversation_id,
+                                            "content": user_input,
+                                            "sender_id": sender,
+                                            "role" : MessageRole.CUSTOMER,
+                                            "timestamp": datetime.now().isoformat(),
+                                            "status": "sent"
+                                        }
+                                    })
+
                                     return {"status": "ok"}
 
                                 client_id = sender
@@ -905,11 +1184,76 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         await store_whatsapp_history(sender, sender_name, user_input, f"Here are some {search_term} that you might be interested in.", [], [], products_space)
                                         insert_into_whatsapp(whatsapp_user, message['text']['body'], response['output'], time_taken)
 
+                                        ai_message_id = await store_message(
+                                            content="Here are some {search_term} that you might be interested in.",
+                                            conversation_id=conversation_id,
+                                            sender_id="AI_BOT",
+                                            role=MessageRole.AI,
+                                            platform="whatsapp"
+                                        )
+
+                                        
+
+                                         # Broadcast appropriate event based on whether it's new or updated
+                                        if not existing_conversation:
+                                            await manager.broadcast({
+                                                "type": "new_conversation",
+                                                "conversation": conversation
+                                            })
+                                        else:
+                                            await manager.broadcast({
+                                                "type": "conversation_updated",
+                                                "conversation": conversation
+                                            })
+
+                                        await manager.broadcast({
+                                            "type": "new_message",
+                                            "platform": "whatsapp",
+                                            "message": {
+                                                "sender_id": sender,
+                                                "content": user_input,
+                                                "timestamp": datetime.now().isoformat()
+                                            }
+                                        })
+
+
                                         search_term = ""
                                         print("websocket_product_data 2: ", websocket_product_data) 
                                     else:
                                         print("Came in else")
                                         await send_message(sender, response['output'])
+
+                                        ai_message_id = await store_message(
+                                            content=response['output'],
+                                            conversation_id=conversation_id,
+                                            sender_id="AI_BOT",
+                                            role=MessageRole.AI,
+                                            platform="whatsapp"
+                                        )
+
+                                        
+
+                                         # Broadcast appropriate event based on whether it's new or updated
+                                        if not existing_conversation:
+                                            await manager.broadcast({
+                                                "type": "new_conversation",
+                                                "conversation": conversation
+                                            })
+                                        else:
+                                            await manager.broadcast({
+                                                "type": "conversation_updated",
+                                                "conversation": conversation
+                                            })
+
+                                        await manager.broadcast({
+                                            "type": "new_message",
+                                            "platform": "whatsapp",
+                                            "message": {
+                                                "sender_id": sender,
+                                                "content": user_input,
+                                                "timestamp": datetime.now().isoformat()
+                                            }
+                                        })
 
                                         toc = time.perf_counter()
                                         print(f"Response took {toc - tic:0.4f} seconds")
@@ -2511,3 +2855,7 @@ async def create_template():
         raise HTTPException(status_code=500, detail="Invalid JSON response from Facebook API")
 
     return {"status": "success", "data": data}
+
+
+
+
