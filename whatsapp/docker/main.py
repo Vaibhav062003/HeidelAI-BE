@@ -532,9 +532,12 @@ async def get_conversations():
     return [Conversation(**conv).dict() for conv in conversations]
 
 @app.get("/conversations/{conversation_id}")
-async def get_conversations(conversation_id: str):
-    conversations = list(conversations_collection.find({"conversation_id": conversation_id}))
-    return [Conversation(**conv).dict() for conv in conversations]
+async def get_conversation(conversation_id: str):
+    conversation = conversations_collection.find_one({"id": conversation_id})
+    if conversation:
+        conversation["_id"] = str(conversation["_id"])  # Convert ObjectId to string
+        return conversation
+    return {"message": "No conversation found"}
 
 @app.get("/conversations/{conversation_id}/messages")
 async def get_messages(conversation_id: str):
@@ -561,6 +564,22 @@ async def create_or_update_conversation(platform, customer_id, customer_name, la
         {"$set": conversation},
         upsert=True
     )
+
+    await manager.broadcast({
+        "type": "conversation_updated",
+        "conversation": {
+        "id": conversation_id,
+        "platform": platform,
+        "customer_id": customer_id,
+        "customer_name": customer_name,
+        "last_message": last_message,
+        "timestamp": datetime.now().isoformat(),
+        "unread_count": 1,
+        "is_ai_enabled": True,  # Default to AI enabled
+        "assigned_agent_id": None
+    }
+    })
+
     return conversation_id
 
 async def store_message(
@@ -590,10 +609,12 @@ async def store_message(
         "content": content,
         "sender_id": sender_id,
         "role": role,
-        "timestamp": datetime.now(),
+        "timestamp": datetime.now().isoformat(),
         "status": "sent"
     }
     })
+
+    
     
     messages_collection.insert_one(message)
     return message["id"]
@@ -611,6 +632,19 @@ async def websocket_endpoint(websocket: WebSocket):
             print(f"Received message from {client_id}: {data}")
     except WebSocketDisconnect:
         manager.disconnect(client_id)
+
+# Add WebSocket endpoint
+# @app.websocket("/ws/conversationlist/{client_id}")
+# async def websocket_endpoint(websocket: WebSocket):
+#     # Retrieve the path parameter from websocket.path_params
+#     client_id = websocket.path_params["client_id"]
+#     await manager.connect(client_id, websocket)
+#     try:
+#         while True:
+#             data = await websocket.receive_json()
+#             print(f"Received message from {client_id}: {data}")
+#     except WebSocketDisconnect:
+#         manager.disconnect(client_id)
 
 
 
@@ -1079,7 +1113,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     platform="whatsapp"
                                 )
 
-                                broadcast_new_message(conversation)
+                                await broadcast_new_message(conversation)
 
                                
                                 # Check if user is already in live agent mode
