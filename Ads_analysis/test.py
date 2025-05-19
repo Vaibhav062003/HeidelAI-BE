@@ -43,7 +43,7 @@ def get_max_campaign_insights_as_natural_language(campaign_id):
 
         campaign_insights = my_account.get_insights(
             fields = [
-        'campaign_name',          # Name of the ad campaign
+    'campaign_name',          # Name of the ad campaign
     'clicks',                # Number of clicks on the ad
     'cpc',                   # Cost per click
     'ctr',                   # Click-through rate (clicks/impressions)
@@ -54,7 +54,7 @@ def get_max_campaign_insights_as_natural_language(campaign_id):
     'conversions',           # Number of desired actions taken
     'cost_per_conversion',   # Average cost for each conversion
     'conversion_values',     # Monetary value of conversions
-    'website_ctr',          # Click-through rate for website clicks
+    # 'website_ctr',          # Click-through rate for website clicks
     'video_play_actions',    # Number of times videos were played
     'video_avg_time_watched_actions',  # Average duration of video views
     'objective',            # Campaign objective (e.g., awareness, conversions)
@@ -62,37 +62,37 @@ def get_max_campaign_insights_as_natural_language(campaign_id):
     'cost_per_unique_click', # Cost per unique click
     'actions',              # All actions taken on the ad
     'action_values',        # Monetary values of different actions
-    'outbound_clicks',      # Clicks that led away from Facebook
-    'cost_per_unique_outbound_click', # Cost per unique outbound click
-    'account_currency',     # Currency used for the account
-    'account_id',          # Facebook Ad account ID
-    'account_name',        # Name of the ad account
+    # 'outbound_clicks',      # Clicks that led away from Facebook
+    # 'cost_per_unique_outbound_click', # Cost per unique outbound click
+    # 'account_currency',     # Currency used for the account
+    # 'account_id',          # Facebook Ad account ID
+    # 'account_name',        # Name of the ad account
     'attribution_setting', # How conversions are attributed
-    'ad_id',              # Individual ad ID
-    'ad_name',            # Name of the specific ad
-    'adset_id',          # Ad set identifier
-    'adset_name',        # Name of the ad set
-    'campaign_id',       # Campaign identifier
-    'ad_click_actions',  # Detailed breakdown of click actions
-    'ad_impression_actions', # Detailed breakdown of impression actions
-    'auction_bid',       # Bid amount in auction
-    'auction_competitiveness', # Level of auction competition
-    'auction_max_competitor_bid', # Highest competitor bid
-    'buying_type',       # Type of ad buying (auction/reach)
+    # 'ad_id',              # Individual ad ID
+    # 'ad_name',            # Name of the specific ad
+    # 'adset_id',          # Ad set identifier
+    # 'adset_name',        # Name of the ad set
+    # 'campaign_id',       # Campaign identifier
+    # 'ad_click_actions',  # Detailed breakdown of click actions
+    # 'ad_impression_actions', # Detailed breakdown of impression actions
+    # 'auction_bid',       # Bid amount in auction
+    # 'auction_competitiveness', # Level of auction competition
+    # 'auction_max_competitor_bid', # Highest competitor bid
+    # 'buying_type',       # Type of ad buying (auction/reach)
     'optimization_goal', # What the campaign is optimizing for
-    'canvas_avg_view_percent', # Average view percentage of canvas ads
-    'canvas_avg_view_time',    # Average viewing time of canvas ads
-    'instant_experience_clicks_to_open', # Clicks to open instant experience
-    'instant_experience_clicks_to_start', # Clicks to start instant experience
-    'instant_experience_outbound_clicks', # Outbound clicks from instant experience
-    'catalog_segment_actions', # Actions related to catalog segments
-    'catalog_segment_value',   # Value from catalog segments
+    # 'canvas_avg_view_percent', # Average view percentage of canvas ads
+    # 'canvas_avg_view_time',    # Average viewing time of canvas ads
+    # 'instant_experience_clicks_to_open', # Clicks to open instant experience
+    # 'instant_experience_clicks_to_start', # Clicks to start instant experience
+    # 'instant_experience_outbound_clicks', # Outbound clicks from instant experience
+    # 'catalog_segment_actions', # Actions related to catalog segments
+    # 'catalog_segment_value',   # Value from catalog segments/
     'catalog_segment_value_mobile_purchase_roas', # ROAS for mobile catalog purchases
     'catalog_segment_value_omni_purchase_roas',   # ROAS for omnichannel purchases
-    'catalog_segment_value_website_purchase_roas', # ROAS for website catalog purchases
+    # 'catalog_segment_value_website_purchase_roas', # ROAS for website catalog purchases
     'converted_product_app_custom_event_fb_mobile_purchase', # Mobile app purchases
     'converted_product_app_custom_event_fb_mobile_purchase_value', # Value of mobile app purchases
-    'converted_product_offline_purchase', # Offline purchase conversions
+    # 'converted_product_offline_purchase', # Offline purchase conversions
     'converted_product_offline_purchase_value', # Value of offline purchases
     'converted_product_omni_purchase', # Omnichannel purchases
     'converted_product_omni_purchase_values', # Value of omnichannel purchases
@@ -171,7 +171,8 @@ def get_max_campaign_insights_as_natural_language(campaign_id):
 ,
             params={
                 "date_preset": "this_quarter",
-                "breakdowns": ["age", "gender"],
+                "breakdowns": ["age"],
+                # "breakdowns": ["age", "gender"],
                 "level": "campaign",
                 'filtering': [{'field': 'campaign.id', 'operator': 'EQUAL', 'value': campaign_id}],
                 "limit": 1000
