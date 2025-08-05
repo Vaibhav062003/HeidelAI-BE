@@ -1,0 +1,94 @@
+from core.managers import manager, manager2
+from database import get_mongo_db
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from core.globals import instagram_connections_map, whatsapp_connections_map
+
+router = APIRouter(tags=["Websockets"])
+
+db = get_mongo_db()
+
+# Add a new WebSocket endpoint for Instagram
+@router.websocket("/ws2/instagram/{client_id}/{instagram_id}")
+async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str, instagram_id: str):
+    """WebSocket endpoint that uses both client_id and instagram_id for Instagram-specific connections"""
+    # Create a combined key for Instagram connections
+    connection_key = f"{client_id}_{instagram_id}"
+    await manager.connect(connection_key, websocket)
+    
+    try:
+        # Store the Instagram ID mapping for notifications
+        if instagram_id:
+            # Add to a dictionary that maps Instagram IDs to connection keys
+            if instagram_id not in instagram_connections_map:
+                instagram_connections_map[instagram_id] = set()
+            instagram_connections_map[instagram_id].add(connection_key)
+            
+            print(f"Registered Instagram connection for ID: {instagram_id}")
+        
+        # Handle incoming messages
+        while True:
+            data = await websocket.receive_json()
+            print(f"Received message from Instagram connection {connection_key}: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(connection_key)
+        # Clean up Instagram ID mapping
+        if instagram_id and instagram_id in instagram_connections_map:
+            instagram_connections_map[instagram_id].discard(connection_key)
+            if not instagram_connections_map[instagram_id]:
+                del instagram_connections_map[instagram_id]
+
+# WebSocket endpoint for WhatsApp
+@router.websocket("/ws2/whatsapp/{client_id}/{whatsapp_id}")
+async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, whatsapp_id: str):
+    """WebSocket endpoint for WhatsApp-specific connections"""
+
+    # query whatsapp_connections to retrieve whatsapp_business_id based on user_id
+    wa_connection = db.whatsapp_connections.find_one(
+            {"user_id": whatsapp_id},
+            {"business_account_id": 1, "_id": 0}
+        )
+
+    if not wa_connection or not wa_connection.get("business_account_id"):
+        print(f"No WhatsApp connection found for user ID: {whatsapp_id}")
+        await websocket.close(code=1008, reason="Invalid WhatsApp connection")
+        return
+    
+    whatsapp_business_id = wa_connection["business_account_id"]
+
+    # Create a combined key for WhatsApp connections
+    connection_key = f"{client_id}_{whatsapp_business_id}"
+    await manager.connect(connection_key, websocket)
+    
+    try:
+        # Store the WhatsApp ID mapping for notifications
+        if whatsapp_business_id:
+            # Add to a dictionary that maps WhatsApp IDs to connection keys
+            if whatsapp_business_id not in whatsapp_connections_map:
+                whatsapp_connections_map[whatsapp_business_id] = set()
+            whatsapp_connections_map[whatsapp_business_id].add(connection_key)
+            
+            print(f"Registered WhatsApp connection for ID: {connection_key}")
+        
+        # Handle incoming messages
+        while True:
+            data = await websocket.receive_json()
+            print(f"Received message from WhatsApp connection {connection_key}: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(connection_key)
+        # Clean up WhatsApp ID mapping
+        if whatsapp_business_id and whatsapp_business_id in whatsapp_connections_map:
+            whatsapp_connections_map[whatsapp_business_id].discard(connection_key)
+            if not whatsapp_connections_map[whatsapp_business_id]:
+                del whatsapp_connections_map[whatsapp_business_id]
+
+@router.websocket("/cs/{client_id}")
+async def websocket_endpoint(websocket: WebSocket):
+    # Retrieve the path parameter from websocket.path_params
+    client_id = websocket.path_params["client_id"]
+    await manager2.connect(client_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            print(f"Received message from {client_id}: {data}")
+    except WebSocketDisconnect:
+        manager2.disconnect(client_id)
