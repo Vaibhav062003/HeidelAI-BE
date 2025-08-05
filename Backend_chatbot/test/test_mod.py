@@ -279,8 +279,8 @@ def fetechGoogleAnalyticsData(start_date: str, end_date: str):
             output_string += f"{metric_name}: {metric_value.value}\n"
 
     # Use LLM to analyze the data
-    llm_heavy, _ = initialize_llm()
-    response = llm_heavy(str(analysis_prompt) + "\n" + str(output_string))
+    llm_light, _ = initialize_llm()
+    response = llm_light(str(analysis_prompt) + "\n" + str(output_string))
 
     return response
 
@@ -352,8 +352,8 @@ def fetchClarityData(optional_arg: Optional[str] = None) -> str:
                     result += f"\"{entry.get('name', 'N/A')}\" - {entry.get('sessionsCount', 'N/A')} sessions\n"
 
     # Use LLM to analyze the data
-    llm_heavy, _ = initialize_llm()
-    response = llm_heavy.invoke(str(analysis_prompt) + "\n" + str(result))
+    llm_light, _ = initialize_llm()
+    response = llm_light.invoke(str(analysis_prompt) + "\n" + str(result))
 
     return response
 
@@ -489,8 +489,8 @@ def fetchDemographicsData(optional_arg: Optional[str] = None) -> str:
     data = demographics_insights()
 
     # Use LLM to analyze the data
-    llm_heavy, _ = initialize_llm()
-    response = llm_heavy.invoke(str(analysis_prompt) + "\n" + str(data))
+    llm_light, _ = initialize_llm()
+    response = llm_light.invoke(str(analysis_prompt) + "\n" + str(data))
 
     return response
 
@@ -546,8 +546,8 @@ def fetchInstagramMediaData(optional_arg: Optional[str] = None) -> str:
             post_insights += f"{insight['title']}: {insight['values'][0]['value']}\n"
 
     # Use LLM to analyze the data
-    llm_heavy, _ = initialize_llm()
-    response = llm_heavy.invoke(str(analysis_prompt) + "\n" + str(post_insights))
+    llm_light, _ = initialize_llm()
+    response = llm_light.invoke(str(analysis_prompt) + "\n" + str(post_insights))
 
     return response
 
@@ -591,3 +591,4 @@ while True:
     toc = time.perf_counter()
     print(response['output'])
     print(f"time_taken {toc - tic:0.4f} seconds")
+    

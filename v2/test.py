@@ -76,7 +76,7 @@ def fetch_product_data(query_str: str) -> str:
         query_str (str): The user's search query, category, and price in the format "query, category, price".
 
     Returns:
-        str: A conformation of the products displayed to the user.
+        str: A confirmation of the products displayed to the user.
     """
 
     global websocket_product_data

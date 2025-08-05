@@ -1,4 +1,5 @@
 import time, requests, os, json, hmac, hashlib
+import uuid
 from asyncio import Lock
 from pinecone import Pinecone
 from dotenv import load_dotenv
@@ -15,6 +16,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from collections import OrderedDict
 from langchain import hub
+from pymongo import MongoClient
+from datetime import datetime
+from typing import List, Optional
+from pydantic import BaseModel
+from pytz import timezone
+from fastapi import WebSocket, WebSocketDisconnect
+from typing import Dict
+from bson.objectid import ObjectId
+from enum import Enum
+
+
+from send_mail import notify
+# Store WebSocket connections
+connected_clients: Dict[str, WebSocket] = {}
+
+
+from fastapi import WebSocket
+
+
 
 # from datetime import datetime
 # from pytz import timezone
@@ -22,6 +42,20 @@ from langchain import hub
 # from custom_mail_service import send_email
 # india_time = datetime.now(timezone('Asia/Kolkata')).strftime("%Y-%m-%d %H:%M:%S")
 # send_email("rounaklongani@gmail.com", "Egenie - Koyeb" ,"Service was redepolyed", f"Koyeb of egeniesales20@gmail.com was redeployed at {india_time}")
+
+# Add MongoDB connection for whatsapp support requests
+MONGODB_URI = os.getenv("MONGODB_URI")
+mongo_client = MongoClient(MONGODB_URI)
+db = mongo_client['Cluster0']  # database name
+support_requests = db['support_requests']  # collection name
+chat_history = db['chat_history']  # collection name
+
+
+MONGODB_URI2 = os.getenv("MONGODB_URI2")
+mongo_client2 = MongoClient(MONGODB_URI2)
+db2 = mongo_client2['Cluster0']  # database name
+conversations_collection = db["conversations"]
+messages_collection = db["messages"]
 
 
 # Regular dictionary to store processed message IDs with their timestamps
@@ -41,6 +75,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERSION = os.getenv("VERSION")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 APP_SECRET = os.getenv("APP_SECRET")
+BUSINESS_ACCOUNT_ID = os.getenv("BUSINESS_ACCOUNT_ID")
 
 # Define the path to your service account JSON file
 SERVICE_ACCOUNT_FILE = 'whatsapp-chatbot-history-cf43052a413d.json'
@@ -329,13 +364,40 @@ agent_executor = get_agent()
 
 app = FastAPI()
 
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://egeniestores.com", "http://localhost"],
+    allow_origins=["https://egeniestores.com", "https://heidelai.com","http://localhost", "http://wordpress.local", "http://wordpress.local:10004", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    try:
+        await websocket.accept()
+        connected_clients[user_id] = websocket
+        print(f"Client connected: {user_id}")
+        
+        try:
+            while True:
+                # Keep the connection alive and wait for messages
+                data = await websocket.receive_text()
+                # Handle any incoming messages if needed
+                print(f"Received message from {user_id}: {data}")
+                
+        except WebSocketDisconnect:
+            print(f"Client disconnected: {user_id}")
+        finally:
+            # Clean up when the connection is closed
+            if user_id in connected_clients:
+                del connected_clients[user_id]
+                
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        if user_id in connected_clients:
+            del connected_clients[user_id]
 
 def remove_expired_message_ids():
     current_time = time.time()
@@ -373,6 +435,220 @@ async def signature_required(request: Request, x_hub_signature_256: str = Header
     if not validate_signature(payload, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
+
+
+active_connections: List[WebSocket] = []
+
+@app.websocket("/ws/conversations")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    try:
+        while True:
+            # Wait for any messages (optional)
+            data = await websocket.receive_text()
+            # Process message if needed
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        active_connections.remove(websocket)
+
+# Call this when a new message arrives
+async def broadcast_new_message(conversation):
+    message = {
+        "type": "new_message",
+        "conversation": conversation
+    }
+    for connection in active_connections:
+        try:
+            await connection.send_text(json.dumps(message))
+        except Exception as e:
+            print(f"Error sending message: {e}")
+
+
+
+class MessageRole(str, Enum):
+    CUSTOMER = "customer"
+    AI = "ai"
+    AGENT = "agent"
+    SYSTEM = "system"
+
+class Message2(BaseModel):
+    id: str
+    platform: str
+    conversation_id: str
+    content: str
+    sender_id: str
+    role: MessageRole
+    timestamp: datetime
+    status: str = "sent"
+
+class Conversation(BaseModel):
+    id: str
+    platform: str
+    customer_id: str
+    customer_name: str
+    last_message: str
+    timestamp: datetime
+    unread_count: int = 0
+    avatar_url: Optional[str] = None
+    is_ai_enabled: bool = True
+    assigned_agent_id: Optional[str] = None
+
+
+# WebSocket Manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, client_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+        print(f"Client connected: {client_id}")
+
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+            print(f"Client disconnected: {client_id}")
+
+    async def broadcast(self, message: dict):
+        disconnected_clients = []
+        for client_id, websocket in self.active_connections.items():
+            try:
+                await websocket.send_json(message)
+            except Exception as e:
+                print(f"Error broadcasting to {client_id}: {e}")
+                disconnected_clients.append(client_id)
+        
+        for client_id in disconnected_clients:
+            self.disconnect(client_id)
+
+# Initialize manager
+manager = ConnectionManager()
+
+@app.get("/conversations")
+async def get_conversations():
+    conversations = list(conversations_collection.find({}))
+    return [Conversation(**conv).dict() for conv in conversations]
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str):
+    conversation = conversations_collection.find_one({"id": conversation_id})
+    if conversation:
+        conversation["_id"] = str(conversation["_id"])  # Convert ObjectId to string
+        return conversation
+    return {"message": "No conversation found"}
+
+@app.get("/conversations/{conversation_id}/messages")
+async def get_messages(conversation_id: str):
+    messages = list(messages_collection.find({"conversation_id": conversation_id}))
+    return [Message2(**msg).dict() for msg in messages]
+
+
+async def create_or_update_conversation(platform, customer_id, customer_name, last_message) -> str:
+    conversation_id = f"{platform}_{customer_id}"
+    conversation = {
+        "id": conversation_id,
+        "platform": platform,
+        "customer_id": customer_id,
+        "customer_name": customer_name,
+        "last_message": last_message,
+        "timestamp": datetime.now(),
+        "unread_count": 1,
+        "is_ai_enabled": True,  # Default to AI enabled
+        "assigned_agent_id": None
+    }
+    
+    conversations_collection.update_one(
+        {"id": conversation_id},
+        {"$set": conversation},
+        upsert=True
+    )
+
+    await manager.broadcast({
+        "type": "conversation_updated",
+        "conversation": {
+        "id": conversation_id,
+        "platform": platform,
+        "customer_id": customer_id,
+        "customer_name": customer_name,
+        "last_message": last_message,
+        "timestamp": datetime.now().isoformat(),
+        "unread_count": 1,
+        "is_ai_enabled": True,  # Default to AI enabled
+        "assigned_agent_id": None
+    }
+    })
+
+    return conversation_id
+
+async def store_message(
+    content: str,
+    conversation_id: str,
+    sender_id: str,
+    role: MessageRole,
+    platform: str
+) -> str:
+    message = {
+        "id": str(uuid.uuid4()),
+        "platform": platform,
+        "conversation_id": conversation_id,
+        "content": content,
+        "sender_id": sender_id,
+        "role": role,
+        "timestamp": datetime.now(),
+        "status": "sent"
+    }
+
+    await manager.broadcast({
+    "type": "new_message",
+    "message": {
+        "id": str(uuid.uuid4()),
+        "platform": platform,
+        "conversation_id": conversation_id,
+        "content": content,
+        "sender_id": sender_id,
+        "role": role,
+        "timestamp": datetime.now().isoformat(),
+        "status": "sent"
+    }
+    })
+
+    
+    
+    messages_collection.insert_one(message)
+    return message["id"]
+
+
+# Add WebSocket endpoint
+@app.websocket("/ws2/{client_id}")
+async def websocket_endpoint(websocket: WebSocket):
+    # Retrieve the path parameter from websocket.path_params
+    client_id = websocket.path_params["client_id"]
+    await manager.connect(client_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            print(f"Received message from {client_id}: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(client_id)
+
+# Add WebSocket endpoint
+# @app.websocket("/ws/conversationlist/{client_id}")
+# async def websocket_endpoint(websocket: WebSocket):
+#     # Retrieve the path parameter from websocket.path_params
+#     client_id = websocket.path_params["client_id"]
+#     await manager.connect(client_id, websocket)
+#     try:
+#         while True:
+#             data = await websocket.receive_json()
+#             print(f"Received message from {client_id}: {data}")
+#     except WebSocketDisconnect:
+#         manager.disconnect(client_id)
+
+
+
+
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     # This is for the webhook verification (GET request)
@@ -406,6 +682,211 @@ Incoming webhook payload: {
   ]
 }
 """
+async def check_live_agent_status(sender_id: str) -> bool:
+    """
+    Check if a user is currently in live agent mode
+    
+    Args:
+        sender_id (str): The WhatsApp ID of the sender
+        
+    Returns:
+        bool: True if user is in live agent mode, False otherwise
+    """
+    try:
+        # Check support_requests collection for active status
+        request = support_requests.find_one({
+            "user_id": sender_id,
+            "status": {"$in": ["pending", "active"]},  # Check for both pending and active states
+            "platform": "whatsapp"
+        })
+        
+        return bool(request)  # Returns True if request exists, False otherwise
+        
+    except Exception as e:
+        print(f"Error checking live agent status: {e}")
+        return False
+
+# Update handle_live_agent_request to set the status
+async def handle_live_agent_request(sender_id: str, sender_name: str):
+    """Handle live agent request by storing user info and chat history in MongoDB"""
+    
+    # Get chat history from Firestore
+    chat_history = get_session_history(sender_id)
+    
+    # Format messages for MongoDB
+    formatted_messages = []
+    for msg in chat_history.messages:
+        formatted_messages.append({
+            "role": msg.type,
+            "content": msg.content,
+            "timestamp": msg.additional_kwargs.get("timestamp", datetime.now())
+        })
+    
+    # Create support request document
+    support_request = {
+        "user_id": sender_id,
+        "user_name": sender_name,
+        "status": "pending",  # pending, active, resolved
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+        "chat_history": formatted_messages,
+        "platform": "whatsapp"
+    }
+    
+    try:
+        # Check if there's an existing request
+        existing_request = support_requests.find_one({
+            "user_id": sender_id,
+            "status": {"$in": ["pending", "active"]}
+        })
+        
+        if existing_request:
+            # Update existing request
+            support_requests.update_one(
+                {"_id": existing_request["_id"]},
+                {
+                    "$set": {
+                        "status": "pending",
+                        "updated_at": datetime.now(),
+                        "chat_history": formatted_messages
+                    }
+                }
+            )
+        else:
+            # Insert new request
+            result = support_requests.insert_one(support_request)
+            print(f"Support request created with ID: {result.inserted_id}")
+        
+        return True
+    except Exception as e:
+        print(f"Error creating support request: {e}")
+        return False
+
+
+# Function to notify connected clients
+async def notify_client(client_id: str, message: dict):
+    if client_id in connected_clients:
+        try:
+            await connected_clients[client_id].send_json(message)
+        except Exception as e:
+            print(f"Error notifying client {client_id}: {e}")
+            # Remove dead connections
+            if client_id in connected_clients:
+                del connected_clients[client_id]
+
+
+# Function to whatsapp history into Mongo DB
+async def store_whatsapp_history(sender_id: str, sender_name: str, sender_message: str, bot_message: str, 
+                                cart_data: List, address_data: List, carousel_data: List, message_id: Optional[str] = None):
+    """Store WhatsApp chat history in MongoDB"""
+    try:
+        # Get current time in Indian timezone
+        india_tz = timezone('Asia/Kolkata')
+        current_time = datetime.now(india_tz)
+
+        # Format messages for chat history, only include non-empty messages
+        new_message = []
+        
+        if sender_message:
+            new_message.append({
+                "role": "user",
+                "content": sender_message,
+                "timestamp": current_time,
+                "id": None  # User messages don't have IDs
+            })
+            
+        if bot_message:
+            new_message.append({
+                "role": "assistant",
+                "content": bot_message,
+                "timestamp": current_time,
+                "id": message_id  # Include message ID for admin/bot messages
+            })
+
+        # Skip if no messages to store
+        if not new_message:
+            return True
+
+        # Check if document exists
+        existing_doc = chat_history.find_one({"user_id": sender_id})
+
+        if existing_doc:
+            # Update existing document
+            existing_messages = existing_doc.get('chat_history', [])
+            updated_messages = existing_messages + new_message
+
+            # Keep only the last 20 messages
+            if len(updated_messages) > 40:
+                updated_messages = updated_messages[-40:]
+
+            update_data = {
+                "chat_history": updated_messages,
+                "last_updated": current_time
+            }
+
+            # Update additional data if provided
+            if cart_data:
+                update_data["cart_data"] = cart_data
+            if address_data:
+                update_data["address_data"] = address_data
+            if carousel_data:
+                update_data["carousel_data"] = carousel_data
+
+            chat_history.update_one(
+                {"user_id": sender_id},
+                {"$set": update_data}
+            )
+        else:
+            # Create new document
+            new_doc = {
+                "user_id": sender_id,
+                "user_name": sender_name,
+                "chat_history": new_message,
+                "cart_data": cart_data if cart_data else [],
+                "address_data": address_data if address_data else [],
+                "carousel_data": carousel_data if carousel_data else [],
+                "created_at": current_time,
+                "last_updated": current_time
+            }
+            chat_history.insert_one(new_doc)
+
+        print(f"Successfully stored/updated chat history for user: {sender_id} in MongoDB")
+
+        # Notify via WebSocket if client is connected
+        if sender_id in connected_clients:
+            try:
+                # Send WebSocket notifications for non-empty messages
+                if sender_message:
+                    await connected_clients[sender_id].send_json({
+                        "type": "new_message",
+                        "message": {
+                            "role": "human",
+                            "content": sender_message,
+                            "timestamp": current_time.isoformat(),
+                            "id": None
+                        }
+                    })
+                if bot_message:
+                    await connected_clients[sender_id].send_json({
+                        "type": "new_message",
+                        "message": {
+                            "role": "assistant",
+                            "content": bot_message,
+                            "timestamp": current_time.isoformat(),
+                            "id": message_id
+                        }
+                    })
+            except Exception as ws_error:
+                print(f"WebSocket send error: {ws_error}")
+                # Remove dead connections
+                if sender_id in connected_clients:
+                    del connected_clients[sender_id]
+
+        return True
+
+    except Exception as e:
+        print(f"Error storing chat history: {e}")
+        return False
 
 sender_name = ""
 
@@ -424,6 +905,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     payload = await request.json()
     print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
+   
 
     if payload["object"] == "instagram":
         if "entry" in payload and len(payload["entry"]) > 0:
@@ -455,7 +937,49 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     user = name + " - @" + username
 
                     print(f"Message Received from {user}, Message: {message_text}")
-                    insert_into_instagram(user, message_text, "", 0) 
+
+                     # Create or update conversation
+                    conversation_id = await create_or_update_conversation("instagram", username, name, message_text)
+                    
+                    
+                    # Check if conversation exists
+                    existing_conversation = conversations_collection.find_one({"id": conversation_id})
+                    
+                    conversation = conversations_collection.find_one({"id": conversation_id})
+
+                    
+                    message_id = await store_message(
+                        content=message_text,
+                        conversation_id=conversation_id,
+                        sender_id=username,
+                        role=MessageRole.CUSTOMER,
+                        platform="instagram"
+                    )
+
+                    
+                    
+
+                    # Broadcast appropriate event based on whether it's new or updated
+                    if not existing_conversation:
+                        await manager.broadcast({
+                            "type": "new_conversation",
+                            "conversation": conversation
+                        })
+                    else:
+                        await manager.broadcast({
+                            "type": "conversation_updated",
+                            "conversation": conversation
+                        })
+
+                    await manager.broadcast({
+                        "type": "new_message",
+                        "platform": "whatsapp",
+                        "message": {
+                            "sender_id": sender,
+                            "content": user_input,
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    })
 
                     if message_text == "Hi":
                         res = await send_ig_introduction(sender_id)
@@ -523,6 +1047,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             doc_ref.update({'messages': messages})
                             print("Document updated with trimmed messages.")
     else:
+        # Payload is WhatsApp
+
         await signature_required(request, x_hub_signature_256)
 
         global sender_name
@@ -571,14 +1097,96 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 user_input = message["text"]["body"]
                                 print("Message Received from Name: ", sender_name, ", Number: ",sender ,", Message: ", user_input)
 
+                                # Create or update conversation
+                                conversation_id = await create_or_update_conversation("whatsapp", sender, sender_name, user_input)
+                                
+                                # Check if conversation exists
+                                existing_conversation = conversations_collection.find_one({"id": conversation_id})
+                                
+                                conversation = conversations_collection.find_one({"id": conversation_id})
+
+                                message_id = await store_message(
+                                    content=user_input,
+                                    conversation_id=conversation_id,
+                                    sender_id=sender,
+                                    role=MessageRole.CUSTOMER,
+                                    platform="whatsapp"
+                                )
+
+                                await broadcast_new_message(conversation)
+
+                               
+                                # Check if user is already in live agent mode
+                                is_live = await check_live_agent_status(sender)
+                                if is_live:
+                                    # Only store the message and notify frontend
+                                    await store_whatsapp_history(
+                                        sender_id=sender,
+                                        sender_name=sender_name,
+                                        sender_message=user_input,
+                                        bot_message="",
+                                        cart_data=[],
+                                        address_data=[],
+                                        carousel_data=[]
+                                    )
+                                    return {"status": "ok"}
+
                                 if user_input == "Hi":
                                     await send_introduction(sender, sender_name)
+                                    await store_whatsapp_history(sender, sender_name, user_input, f"Hi {sender_name}!👋 I'm *Talkative*, an AI-powered agent for eGenie Stores. I'm here to help you find the perfect tech products for your needs. \n \n✅ *Whether you're looking for:* \n  - A new phone\n  - A powerful gaming laptop\n  - A custom-built PC \n\nI can help you find the *best* options for your budget and preferences.🎉 \n\nFeel free to ask me any questions you may have about our *services* or *policies* , and I'll be happy to assist!📕", [], [], [])
                                     print("Introduction sent to Name: ", sender_name, ", Number: ",sender )
                                     continue
         
+                                if ("live agent" in user_input.lower() or
+                                "sales representative" in user_input.lower() or
+                                "human" in user_input.lower() or
+                                "customer support" in user_input.lower()):
+                                    success = await handle_live_agent_request(sender, sender_name)
+                                    if success:
+                                        response = "Thank you for requesting live support. Our team has been notified and will get back to you shortly."
+                                    else:
+                                        response = "We're sorry, there was an error processing your live support request. Please try again later."
+                                    await send_message(sender, response)
+                                    customer_details = sender_name + " - " + sender
+                                    notify(customer_details, "egeniestore@gmail.com")
+                                    await store_whatsapp_history(sender, sender_name, user_input, response, [], [], [])
+                                    return {"status": "ok"}
+
+
+                                is_live = await check_live_agent_status(sender)
+                                if is_live:
+                                    # Store message and notify frontend only
+                                    await store_whatsapp_history(sender, sender_name, user_input, "", [], [], [])
+                                    # Broadcast appropriate event based on whether it's new or updated
+                                    if not existing_conversation:
+                                        await manager.broadcast({
+                                            "type": "new_conversation",
+                                            "conversation": conversation
+                                        })
+                                    else:
+                                        await manager.broadcast({
+                                            "type": "conversation_updated",
+                                            "conversation": conversation
+                                        })
+
+                                    await manager.broadcast({
+                                        "type": "new_message",
+                                        "platform": "whatsapp",
+                                        "message": {
+                                            "id" : message_id,
+                                            "conversation_id": conversation_id,
+                                            "content": user_input,
+                                            "sender_id": sender,
+                                            "role" : MessageRole.CUSTOMER,
+                                            "timestamp": datetime.now().isoformat(),
+                                            "status": "sent"
+                                        }
+                                    })
+
+                                    return {"status": "ok"}
 
                                 client_id = sender
-                                user_input = f"(client_id: {client_id}): " + user_input
+                                format_user_input = f"(client_id: {client_id}): " + user_input
 
                                 # John Doe - +91 9900990099
                                 whatsapp_user = sender_name + " - +" + client_id[:2] + " " + client_id[2:]
@@ -586,7 +1194,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 tic = time.perf_counter()
 
                                 response = agent_executor.invoke(
-                                    {"input": user_input},
+                                    {"input": format_user_input},
                                     config={"configurable": {"session_id": client_id}},
                                 )
 
@@ -607,7 +1215,41 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         print(f"Response took {toc - tic:0.4f} seconds")
                                         time_taken = round(toc - tic, 4)
 
+                                        await store_whatsapp_history(sender, sender_name, user_input, f"Here are some {search_term} that you might be interested in.", [], [], products_space)
                                         insert_into_whatsapp(whatsapp_user, message['text']['body'], response['output'], time_taken)
+
+                                        ai_message_id = await store_message(
+                                            content="Here are some {search_term} that you might be interested in.",
+                                            conversation_id=conversation_id,
+                                            sender_id="AI_BOT",
+                                            role=MessageRole.AI,
+                                            platform="whatsapp"
+                                        )
+
+                                        
+
+                                         # Broadcast appropriate event based on whether it's new or updated
+                                        if not existing_conversation:
+                                            await manager.broadcast({
+                                                "type": "new_conversation",
+                                                "conversation": conversation
+                                            })
+                                        else:
+                                            await manager.broadcast({
+                                                "type": "conversation_updated",
+                                                "conversation": conversation
+                                            })
+
+                                        await manager.broadcast({
+                                            "type": "new_message",
+                                            "platform": "whatsapp",
+                                            "message": {
+                                                "sender_id": sender,
+                                                "content": user_input,
+                                                "timestamp": datetime.now().isoformat()
+                                            }
+                                        })
+
 
                                         search_term = ""
                                         print("websocket_product_data 2: ", websocket_product_data) 
@@ -615,10 +1257,43 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         print("Came in else")
                                         await send_message(sender, response['output'])
 
+                                        ai_message_id = await store_message(
+                                            content=response['output'],
+                                            conversation_id=conversation_id,
+                                            sender_id="AI_BOT",
+                                            role=MessageRole.AI,
+                                            platform="whatsapp"
+                                        )
+
+                                        
+
+                                         # Broadcast appropriate event based on whether it's new or updated
+                                        if not existing_conversation:
+                                            await manager.broadcast({
+                                                "type": "new_conversation",
+                                                "conversation": conversation
+                                            })
+                                        else:
+                                            await manager.broadcast({
+                                                "type": "conversation_updated",
+                                                "conversation": conversation
+                                            })
+
+                                        await manager.broadcast({
+                                            "type": "new_message",
+                                            "platform": "whatsapp",
+                                            "message": {
+                                                "sender_id": sender,
+                                                "content": user_input,
+                                                "timestamp": datetime.now().isoformat()
+                                            }
+                                        })
+
                                         toc = time.perf_counter()
                                         print(f"Response took {toc - tic:0.4f} seconds")
                                         time_taken = round(toc - tic, 4)
 
+                                        await store_whatsapp_history(sender, sender_name, user_input, response['output'], [], [], [])
                                         insert_into_whatsapp(whatsapp_user, message['text']['body'], response['output'], time_taken)
 
                                 print("Products space 3: ", products_space)
@@ -655,6 +1330,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 # await send_message(sender, "This functionality is in development.")
                                 print("Sender clicked Know More")
                                 await send_product(sender, payload)
+                                product_name = payload[2]
+                                await store_whatsapp_history(sender, sender_name, "Know More", f"*{product_name}* \n\n🎉 *Key Highlights:* \n  - EMI Available! ✅ \n  - Get GST invoice and save up to 28% on business purchases \n  - Free Shipping all over India 🚚\n\nTo contact us, simply type 'Live Agent'", [], [], [payload[0]])
                                 # print("Sent message to Name: ", sender_name, ", Number: ", sender, "")
 
                                 # await send_product(sender, payload)
@@ -673,6 +1350,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     print(f"Product ID: {product_id}, Quantity: {quantity}, Price: {item_price}, Currency: {currency}")
 
                                 print("Sender sent cart")
+                                await store_whatsapp_history(sender, sender_name,"Sender sent cart" , "Thanks for sending your us cart! 📦🤩\n\nBefore we can proceed, we just need a few more details about *your address* so we know exactly where to deliver your order.\n\nLet's get this sorted and your items will be on their way!🚀", product_items,[], [])
                                 add_order_details(sender, product_items)
                                 await get_details(sender, again=False)
 
@@ -706,6 +1384,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     if payload == "info_correct":
                                         print("Info is correct")
                                         await get_payment(sender, sender_name)
+                                        details = get_sender_details(sender)
+                                        await store_whatsapp_history(sender, sender_name, "Sender sent address", "", [], details, [])
                                     elif payload == "info_incorrect":
                                         print("Info is incorrect")
                                         delete_address_details(sender)
@@ -1631,7 +2311,7 @@ async def get_payment(sender, sender_name):
             }
         }
     }
-}
+    }
 
     response = requests.post(url, headers=headers, json=data)
     print(f"Response: {response.status_code}, {response.json()}")
@@ -1890,3 +2570,326 @@ Incoming webhook payload: {
 {"version":"3.1","screens":[{"id":"RECOMMEND","title":"Contact Details","data":{},"layout":{"type":"SingleColumnLayout","children":[{"type":"Form","name":"flow_path","children":[{"type":"TextSubheading","text":"Full name"},{"type":"TextInput","label":"Eg. Steve Jobs","name":"TextInput_3be76e","required":true,"input-type":"text","helper-text":""},{"type":"TextSubheading","text":"Contact Information"},{"type":"TextInput","label":"Email address","name":"TextInput_863f4d","required":true,"input-type":"email","helper-text":""},{"type":"TextCaption","text":"We'll use this email to send you details and updates about your order."},{"type":"Footer","label":"Continue","on-click-action":{"name":"navigate","next":{"type":"screen","name":"screen_xdycdl"},"payload":{"screen_0_TextInput_0":"${form.TextInput_3be76e}","screen_0_TextInput_1":"${form.TextInput_863f4d}"}}}]}]}},{"id":"screen_xdycdl","title":"Delivery Details","data":{"screen_0_TextInput_0":{"type":"string","__example__":"Example"},"screen_0_TextInput_1":{"type":"string","__example__":"Example"}},"terminal":true,"layout":{"type":"SingleColumnLayout","children":[{"type":"Form","name":"flow_path","children":[{"type":"TextSubheading","text":"Shipping Address"},{"type":"TextCaption","text":"Enter the address where you want your order delivered.\nNote: This address will be used for billing."},{"type":"Dropdown","label":"Country","required":true,"name":"Dropdown_057767","data-source":[{"id":"0_India","title":"India"}]},{"type":"TextArea","label":"Address","required":true,"name":"TextArea_72d055"},{"type":"TextInput","label":"State","name":"TextInput_1a72ca","required":true,"input-type":"text","helper-text":""},{"type":"TextInput","label":"City","name":"TextInput_064ada","required":true,"input-type":"text"},{"type":"TextInput","label":"PIN Code","name":"TextInput_e94033","required":true,"input-type":"number"},{"type":"Footer","label":"Submit","on-click-action":{"name":"complete","payload":{"screen_1_Dropdown_0":"${form.Dropdown_057767}","screen_1_TextArea_1":"${form.TextArea_72d055}","screen_1_TextInput_2":"${form.TextInput_1a72ca}","screen_1_TextInput_3":"${form.TextInput_064ada}","screen_1_TextInput_4":"${form.TextInput_e94033}","screen_0_TextInput_0":"${data.screen_0_TextInput_0}","screen_0_TextInput_1":"${data.screen_0_TextInput_1}"}}}]}]}}]}
 
 """
+
+
+
+class Message(BaseModel):
+    user_id: str
+    message: str
+
+
+# Define the message model
+class ChatMessage(BaseModel):
+    user_id: str
+    message: str
+    message_id: Optional[str] = None
+
+@app.post("/api/chat_history/message")
+async def send_chat_message(message: ChatMessage):
+    try:
+        # Send message to WhatsApp
+        await send_message(message.user_id, message.message)
+        
+        # Store in chat history
+        await store_whatsapp_history(
+            sender_id=message.user_id,
+            sender_name="Admin",
+            sender_message="",
+            bot_message=message.message,
+            message_id=message.message_id,  # Pass the message ID
+            cart_data=[],
+            address_data=[],
+            carousel_data=[]
+        )
+        
+        return {"status": "success", "message": "Message sent successfully"}
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/chat_history")
+async def get_chat_history():
+    try:
+        conversations = list(chat_history.find(
+            {},
+            {'_id': 0}
+        ).sort('last_updated', -1).limit(50))
+        
+        return conversations
+    except Exception as e:
+        print(f"Error fetching chat history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat_history/{user_id}")
+async def get_user_chat(user_id: str):
+    try:
+        user_chat = chat_history.find_one(
+            {'user_id': user_id},
+            {'_id': 0}
+        )
+        
+        if not user_chat:
+            raise HTTPException(status_code=404, detail="Chat history not found")
+            
+        return user_chat
+    except Exception as e:
+        print(f"Error fetching user chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat_history/{user_id}/new")
+async def get_new_messages(user_id: str, since: str):
+    try:
+        # Convert the since parameter to timezone-aware datetime
+        since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+        
+        # Query MongoDB for new messages
+        user_chat = chat_history.find_one(
+            {
+                'user_id': user_id,
+                'chat_history': {
+                    '$elemMatch': {
+                        'timestamp': {'$gt': since_dt}
+                    }
+                }
+            },
+            {'_id': 0, 'chat_history': 1}
+        )
+        
+        if not user_chat:
+            return []
+            
+        # Filter messages after the since timestamp
+        new_messages = [
+            msg for msg in user_chat['chat_history']
+            if msg.get('timestamp') and msg['timestamp'] > since_dt
+        ]
+        
+        return new_messages
+    except Exception as e:
+        print(f"Error fetching new messages: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversations")
+async def get_conversations():
+    try:
+        conversations = list(support_requests.find(
+            {},
+            {'_id': 0}
+        ).sort('created_at', -1).limit(50))
+        
+        # Format the response
+        return [
+            {
+                'user_id': conv['user_id'],
+                'user_name': conv['user_name'],
+                'status': conv['status'],
+                'created_at': conv['created_at'],
+                'chat_history': conv['chat_history'][-1:],  # Get only last message
+                'platform': conv['platform']
+            }
+            for conv in conversations
+        ]
+    except Exception as e:
+        print(f"Error fetching conversations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversations/{user_id}")
+async def get_conversation(user_id: str):
+    try:
+        conversation = support_requests.find_one(
+            {'user_id': user_id},
+            {'_id': 0}
+        )
+        
+        if not conversation:
+            print(f"Conversation not found for user_id: {user_id}")
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+        return conversation
+    except Exception as e:
+        print(f"Error fetching conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/conversations/message")
+async def send_message_from_api(message: Message):
+    try:
+        result = support_requests.update_one(
+            {'user_id': message.user_id},
+            {'$push': {
+                'chat_history': {
+                    'role': 'assistant',
+                    'content': message.message,
+                    'timestamp': datetime.utcnow()
+                }
+            }}
+        )
+        # Send message to WhatsApp user
+        
+        url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "messaging_product": "whatsapp",
+            "to": message.user_id,
+            "type": "text",
+            "text": {"body": message.message}
+        }
+        
+        response = requests.post(url, headers=headers, json=data)
+        if not response.ok:
+            print(f"Error sending WhatsApp message: {response.text}")
+            raise HTTPException(status_code=500, detail="Failed to send WhatsApp message")
+        
+        if result.modified_count == 0:
+            print(f"Conversation not found for user_id: {message.user_id}")
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+        return {"success": True}
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/products/details")
+async def get_product_details(payload: dict):
+    try:
+        # Validate required fields
+        product_id = payload.get("product_retailer_id")
+        quantity = payload.get("quantity")
+        item_price = payload.get("item_price")
+        
+        if not all([product_id, quantity, item_price]):
+            return {"error": "Missing required fields"}
+
+        # First API call to get product catalog ID
+        url1 = f"https://graph.facebook.com/v20.0/759103595212051/products"
+        params1 = {
+            "filter": json.dumps({
+                "retailer_id": {"eq": product_id}
+            }),
+            "fields": "id",
+            "access_token": ACCESS_TOKEN
+        }
+
+        response = requests.get(url1, params=params1)
+        response.raise_for_status()  # Raise exception for non-200 status codes
+        data = response.json()
+        
+        if not data.get('data') or len(data['data']) == 0:
+            return {"error": "Product not found"}
+
+        product_cat_id = data['data'][0]['id']
+
+        # Second API call to get product details
+        url = f"https://graph.facebook.com/{product_cat_id}"
+        params = {
+            "access_token": ACCESS_TOKEN,
+            "fields": "name,price,image_url"
+        }
+
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        product_data = response.json()
+
+        # Clean and format price
+        price = product_data.get('price', '0')
+        clean_price = int(float(price.replace("₹", "").replace(",", "")))
+
+        product_details = {
+            "name": product_data.get('name', ''),
+            "amount": {
+                "value": int(f"{clean_price}00"),
+                "offset": 100
+            },
+            "sale_amount": {
+                "value": int(f"{item_price}00"),
+                "offset": 100
+            },
+            "quantity": int(quantity),
+            "country_of_origin": "IN",
+            "image": {
+                "link": product_data.get('image_url', '')
+            }
+        }
+
+        return product_details
+
+    except requests.RequestException as e:
+        print(f"API request failed: {e}")
+        return {"error": "Failed to fetch product details"}
+    except (ValueError, KeyError) as e:
+        print(f"Data processing error: {e}")
+        return {"error": "Invalid data format"}
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return {"error": "An unexpected error occurred"}
+    
+@app.post("/api/create_template")
+async def create_template(payload: dict):
+    name = payload.get("name")
+    language = payload.get("language")
+    category = payload.get("category")
+    header = payload.get("header")
+    body = payload.get("body")
+    footer = payload.get("footer")
+
+    url = f"https://graph.facebook.com/{BUSINESS_ACCOUNT_ID}/message_templates"
+
+    headers = {
+        "Authorization": "Bearer " + ACCESS_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "name": name,
+        "language": "en_US",
+        "category": category,
+        "components": [
+            {
+             "type": "HEADER",
+             "format": "TEXT",
+             "text": header,
+            },
+            {
+            "type": "body",
+            "text": body,
+            },
+            
+            {
+            "type": "footer",
+            "text": footer
+            }
+        ]
+    }
+
+
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(data))
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx and 5xx)
+    except requests.exceptions.RequestException as e:
+        # Log or handle the error here
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return response.json()  # Return the JSON response from the Facebook API
+
+@app.get("/api/fetch_templates")
+async def create_template():
+    url = f"https://graph.facebook.com/{BUSINESS_ACCOUNT_ID}/message_templates?fields=name,status,category,language"
+    headers = {"Authorization": "Bearer " + ACCESS_TOKEN}
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching templates: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=500, detail="Invalid JSON response from Facebook API")
+
+    return {"status": "success", "data": data}
+
+
+
+
