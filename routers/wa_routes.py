@@ -23,6 +23,7 @@ from services.wa_service import broadcast_whatsapp_message, store_whatsapp_messa
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
 from auth.dependencies import get_current_user
+from auth.auth_utils import admin_required, require_auth
 from config.settings import (
     APP_ID,
     APP_SECRET,
@@ -45,7 +46,7 @@ db = get_mongo_db()
 router = APIRouter(prefix="/api/whatsapp", tags=["WhatsApp"])
 
 @router.post("/auth")
-async def whatsapp_auth_exchange(request: WhatsappAuthRequest):
+async def whatsapp_auth_exchange(request: WhatsappAuthRequest, _: None = Depends(require_auth)):
     try:
         # Extract authorization code from request
         code = request.code
@@ -215,7 +216,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest):
         raise HTTPException(status_code=500, detail=f"WhatsApp authentication error: {str(e)}")
     
 @router.post("/disconnect")
-async def whatsapp_disconnect(request: dict):
+async def whatsapp_disconnect(request: dict, _: None = Depends(require_auth)):
     try:
         user_id = request.get("user_id")
         org_id = request.get("org_id")
@@ -252,7 +253,7 @@ async def whatsapp_disconnect(request: dict):
         raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
 
 @router.get("/status")
-async def get_whatsapp_status(org_id: str, user_id: Optional[str] = None):
+async def get_whatsapp_status(org_id: str, user_id: Optional[str] = None, _: None = Depends(require_auth)):
     """Check if WhatsApp Business account is connected and return connection details"""
     try:
         if not user_id:
@@ -290,7 +291,7 @@ async def get_whatsapp_status(org_id: str, user_id: Optional[str] = None):
         raise HTTPException(status_code=500, detail=f"Failed to check WhatsApp connection status: {str(e)}")
     
 @router.get("/{whatsapp_id}/details")
-async def get_whatsapp_details(whatsapp_id: str):
+async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)):
     """
     Fetch detailed WhatsApp Business Account information from Meta Graph API
     
@@ -401,7 +402,8 @@ async def get_whatsapp_conversation_analytics(
     start_date: Optional[int] = None,
     end_date: Optional[int] = None,
     granularity: Optional[str] = "DAILY",
-    phone_number: Optional[str] = None
+    phone_number: Optional[str] = None, 
+    _: None = Depends(require_auth)
 ):
     """
     Fetch conversation analytics for a WhatsApp Business Account
@@ -896,7 +898,8 @@ async def upload_and_send_whatsapp_media(
     whatsapp_id: str, 
     recipient_id: str = Form(...),
     caption: Optional[str] = Form(None), 
-    file: UploadFile = File(...)
+    file: UploadFile = File(...), 
+    _: None = Depends(require_auth)
 ):
     """
     Upload media to WhatsApp servers and send it to a recipient

@@ -5,6 +5,7 @@ from config.settings import *
 from services.ig_service import *
 from schemas.models import InstagramDisconnectRequest, MessageRole
 from auth.dependencies import get_current_user
+from auth.auth_utils import admin_required, require_auth
 
 from database import get_mongo_db
 
@@ -114,7 +115,7 @@ async def get_instagram_profile(instagram_id: str, user=Depends(get_current_user
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram profile: {str(e)}")
 
 @router.post("/auth")
-async def instagram_auth(request: dict):
+async def instagram_auth(request: dict, _: None = Depends(require_auth)):
     try:
         # Extract authorization code from frontend
         code = request.get("code")
@@ -232,7 +233,7 @@ async def instagram_auth(request: dict):
         raise HTTPException(status_code=500, detail=f"Instagram authentication error: {str(e)}")
 
 @router.post("/disconnect")
-async def instagram_disconnect(request: InstagramDisconnectRequest):
+async def instagram_disconnect(request: InstagramDisconnectRequest, _: None = Depends(require_auth)):
     """Revoke Instagram access token and remove connection"""
     try:
 
@@ -294,7 +295,7 @@ async def instagram_disconnect(request: InstagramDisconnectRequest):
         raise HTTPException(status_code=500, detail=f"Failed to disconnect Instagram: {str(e)}")
 
 @router.get("/status")
-async def get_instagram_status(org_id: str, instagram_id: Optional[str] = None, app_user_id: Optional[str] = None):
+async def get_instagram_status(org_id: str, instagram_id: Optional[str] = None, app_user_id: Optional[str] = None, _: None = Depends(require_auth)):
     """Check if Instagram account is connected and return connection details"""
     try:
         # At least one of the IDs must be provided
@@ -364,7 +365,7 @@ async def link_instagram_to_user(instagram_id: str, app_user_id: str, user=Depen
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/{instagram_id}/posts")
-async def get_instagram_posts(instagram_id: str, limit: int = 24):
+async def get_instagram_posts(instagram_id: str, limit: int = 24, _: None = Depends(require_auth)):
     """
     Fetch Instagram posts for a specific Instagram business account
     

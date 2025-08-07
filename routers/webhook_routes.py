@@ -112,6 +112,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         print(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
                         continue
                     
+                    # org_id = connection.get("org_id")
+
                     # Get sender name from contacts if available
                     sender_name2 = "Unknown Sender"
                     contacts = value.get("contacts", [])
@@ -202,6 +204,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         if "entry" in payload and len(payload["entry"]) > 0:
             for entry in payload["entry"]:
                 ig_account_id = entry.get("id")
+
+                
                 # Prithal's code testing
                 for changes in entry.get('changes', []):
                     field = changes.get('field')
@@ -220,7 +224,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         sender_id = message["sender"]["id"]        # Instagram user ID who deleted the message
                         
                         print(f"Message deletion event detected - mid: {deleted_message_id}")
-                        
+
+                        # Find the corresponding Instagram account in our connections
+                        instagram_connection = db.instagram_connections.find_one(
+                            {"instagram_id": recipient_id, "is_active": True},
+                            sort=[("last_updated", -1)]
+                        )
+
+                        org_id = instagram_connection.get("org_id")
+
                         # Get the Instagram-specific collection names
                         messages_collection_name = f"messages_{org_id}"
                         conversations_collection_name = f"conversations_{org_id}"  # Add this line
@@ -332,11 +344,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         {"instagram_id": recipient_id, "is_active": True},
                         sort=[("last_updated", -1)]
                     )
-                    
+
                     if not instagram_connection:
                         print(f"No active Instagram connection found for recipient ID: {recipient_id}")
                         return {"status": "error", "message": "Instagram account not found"}
                     
+                    org_id = instagram_connection.get("org_id")
+
                     # get the page access token
                     page_access_token = instagram_connection.get("page_access_token")
                     if not page_access_token:
