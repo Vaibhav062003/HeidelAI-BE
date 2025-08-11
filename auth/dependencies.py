@@ -27,7 +27,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             print("Key not found for kid:", header.get("kid"))
             raise JWTError("Key not found")
         public_key = jwk.construct(key_data)
-        print("Decoding JWT with public key:")
+
         payload = jwt.decode(token, 
                              public_key, 
                              algorithms=[JWT_HEADER_ALGORITHM], 

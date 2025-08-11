@@ -20,16 +20,27 @@ class ConversationSummary(BaseModel):
         ..., description="A concise summary of the conversation, limited to 2-5 bullet points."
     )
     priority: str = Field(
-        ..., description="Priority level of the customer: 'low', 'medium', or 'high'."
+        ..., description="Priority level of the customer: 'low', 'medium', or 'high'.",
+        example="high"
     )
     query: str = Field(
         ..., description="The primary product mentioned in the conversation. This should be a concise phrase representing the latest product the user is inquiring about, ensuring it reflects the most relevant item if multiple products have been discussed. If no product is mentioned, use 'None'."
     )
     sentiment: str = Field(
-        ..., description="The sentiment of the conversation: 'positive', 'neutral, or 'negative'."
+        ..., description="The sentiment of the conversation: 'positive', 'neutral, or 'negative'.",
+        example="positive"
     )
     suggestions: List[str] = Field(
         ..., description="A list of exactly 3 actionable suggestions based on the conversation. Each suggestion should be a concise bullet point aimed at improving response quality, sales effectiveness, or customer satisfaction."
+    )
+    categories: List[str] = Field(
+        ...,
+        description=(
+            "A list of product categories the user is interested in. "
+            "Allowed values (case-insensitive): "
+            "['Custom Built Pc', 'Accessories', 'Gaming Laptop', 'Business Laptop']."
+        ),
+        example=["Gaming Laptop", "Accessories"]
     )
 
 # Agent that uses structured outputs for conversation analysis
@@ -40,7 +51,10 @@ chat_analysis_agent = Agent(
     instructions=[
         "Ensure the 'priority' field contains only one of the following values: 'low', 'medium', or 'high'.",
         "Extract the latest mentioned product as 'query', this will be used to search a vector db so generate the query according to the product.",
-        "Summarize the chat in 2-5 bullet points, keeping it concise and relevant."
+        "Summarize the chat in 2-5 bullet points, keeping it concise and relevant.",
+        "Populate the 'categories' field with one or more relevant product categories the user is interested in. ",
+        "Allowed values are exactly: 'custom_built_pc', 'accessories', 'gaming_laptop', 'business_laptop'. ",
+        "If none apply, return an empty list."
     ],
 )
 
@@ -94,7 +108,8 @@ def process_and_update_conversation(org_id: str, conversation_id: str):
             "summary": analysis_result.summary,
             "query": analysis_result.query,
             "sentiment": analysis_result.sentiment,
-            "suggestions": analysis_result.suggestions
+            "suggestions": analysis_result.suggestions,
+            "categories": analysis_result.categories
         }
 
         conversations_collection.update_one(

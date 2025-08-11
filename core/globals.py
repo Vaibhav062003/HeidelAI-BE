@@ -19,3 +19,4 @@ websocket_product_data = {}
 websocket_product_data_ig = {}
 flag = False
 search_term = ""
+_prompt_cache = {}

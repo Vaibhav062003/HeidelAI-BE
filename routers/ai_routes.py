@@ -1,7 +1,9 @@
-from fastapi import APIRouter, HTTPException, Depends
 from database import get_mongo_db
-from agents.followup_agent.follow_up_agent import get_followup
+from schemas.models import ChatbotPromptUpdate
 from auth.dependencies import get_current_user
+from services.ai_chatbot import update_prompt_in_cache
+from fastapi import APIRouter, HTTPException, Depends
+from agents.followup_agent.follow_up_agent import get_followup
 
 db = get_mongo_db()
 
@@ -47,3 +49,24 @@ def get_followup_api(conversation_id: str, user=Depends(get_current_user)):
             raise HTTPException(status_code=500, detail="Failed to generate follow-up message.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@router.put("/chatbot-prompt")
+def update_chatbot_prompt(payload: ChatbotPromptUpdate, user=Depends(get_current_user)):
+    """
+    Update the chatbot prompt for the authenticated user's organization.
+    """
+    org_id = user.get("org_id")
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Organization ID not found in user context.")
+
+    result = db.organizations.update_one(
+        {"org_id": org_id},
+        {"$set": {"chatbot_prompt": payload.chatbot_prompt}}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+
+    update_prompt_in_cache(org_id, payload.chatbot_prompt)
+
+    return {"status": "success", "message": "Chatbot prompt updated successfully."}

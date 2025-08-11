@@ -1,5 +1,5 @@
 # Pydantic
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from enum import Enum
 from datetime import datetime
@@ -45,3 +45,6 @@ class InstagramDisconnectRequest(BaseModel):
 class WhatsappAuthRequest(BaseModel):
     code: str
     redirect_uri: str
+
+class ChatbotPromptUpdate(BaseModel):
+    chatbot_prompt: str = Field(..., min_length=10, max_length=5000)

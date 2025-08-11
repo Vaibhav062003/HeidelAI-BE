@@ -1,7 +1,7 @@
 from .llm import get_llm
 from .tools import search_tool
 from .models import ProductResponse
-from .prompts import SYSTEM_MESSAGE
+# from .prompts import SYSTEM_MESSAGE
 from config.settings import LLM_MODEL
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
@@ -12,6 +12,7 @@ from langchain_core.messages import BaseMessage, SystemMessage
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     finalResponse: Union[ProductResponse, None]
+    system_prompt: str
 
 main_llm = get_llm(
     model=LLM_MODEL,
@@ -28,7 +29,7 @@ tool_node = ToolNode([search_tool])
 
 # --- Agent Nodes ---
 def call_main_llm(state: AgentState) -> AgentState:
-    input_messages = [SystemMessage(content=SYSTEM_MESSAGE)] + state["messages"]
+    input_messages = [SystemMessage(content=state["system_prompt"])] + state["messages"]
     response = main_llm.invoke(input_messages)
     return {"messages": response}
 

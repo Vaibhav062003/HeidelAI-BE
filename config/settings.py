@@ -51,3 +51,6 @@ WA_ACCESS_TOKEN_ENCRYPTION_KEY = os.getenv('WA_ACCESS_TOKEN_ENCRYPTION_KEY')
 JWKS_URL = os.getenv('JWKS_URL')
 JWT_TOKEN_ISSUER = os.getenv('JWT_TOKEN_ISSUER')
 JWT_HEADER_ALGORITHM = os.getenv('JWT_HEADER_ALGORITHM')
+
+# Egenie Specific Configurations
+ORG_ID = os.getenv("ORG_ID")
