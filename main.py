@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # === Internal Modules ===
-from routers import ig_routes, wa_routes, websockets_routes, webhook_routes, ai_routes
+from routers import ig_routes, wa_routes, websockets_routes, webhook_routes, ai_routes, common_routes
 
 
 # INSTAGRAM LOGIN CODE EXCHANGE
@@ -22,6 +22,7 @@ app.include_router(wa_routes.router)
 app.include_router(webhook_routes.router)
 app.include_router(websockets_routes.router)
 app.include_router(ai_routes.router)
+app.include_router(common_routes.router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,3 +45,7 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"]  
 )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
