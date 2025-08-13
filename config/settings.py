@@ -18,13 +18,14 @@ BUSINESS_ACCOUNT_ID = os.getenv("BUSINESS_ACCOUNT_ID")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL")
-PINECONE_INDEX = os.getenv("PINECONE_INDEX")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 FIRESTORE_CONTEXT_DB = os.getenv("FIRESTORE_CONTEXT_DB")
 
 # MongoDB URIs
 MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_URI2 = os.getenv("MONGODB_URI2")
+MONGODB_CLUSTER = os.getenv("MONGODB_CLUSTER")
 
 # Supabase
 SUPABASE_URL = os.environ.get('SUPABASE_URL')
@@ -54,3 +55,6 @@ JWT_HEADER_ALGORITHM = os.getenv('JWT_HEADER_ALGORITHM')
 
 # Egenie Specific Configurations
 ORG_ID = os.getenv("ORG_ID")
+
+#Sentence Transformers
+SENTENCE_TRANSFORMERS_MODEL = os.getenv("sentence_transformers_model")

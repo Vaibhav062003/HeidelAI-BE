@@ -3,11 +3,11 @@ from typing import List, Optional
 
 class Product(BaseModel):
     """Data model for a single product."""
-    title: str = Field(..., description="The name or title of the product.")
-    link: str = Field(..., description="The direct URL to the product page.")
-    price: str = Field(..., description="The price of the product, including currency.")
-    image: str = Field(..., description="URL of the product's image.")
-    rating: Optional[str] = Field(None, description="The product's rating, if available.") 
+    name: str = Field(..., description="The name or title of the product.")
+    permalink: str = Field(..., description="The direct URL to the product page.")
+    price: int = Field(..., description="The price of the product")
+    images: str = Field(..., description="URL of the product's image.")
+    # rating: Optional[str] = Field(None, description="The product's rating, if available.") 
 
 class ProductResponse(BaseModel):
     """

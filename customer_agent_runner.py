@@ -1,5 +1,6 @@
 from agents.customer_agent.graph import CHAT_AGENT
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from agents.customer_agent.prompts import SYSTEM_MESSAGE
 from config.settings import ORG_ID
 from database import get_mongo_db
 from core.globals import _prompt_cache
@@ -39,6 +40,14 @@ if __name__ == "__main__":
     conversation_history = []
     load_prompts_into_cache()
 
+    prompt = get_prompt(ORG_ID)
+
+    system_message = SystemMessage(
+        content=SYSTEM_MESSAGE
+    )
+
+    conversation_history.append(system_message)
+
     while True:
         msg = input("User: ")
 
@@ -50,9 +59,8 @@ if __name__ == "__main__":
             break
 
         conversation_history.append(HumanMessage(content=msg))
-        prompt = get_prompt("ORG_ID")
 
-        inputs = {"system_prompt": prompt, "messages": conversation_history}
+        inputs = {"messages": conversation_history}
         result = CHAT_AGENT.invoke(inputs)
         
         if result.get("final_response"):

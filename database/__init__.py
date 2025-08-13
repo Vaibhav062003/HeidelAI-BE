@@ -1,11 +1,10 @@
 import os
-from pymongo import MongoClient
+from pinecone import Pinecone
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from config.settings import MONGODB_URI, MONGODB_CLUSTER, PINECONE_API_KEY, PINECONE_INDEX_NAME
 
 load_dotenv()
-
-MONGODB_URI = os.getenv("MONGODB_URI")
-MONGODB_DB = os.getenv("MONGODB_CLUSTER", "Cluster0")
 
 _client = None
 _db = None
@@ -19,5 +18,13 @@ def get_client():
 def get_mongo_db():
     global _db
     if _db is None:
-        _db = get_client()[MONGODB_DB]
+        _db = get_client()[MONGODB_CLUSTER]
     return _db
+
+def get_pinecone_db():
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+
+    index_name = PINECONE_INDEX_NAME
+
+    index = pc.Index(index_name)
+    return index
