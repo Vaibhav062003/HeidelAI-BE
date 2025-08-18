@@ -1,44 +1,19 @@
-from agents.customer_agent.graph import CHAT_AGENT
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from agents.customer_agent.prompts import SYSTEM_MESSAGE
+from agents.egenie.customer_agent.prompts import SYSTEM_MESSAGE
 from config.settings import ORG_ID
 from database import get_mongo_db
-from core.globals import _prompt_cache
+from core.services import services
+from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cache, get_prompt
 
 db = get_mongo_db()
-
-def load_prompts_into_cache():
-    """
-    Load all prompts from DB into local memory.
-    Should be called once at startup or when cache needs refreshing.
-    """
-    global _prompt_cache
-    cursor = db.organizations.find({}, {"org_id": 1, "chatbot_prompt": 1})
-    _prompt_cache = {
-        doc["org_id"]: doc.get("chatbot_prompt", "You are a helpful assistant.")
-        for doc in cursor
-    }
-
-
-def get_prompt(org_id: str) -> str:
-    """
-    Get the prompt for a given org from cache.
-    If not in cache, fetch from DB and update cache.
-    """
-    if org_id in _prompt_cache:
-        return _prompt_cache[org_id]
-
-    doc = db.organizations.find_one(
-        {"org_id": org_id},
-        {"chatbot_prompt": 1}
-    )
-    prompt = doc["chatbot_prompt"]  
-    _prompt_cache[org_id] = prompt
-    return prompt
 
 if __name__ == "__main__":
     conversation_history = []
     load_prompts_into_cache()
+
+    load_agents()
+
+    CHAT_AGENT = services.agents[ORG_ID]
 
     prompt = get_prompt(ORG_ID)
 
@@ -56,6 +31,7 @@ if __name__ == "__main__":
             msg.lower() == "q"
         ):
             print("Exiting the agent.")
+            clear_agents()
             break
 
         conversation_history.append(HumanMessage(content=msg))

@@ -10,7 +10,7 @@ from bson.objectid import ObjectId
 from core.managers import manager
 from schemas.models import MessageRole
 from database import get_mongo_db
-from core.globals import instagram_connections_map
+from core.services import services
 from config.settings import IG_ID, IG_ACCESS_TOKEN, IG_VERSION
 
 db = get_mongo_db()
@@ -169,7 +169,7 @@ async def store_instagram_message(
     }
     
     # Broadcast to Instagram-specific WebSocket connections
-    if recipient_id in instagram_connections_map:
+    if recipient_id in services.instagram_connections_map:
         await broadcast_instagram_message(recipient_id, "new_message", {
             "message": broadcast_message
         })
@@ -257,7 +257,7 @@ async def create_or_update_instagram_conversation(org_id: str, recipient_id, sen
     updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
     
     # Broadcast to Instagram-specific connections
-    if recipient_id in instagram_connections_map:
+    if recipient_id in services.instagram_connections_map:
         # Format the timestamp for JSON serialization
         broadcast_conversation = dict(updated_conversation)
         if "last_message_timestamp" in broadcast_conversation:
@@ -282,14 +282,14 @@ async def broadcast_instagram_message(instagram_id: str, message_type: str, data
         data: The message data to broadcast
     """
     # First, check if we have any connections for this Instagram ID
-    if instagram_id in instagram_connections_map and instagram_connections_map[instagram_id]:
+    if instagram_id in services.instagram_connections_map and services.instagram_connections_map[instagram_id]:
         disconnected_clients = []
         
         # Convert any datetime objects in the data to ISO format strings
         serializable_data = json.loads(json.dumps(data, default=lambda obj: obj.isoformat() if isinstance(obj, datetime) else str(obj) if isinstance(obj, ObjectId) else None))
         
         # Send to all Instagram-specific connections
-        for connection_key in instagram_connections_map[instagram_id]:
+        for connection_key in services.instagram_connections_map[instagram_id]:
             try:
                 if connection_key in manager.active_connections:
                     await manager.active_connections[connection_key].send_json({
@@ -306,10 +306,10 @@ async def broadcast_instagram_message(instagram_id: str, message_type: str, data
         for client_id in disconnected_clients:
             if client_id in manager.active_connections:
                 del manager.active_connections[client_id]
-            if instagram_id in instagram_connections_map:
-                instagram_connections_map[instagram_id].discard(client_id)
-                if not instagram_connections_map[instagram_id]:
-                    del instagram_connections_map[instagram_id]
+            if instagram_id in services.instagram_connections_map:
+                services.instagram_connections_map[instagram_id].discard(client_id)
+                if not services.instagram_connections_map[instagram_id]:
+                    del services.instagram_connections_map[instagram_id]
 
 
 async def get_ig_username(sender_id, page_access_token):

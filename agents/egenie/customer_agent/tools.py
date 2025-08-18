@@ -53,7 +53,7 @@ def product_search_tool(query: str) -> ProductResponse:
 
 tools = [
     product_search_tool,
-    fetch_company_info
+    # fetch_company_info
 ]
 
 if __name__ == "__main__":

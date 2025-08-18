@@ -17,7 +17,7 @@ from fastapi import (
 )
 
 # Internal modules
-from core.globals import whatsapp_connections_map
+from core.services import services
 from schemas.models import WhatsappAuthRequest, MessageRole
 from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message
 from services.cloudinary_service import check_cloudinary_storage_limit
@@ -766,7 +766,7 @@ async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body
                 broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
             
             # Broadcast to WhatsApp-specific connections
-            if whatsapp_id in whatsapp_connections_map:
+            if whatsapp_id in services.whatsapp_connections_map:
                 await broadcast_whatsapp_message(whatsapp_id, "conversation_updated", {
                     "conversation": broadcast_conversation
                 })
@@ -877,7 +877,7 @@ async def send_whatsapp_message(whatsapp_id: str, message: dict, user=Depends(ge
         }
         
         # Broadcast to WhatsApp-specific clients
-        if whatsapp_business_id in whatsapp_connections_map:
+        if whatsapp_business_id in services.whatsapp_connections_map:
             await broadcast_whatsapp_message(whatsapp_business_id, "new_message", {
                 "message": broadcast_message
             })

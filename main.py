@@ -6,8 +6,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # === Internal Modules ===
+from core.lifespan import lifespan
 from routers import ig_routes, wa_routes, websockets_routes, webhook_routes, ai_routes, common_routes
-
 
 # INSTAGRAM LOGIN CODE EXCHANGE
 if not INSTAGRAM_APP_ID or not INSTAGRAM_APP_SECRET:
@@ -15,7 +15,7 @@ if not INSTAGRAM_APP_ID or not INSTAGRAM_APP_SECRET:
 else:
     print(f"Using Instagram App ID: {INSTAGRAM_APP_ID[:5]}... (truncated)")
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 app.include_router(ig_routes.router)
 app.include_router(wa_routes.router)

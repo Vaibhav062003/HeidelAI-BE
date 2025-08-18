@@ -4,6 +4,7 @@ from auth.dependencies import get_current_user
 from services.ai_chatbot import update_prompt_in_cache
 from fastapi import APIRouter, HTTPException, Depends
 from agents.followup_agent.follow_up_agent import get_followup
+from core.services import services
 
 db = get_mongo_db()
 

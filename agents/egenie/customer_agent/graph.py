@@ -64,9 +64,9 @@ workflow.add_conditional_edges(
 workflow.add_edge("tools", "product_agent")
 workflow.add_edge("product_agent", END)
 
-CHAT_AGENT = workflow.compile()
+EGENIE_CHAT_AGENT = workflow.compile()
 
-print(CHAT_AGENT.get_graph().draw_ascii())
+print(EGENIE_CHAT_AGENT.get_graph().draw_ascii())
 
 if __name__ == "__main__":
     pass

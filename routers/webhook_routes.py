@@ -12,15 +12,7 @@ from services.ig_service import *
 from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET
-from core.globals import (
-    processed_message_ids, 
-    EXPIRY_TIME_SECONDS, 
-    instagram_connections_map, 
-    websocket_product_data, 
-    websocket_product_data_ig,
-    search_term, 
-    flag
-    )
+from core.services import services
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -53,13 +45,13 @@ def remove_expired_message_ids():
     expired_ids = []
 
     # Iterate through the dictionary to find expired message IDs
-    for message_id, timestamp in processed_message_ids.items():
-        if current_time - timestamp > EXPIRY_TIME_SECONDS:
+    for message_id, timestamp in services.processed_message_ids.items():
+        if current_time - timestamp > services.EXPIRY_TIME_SECONDS:
             expired_ids.append(message_id)
 
     # Remove the expired message IDs
     for message_id in expired_ids:
-        del processed_message_ids[message_id]
+        del services.processed_message_ids[message_id]
 
 @router.get("")
 async def verify_webhook(request: Request):
@@ -132,12 +124,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 
                             # Check if message ID is already processed
                             message_id = message["id"]
-                            if message_id in processed_message_ids:
+                            if message_id in services.processed_message_ids:
                                 print("Duplicate WhatsApp message, skipping processing.")
                                 continue
                                 
                             # Add message ID with the current timestamp
-                            processed_message_ids[message_id] = time.time()
+                            services.processed_message_ids[message_id] = time.time()
                             
                             # Extract essential data
                             sender_id = message.get("from")
@@ -307,7 +299,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         conversation["last_message_timestamp"] = conversation["last_message_timestamp"].isoformat()
                                     
                                     # Broadcast both the deletion event and updated conversation
-                                    if recipient_id in instagram_connections_map and conversation_id:
+                                    if recipient_id in services.instagram_connections_map and conversation_id:
                                         await broadcast_instagram_message(recipient_id, "message_deleted", {
                                             "message_id": deleted_message_id,
                                             "conversation_id": conversation_id
@@ -327,13 +319,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         continue
 
                     ig_message_id = message["message"]["mid"]
-                    
-                    if ig_message_id in processed_message_ids:
+
+                    if ig_message_id in services.processed_message_ids:
                         print("Duplicate message, skipping processing.")
                         continue
                     
                     # Add message ID with the current timestamp
-                    processed_message_ids[ig_message_id] = time.time()
+                    services.processed_message_ids[ig_message_id] = time.time()
 
                     sender_id = message["sender"]["id"]
                     recipient_id = message["recipient"]["id"]
@@ -401,8 +393,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     conversation = conversations_collection.find_one({"id": conversation_id})
 
 
-                    if recipient_id in instagram_connections_map:
-                        for connection_key in instagram_connections_map[recipient_id]:
+                    if recipient_id in services.instagram_connections_map:
+                        for connection_key in services.instagram_connections_map[recipient_id]:
                             # Notify each connected client for this Instagram ID
                             try:
                                 if connection_key in manager.active_connections:

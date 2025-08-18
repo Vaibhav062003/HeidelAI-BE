@@ -9,8 +9,8 @@ from supabase import create_client, Client
 from core.managers import manager
 from schemas.models import MessageRole
 from database import get_mongo_db
-from core.globals import whatsapp_connections_map, responded_users_by_media
-from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
+from core.services import services
+# from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from config.settings import (
     SUPABASE_URL, 
     SUPABASE_KEY, 
@@ -86,7 +86,7 @@ async def create_or_update_whatsapp_conversation(org_id: str, recipient_id, send
     updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
     
     # Broadcast to WhatsApp-specific connections
-    if recipient_id in whatsapp_connections_map:
+    if recipient_id in services.whatsapp_connections_map:
         # Format the timestamp for JSON serialization
         broadcast_conversation = dict(updated_conversation)
         if "last_message_timestamp" in broadcast_conversation:
@@ -186,7 +186,7 @@ async def store_whatsapp_message(
     }
     
     # Broadcast to WhatsApp-specific WebSocket connections
-    if recipient_id in whatsapp_connections_map:
+    if recipient_id in services.whatsapp_connections_map:
         await broadcast_whatsapp_message(recipient_id, "new_message", {
             "message": broadcast_message
         })
@@ -195,8 +195,8 @@ async def store_whatsapp_message(
     if conversation and conversation.get("message_counter", 0) >= 10:
         # Perform analytics tasks
         try:
-            await analyze_conversation_messages(conversation_id)
-            await update_product_recommendations(conversation_id)
+            # await analyze_conversation_messages(conversation_id)
+            # await update_product_recommendations(conversation_id)
             
             # Reset the counter to 0
             conversations_collection.update_one(
@@ -219,14 +219,14 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
         data: The message data to broadcast
     """
     # First, check if we have any connections for this WhatsApp ID
-    if whatsapp_id in whatsapp_connections_map and whatsapp_connections_map[whatsapp_id]:
+    if whatsapp_id in services.whatsapp_connections_map and services.whatsapp_connections_map[whatsapp_id]:
         disconnected_clients = []
         
         # Convert any datetime objects in the data to ISO format strings
         serializable_data = json.loads(json.dumps(data, default=lambda obj: obj.isoformat() if isinstance(obj, datetime) else str(obj) if isinstance(obj, ObjectId) else None))
         
         # Send to all WhatsApp-specific connections
-        for connection_key in whatsapp_connections_map[whatsapp_id]:
+        for connection_key in services.whatsapp_connections_map[whatsapp_id]:
             try:
                 if connection_key in manager.active_connections:
                     await manager.active_connections[connection_key].send_json({
@@ -243,10 +243,10 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
         for client_id in disconnected_clients:
             if client_id in manager.active_connections:
                 del manager.active_connections[client_id]
-            if whatsapp_id in whatsapp_connections_map:
-                whatsapp_connections_map[whatsapp_id].discard(client_id)
-                if not whatsapp_connections_map[whatsapp_id]:
-                    del whatsapp_connections_map[whatsapp_id]
+            if whatsapp_id in services.whatsapp_connections_map:
+                services.whatsapp_connections_map[whatsapp_id].discard(client_id)
+                if not services.whatsapp_connections_map[whatsapp_id]:
+                    del services.whatsapp_connections_map[whatsapp_id]
 
 # Fetch data from Supabase
 def fetch_media_data():
@@ -407,10 +407,10 @@ async def process_comments_events(value, ig_account_id):
 
     if media_info and media_info['keyword'].lower() in text:
         # Initialize the set if media_id not seen before
-        if str(media_id) not in responded_users_by_media:
-            responded_users_by_media[str(media_id)] = set()
+        if str(media_id) not in services.responded_users_by_media:
+            services.responded_users_by_media[str(media_id)] = set()
 
-        if user_id not in responded_users_by_media[str(media_id)]:
+        if user_id not in services.responded_users_by_media[str(media_id)]:
             print(f"Keyword match found: '{media_info['keyword']}' in comment text. First time responding.")
             reply_message = media_info['reply']
             link_url = media_info.get('link')
@@ -426,7 +426,7 @@ async def process_comments_events(value, ig_account_id):
                 button_title=button_title
             )
 
-            responded_users_by_media[str(media_id)].add(user_id)
+            services.responded_users_by_media[str(media_id)].add(user_id)
         else:
             print(f"Already responded to user_id {user_id} for media_id {media_id}. Skipping.")
     else:

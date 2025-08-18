@@ -1,7 +1,7 @@
 from core.managers import manager, manager2
 from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from core.globals import instagram_connections_map, whatsapp_connections_map
+from core.services import services
 
 router = APIRouter(tags=["Websockets"])
 
@@ -19,10 +19,10 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str, ins
         # Store the Instagram ID mapping for notifications
         if instagram_id:
             # Add to a dictionary that maps Instagram IDs to connection keys
-            if instagram_id not in instagram_connections_map:
-                instagram_connections_map[instagram_id] = set()
-            instagram_connections_map[instagram_id].add(connection_key)
-            
+            if instagram_id not in services.instagram_connections_map:
+                services.instagram_connections_map[instagram_id] = set()
+            services.instagram_connections_map[instagram_id].add(connection_key)
+
             print(f"Registered Instagram connection for ID: {instagram_id}")
         
         # Handle incoming messages
@@ -32,10 +32,10 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str, ins
     except WebSocketDisconnect:
         manager.disconnect(connection_key)
         # Clean up Instagram ID mapping
-        if instagram_id and instagram_id in instagram_connections_map:
-            instagram_connections_map[instagram_id].discard(connection_key)
-            if not instagram_connections_map[instagram_id]:
-                del instagram_connections_map[instagram_id]
+        if instagram_id and instagram_id in services.instagram_connections_map:
+            services.instagram_connections_map[instagram_id].discard(connection_key)
+            if not services.instagram_connections_map[instagram_id]:
+                del services.instagram_connections_map[instagram_id]
 
 # WebSocket endpoint for WhatsApp
 @router.websocket("/ws2/whatsapp/{client_id}/{whatsapp_id}")
@@ -63,10 +63,10 @@ async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, what
         # Store the WhatsApp ID mapping for notifications
         if whatsapp_business_id:
             # Add to a dictionary that maps WhatsApp IDs to connection keys
-            if whatsapp_business_id not in whatsapp_connections_map:
-                whatsapp_connections_map[whatsapp_business_id] = set()
-            whatsapp_connections_map[whatsapp_business_id].add(connection_key)
-            
+            if whatsapp_business_id not in services.whatsapp_connections_map:
+                services.whatsapp_connections_map[whatsapp_business_id] = set()
+            services.whatsapp_connections_map[whatsapp_business_id].add(connection_key)
+
             print(f"Registered WhatsApp connection for ID: {connection_key}")
         
         # Handle incoming messages
@@ -76,10 +76,10 @@ async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, what
     except WebSocketDisconnect:
         manager.disconnect(connection_key)
         # Clean up WhatsApp ID mapping
-        if whatsapp_business_id and whatsapp_business_id in whatsapp_connections_map:
-            whatsapp_connections_map[whatsapp_business_id].discard(connection_key)
-            if not whatsapp_connections_map[whatsapp_business_id]:
-                del whatsapp_connections_map[whatsapp_business_id]
+        if whatsapp_business_id and whatsapp_business_id in services.whatsapp_connections_map:
+            services.whatsapp_connections_map[whatsapp_business_id].discard(connection_key)
+            if not services.whatsapp_connections_map[whatsapp_business_id]:
+                del services.whatsapp_connections_map[whatsapp_business_id]
 
 @router.websocket("/cs/{client_id}")
 async def websocket_endpoint(websocket: WebSocket):

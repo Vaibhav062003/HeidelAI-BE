@@ -1,5 +1,5 @@
-from agents.support_agent.product_suggestions import get_products
-from agents.support_agent.generate_insights import process_and_update_conversation
+from .product_suggestions import get_products
+from .generate_insights import process_and_update_conversation
 from core.managers import manager2
 
 async def analyze_conversation_messages(org_id: str, conversation_id: str) -> None:

@@ -1,10 +1,6 @@
-import os
 from pinecone import Pinecone
-from dotenv import load_dotenv
 from pymongo import MongoClient
 from config.settings import MONGODB_URI, MONGODB_CLUSTER, PINECONE_API_KEY, PINECONE_INDEX_NAME
-
-load_dotenv()
 
 _client = None
 _db = None
