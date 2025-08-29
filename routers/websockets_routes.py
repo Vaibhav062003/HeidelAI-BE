@@ -2,16 +2,30 @@ from core.managers import manager, manager2
 from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
+from auth.dependencies import get_current_user
 
 router = APIRouter(tags=["Websockets"])
 
 db = get_mongo_db()
 
 # Add a new WebSocket endpoint for Instagram
-@router.websocket("/ws2/instagram/{client_id}/{instagram_id}")
-async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str, instagram_id: str):
+@router.websocket("/ws2/instagram/{client_id}")
+async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
     """WebSocket endpoint that uses both client_id and instagram_id for Instagram-specific connections"""
     # Create a combined key for Instagram connections
+    
+    token = websocket.headers.get("sec-websocket-protocol")
+    instagram_id = None
+
+    try:
+        user = get_current_user(token)  # reusing the same function
+        org_id = user.org_id
+        instagram_id = db.organizations.find_one({"_id": org_id}, {"instagram_id": 1}).get("instagram_id")
+
+    except Exception:
+        await websocket.close(code=1008)  # Policy Violation
+        return
+
     connection_key = f"{client_id}_{instagram_id}"
     await manager.connect(connection_key, websocket)
     

@@ -7,7 +7,7 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
 
     async def connect(self, client_id: str, websocket: WebSocket):
-        await websocket.accept()
+        await websocket.accept(subprotocol=websocket.headers.get("sec-websocket-protocol"))
         self.active_connections[client_id] = websocket
         print(f"Client connected: {client_id}")
 

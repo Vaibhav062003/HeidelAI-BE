@@ -1,3 +1,5 @@
+# ig_service.py
+
 # Built-in modules
 import uuid
 import requests
@@ -5,13 +7,24 @@ import json
 from typing import Optional
 from datetime import datetime
 from bson.objectid import ObjectId
+from supabase import create_client, Client
 
 # Internal modules
 from core.managers import manager
 from schemas.models import MessageRole
 from database import get_mongo_db
 from core.services import services
-from config.settings import IG_ID, IG_ACCESS_TOKEN, IG_VERSION
+from config.settings import (
+    IG_ID, 
+    IG_ACCESS_TOKEN, 
+    IG_VERSION,
+    SUPABASE_URL, 
+    SUPABASE_KEY, 
+    SUPABASE_INSTA_DM_TABLE,  
+    IG_ACCESS_TOKEN
+)
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 db = get_mongo_db()
 
@@ -118,6 +131,11 @@ async def store_instagram_message(
     # Get Instagram-specific collections
     conversations_collection = db[f"conversations_{org_id}"]
     messages_collection = db[f"messages_{org_id}"]
+
+    if("conversations_{org_id}" in db.list_collection_names()):
+        print(f"Conversations collection exists: {conversations_collection}")
+    else:
+        print(f"Conversations collection does not exist: {conversations_collection}")
     
     # Create message object
     message = {
@@ -154,7 +172,9 @@ async def store_instagram_message(
         {"$inc": {"message_counter": 1, "unread_count": 1}},
         return_document=True
     )
-    
+
+    print("Conversation updated:", conversation_id)
+
     # Format message for WebSocket broadcast
     broadcast_message = {
         "id": message_id,
@@ -168,8 +188,11 @@ async def store_instagram_message(
         "sender_name": sender_name
     }
     
+    
     # Broadcast to Instagram-specific WebSocket connections
+
     if recipient_id in services.instagram_connections_map:
+        print(f"Broadcasting message to Instagram user {recipient_id}")
         await broadcast_instagram_message(recipient_id, "new_message", {
             "message": broadcast_message
         })
@@ -206,10 +229,15 @@ async def create_or_update_instagram_conversation(org_id: str, recipient_id, sen
     """
     conversation_id = f"instagram_{username}"
     
-    # Get the Instagram-specific collection
+    # Get the org-specific collection
     conversations_collection_name = f"conversations_{org_id}"
     conversations_collection = db[conversations_collection_name]
     
+    if(conversations_collection_name in db.list_collection_names()):
+        print(f"Conversations collection exists: {conversations_collection_name}")
+    else:
+        print(f"Conversations collection does not exist: {conversations_collection_name}")
+
     # Check if conversation already exists
     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
     
@@ -245,13 +273,15 @@ async def create_or_update_instagram_conversation(org_id: str, recipient_id, sen
             "unread_count": 1,
             "is_ai_enabled": True  # Default for new conversations
         }
-    
+
     # Use $set to update only specified fields
     conversations_collection.update_one(
         {"conversation_id": conversation_id},
         {"$set": ig_conversation},
         upsert=True
     )
+
+    print("Conversation updated:", ig_conversation)
     
     # Get the updated conversation for broadcasting
     updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
@@ -328,3 +358,187 @@ async def get_ig_username(sender_id, page_access_token):
     print(f"Response: {response.status_code}, {response.json()}")
     response = response.json()
     return response
+
+# Fetch data from Supabase
+def fetch_media_data():
+    try:
+        response = supabase.table(SUPABASE_INSTA_DM_TABLE).select('*').execute()
+        if response.data:
+            return {
+                str(item['post_id']): {
+                    'keyword': item['keyword'],
+                    'reply': item['reply'],
+                    'link': item.get('link'),
+                    'button_title': item.get('button_title', 'View Offer')  # Default fallback
+                }
+                for item in response.data
+            }
+        else:
+            print("No data found in Supabase table.")
+            return {}
+    except Exception as e:
+        print(f"Error fetching data from Supabase: {e}")
+        return {}
+
+media_data = fetch_media_data()
+
+async def reply_to_comment(comment_id, message, ig_account_id):
+    if ig_account_id:
+        # Query the specific Instagram connection to get its access token
+        connection = db.instagram_connections.find_one(
+            {"instagram_id": ig_account_id, "is_active": True},
+            {"page_access_token": 1},
+            sort=[("last_updated", -1)]
+        )
+
+        print(f"Retrieved IG Connection: {connection}")
+        
+        if connection and connection.get("page_access_token"):
+            # Use the connection-specific token
+            access_token = connection["page_access_token"]
+            print(f"Using Instagram-specific token for {ig_account_id}")
+        else:
+            # Fallback to default token if connection not found
+            access_token = IG_ACCESS_TOKEN
+            print(f"Instagram connection not found for {ig_account_id}, using default token")
+
+    url = f"https://graph.facebook.com/v21.0/{comment_id}/replies"
+    payload= {
+      "message": message,
+      "access_token": access_token
+    }
+
+    response = requests.post(url, data=payload)
+    print("Comment reply response:", response.json())
+
+async def send_private_reply(comment_id,ig_account_id, message_text=None, link_url=None, button_title="View Offer"):
+    """Send private message to user who commented"""
+    if ig_account_id:
+        # Query the specific Instagram connection to get its access token
+        connection = db.instagram_connections.find_one(
+            {"instagram_id": ig_account_id, "is_active": True},
+            {"page_access_token": 1},
+            sort=[("last_updated", -1)]
+        )
+
+        print(f"Retrieved IG Connection: {connection}")
+        
+        if connection and connection.get("page_access_token"):
+            # Use the connection-specific token
+            access_token = connection["page_access_token"]
+            print(f"Using Instagram-specific token for {ig_account_id}")
+        else:
+            # Fallback to default token if connection not found
+            access_token = IG_ACCESS_TOKEN
+            print(f"Instagram connection not found for {ig_account_id}, using default token")
+    
+    url = f"https://graph.instagram.com/v23.0/{ig_account_id}/messages"
+
+    # Validate and clean the link_url
+    has_valid_link = (
+        link_url is not None and 
+        isinstance(link_url, str) and 
+        link_url.strip() and 
+        (link_url.startswith('http://') or link_url.startswith('https://'))
+    )
+
+    if has_valid_link:
+        # Ensure button_title is valid
+        if not button_title or not isinstance(button_title, str):
+            button_title = "View Link"  # Default fallback
+        
+        # Trim button title if too long (Instagram has limits)
+        button_title = button_title[:20] if len(button_title) > 20 else button_title
+        
+        payload = {
+            "recipient": {
+                "comment_id": comment_id
+            },
+            "message": {
+                "attachment": {
+                    "type": "template",
+                    "payload": {
+                        "template_type": "button",
+                        "text": message_text,
+                        "buttons": [
+                            {  
+                                "type": "web_url",
+                                "url": link_url.strip(),
+                                "title": button_title.strip()
+                            }
+                        ]
+                    }
+                }
+            },
+            "access_token": access_token
+        }
+        print(f"Sending button message with link: {link_url}")
+    else:
+        # Send simple text message when no valid link is provided
+        payload = {
+            "recipient": { 
+                "comment_id": comment_id
+            },
+            "message": { 
+                "text": message_text
+            },
+            "access_token": access_token
+        }
+        print("Sending simple text message (no valid link provided)")
+
+    try:
+        response = requests.post(url, json=payload)
+        print(f"Private message response: {response.status_code}")
+        
+        if response.status_code == 200:
+            print("Message sent successfully!")
+            return True
+        else:
+            print(f"Error sending message: {response.json()}")
+            return False
+            
+    except Exception as e:
+        print(f"Exception while sending message: {e}")
+        return False
+
+async def process_comments_events(value, ig_account_id): 
+    comment_id = value.get('id')
+    text = value.get('text', '').lower()
+    from_user = value.get('from', {}).get('username', 'unknown_user')
+    media_id = value.get('media', {}).get('id')
+    user_id = value.get('from', {}).get('id')
+
+    print(f"new comment by @{from_user}: {text} on media_id {media_id}")
+
+    if not media_id or not user_id:
+        print("Missing media_id or user_id.")
+        return
+
+    media_info = media_data.get(str(media_id))
+
+    if media_info and media_info['keyword'].lower() in text:
+        # Initialize the set if media_id not seen before
+        if str(media_id) not in services.responded_users_by_media:
+            services.responded_users_by_media[str(media_id)] = set()
+
+        if user_id not in services.responded_users_by_media[str(media_id)]:
+            print(f"Keyword match found: '{media_info['keyword']}' in comment text. First time responding.")
+            reply_message = media_info['reply']
+            link_url = media_info.get('link')
+            button_title = media_info.get('button_title', 'View Offer')
+
+            await reply_to_comment(comment_id,reply_message, ig_account_id)
+
+            await send_private_reply(
+                comment_id=comment_id,
+                ig_account_id=ig_account_id,
+                message_text=reply_message,
+                link_url=link_url,
+                button_title=button_title
+            )
+
+            services.responded_users_by_media[str(media_id)].add(user_id)
+        else:
+            print(f"Already responded to user_id {user_id} for media_id {media_id}. Skipping.")
+    else:
+        print("No matching keyword or media not tracked.")

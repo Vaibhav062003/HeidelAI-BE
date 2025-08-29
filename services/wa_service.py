@@ -1,9 +1,10 @@
+# wa_service.py
+
 # Built-in modules
 import json, requests
 from typing import Optional
 from datetime import datetime
 from bson.objectid import ObjectId
-from supabase import create_client, Client
 
 # Internal modules
 from core.managers import manager
@@ -11,15 +12,8 @@ from schemas.models import MessageRole
 from database import get_mongo_db
 from core.services import services
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
-from config.settings import (
-    SUPABASE_URL, 
-    SUPABASE_KEY, 
-    SUPABASE_INSTA_DM_TABLE,  
-    IG_ACCESS_TOKEN
-)
 
 db = get_mongo_db()
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 async def create_or_update_whatsapp_conversation(org_id: str, recipient_id, sender_id, customer_name, last_message) -> str:
     """
@@ -248,186 +242,3 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
                 if not services.whatsapp_connections_map[whatsapp_id]:
                     del services.whatsapp_connections_map[whatsapp_id]
 
-# Fetch data from Supabase
-def fetch_media_data():
-    try:
-        response = supabase.table(SUPABASE_INSTA_DM_TABLE).select('*').execute()
-        if response.data:
-            return {
-                str(item['post_id']): {
-                    'keyword': item['keyword'],
-                    'reply': item['reply'],
-                    'link': item.get('link'),
-                    'button_title': item.get('button_title', 'View Offer')  # Default fallback
-                }
-                for item in response.data
-            }
-        else:
-            print("No data found in Supabase table.")
-            return {}
-    except Exception as e:
-        print(f"Error fetching data from Supabase: {e}")
-        return {}
-
-media_data = fetch_media_data()
-
-async def reply_to_comment(comment_id, message, ig_account_id):
-    if ig_account_id:
-        # Query the specific Instagram connection to get its access token
-        connection = db.instagram_connections.find_one(
-            {"instagram_id": ig_account_id, "is_active": True},
-            {"page_access_token": 1},
-            sort=[("last_updated", -1)]
-        )
-
-        print(f"Retrieved IG Connection: {connection}")
-        
-        if connection and connection.get("page_access_token"):
-            # Use the connection-specific token
-            access_token = connection["page_access_token"]
-            print(f"Using Instagram-specific token for {ig_account_id}")
-        else:
-            # Fallback to default token if connection not found
-            access_token = IG_ACCESS_TOKEN
-            print(f"Instagram connection not found for {ig_account_id}, using default token")
-
-    url = f"https://graph.facebook.com/v21.0/{comment_id}/replies"
-    payload= {
-      "message": message,
-      "access_token": access_token
-    }
-
-    response = requests.post(url, data=payload)
-    print("Comment reply response:", response.json())
-
-async def send_private_reply(comment_id,ig_account_id, message_text=None, link_url=None, button_title="View Offer"):
-    """Send private message to user who commented"""
-    if ig_account_id:
-        # Query the specific Instagram connection to get its access token
-        connection = db.instagram_connections.find_one(
-            {"instagram_id": ig_account_id, "is_active": True},
-            {"page_access_token": 1},
-            sort=[("last_updated", -1)]
-        )
-
-        print(f"Retrieved IG Connection: {connection}")
-        
-        if connection and connection.get("page_access_token"):
-            # Use the connection-specific token
-            access_token = connection["page_access_token"]
-            print(f"Using Instagram-specific token for {ig_account_id}")
-        else:
-            # Fallback to default token if connection not found
-            access_token = IG_ACCESS_TOKEN
-            print(f"Instagram connection not found for {ig_account_id}, using default token")
-    
-    url = f"https://graph.instagram.com/v23.0/{ig_account_id}/messages"
-
-    # Validate and clean the link_url
-    has_valid_link = (
-        link_url is not None and 
-        isinstance(link_url, str) and 
-        link_url.strip() and 
-        (link_url.startswith('http://') or link_url.startswith('https://'))
-    )
-
-    if has_valid_link:
-        # Ensure button_title is valid
-        if not button_title or not isinstance(button_title, str):
-            button_title = "View Link"  # Default fallback
-        
-        # Trim button title if too long (Instagram has limits)
-        button_title = button_title[:20] if len(button_title) > 20 else button_title
-        
-        payload = {
-            "recipient": {
-                "comment_id": comment_id
-            },
-            "message": {
-                "attachment": {
-                    "type": "template",
-                    "payload": {
-                        "template_type": "button",
-                        "text": message_text,
-                        "buttons": [
-                            {  
-                                "type": "web_url",
-                                "url": link_url.strip(),
-                                "title": button_title.strip()
-                            }
-                        ]
-                    }
-                }
-            },
-            "access_token": access_token
-        }
-        print(f"Sending button message with link: {link_url}")
-    else:
-        # Send simple text message when no valid link is provided
-        payload = {
-            "recipient": { 
-                "comment_id": comment_id
-            },
-            "message": { 
-                "text": message_text
-            },
-            "access_token": access_token
-        }
-        print("Sending simple text message (no valid link provided)")
-
-    try:
-        response = requests.post(url, json=payload)
-        print(f"Private message response: {response.status_code}")
-        
-        if response.status_code == 200:
-            print("Message sent successfully!")
-            return True
-        else:
-            print(f"Error sending message: {response.json()}")
-            return False
-            
-    except Exception as e:
-        print(f"Exception while sending message: {e}")
-        return False
-
-async def process_comments_events(value, ig_account_id): 
-    comment_id = value.get('id')
-    text = value.get('text', '').lower()
-    from_user = value.get('from', {}).get('username', 'unknown_user')
-    media_id = value.get('media', {}).get('id')
-    user_id = value.get('from', {}).get('id')
-
-    print(f"new comment by @{from_user}: {text} on media_id {media_id}")
-
-    if not media_id or not user_id:
-        print("Missing media_id or user_id.")
-        return
-
-    media_info = media_data.get(str(media_id))
-
-    if media_info and media_info['keyword'].lower() in text:
-        # Initialize the set if media_id not seen before
-        if str(media_id) not in services.responded_users_by_media:
-            services.responded_users_by_media[str(media_id)] = set()
-
-        if user_id not in services.responded_users_by_media[str(media_id)]:
-            print(f"Keyword match found: '{media_info['keyword']}' in comment text. First time responding.")
-            reply_message = media_info['reply']
-            link_url = media_info.get('link')
-            button_title = media_info.get('button_title', 'View Offer')
-
-            await reply_to_comment(comment_id,reply_message, ig_account_id)
-
-            await send_private_reply(
-                comment_id=comment_id,
-                ig_account_id=ig_account_id,
-                message_text=reply_message,
-                link_url=link_url,
-                button_title=button_title
-            )
-
-            services.responded_users_by_media[str(media_id)].add(user_id)
-        else:
-            print(f"Already responded to user_id {user_id} for media_id {media_id}. Skipping.")
-    else:
-        print("No matching keyword or media not tracked.")

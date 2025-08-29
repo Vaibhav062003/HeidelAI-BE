@@ -2,11 +2,15 @@ from typing import List
 from database import get_pinecone_db
 from langchain_core.tools import tool
 from .models import ProductResponse, Product
-from sentence_transformers import SentenceTransformer
-from config.settings import SENTENCE_TRANSFORMERS_MODEL
+from fastapi import HTTPException
+import aiohttp
+# from sentence_transformers import SentenceTransformer
+# from config.settings import SENTENCE_TRANSFORMERS_MODEL
+
+from config.settings import KOYEB2
 
 index = get_pinecone_db()
-model = SentenceTransformer(SENTENCE_TRANSFORMERS_MODEL)
+# model = SentenceTransformer(SENTENCE_TRANSFORMERS_MODEL)
 
 @tool
 def fetch_company_info(dummy: str) -> str:
@@ -29,6 +33,35 @@ def fetch_company_info(dummy: str) -> str:
     - Commitment to customer satisfaction and after-sales support.
     """
 
+async def get_query_vector(query: str) -> List[float]:
+    """
+    Call the encoding service API to get query vector
+
+    Args:
+        query (str): Query string to encode.
+
+    Returns:
+        List[float]: Encoded vector for the query.
+    """
+    url = f"{KOYEB2}/encode"  
+    print("hitting donella")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json={"query": query}
+            ) as response:
+                if response:
+                    data = await response.json()
+                    # print("response", data["vector"])
+                    return data["vector"]
+                else:
+                    print(f"Error from encoding service: {await response.text()}")
+                    raise HTTPException(status_code=response.status, detail="Encoding service error")
+    except Exception as e:
+        print(f"Error calling encoding service: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @tool
 def product_search_tool(query: str) -> ProductResponse:
     """
@@ -41,7 +74,8 @@ def product_search_tool(query: str) -> ProductResponse:
     Returns:
         ProductResponse: A response object containing the search results.
     """
-    query_vector = model.encode(query).tolist()
+    # query_vector = model.encode(query).tolist()
+    query_vector = get_query_vector(query)
     search_results = index.query(
         vector=query_vector,
         top_k=5,

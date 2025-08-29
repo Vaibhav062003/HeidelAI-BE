@@ -58,3 +58,4 @@ ORG_ID = os.getenv("ORG_ID")
 
 #Sentence Transformers
 SENTENCE_TRANSFORMERS_MODEL = os.getenv("sentence_transformers_model")
+KOYEB2 = os.getenv("KOYEB2")

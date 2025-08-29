@@ -61,7 +61,7 @@ async def verify_webhook(request: Request):
         return PlainTextResponse(content=str(args.get("hub.challenge")))
     return {"status": "Verification failed"}
 
-@router.post("/webhook")
+@router.post("")
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
     """
     This weebhook accepts POST requests from 
@@ -224,11 +224,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         )
 
                         org_id = instagram_connection.get("org_id")
+                        print(f"Org_id: {org_id}")
 
                         # Get the Instagram-specific collection names
                         messages_collection_name = f"messages_{org_id}"
                         conversations_collection_name = f"conversations_{org_id}"  # Add this line
-                        
+
                         # Check if collection exists
                         if messages_collection_name in db.list_collection_names():
 
@@ -341,7 +342,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         print(f"No active Instagram connection found for recipient ID: {recipient_id}")
                         return {"status": "error", "message": "Instagram account not found"}
                     
-                    org_id = instagram_connection.get("org_id")
+                    org_collection = db.organizations.find_one({"ig_id": recipient_id, "is_active": True})
+
+                    if not org_collection:
+                        print(f"No active organization found for Instagram ID: {recipient_id}")
+                        return {"status": "error", "message": "Organization not found"}
+
+                    org_id = org_collection.get("org_id")
 
                     # get the page access token
                     page_access_token = instagram_connection.get("page_access_token")
@@ -364,6 +371,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     user = name + " - @" + username
 
                     print(f"Message Received from {user}, Message: {message_text}")
+
+                    print("Calling function create_or_update_instagram_conversation")
 
                     # Create or update conversation
                     conversation_id = await create_or_update_instagram_conversation(

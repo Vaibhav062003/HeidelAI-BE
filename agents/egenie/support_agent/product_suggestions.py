@@ -1,16 +1,11 @@
 import os
-from dotenv import load_dotenv
 from pinecone import Pinecone
 # from sentence_transformers import SentenceTransformer
 from pymongo import MongoClient
 import aiohttp
 from fastapi import HTTPException
 from typing import List
-
-load_dotenv()
-
-MONGODB_URI = os.getenv("MONGODB_URI")
-KOYEB2 = os.getenv("KOYEB2")
+from config.settings import KOYEB2, MONGODB_URI
 
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client['Cluster0']
