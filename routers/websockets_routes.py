@@ -15,11 +15,15 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
     # Create a combined key for Instagram connections
     
     token = websocket.headers.get("sec-websocket-protocol")
+    print("="*20)
+    print(f"Token from headers: {token}")
+    print("="*20)
     instagram_id = None
 
     try:
         user = get_current_user(token)  # reusing the same function
         org_id = user.org_id
+        print(f"User's organization ID: {org_id}")
         instagram_id = db.organizations.find_one({"_id": org_id}, {"instagram_id": 1}).get("instagram_id")
 
     except Exception:
@@ -27,8 +31,9 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
         return
 
     connection_key = f"{client_id}_{instagram_id}"
-    await manager.connect(connection_key, websocket)
-    
+        # Accept with subprotocol and add to manager
+    await manager.connect(connection_key, websocket, token)
+
     try:
         # Store the Instagram ID mapping for notifications
         if instagram_id:

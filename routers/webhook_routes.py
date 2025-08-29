@@ -40,6 +40,19 @@ def validate_signature(payload, signature):
     # Compare signatures to ensure they match
     return hmac.compare_digest(f"sha256={expected_signature}", signature)
 
+# def validate_signature(payload, signature):
+#     expected_signature = hmac.new(
+#         bytes(APP_SECRET, 'latin-1'),
+#         msg=payload.encode('utf-8'),
+#         digestmod=hashlib.sha256
+#     ).hexdigest()
+    
+#     computed_signature = f"sha256={expected_signature}"
+#     print(f"Computed Signature: {computed_signature}")
+#     print(f"Received Signature: {signature}")
+    
+#     return hmac.compare_digest(computed_signature, signature)
+
 def remove_expired_message_ids():
     current_time = time.time()
     expired_ids = []
@@ -77,11 +90,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     
     # Validate signature
     if not x_hub_signature_256:
+        print(f"NO Signature: {payload_str}")
         raise HTTPException(status_code=403, detail="Signature missing")
     
     if not validate_signature(payload_str, x_hub_signature_256):
+        print(f"Validate Signature: {payload_str}")
         raise HTTPException(status_code=403, detail="Invalid signature")
     
+    print("RECEIVED CORRECT SIGNATURE:", payload_str)
+
     # Now parse the payload
     payload = json.loads(payload_str)
 
