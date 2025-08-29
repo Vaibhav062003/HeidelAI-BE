@@ -71,13 +71,22 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     global websocket_product_data
     global websocket_product_data_ig
 
+    # First, validate the signature
+    body = await request.body()
+    payload_str = body.decode('utf-8')
+    
+    # Validate signature
+    if not x_hub_signature_256:
+        raise HTTPException(status_code=403, detail="Signature missing")
+    
+    if not validate_signature(payload_str, x_hub_signature_256):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+    
+    # Now parse the payload
+    payload = json.loads(payload_str)
+
     # Remove expired message IDs
     remove_expired_message_ids()
-
-    # First, validate the signature
-    payload = await request.json()
-
-    await signature_required(request, x_hub_signature_256)
 
     print("Incoming webhook payload:", json.dumps(payload, indent=2))
 
