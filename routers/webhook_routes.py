@@ -424,8 +424,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     )
                     
                     # Check if conversation exists
-                    existing_conversation = conversations_collection.find_one({"id": conversation_id})
-                    conversation = conversations_collection.find_one({"id": conversation_id})
+                    existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+                    conversation = conversations_collection.find_one({"conversation_id": conversation_id})
 
 
                     if recipient_id in services.instagram_connections_map:
@@ -466,6 +466,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     # Broadcast the new message to Instagram-specific clients
                     await broadcast_instagram_message(recipient_id, "new_message", {
                         "message": {
+                            "conversation_id": conversation_id,
                             "sender_id": username,
                             "content": message_text,
                             "timestamp": datetime.now().isoformat()
