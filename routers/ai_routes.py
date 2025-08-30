@@ -1,6 +1,5 @@
 # === Third-party Modules ===
 import dateparser
-from pymongo import UpdateOne
 from pymongo.errors import PyMongoError
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
@@ -82,23 +81,22 @@ def update_chatbot_prompt(payload: ChatbotPromptUpdate, user=Depends(get_current
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-@router.post("/generate-reminder/{conversation_id}")
-async def generate_reminder(conversation_id: str, user=Depends(get_current_user)):
+@router.post("/schedule-message/{conversation_id}")
+async def schedule_message(conversation_id: str, user=Depends(get_current_user)):
     """
-    Generate and store a reminder message for a given conversation.
+    Schedule a follow-up message for a conversation using an AI agent to determine the content and timing.
     """
     try:
         org_id = user.get("org_id")
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found.")
 
-        scheduled_messages_collection = db["scheduled_messages"]
-
         platform = conversation_id.split("_")[0]
 
-        conversation_collection = db[f"conversations_{org_id}"]
+        scheduled_messages_collection = db["scheduled_messages"]
 
-        conversation = conversation_collection.find_one({"id": conversation_id}, {"customer_id": 1})
+        conversation_collection = db[f"conversations_{org_id}"]
+        conversation = conversation_collection.find_one({"conversation_id": conversation_id})
 
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found.")
@@ -106,16 +104,22 @@ async def generate_reminder(conversation_id: str, user=Depends(get_current_user)
         receiver_id = conversation.get("customer_id")
         sender_id = conversation.get("instagram_id")
 
-        # Running through LLM reminder agent
+        if not receiver_id or not sender_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="Missing sender_id or receiver_id in conversation"
+            )
+
+        # Running through LLM follow-up agent
         try:
-            reminder_result = await get_followup_message(org_id, conversation_id)
+            followup_result = await get_followup_message(org_id, conversation_id)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Reminder generation failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Follow-up generation failed: {str(e)}")
 
         # Converting delay (natural language) → ISO datetime
         try:
             send_time = dateparser.parse(
-                reminder_result.delay,
+                followup_result.delay,
                 settings={
                     "TIMEZONE": "UTC",
                     "RETURN_AS_TIMEZONE_AWARE": True,
@@ -128,26 +132,28 @@ async def generate_reminder(conversation_id: str, user=Depends(get_current_user)
         if not send_time:
             raise HTTPException(status_code=500, detail="Failed to parse follow-up delay.")
 
-        iso_time = send_time.isoformat()
-
-        reminder_doc = {
+        # iso_time = send_time.isoformat()
+        
+        followup_doc = {
             "org_id": org_id,
             "platform": platform,
             "conversation_id": conversation_id,
-            "followup_text": reminder_result.followup,
-            "delay": reminder_result.delay,
-            "scheduled_time": iso_time,
+            "sender_id": sender_id,        
+            "receiver_id": receiver_id, 
+            "followup_text": followup_result.followup,
+            "delay": followup_result.delay,
+            "scheduled_time": send_time,
             "status": "pending",
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.now(timezone.utc)
         }
 
-        # Store reminder
+        # Store follow-up message
         try:
-            scheduled_messages_collection.insert_one(reminder_doc)
+            scheduled_messages_collection.insert_one(followup_doc)
         except PyMongoError as e:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-        return {"status": "success", "data": reminder_doc}
+        return {"status": "success", "message": "Follow-up message scheduled successfully."}
 
     except HTTPException:
         raise

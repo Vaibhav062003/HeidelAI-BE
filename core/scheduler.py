@@ -1,3 +1,4 @@
+from pymongo import UpdateOne
 from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -6,7 +7,7 @@ from database import get_mongo_db
 from services.messaging import instagram_service
 
 db = get_mongo_db()
-scheduled_collection = db["scheduled_jobs"]
+scheduled_collection = db["scheduled_messages"]
 
 # mapping of platforms -> service instance
 messaging_services = {
@@ -18,8 +19,8 @@ async def process_scheduled_messages():
 
     pending = list(
         scheduled_collection.find(
-            {"status": "pending", "send_time": {"$lte": now}}
-        ).sort("send_time", 1)
+            {"status": "pending", "scheduled_time": {"$lte": now}}
+        ).sort("scheduled_time", 1)
     )
 
     if not pending:
@@ -28,30 +29,67 @@ async def process_scheduled_messages():
 
     print(f"[{now}] Found {len(pending)} messages to send.")
 
-    sent_ids = []
+    updates = []
     for msg in pending:
         platform = msg["platform"]
-        recipient_id = msg["recipient_id"]
-        message = msg["message"]
+        sender_id = msg["sender_id"]
+        receiver_id = msg["receiver_id"]
+        message = msg["followup_text"]
 
         service = messaging_services.get(platform)
         if not service:
             print(f"No service found for platform: {platform}")
+            updates.append(
+                UpdateOne(
+                    {"_id": msg["_id"]},
+                    {
+                        "$set": {
+                            "status": "failed",
+                            "error": f"No service found for platform: {platform}",
+                            "processed_at": now
+                        }
+                    }
+                )
+            )
             continue
 
         try:
-            await service.send_message(recipient_id, message)
-            sent_ids.append(msg["_id"])
-            print(f"Sent message to {recipient_id} on {platform}")
+            await service.send_message(sender_id, receiver_id, message)
+            updates.append(
+                UpdateOne(
+                    {"_id": msg["_id"]},
+                    {
+                        "$set": {
+                            "status": "sent",
+                            "sent_at": now,
+                            "processed_at": now
+                        }
+                    }
+                )
+            )
+            print(f"Sent message to {receiver_id} on {platform}")
         except Exception as e:
-            print(f"Failed to send to {recipient_id} on {platform}: {e}")
+            error_msg = str(e)
+            print(f"Failed to send to {receiver_id} on {platform}: {error_msg}")
+            updates.append(
+                UpdateOne(
+                    {"_id": msg["_id"]},
+                    {
+                        "$set": {
+                            "status": "failed",
+                            "error": error_msg,
+                            "processed_at": now
+                        }
+                    }
+                )
+            )
 
-    if sent_ids:
-        scheduled_collection.update_many(
-            {"_id": {"$in": sent_ids}},
-            {"$set": {"status": "sent", "sent_at": now}}
-        )
-        print(f"Marked {len(sent_ids)} messages as sent.")
+    if updates:
+        try:
+            result = scheduled_collection.bulk_write(updates)
+            print(f"Updated {result.modified_count} message statuses")
+        except Exception as e:
+            print(f"Error updating message statuses: {e}")
 
 def start_scheduler():
     scheduler = AsyncIOScheduler()

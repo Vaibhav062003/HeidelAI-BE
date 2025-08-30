@@ -79,14 +79,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     """
     This weebhook accepts POST requests from 
     """
-    global flag
-    global search_term
-    global websocket_product_data
-    global websocket_product_data_ig
 
     # First, validate the signature
     body = await request.body()
     payload_str = body.decode('utf-8')
+
+    # payload_str = request.state.payload_body.decode('utf-8')
+    # payload = json.loads(payload_str)
+
+    # print("Incoming webhook payload:", json.dumps(payload, indent=2))
     
     # Validate signature
     if not x_hub_signature_256:
@@ -465,13 +466,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         })
                     
                     # Broadcast the new message to Instagram-specific clients
-                    await broadcast_instagram_message(recipient_id, "new_message", {
-                        "message": {
-                            "conversation_id": conversation_id,
-                            "sender_id": username,
-                            "content": message_text,
-                            "timestamp": datetime.now().isoformat()
-                        }
-                    })
+                    # await broadcast_instagram_message(recipient_id, "new_message", {
+                    #     "message": {
+                    #         "role": "customer",
+                    #         "conversation_id": conversation_id,
+                    #         "sender_id": username,
+                    #         "content": message_text,
+                    #         "timestamp": datetime.now().isoformat()
+                    #     }
+                    # })
 
     return {"status": "ok"}

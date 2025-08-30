@@ -49,7 +49,7 @@ follow_up_agent = Agent(
 )
 
 
-def generate_followup_message(conversation: str) -> str:
+def generate_followup_message(conversation: str) -> FollowUpAgentResponse:
     """
     Generates a follow-up message using the follow_up_agent.
 
@@ -63,5 +63,4 @@ def generate_followup_message(conversation: str) -> str:
     if isinstance(response.content, FollowUpAgentResponse):
         return response.content
     else:
-        print("Error: AI response is not in the expected format.")
-        return None
+        raise ValueError("AI response is not in the expected format")

@@ -44,7 +44,7 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
             # Query the specific Instagram connection to get its access token
             connection = db.instagram_connections.find_one(
                 {"instagram_id": instagram_id, "is_active": True},
-                {"page_access_token": 1, "page_id": 1},
+                {"page_access_token": 1},
                 sort=[("last_updated", -1)]
             )
 
@@ -53,7 +53,7 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
             if connection and connection.get("page_access_token"):
                 # Use the connection-specific token and page ID
                 access_token = connection["page_access_token"]
-                page_id = connection.get("page_id", instagram_id)
+                # page_id = connection.get("page_id", instagram_id)
                 print(f"Using Instagram-specific token for {instagram_id}")
             else:
                 # Fallback to default token if connection not found
@@ -299,9 +299,9 @@ async def create_or_update_instagram_conversation(org_id: str, recipient_id, sen
         if "_id" in broadcast_conversation:
             broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
             
-        await broadcast_instagram_message(recipient_id, "conversation_updated", {
-            "conversation": broadcast_conversation
-        })
+        # await broadcast_instagram_message(recipient_id, "conversation_updated", {
+        #     "conversation": broadcast_conversation
+        # })
         
     return conversation_id
 

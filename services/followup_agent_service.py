@@ -3,7 +3,7 @@ from agents.followup_agent.follow_up_agent import generate_followup_message
 
 db = get_mongo_db()
 
-def get_followup_message(org_id: str, conversation_id: str) -> dict:
+async def get_followup_message(org_id: str, conversation_id: str) -> dict:
     """
     Fetches the latest 30 messages for a given conversation_id, 
     generates a follow-up message, and updates the conversation document 
@@ -28,11 +28,10 @@ def get_followup_message(org_id: str, conversation_id: str) -> dict:
     # Generate the follow-up message
     followup_object = generate_followup_message(conversation_text)
 
-    if messages:
-        # Update the conversation document with the follow-up message
-        return followup_object
-    else:
-        print(f"Failed to generate follow-up message for conversation {conversation_id}")
+    if not followup_object or not messages:
+        raise ValueError(f"Failed to generate follow-up message for conversation {conversation_id}")
+
+    return followup_object
 
 
 if __name__ == "__main__":
