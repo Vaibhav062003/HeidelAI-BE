@@ -436,6 +436,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     await manager.active_connections[connection_key].send_json({
                                         "type": "new_instagram_message",
                                         "message": {
+                                            "conversation_id": conversation_id,
                                             "sender_id": username,
                                             "content": message_text,
                                             "timestamp": datetime.now().isoformat()
