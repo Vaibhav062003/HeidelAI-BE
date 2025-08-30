@@ -464,12 +464,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         })
                     
                     # Broadcast the new message to Instagram-specific clients
-                    await broadcast_instagram_message(recipient_id, "new_message", {
-                        "message": {
-                            "sender_id": username,
-                            "content": message_text,
-                            "timestamp": datetime.now().isoformat()
-                        }
-                    })
+                    # await broadcast_instagram_message(recipient_id, "new_message", {
+                    #     "message": {
+                    #         "sender_id": username,
+                    #         "content": message_text,
+                    #         "timestamp": datetime.now().isoformat()
+                    #     }
+                    # })
 
     return {"status": "ok"}

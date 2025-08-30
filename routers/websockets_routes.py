@@ -45,12 +45,8 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
             await websocket.close(code=1008, reason="No Instagram ID configured")
             return
 
-        # Create connection key after validation
-        connection_key = f"{client_id}_{instagram_id}"
-        
-        
         # Add to manager after accepting
-        await manager.connect(connection_key, websocket, token)
+        await manager.connect(client_id, websocket, token)
 
     except Exception as e:
         import traceback
@@ -63,19 +59,20 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
         # Store the Instagram ID mapping for notifications
         if instagram_id not in services.instagram_connections_map:
             services.instagram_connections_map[instagram_id] = set()
-        services.instagram_connections_map[instagram_id].add(connection_key)
+        services.instagram_connections_map[instagram_id].add(client_id)
 
         print(f"Registered Instagram connection for ID: {instagram_id}")
         
         # Handle incoming messages
         while True:
             data = await websocket.receive_json()
-            print(f"Received message from Instagram connection {connection_key}: {data}")
+            print(f"Received message from Instagram connection {client_id}: {data}")
+
     except WebSocketDisconnect:
-        manager.disconnect(connection_key)
+        manager.disconnect(client_id)
         # Clean up Instagram ID mapping
         if instagram_id and instagram_id in services.instagram_connections_map:
-            services.instagram_connections_map[instagram_id].discard(connection_key)
+            services.instagram_connections_map[instagram_id].discard(client_id)
             if not services.instagram_connections_map[instagram_id]:
                 del services.instagram_connections_map[instagram_id]
 
