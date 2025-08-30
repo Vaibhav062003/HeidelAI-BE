@@ -4,3 +4,4 @@ __pycache__/
 credentials.json
 .vscode/settings.json
 whatsapp-chatbot-history-cf43052a413d.json
+venv

@@ -5,6 +5,7 @@ from core.services import services
 from auth.dependencies import get_current_user
 
 from fastapi.security import HTTPAuthorizationCredentials
+import json
 
 router = APIRouter(tags=["Websockets"])
 
@@ -25,13 +26,19 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
 
     try:
         # Validate user before accepting connection
-
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         user = await get_current_user(credentials)
-        print(user)
-        org_id = user.org_id
+        
+        # Fix: Check if user is a dict or has dict() method
+        if hasattr(user, 'dict'):
+            print("User: ", json.dumps(user.dict(), indent=4, default=str))
+            org_id = user.org_id
+        else:
+            print("User: ", json.dumps(user, indent=4, default=str))
+            org_id = user.get("org_id")
+            
         print(f"User's organization ID: {org_id}")
-        instagram_id = db.organizations.find_one({"_id": org_id}, {"instagram_id": 1}).get("instagram_id")
+        instagram_id = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}).get("ig_id")
         
         if not instagram_id:
             print("No Instagram ID found for organization")
@@ -41,14 +48,14 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
         # Create connection key after validation
         connection_key = f"{client_id}_{instagram_id}"
         
-        # Accept connection only after successful validation
-        await websocket.accept(subprotocol=token)
         
         # Add to manager after accepting
         await manager.connect(connection_key, websocket, token)
 
     except Exception as e:
+        import traceback
         print(f"Authentication error: {str(e)}")
+        print(traceback.format_exc())  # Print full stack trace
         await websocket.close(code=1008, reason="Authentication failed")
         return
 
