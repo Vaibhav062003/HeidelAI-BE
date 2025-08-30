@@ -368,7 +368,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         print(f"No active Instagram connection found for recipient ID: {recipient_id}")
                         return {"status": "error", "message": "Instagram account not found"}
                     
-                    org_collection = db.organizations.find_one({"ig_id": recipient_id, "is_active": True})
+                    org_collection = db.organizations.find_one({"ig_id": recipient_id})
 
                     if not org_collection:
                         print(f"No active organization found for Instagram ID: {recipient_id}")
