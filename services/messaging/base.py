@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 class MessageSender(ABC):
     @abstractmethod
-    async def send_message(self, recipient_id: str, message: str) -> None:
+    async def send_message(self, sender_id: str, recipient_id: str, message: str) -> None:
         pass
 
 

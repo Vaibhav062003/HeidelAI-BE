@@ -4,6 +4,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
 from auth.dependencies import get_current_user
 
+from fastapi.security import HTTPAuthorizationCredentials
+
 router = APIRouter(tags=["Websockets"])
 
 db = get_mongo_db()
@@ -12,8 +14,9 @@ db = get_mongo_db()
 @router.websocket("/ws2/instagram/{client_id}")
 async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
     """WebSocket endpoint that uses both client_id and instagram_id for Instagram-specific connections"""
-    # Create a combined key for Instagram connections
-    
+    print("="*20)
+    print(websocket.headers)
+    print("="*20)
     token = websocket.headers.get("sec-websocket-protocol")
     print("="*20)
     print(f"Token from headers: {token}")
@@ -21,28 +24,41 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
     instagram_id = None
 
     try:
-        user = get_current_user(token)  # reusing the same function
+        # Validate user before accepting connection
+
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        user = await get_current_user(credentials)
+        print(user)
         org_id = user.org_id
         print(f"User's organization ID: {org_id}")
         instagram_id = db.organizations.find_one({"_id": org_id}, {"instagram_id": 1}).get("instagram_id")
+        
+        if not instagram_id:
+            print("No Instagram ID found for organization")
+            await websocket.close(code=1008, reason="No Instagram ID configured")
+            return
 
-    except Exception:
-        await websocket.close(code=1008)  # Policy Violation
+        # Create connection key after validation
+        connection_key = f"{client_id}_{instagram_id}"
+        
+        # Accept connection only after successful validation
+        await websocket.accept(subprotocol=token)
+        
+        # Add to manager after accepting
+        await manager.connect(connection_key, websocket, token)
+
+    except Exception as e:
+        print(f"Authentication error: {str(e)}")
+        await websocket.close(code=1008, reason="Authentication failed")
         return
-
-    connection_key = f"{client_id}_{instagram_id}"
-        # Accept with subprotocol and add to manager
-    await manager.connect(connection_key, websocket, token)
 
     try:
         # Store the Instagram ID mapping for notifications
-        if instagram_id:
-            # Add to a dictionary that maps Instagram IDs to connection keys
-            if instagram_id not in services.instagram_connections_map:
-                services.instagram_connections_map[instagram_id] = set()
-            services.instagram_connections_map[instagram_id].add(connection_key)
+        if instagram_id not in services.instagram_connections_map:
+            services.instagram_connections_map[instagram_id] = set()
+        services.instagram_connections_map[instagram_id].add(connection_key)
 
-            print(f"Registered Instagram connection for ID: {instagram_id}")
+        print(f"Registered Instagram connection for ID: {instagram_id}")
         
         # Handle incoming messages
         while True:

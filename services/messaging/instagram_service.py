@@ -7,9 +7,9 @@ from services.ig_service import broadcast_instagram_message, send_ig_message
 db = get_mongo_db()
 
 class InstagramMessageSender(MessageSender):
-    async def send_message(self, recipient_id: str, message: str) -> None:
+    async def send_message(self, sender_id: str, recipient_id: str, message: str) -> None:
 
-        await send_ig_message(recipient_id, message)
+        await send_ig_message(recipient_id, message, instagram_id=sender_id)
 
 
 class InstagramConversationHandler(ConversationHandler):
@@ -74,8 +74,8 @@ class InstagramService:
         self.sender = InstagramMessageSender()
         self.conversations = InstagramConversationHandler()
 
-    async def send_message(self, recipient_id: str, message: str):
-        return await self.sender.send_message(recipient_id, message)
+    async def send_message(self, sender_id: str, recipient_id: str, message: str):
+        return await self.sender.send_message(sender_id, recipient_id, message)
 
     async def handle_conversation(self, org_id: str, **kwargs):
         conv_id = await self.conversations.create_or_update_conversation(org_id, **kwargs)

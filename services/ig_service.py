@@ -28,7 +28,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 db = get_mongo_db()
 
-async def send_ig_message(id, message_text, instagram_id=None) -> dict:
+async def send_ig_message(id, message_text, instagram_id) -> dict:
     """
     Send a message to an Instagram user using the appropriate access token
     
@@ -57,14 +57,18 @@ async def send_ig_message(id, message_text, instagram_id=None) -> dict:
                 print(f"Using Instagram-specific token for {instagram_id}")
             else:
                 # Fallback to default token if connection not found
+                print(f"No Instagram ID specified, cannot send message")
+                return 1
                 access_token = IG_ACCESS_TOKEN
                 page_id = IG_ID
                 print(f"Instagram connection not found for {instagram_id}, using default token")
         else:
             # Use default token if no Instagram ID specified
-            access_token = IG_ACCESS_TOKEN
-            page_id = IG_ID
-            print("Using default Instagram token")
+            print(f"No Instagram ID specified, cannot send message")
+            return 1
+            # access_token = IG_ACCESS_TOKEN
+            # page_id = IG_ID
+            # print("Using default Instagram token")
         
         # Build the API URL using the appropriate page_id
         url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"

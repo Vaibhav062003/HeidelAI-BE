@@ -115,12 +115,12 @@ async def get_instagram_profile(instagram_id: str, user=Depends(get_current_user
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram profile: {str(e)}")
 
 @router.post("/auth")
-async def instagram_auth(request: dict, _: None = Depends(require_auth)):
+async def instagram_auth(request: dict, user=Depends(get_current_user)):
     try:
         # Extract authorization code from frontend
         code = request.get("code")
         redirect_uri = request.get("redirect_uri")
-        org_id = request.get("org_id")
+        org_id = user.get("org_id")
         
         if not code:
             raise HTTPException(status_code=400, detail="Authorization code is required")
@@ -232,67 +232,66 @@ async def instagram_auth(request: dict, _: None = Depends(require_auth)):
         print(f"Instagram authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Instagram authentication error: {str(e)}")
 
-@router.post("/disconnect")
-async def instagram_disconnect(request: InstagramDisconnectRequest, _: None = Depends(require_auth)):
-    """Revoke Instagram access token and remove connection"""
-    try:
+# @router.post("/disconnect")
+# async def instagram_disconnect(request: InstagramDisconnectRequest, user: None = Depends(require_auth)):
+#     """Revoke Instagram access token and remove connection"""
+#     try:
+#         org_id = user.get("org_id")
+#         # Find the connection to get the access token if not provided
+#         connection = None
+#         connection = db.instagram_connections.find_one(
+#             {"instagram_id": request.user_id, "is_active": True, "org_id": org_id}
+#         )
+#         if connection:
+#             access_token = connection.get("page_access_token")
+#         else:
+#             # If no connection found, just return success (already disconnected)
+#             return {"status": "success", "message": "Instagram connection not found"}
+        
+#         # Call the Instagram Graph API to revoke the token if we have one
+#         if access_token:
+#             try:
+#                 revoke_response = requests.delete(
+#                     f"https://graph.instagram.com/{request.user_id}/permissions",
+#                     params={"access_token": access_token}
+#                 )
+#                 print(f"Instagram token revocation response: {revoke_response.status_code} - {revoke_response.text}")
+#             except Exception as revoke_error:
+#                 # Log but continue even if revocation fails
+#                 print(f"Error revoking Instagram token: {revoke_error}")
+        
+#         # Delete the Instagram-specific collections
+#         try:
+#             # Delete Instagram messages only
+#             messages_collection_name = f"messages_{org_id}"
+#             if messages_collection_name in db.list_collection_names():
+#                 deleted_messages = db[messages_collection_name].delete_many({"platform": "instagram"})
+#                 print(f"Deleted {deleted_messages.deleted_count} Instagram messages from {messages_collection_name}")
 
-        org_id = request.org_id
-        # Find the connection to get the access token if not provided
-        connection = None
-        connection = db.instagram_connections.find_one(
-            {"instagram_id": request.user_id, "is_active": True, "org_id": org_id}
-        )
-        if connection:
-            access_token = connection.get("page_access_token")
-        else:
-            # If no connection found, just return success (already disconnected)
-            return {"status": "success", "message": "Instagram connection not found"}
-        
-        # Call the Instagram Graph API to revoke the token if we have one
-        if access_token:
-            try:
-                revoke_response = requests.delete(
-                    f"https://graph.instagram.com/{request.user_id}/permissions",
-                    params={"access_token": access_token}
-                )
-                print(f"Instagram token revocation response: {revoke_response.status_code} - {revoke_response.text}")
-            except Exception as revoke_error:
-                # Log but continue even if revocation fails
-                print(f"Error revoking Instagram token: {revoke_error}")
-        
-        # Delete the Instagram-specific collections
-        try:
-            # Delete Instagram messages only
-            messages_collection_name = f"messages_{org_id}"
-            if messages_collection_name in db.list_collection_names():
-                deleted_messages = db[messages_collection_name].delete_many({"platform": "instagram"})
-                print(f"Deleted {deleted_messages.deleted_count} Instagram messages from {messages_collection_name}")
+#             # Delete Instagram conversations only
+#             conversations_collection_name = f"conversations_{org_id}"
+#             if conversations_collection_name in db.list_collection_names():
+#                 deleted_conversations = db[conversations_collection_name].delete_many({"platform": "instagram"})
+#                 print(f"Deleted {deleted_conversations.deleted_count} Instagram conversations from {conversations_collection_name}")
 
-            # Delete Instagram conversations only
-            conversations_collection_name = f"conversations_{org_id}"
-            if conversations_collection_name in db.list_collection_names():
-                deleted_conversations = db[conversations_collection_name].delete_many({"platform": "instagram"})
-                print(f"Deleted {deleted_conversations.deleted_count} Instagram conversations from {conversations_collection_name}")
-
-        except Exception as collection_error:
-            print(f"Error deleting Instagram collections: {collection_error}")
+#         except Exception as collection_error:
+#             print(f"Error deleting Instagram collections: {collection_error}")
         
-        # Delete all connections for this Instagram ID
-        delete_result = db.instagram_connections.delete_many(
-            {"instagram_id": request.user_id, "org_id": org_id}
-        )
+#         # Delete all connections for this Instagram ID
+#         delete_result = db.instagram_connections.delete_many(
+#             {"instagram_id": request.user_id, "org_id": org_id}
+#         )
         
-        print(f"Deleted {delete_result.deleted_count} Instagram connections for ID: {request.user_id}")
+#         print(f"Deleted {delete_result.deleted_count} Instagram connections for ID: {request.user_id}")
         
-        return {
-            "status": "success", 
-            "message": f"Instagram connection disconnected, removed {delete_result.deleted_count} connections"
-        }
+#         return {
+#             "status": "success", 
+#             "message": f"Instagram connection disconnected, removed {delete_result.deleted_count} connections"
+#         }
         
-    except Exception as e:
-        print(f"Error disconnecting Instagram: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to disconnect Instagram: {str(e)}")
+#     except Exception as e:
+#         print(f"Error disconnecting Instagram: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"Failed to disconnect Instagram: {str(e)}")
 
 @router.get("/status")
 async def get_instagram_status(org_id: str, instagram_id: Optional[str] = None, app_user_id: Optional[str] = None, _: None = Depends(require_auth)):
