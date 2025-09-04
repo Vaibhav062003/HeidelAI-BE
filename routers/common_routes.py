@@ -1,6 +1,6 @@
 from datetime import datetime
 from database import get_mongo_db
-from auth.dependencies import get_current_user
+from auth.dependencies import CurrentUser
 from fastapi import APIRouter, Depends, HTTPException
 
 db = get_mongo_db()
@@ -8,13 +8,13 @@ db = get_mongo_db()
 router = APIRouter(prefix="/api", tags=["Common Routes"])
 
 @router.get("/conversations")
-async def get_instagram_conversations(user=Depends(get_current_user)):
+async def get_instagram_conversations(user: CurrentUser):
     """
     Fetch all the Instagram conversations for a specific Organization using org_id
     Returns them in the standard conversation format for compatibility with the frontend
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
         

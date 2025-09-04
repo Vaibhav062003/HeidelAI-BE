@@ -2,7 +2,7 @@ from core.managers import manager, manager2
 from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
-from auth.dependencies import get_current_user
+from auth.dependencies import CurrentUser
 
 from fastapi.security import HTTPAuthorizationCredentials
 import json
@@ -35,7 +35,7 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
             org_id = user.org_id
         else:
             print("User: ", json.dumps(user, indent=4, default=str))
-            org_id = user.get("org_id")
+            org_id = user.org_id 
             
         print(f"User's organization ID: {org_id}")
         instagram_id = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}).get("ig_id")

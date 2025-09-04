@@ -22,7 +22,7 @@ from schemas.models import WhatsappAuthRequest, MessageRole
 from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
-from auth.dependencies import get_current_user
+from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required, require_auth
 from config.settings import (
     APP_ID,
@@ -219,7 +219,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, _: None = Depends
 async def whatsapp_disconnect(request: dict, _: None = Depends(require_auth)):
     try:
         user_id = request.get("user_id")
-        org_id = request.get("org_id")
+        org_id = request.org_id 
         
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID is required")
@@ -542,13 +542,13 @@ async def get_whatsapp_conversation_analytics(
         )
 
 @router.get("/conversations")
-async def get_whatsapp_conversations(user=Depends(get_current_user)):
+async def get_whatsapp_conversations(user: CurrentUser):
     """
     Fetch all conversations for a specific WhatsApp business account ID
     Returns them in the standard conversation format for compatibility with the frontend
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
 
         # Get the WhatsApp-specific collection name
         conversations_collection_name = f"conversations_{org_id}"
@@ -601,13 +601,13 @@ async def get_whatsapp_conversations(user=Depends(get_current_user)):
         )
 
 @router.get("/conversations/{conversation_id}")
-async def get_whatsapp_conversation(conversation_id: str, user=Depends(get_current_user)):
+async def get_whatsapp_conversation(conversation_id: str, user: CurrentUser):
     """
     Fetch a specific conversation for an Whatsapp business account ID
     Returns the conversation in the standard format for compatibility with the frontend
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
 
         conversations_collection_name = f"conversations_{org_id}"
         
@@ -643,10 +643,10 @@ async def get_whatsapp_conversation(conversation_id: str, user=Depends(get_curre
         )
 
 @router.get("/conversations/{conversation_id}/messages")
-async def get_whatsapp_messages(conversation_id: str, user=Depends(get_current_user)):
+async def get_whatsapp_messages(conversation_id: str, user: CurrentUser):
     """Fetch messages for a specific WhatsApp conversation"""
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
 
         # Get the WhatsApp-specific collection name
         messages_collection_name = f"messages_{org_id}"
@@ -679,11 +679,11 @@ async def get_whatsapp_messages(conversation_id: str, user=Depends(get_current_u
         )
 
 @router.get("/conversations/{conversation_id}/read")
-async def update_whatsapp_unread_count(conversation_id: str, user=Depends(get_current_user)):
+async def update_whatsapp_unread_count(conversation_id: str, user: CurrentUser):
     """Reset unread count for a specific WhatsApp conversation"""
 
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
 
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
@@ -707,11 +707,11 @@ async def update_whatsapp_unread_count(conversation_id: str, user=Depends(get_cu
         )
 
 @router.get("/conversations/{conversation_id}/ai")
-async def get_whatsapp_ai_status(conversation_id: str, user=Depends(get_current_user)):
+async def get_whatsapp_ai_status(conversation_id: str, user: CurrentUser):
     """Get AI status for a specific WhatsApp conversation"""
     try:
 
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
         
@@ -732,10 +732,10 @@ async def get_whatsapp_ai_status(conversation_id: str, user=Depends(get_current_
         )
 
 @router.post("/{whatsapp_id}/conversations/{conversation_id}/toggle_ai")
-async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body: dict, user=Depends(get_current_user)):
+async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body: dict, user: CurrentUser):
     """Toggle AI status for a specific WhatsApp conversation"""
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
         
@@ -781,9 +781,9 @@ async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body
         )
 
 @router.post("/{whatsapp_id}/conversations/send_message")
-async def send_whatsapp_message(whatsapp_id: str, message: dict, user=Depends(get_current_user)):
+async def send_whatsapp_message(whatsapp_id: str, message: dict, user: CurrentUser):
     """Send a message to a WhatsApp conversation"""
-    org_id = user.get("org_id")
+    org_id = user.org_id 
     wa_connection = db.whatsapp_connections.find_one(
             {"user_id": whatsapp_id, "org_id": org_id},
             {"business_account_id": 1, "_id": 0}

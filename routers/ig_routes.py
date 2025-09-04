@@ -4,7 +4,7 @@ from datetime import datetime
 from config.settings import *
 from services.ig_service import *
 from schemas.models import InstagramDisconnectRequest, MessageRole
-from auth.dependencies import get_current_user
+from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required, require_auth
 
 from database import get_mongo_db
@@ -60,7 +60,7 @@ def exchange_for_long_lived_token(short_lived_token):
         }
 
 @router.get("/{instagram_id}/profile")
-async def get_instagram_profile(instagram_id: str, user=Depends(get_current_user)):
+async def get_instagram_profile(instagram_id: str, user: CurrentUser):
     """
     Fetch detailed Instagram profile information
     
@@ -71,7 +71,7 @@ async def get_instagram_profile(instagram_id: str, user=Depends(get_current_user
         Instagram profile information including bio, followers count, etc.
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # Get the page access token for this Instagram account
         connection = db.instagram_connections.find_one(
             {"instagram_id": instagram_id, "is_active": True, "org_id": org_id},
@@ -115,12 +115,12 @@ async def get_instagram_profile(instagram_id: str, user=Depends(get_current_user
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram profile: {str(e)}")
 
 @router.post("/auth")
-async def instagram_auth(request: dict, user=Depends(get_current_user)):
+async def instagram_auth(request: dict, user: CurrentUser):
     try:
         # Extract authorization code from frontend
         code = request.get("code")
         redirect_uri = request.get("redirect_uri")
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         
         if not code:
             raise HTTPException(status_code=400, detail="Authorization code is required")
@@ -236,7 +236,7 @@ async def instagram_auth(request: dict, user=Depends(get_current_user)):
 # async def instagram_disconnect(request: InstagramDisconnectRequest, user: None = Depends(require_auth)):
 #     """Revoke Instagram access token and remove connection"""
 #     try:
-#         org_id = user.get("org_id")
+#         org_id = user.org_id 
 #         # Find the connection to get the access token if not provided
 #         connection = None
 #         connection = db.instagram_connections.find_one(
@@ -338,10 +338,10 @@ async def get_instagram_status(org_id: str, instagram_id: Optional[str] = None, 
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.put("/link-user")
-async def link_instagram_to_user(instagram_id: str, app_user_id: str, user=Depends(get_current_user)):
+async def link_instagram_to_user(instagram_id: str, app_user_id: str, user: CurrentUser):
     """Link an Instagram connection to a specific app user ID"""
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # Update the Instagram connection record to add the app user ID - Remove await
         result = db.instagram_connections.update_one(
             {"instagram_id": instagram_id, "org_id": org_id},
@@ -435,13 +435,13 @@ async def get_instagram_posts(instagram_id: str, limit: int = 24, _: None = Depe
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram posts: {str(e)}")
 
 @router.get("/conversations/{conversation_id}")
-async def get_instagram_conversation(conversation_id: str, user=Depends(get_current_user)):
+async def get_instagram_conversation(conversation_id: str, user: CurrentUser):
     """
     Fetch the conversation of a specific user for the organization.
     Returns the conversation in the standard format for compatibility with the frontend
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         print(org_id)
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
@@ -478,13 +478,13 @@ async def get_instagram_conversation(conversation_id: str, user=Depends(get_curr
         )
 
 @router.get("/conversations")
-async def get_instagram_conversations(user=Depends(get_current_user)):
+async def get_instagram_conversations(user: CurrentUser):
     """
     Fetch all the Instagram conversations for a specific Organization using org_id
     Returns them in the standard conversation format for compatibility with the frontend
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
         
@@ -538,10 +538,10 @@ async def get_instagram_conversations(user=Depends(get_current_user)):
 
 # Instagram-specific messages endpoint
 @router.get("/conversations/{conversation_id}/messages")
-async def get_instagram_messages(conversation_id: str, user=Depends(get_current_user)):
+async def get_instagram_messages(conversation_id: str, user: CurrentUser):
     """Fetch messages for a specific Instagram conversation"""
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # organization specific collection name for conversations
         org_messages_collection_name = f"messages_{org_id}"
         
@@ -575,10 +575,10 @@ async def get_instagram_messages(conversation_id: str, user=Depends(get_current_
 
 # Instagram-specific AI status endpoint
 @router.get("/conversations/{conversation_id}/ai")
-async def get_instagram_ai_status(conversation_id: str, user=Depends(get_current_user)):
+async def get_instagram_ai_status(conversation_id: str, user: CurrentUser):
     """Get AI status for a specific Instagram conversation"""
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
         
@@ -603,10 +603,10 @@ async def get_instagram_ai_status(conversation_id: str, user=Depends(get_current
 
 # Instagram-specific AI toggle endpoint
 @router.post("/conversations/{conversation_id}/toggle_ai")
-async def toggle_instagram_ai_status(conversation_id: str, body: dict, user=Depends(get_current_user)):
+async def toggle_instagram_ai_status(conversation_id: str, body: dict, user: CurrentUser):
     """Toggle AI status for a specific Instagram conversation"""
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
         
@@ -658,10 +658,10 @@ async def toggle_instagram_ai_status(conversation_id: str, body: dict, user=Depe
 
 # Instagram-specific unread count reset endpoint
 @router.get("/conversations/{conversation_id}/read")
-async def update_instagram_unread_count(conversation_id: str, user=Depends(get_current_user)):
+async def update_instagram_unread_count(conversation_id: str, user: CurrentUser):
     """Reset unread count for a specific Instagram conversation"""
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         # Get the Instagram-specific collection
         org_conversations_collection = db[f"conversations_{org_id}"]
 
@@ -685,10 +685,10 @@ async def update_instagram_unread_count(conversation_id: str, user=Depends(get_c
 
 # Instagram-specific send message endpoint
 @router.post("/conversations/send_message")
-async def send_instagram_message(message: dict, user=Depends(get_current_user)):
+async def send_instagram_message(message: dict, user: CurrentUser):
     """Send a message to an Instagram conversation"""
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         conversation_id = message["conversation_id"]
         content = message["content"]
         sender_id = message["sender_id"]

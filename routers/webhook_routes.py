@@ -131,7 +131,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         print(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
                         continue
                     
-                    # org_id = connection.get("org_id")
+                    # org_id = connection.org_id 
 
                     # Get sender name from contacts if available
                     sender_name2 = "Unknown Sender"
@@ -250,7 +250,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             sort=[("last_updated", -1)]
                         )
 
-                        org_id = instagram_connection.get("org_id")
+                        org_id = instagram_connection.org_id 
                         print(f"Org_id: {org_id}")
 
                         # Get the Instagram-specific collection names
@@ -375,7 +375,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         print(f"No active organization found for Instagram ID: {recipient_id}")
                         return {"status": "error", "message": "Organization not found"}
 
-                    org_id = org_collection.get("org_id")
+                    org_id = org_collection.org_id 
 
                     # get the page access token
                     page_access_token = instagram_connection.get("page_access_token")

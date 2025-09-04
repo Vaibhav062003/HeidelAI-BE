@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from database import get_mongo_db
 from services.followup_agent_service import get_followup_message
 from schemas.models import ChatbotPromptUpdate
-from auth.dependencies import get_current_user
+from auth.dependencies import CurrentUser
 from services.ai_chatbot import update_prompt_in_cache
 
 db = get_mongo_db()
@@ -16,12 +16,12 @@ db = get_mongo_db()
 router = APIRouter(prefix="/api/ai", tags=["AI Routes"])
 
 @router.get("/product-recommendations/{conversation_id}")
-async def get_product_recommendations(conversation_id: str, user=Depends(get_current_user)):
+async def get_product_recommendations(conversation_id: str, user: CurrentUser):
     """
     This endpoint retrieves product recommendations for a specific conversation.
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID missing in user context")
 
@@ -48,12 +48,12 @@ async def get_product_recommendations(conversation_id: str, user=Depends(get_cur
 
 
 @router.put("/chatbot-prompt")
-def update_chatbot_prompt(payload: ChatbotPromptUpdate, user=Depends(get_current_user)):
+def update_chatbot_prompt(payload: ChatbotPromptUpdate, user: CurrentUser):
     """
     Update the chatbot prompt for the authenticated user's organization.
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found in user context.")
 
@@ -82,12 +82,12 @@ def update_chatbot_prompt(payload: ChatbotPromptUpdate, user=Depends(get_current
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @router.post("/schedule-message/{conversation_id}")
-async def schedule_message(conversation_id: str, user=Depends(get_current_user)):
+async def schedule_message(conversation_id: str, user: CurrentUser):
     """
     Schedule a follow-up message for a conversation using an AI agent to determine the content and timing.
     """
     try:
-        org_id = user.get("org_id")
+        org_id = user.org_id 
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found.")
 
