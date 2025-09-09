@@ -2,7 +2,7 @@ from core.managers import manager, manager2
 from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
-from auth.dependencies import CurrentUser
+from auth.dependencies import CurrentUser, get_current_user
 
 from fastapi.security import HTTPAuthorizationCredentials
 import json
@@ -67,6 +67,22 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
         while True:
             data = await websocket.receive_json()
             print(f"Received message from Instagram connection {client_id}: {data}")
+            msg_type = data.get("type")
+                          
+            if msg_type == "typing_indicator":
+                print(f"✍️ Typing event from Instagram {client_id}: {data}")
+                if instagram_id in services.instagram_connections_map:
+                    for other_client_id in services.instagram_connections_map[instagram_id]:
+                        if other_client_id != client_id:
+                            
+                            other_ws = manager.active_connections.get(other_client_id)
+                            if other_ws:
+                                try:
+                                    await other_ws.send_json(data)
+                                except Exception as e:
+                                    print(f"Error sending typing indicator to {other_client_id}: {e}")
+
+
 
     except WebSocketDisconnect:
         manager.disconnect(client_id)
