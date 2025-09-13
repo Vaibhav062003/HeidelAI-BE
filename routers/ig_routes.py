@@ -442,7 +442,7 @@ async def get_instagram_conversation(conversation_id: str, user: CurrentUser):
     """
     try:
         org_id = user.org_id 
-        print(org_id)
+
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
         

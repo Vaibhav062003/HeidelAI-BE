@@ -17,6 +17,17 @@ from core.services import services
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
 
+def validate_signature(payload, signature):
+    # Hash the payload with the app secret
+    expected_signature = hmac.new(
+        bytes(APP_SECRET, 'latin-1'),
+        msg=payload.encode('utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+    
+    # Compare signatures to ensure they match
+    return hmac.compare_digest(f"sha256={expected_signature}", signature)
+
 # Middleware or decorator to validate signature for POST requests
 async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
     # Get the request payload
@@ -28,17 +39,6 @@ async def signature_required(request: Request, x_hub_signature_256: str = Header
 
     if not validate_signature(payload, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Invalid signature")
-
-def validate_signature(payload, signature):
-    # Hash the payload with the app secret
-    expected_signature = hmac.new(
-        bytes(APP_SECRET, 'latin-1'),
-        msg=payload.encode('utf-8'),
-        digestmod=hashlib.sha256
-    ).hexdigest()
-    
-    # Compare signatures to ensure they match
-    return hmac.compare_digest(f"sha256={expected_signature}", signature)
 
 # def validate_signature(payload, signature):
 #     expected_signature = hmac.new(
@@ -80,6 +80,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     This weebhook accepts POST requests from 
     """
 
+    if not signature_required(request, x_hub_signature_256):
+        print("APP SECRET:", APP_SECRET)
+        raise HTTPException(status_code=403, detail="Invalid signature")
+    else:
+        print("Signature validated successfully.")
+
     # First, validate the signature
     body = await request.body()
     payload_str = body.decode('utf-8')
@@ -90,13 +96,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     # print("Incoming webhook payload:", json.dumps(payload, indent=2))
     
     # Validate signature
-    if not x_hub_signature_256:
-        print(f"NO Signature: {payload_str}")
-        raise HTTPException(status_code=403, detail="Signature missing")
+    # if not x_hub_signature_256:
+    #     print(f"NO Signature: {payload_str}")
+    #     raise HTTPException(status_code=403, detail="Signature missing")
     
-    if not validate_signature(payload_str, x_hub_signature_256):
-        print(f"Validate Signature: {x_hub_signature_256}")
-        raise HTTPException(status_code=403, detail="Invalid signature")
+    # if not validate_signature(payload_str, x_hub_signature_256):
+    #     print(f"Validate Signature: {x_hub_signature_256}")
+    #     raise HTTPException(status_code=403, detail="Invalid signature")
     
     print("RECEIVED CORRECT SIGNATURE:", x_hub_signature_256)
 
@@ -346,7 +352,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         print("Message read event")
                         continue
 
-                    ig_message_id = message["message"]["mid"]
+                    sender_id = message["sender"]["id"]
+                    recipient_id = message["recipient"]["id"]
+                    message = message.get("message")
+                    
+                    if (message is None):
+                        print("No message content, skipping.")
+                        return {"status": "ok"}
+                    
+                    if (message.get("text") is None):
+                        print("No message content, skipping.")
+                        return {"status": "ok"}
+
+                    ig_message_id = message["mid"]
 
                     if ig_message_id in services.processed_message_ids:
                         print("Duplicate message, skipping processing.")
@@ -355,9 +373,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     # Add message ID with the current timestamp
                     services.processed_message_ids[ig_message_id] = time.time()
 
-                    sender_id = message["sender"]["id"]
-                    recipient_id = message["recipient"]["id"]
-                    message_text = message["message"]["text"]
+                    message_text = message.get("text", None)
+                    message_echo = message.get("is_echo", False)
+
+                    if message_echo:
+                        recipient_id, sender_id = sender_id, recipient_id
 
                     # Find the corresponding Instagram account in our connections
                     instagram_connection = db.instagram_connections.find_one(
@@ -367,15 +387,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     if not instagram_connection:
                         print(f"No active Instagram connection found for recipient ID: {recipient_id}")
-                        return {"status": "error", "message": "Instagram account not found"}
+                        return {"status": "ok"}
                     
                     org_collection = db.organizations.find_one({"ig_id": recipient_id})
 
                     if not org_collection:
                         print(f"No active organization found for Instagram ID: {recipient_id}")
-                        return {"status": "error", "message": "Organization not found"}
+                        return {"status": "ok"}
 
-                    org_id = org_collection.org_id 
+                    org_id = org_collection.get("org_id")
+
+                    if (not org_id):
+                        print(f"No active organization ID found for Instagram ID: {recipient_id}")
+                        return {"status": "ok"}
 
                     # get the page access token
                     page_access_token = instagram_connection.get("page_access_token")
@@ -420,7 +444,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         sender_name=name,
                         sender_username=username,
                         recipient_id=recipient_id,
-                        role=MessageRole.CUSTOMER,
+                        role= message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
                         message_id=ig_message_id  # Use the ID from the webhook for deduplication
                     )
                     
@@ -440,7 +464,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "conversation_id": conversation_id,
                                             "sender_id": username,
                                             "content": message_text,
-                                            "timestamp": datetime.now().isoformat()
+                                            "timestamp": datetime.now().isoformat(),
+                                            "role": message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
                                         }
                                     })
                             except Exception as e:

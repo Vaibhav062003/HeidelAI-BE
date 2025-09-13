@@ -15,29 +15,17 @@ db = get_mongo_db()
 @router.websocket("/ws2/instagram/{client_id}")
 async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
     """WebSocket endpoint that uses both client_id and instagram_id for Instagram-specific connections"""
-    print("="*20)
-    print(websocket.headers)
-    print("="*20)
+
     token = websocket.headers.get("sec-websocket-protocol")
-    print("="*20)
-    print(f"Token from headers: {token}")
-    print("="*20)
     instagram_id = None
 
     try:
         # Validate user before accepting connection
         credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
         user = await get_current_user(credentials)
-        
-        # Fix: Check if user is a dict or has dict() method
-        if hasattr(user, 'dict'):
-            print("User: ", json.dumps(user.dict(), indent=4, default=str))
-            org_id = user.org_id
-        else:
-            print("User: ", json.dumps(user, indent=4, default=str))
-            org_id = user.org_id 
-            
-        print(f"User's organization ID: {org_id}")
+           
+        org_id = user.org_id
+
         instagram_id = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}).get("ig_id")
         
         if not instagram_id:
@@ -51,7 +39,7 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
     except Exception as e:
         import traceback
         print(f"Authentication error: {str(e)}")
-        print(traceback.format_exc())  # Print full stack trace
+        # print(traceback.format_exc())  # Print full stack trace
         await websocket.close(code=1008, reason="Authentication failed")
         return
 

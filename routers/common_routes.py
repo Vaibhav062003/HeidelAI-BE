@@ -14,20 +14,38 @@ async def get_instagram_conversations(user: CurrentUser):
     Returns them in the standard conversation format for compatibility with the frontend
     """
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+        org_collection = db.organizations
+        org_data = org_collection.find_one({"org_id": org_id})
+
+        if not org_data:
+            raise HTTPException(status_code=404, detail="Organization not found")
+         
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
-        
+
         # Check if collection exists in database
         if org_conversations_collection_name not in db.list_collection_names():
             return []
         
         # Get the collection
         org_conversations_collection = db[org_conversations_collection_name]
+        
+        allowed_platforms = []
+        if org_data.get("ig_id"):
+            allowed_platforms.append("instagram")
+        if org_data.get("wa_id"):
+            allowed_platforms.append("whatsapp")
+
+        query_filter = {"platform": {"$in": allowed_platforms}}
 
         # Fetch conversations and sort by last_message_timestamp
         raw_conversations = list(org_conversations_collection.find(
-            {}, 
+            query_filter,
             {"_id": 0}  # Exclude _id field
         ).sort("last_message_timestamp", -1))
         
@@ -65,3 +83,4 @@ async def get_instagram_conversations(user: CurrentUser):
             status_code=500, 
             detail=f"Failed to fetch conversations: {str(e)}"
         )
+    
