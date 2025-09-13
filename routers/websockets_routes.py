@@ -2,7 +2,7 @@ from core.managers import manager, manager2
 from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
-from auth.dependencies import CurrentUser, get_current_user
+from auth.dependencies import get_current_user
 
 from fastapi.security import HTTPAuthorizationCredentials
 import json
