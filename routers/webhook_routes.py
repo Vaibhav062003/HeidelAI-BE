@@ -95,10 +95,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         raise HTTPException(status_code=403, detail="Signature missing")
     
     if not validate_signature(payload_str, x_hub_signature_256):
-        print(f"Validate Signature: {payload_str}")
+        print(f"Validate Signature: {x_hub_signature_256}")
         raise HTTPException(status_code=403, detail="Invalid signature")
     
-    print("RECEIVED CORRECT SIGNATURE:", payload_str)
+    print("RECEIVED CORRECT SIGNATURE:", x_hub_signature_256)
 
     # Now parse the payload
     payload = json.loads(payload_str)
@@ -338,7 +338,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         })
                         
                         # Return success early since we've handled the deletion event
-                        return {"status": "success"}
+                        return {"status": "ok"}
                 
 
                     # Check if the message is a read event
