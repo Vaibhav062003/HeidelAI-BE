@@ -713,19 +713,9 @@ async def send_instagram_message(message: dict, user: CurrentUser):
         # Send message via Instagram API
         await send_ig_message(user_instagram_id, content, instagram_id)
         
-        # Store message in Instagram-specific collection
-        message_id = await store_instagram_message(
-            org_id=org_id,
-            content=content,
-            conversation_id=conversation_id,
-            sender_id=sender_id,
-            sender_name="Agent",
-            sender_username="agent",
-            recipient_id=instagram_id,
-            role=MessageRole.AGENT
-        )
+        # no need to store message and broadcast here as due to insta sending us our own message using is_echo:true it is handled in webhook code to broadcast and store this msg
         
-        return {"status": "success", "message": "Message sent", "message_id": message_id}
+        return {"status": "success", "message": "Message sent"}
     
     except Exception as e:
         print(f"Error sending Instagram message: {e}")
