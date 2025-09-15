@@ -110,11 +110,8 @@ async def get_instagram_profile(user: CurrentUser):
             )
         
         profile_data = response.json()
-        
-        return {
-            "status": "success",
-            "data": profile_data
-        }
+
+        return profile_data
     
     except HTTPException as e:
         raise e
@@ -301,49 +298,49 @@ async def instagram_auth(request: dict, user: CurrentUser):
 #         print(f"Error disconnecting Instagram: {str(e)}")
 #         raise HTTPException(status_code=500, detail=f"Failed to disconnect Instagram: {str(e)}")
 
-@router.get("/status")
-async def get_instagram_status(org_id: str, instagram_id: Optional[str] = None, app_user_id: Optional[str] = None, _: None = Depends(require_auth)):
-    """Check if Instagram account is connected and return connection details"""
-    try:
-        # At least one of the IDs must be provided
-        if not instagram_id and not app_user_id:
-            raise HTTPException(status_code=400, detail="Either instagram_id or app_user_id must be provided")
+# @router.get("/status")
+# async def get_instagram_status(org_id: str, instagram_id: Optional[str] = None, app_user_id: Optional[str] = None, _: None = Depends(require_auth)):
+#     """Check if Instagram account is connected and return connection details"""
+#     try:
+#         # At least one of the IDs must be provided
+#         if not instagram_id and not app_user_id:
+#             raise HTTPException(status_code=400, detail="Either instagram_id or app_user_id must be provided")
         
-        # Query by Instagram ID first if available - Remove await
-        if instagram_id:
-            connection = db.instagram_connections.find_one(
-                {"instagram_id": instagram_id, "is_active": True, "org_id": org_id}
-            )
-        # If Instagram ID is not available or no connection found, try with app user ID
-        elif app_user_id:
-            connection = db.instagram_connections.find_one(
-                {"app_user_id": app_user_id, "is_active": True, "org_id": org_id}
-            )
+#         # Query by Instagram ID first if available - Remove await
+#         if instagram_id:
+#             connection = db.instagram_connections.find_one(
+#                 {"instagram_id": instagram_id, "is_active": True, "org_id": org_id}
+#             )
+#         # If Instagram ID is not available or no connection found, try with app user ID
+#         elif app_user_id:
+#             connection = db.instagram_connections.find_one(
+#                 {"app_user_id": app_user_id, "is_active": True, "org_id": org_id}
+#             )
         
-        # If no connection found with either ID
-        if not connection:
-            return {
-                "instagram_connected": False,
-                "instagram_data": None
-            }
+#         # If no connection found with either ID
+#         if not connection:
+#             return {
+#                 "instagram_connected": False,
+#                 "instagram_data": None
+#             }
         
-        # Return connection details
-        return {
-            "instagram_connected": True,
-            "org_id": org_id,
-            "instagram_data": {
-                "username": connection.get("username"),
-                "user_id": connection.get("instagram_id"),
-                "profile_picture": connection.get("profile_picture"),
-                "business_info": connection.get("business_info"),
-                "connected_at": connection.get("connected_at").isoformat() if connection.get("connected_at") else None
-            }
-        }
+#         # Return connection details
+#         return {
+#             "instagram_connected": True,
+#             "org_id": org_id,
+#             "instagram_data": {
+#                 "username": connection.get("username"),
+#                 "user_id": connection.get("instagram_id"),
+#                 "profile_picture": connection.get("profile_picture"),
+#                 "business_info": connection.get("business_info"),
+#                 "connected_at": connection.get("connected_at").isoformat() if connection.get("connected_at") else None
+#             }
+#         }
             
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#     except HTTPException as http_exc:
+#         raise http_exc
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 @router.put("/link-user")
 async def link_instagram_to_user(instagram_id: str, app_user_id: str, user: CurrentUser):
@@ -371,8 +368,8 @@ async def link_instagram_to_user(instagram_id: str, app_user_id: str, user: Curr
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/{instagram_id}/posts")
-async def get_instagram_posts(instagram_id: str, limit: int = 24, _: None = Depends(require_auth)):
+@router.get("/posts")
+async def get_instagram_posts(user: CurrentUser, limit: int = 24):
     """
     Fetch Instagram posts for a specific Instagram business account
     
@@ -384,6 +381,15 @@ async def get_instagram_posts(instagram_id: str, limit: int = 24, _: None = Depe
         List of Instagram posts with media URLs and metadata
     """
     try:
+        org_id = user.org_id 
+
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        instagram_id = org_document.get("ig_id")
+
+        if not instagram_id:
+            raise HTTPException(status_code=400, detail="Instagram ID not configured for this organization")
+
         # First, get the page access token for this Instagram account
         connection = db.instagram_connections.find_one(
             {"instagram_id": instagram_id, "is_active": True},
