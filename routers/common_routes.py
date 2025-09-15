@@ -1,13 +1,13 @@
 from datetime import datetime
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 
 db = get_mongo_db()
 
-router = APIRouter(prefix="/api", tags=["Common Routes"])
+router = APIRouter(tags=["Common Routes"])
 
-@router.get("/conversations")
+@router.get("/api/conversations")
 async def get_instagram_conversations(user: CurrentUser):
     """
     Fetch all the Instagram conversations for a specific Organization using org_id
@@ -84,3 +84,10 @@ async def get_instagram_conversations(user: CurrentUser):
             detail=f"Failed to fetch conversations: {str(e)}"
         )
     
+@router.get("/")
+async def health_check():
+    return {"status": "ok"}
+
+@router.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204) 

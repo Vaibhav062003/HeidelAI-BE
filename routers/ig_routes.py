@@ -59,8 +59,8 @@ def exchange_for_long_lived_token(short_lived_token):
             "error": str(e)
         }
 
-@router.get("/{instagram_id}/profile")
-async def get_instagram_profile(instagram_id: str, user: CurrentUser):
+@router.get("/profile")
+async def get_instagram_profile(user: CurrentUser):
     """
     Fetch detailed Instagram profile information
     
@@ -72,13 +72,21 @@ async def get_instagram_profile(instagram_id: str, user: CurrentUser):
     """
     try:
         org_id = user.org_id 
+
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        instagram_id = org_document.get("ig_id")
+
+        if not instagram_id:
+            raise HTTPException(status_code=400, detail="Instagram ID not configured for this organization")
+
         # Get the page access token for this Instagram account
         connection = db.instagram_connections.find_one(
             {"instagram_id": instagram_id, "is_active": True, "org_id": org_id},
             {"page_access_token": 1,"access_token" : 1, "page_id": 1}
         )
 
-        print("Details retrieved for /profile from db:", connection)
+        # print("Details retrieved for /profile from db:", connection)
         
         if not connection or not connection.get("page_access_token"):
             raise HTTPException(status_code=404, detail="Instagram connection not found or inactive")

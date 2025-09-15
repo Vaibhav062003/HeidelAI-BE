@@ -133,13 +133,14 @@ async def store_instagram_message(
         message_id = str(uuid.uuid4())
     
     # Get Instagram-specific collections
-    conversations_collection = db[f"conversations_{org_id}"]
+    conversation_collection_name = f"conversations_{org_id}"
+    conversations_collection = db[conversation_collection_name]
     messages_collection = db[f"messages_{org_id}"]
 
-    if("conversations_{org_id}" in db.list_collection_names()):
-        print(f"Conversations collection exists: {conversations_collection}")
+    if conversation_collection_name in db.list_collection_names():
+        print(f"Conversations collection exists: {conversation_collection_name}")
     else:
-        print(f"Conversations collection does not exist: {conversations_collection}")
+        print(f"Conversations collection does not exist: {conversation_collection_name}")
     
     # Create message object
     message = {
