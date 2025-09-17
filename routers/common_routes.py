@@ -19,8 +19,8 @@ async def get_instagram_conversations(user: CurrentUser):
         if not org_id:
             raise HTTPException(status_code=400, detail="Invalid organization ID")
 
-        org_collection = db.organizations
-        org_data = org_collection.find_one({"org_id": org_id})
+        orgs_collection = db.organizations
+        org_data = orgs_collection.find_one({"org_id": org_id})
 
         if not org_data:
             raise HTTPException(status_code=404, detail="Organization not found")
@@ -43,23 +43,39 @@ async def get_instagram_conversations(user: CurrentUser):
 
         query_filter = {"platform": {"$in": allowed_platforms}}
 
+        conversationFieldProjection = {
+            "conversation_id": 1,
+            "platform": 1,
+            "customer_username": 1,
+            "customer_name": 1,
+            "last_message": 1,
+            "last_message_timestamp": 1,
+            "unread_count": 1,
+            "is_ai_enabled": 1,
+            "assigned_agent_id": 1,
+            "priority": 1,
+            "sentiment": 1,
+            "query": 1,
+            "_id": 0
+        }
+
         # Fetch conversations and sort by last_message_timestamp
         raw_conversations = list(org_conversations_collection.find(
             query_filter,
-            {"_id": 0}  # Exclude _id field
+            conversationFieldProjection  
         ).sort("last_message_timestamp", -1))
         
         # Format conversations to match the required structure
         formatted_conversations = []
         for conv in raw_conversations:
             # Format timestamps
-            timestamp = conv.get("last_message_timestamp") or conv.get("timestamp")
+            timestamp = conv.get("last_message_timestamp")
             if timestamp and isinstance(timestamp, datetime):
                 timestamp = timestamp.isoformat()
             
             # Format the conversation object to match expected structure
             formatted_conversation = {
-                'id': conv.get('conversation_id', conv.get('id')),
+                'id': conv.get('conversation_id'),
                 'platform': conv.get('platform'),
                 'customer_id': conv.get('customer_username'),
                 'customer_name': f"{conv.get('customer_name', '')}",
