@@ -1,6 +1,6 @@
 # Pydantic
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Literal
 from enum import Enum
 from datetime import datetime
 
@@ -48,3 +48,11 @@ class WhatsappAuthRequest(BaseModel):
 
 class ChatbotPromptUpdate(BaseModel):
     chatbot_prompt: str = Field(..., min_length=10, max_length=5000)
+
+class ChatAnalysis(BaseModel):
+    conversation_id: str
+    summary: List[str] = Field(default_factory=list)
+    priority: Optional[Literal["low", "medium", "high"]] = None
+    sentiment: Optional[Literal["positive", "neutral", "negative"]] = None
+    suggestions: List[str] = Field(default_factory=list)
+    last_analyzed: Optional[datetime] = None
