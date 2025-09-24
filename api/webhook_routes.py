@@ -81,7 +81,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     """
 
     if not signature_required(request, x_hub_signature_256):
-        print("APP SECRET:", APP_SECRET)
+        # print("APP SECRET:", APP_SECRET)
         raise HTTPException(status_code=403, detail="Invalid signature")
     else:
         print("Signature validated successfully.")
@@ -104,7 +104,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     #     print(f"Validate Signature: {x_hub_signature_256}")
     #     raise HTTPException(status_code=403, detail="Invalid signature")
     
-    print("RECEIVED CORRECT SIGNATURE:", x_hub_signature_256)
+    # print("RECEIVED CORRECT SIGNATURE:", x_hub_signature_256)
 
     # Now parse the payload
     payload = json.loads(payload_str)
@@ -432,7 +432,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         sender_id=sender_id,
                         customer_name=name,
                         username=username,
-                        last_message=message_text
+                        last_message=message_text,
+                        last_sender= message_echo and MessageRole.AGENT or MessageRole.CUSTOMER
                     )
                     
                     # Store in Instagram-specific collections

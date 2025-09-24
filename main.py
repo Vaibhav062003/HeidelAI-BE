@@ -1,13 +1,12 @@
-# === Built-in Modules ===
-from config.settings import INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET
-
 # === Third-party Modules ===
+import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # === Internal Modules ===
-from core.lifespan import lifespan
 from api import router
+from core.lifespan import lifespan
+from config.settings import INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET
 
 # INSTAGRAM LOGIN CODE EXCHANGE
 if not INSTAGRAM_APP_ID or not INSTAGRAM_APP_SECRET:
@@ -42,5 +41,4 @@ app.add_middleware(
 )
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)

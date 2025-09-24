@@ -5,7 +5,7 @@ import uuid
 import requests
 import json
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from supabase import create_client, Client
 
@@ -217,7 +217,14 @@ async def store_instagram_message(
     return message_id
 
 
-async def create_or_update_instagram_conversation(org_id: str, recipient_id, sender_id, customer_name, username, last_message) -> str:
+async def create_or_update_instagram_conversation(org_id: str, 
+                                                  recipient_id: str, 
+                                                  sender_id: str, 
+                                                  customer_name: str, 
+                                                  username: str, 
+                                                  last_message: str, 
+                                                  last_sender: str,
+                                                  is_auto_followup: bool = False) -> str:
     """
     Create or update a conversation in the Instagram-specific conversations collection
     
@@ -233,6 +240,8 @@ async def create_or_update_instagram_conversation(org_id: str, recipient_id, sen
         str: The conversation ID
     """
     conversation_id = f"instagram_{username}"
+
+    now = datetime.now(timezone.utc)
     
     # Get the org-specific collection
     conversations_collection_name = f"conversations_{org_id}"
@@ -249,7 +258,6 @@ async def create_or_update_instagram_conversation(org_id: str, recipient_id, sen
     if existing_conversation:
         # Update existing conversation without modifying is_ai_enabled
         ig_conversation = {
-            "id": conversation_id,
             "platform": "instagram",
             "conversation_id": conversation_id,
             "instagram_id": recipient_id,
@@ -257,15 +265,26 @@ async def create_or_update_instagram_conversation(org_id: str, recipient_id, sen
             "customer_name": customer_name,
             "customer_username": username,
             "last_message": last_message,
-            "timestamp": datetime.now(),
-            "last_message_timestamp": datetime.now(),
+            "last_message_timestamp": now,
+            "last_sender": last_sender,
+            "status": "open",
             # NOTE: Preserve existing values for fields below
             # "unread_count" and "is_ai_enabled" will keep their existing values
         }
+
+        if last_sender == "customer":
+            # Reset inactivity reminders on customer reply
+            ig_conversation["reminder_stage"] = 0
+            ig_conversation["next_action_at"] = None
+
+        elif last_sender == "agent" and not is_auto_followup:
+            # Manual agent message resets the inactivity countdown
+            ig_conversation["reminder_stage"] = 0
+            ig_conversation["next_action_at"] = now + timedelta(hours=6)
+
     else:
         # Create new conversation with is_ai_enabled set to True
         ig_conversation = {
-            "id": conversation_id,
             "platform": "instagram",
             "conversation_id": conversation_id,
             "instagram_id": recipient_id,
@@ -273,12 +292,18 @@ async def create_or_update_instagram_conversation(org_id: str, recipient_id, sen
             "customer_name": customer_name,
             "customer_username": username,
             "last_message": last_message,
-            "timestamp": datetime.now(),
-            "last_message_timestamp": datetime.now(),
+            "last_message_timestamp": now,
             "unread_count": 1,
-            "is_ai_enabled": True  # Default for new conversations
+            "is_ai_enabled": False,
+            "agent_joined_at": now,
+            "status": "open",
+            "last_sender": last_sender,
+            "started_at": now,
+            "reminder_stage": 0,
+            "next_action_at": now + timedelta(hours=6),
+            "closed_at": None
         }
-
+ 
     # Use $set to update only specified fields
     conversations_collection.update_one(
         {"conversation_id": conversation_id},

@@ -41,7 +41,7 @@ async def get_instagram_conversations(user: CurrentUser):
         if org_data.get("wa_id"):
             allowed_platforms.append("whatsapp")
 
-        query_filter = {"platform": {"$in": allowed_platforms}}
+        query_filter = {"platform": {"$in": allowed_platforms}, "status": {"$in": ["open", "follow-up"]}}
 
         conversationFieldProjection = {
             "conversation_id": 1,
@@ -55,7 +55,7 @@ async def get_instagram_conversations(user: CurrentUser):
             "assigned_agent_id": 1,
             "priority": 1,
             "sentiment": 1,
-            "query": 1,
+            "status": 1,
             "_id": 0
         }
 

@@ -67,6 +67,9 @@ async def schedule_message(conversation_id: str, user: CurrentUser):
         conversation_collection = db[f"conversations_{org_id}"]
         conversation = conversation_collection.find_one({"conversation_id": conversation_id})
 
+        if conversation.get("status") != "open":
+            return {"message": "Follow-up can only be scheduled for open conversations."}
+        
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found.")
 
@@ -119,10 +122,12 @@ async def schedule_message(conversation_id: str, user: CurrentUser):
         # Store follow-up message
         try:
             scheduled_messages_collection.insert_one(followup_doc)
+            conversation_collection.update_one({"conversation_id": conversation_id}, {"$set": {"status": "follow-up"}})
+
         except PyMongoError as e:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-        return {"status": "success", "message": "Follow-up message scheduled successfully."}
+        return {"message": "Follow-up message scheduled successfully."}
 
     except HTTPException:
         raise

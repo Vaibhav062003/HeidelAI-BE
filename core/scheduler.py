@@ -1,5 +1,5 @@
 from pymongo import UpdateOne
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # === Internal Modules ===
@@ -91,8 +91,106 @@ async def process_scheduled_messages():
         except Exception as e:
             print(f"Error updating message statuses: {e}")
 
+async def process_inactivity_for_org(org_id: str):
+    conv_col = db[f"conversations_{org_id}"]
+    now = datetime.now(timezone.utc)
+
+    # Only process open conversations not in follow-up
+    query = {
+        "status": "open",
+        "last_sender": "agent",
+        "next_action_at": {"$lte": now}
+    }
+
+    while True:
+        conv = conv_col.find_one_and_update(
+            query,
+            {"$set": {}},  # placeholder, will update per stage
+            return_document=True
+        )
+        if not conv:
+            break
+
+        stage = conv.get("reminder_stage", 0)
+
+        if stage == 0:
+            # First 6h inactivity follow-up
+            conv_col.update_one(
+                {"conversation_id": conv["conversation_id"]},
+                {
+                    "$set": {
+                        "reminder_stage": 1,
+                        "next_action_at": now + timedelta(hours=6)
+                    }
+                }
+            )
+
+            # await store_instagram_message(
+            #     org_id=org_id,
+            #     conversation_id=conv["conversation_id"],
+            #     content=content,
+            #     sender_id="system",
+            #     sender_name="Auto Follow-up",
+            #     sender_username="auto_followup",
+            #     recipient_id=conv["instagram_id"],
+            #     role="agent",
+            #     is_auto_followup=True
+            # )
+            # await dummy_send_message_to_user()
+
+        elif stage == 1:
+            # Second 12h inactivity follow-up
+            conv_col.update_one(
+                {"conversation_id": conv["conversation_id"]},
+                {
+                    "$set": {
+                        "reminder_stage": 2,
+                        "next_action_at": now + timedelta(hours=12)
+                    }
+                }
+            )
+            # content = "We're still here if you need assistance! 😊"
+            # await store_instagram_message(
+            #     org_id=org_id,
+            #     conversation_id=conv["conversation_id"],
+            #     content=content,
+            #     sender_id="system",
+            #     sender_name="Auto Follow-up",
+            #     sender_username="auto_followup",
+            #     recipient_id=conv["instagram_id"],
+            #     role="agent",
+            #     is_auto_followup=True
+            # )
+            # await dummy_send_message_to_user()
+
+        elif stage == 2:
+            # Close conversation
+            conv_col.update_one(
+                {"conversation_id": conv["conversation_id"]},
+                {
+                    "$set": {
+                        "reminder_stage": 3,
+                        "status": "closed",
+                        "closed_at": now,
+                        "next_action_at": None
+                    }
+                }
+            )
+            print(f"[ORG {org_id}] Closed conversation {conv['conversation_id']} due to inactivity")
+
+async def process_time_based_tasks():
+
+    # Process scheduled messages
+    await process_scheduled_messages()
+
+    # Process inactivity follow-ups & closures for all orgs
+    orgs = db.organizations.find({}, {"org_id": 1})
+    for org in orgs:
+        org_id = org["org_id"]
+        await process_inactivity_for_org(org_id)
+
 def start_scheduler():
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(process_scheduled_messages, "interval", hours=1)
+    scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
     scheduler.start()
-    print("APScheduler started (interval = 1 hour).")
+    print("APScheduler started (interval = 6 hours).")
