@@ -1,0 +1,126 @@
+import dateparser
+from bson import ObjectId
+from fastapi import HTTPException
+from datetime import datetime, timezone
+from pymongo.errors import PyMongoError
+
+# === Internal Modules ===
+from database import get_mongo_db
+from .followup_agent_service import get_followup_message
+
+db = get_mongo_db()
+
+def schedule_followup_message(org_id: str, conversation_id: str):
+    """
+    Core business logic for scheduling a follow-up message.
+    Raises HTTPException if something goes wrong, so API layer can respond properly.
+    """
+    try:
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found.")
+
+        platform = conversation_id.split("_")[0]
+
+        scheduled_messages_collection = db["scheduled_messages"]
+        conversation_collection = db[f"conversations_{org_id}"]
+
+        conversation = conversation_collection.find_one({"conversation_id": conversation_id})
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+
+        if conversation.get("status") != "open":
+            return {"message": "Follow-up can only be scheduled for open conversations."}
+
+        receiver_id = conversation.get("customer_id")
+        sender_id = conversation.get("instagram_id")
+
+        if not receiver_id or not sender_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing sender_id or receiver_id in conversation"
+            )
+
+        # Run AI agent for follow-up
+        try:
+            followup_result = get_followup_message(org_id, conversation_id)
+            if callable(followup_result):  # if it's async, you can await outside
+                raise RuntimeError("get_followup_message should be awaited outside.")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Follow-up generation failed: {str(e)}")
+
+        # Parse delay into datetime
+        try:
+            send_time = dateparser.parse(
+                followup_result.delay,
+                settings={
+                    "TIMEZONE": "UTC",
+                    "RETURN_AS_TIMEZONE_AWARE": True,
+                    "PREFER_DATES_FROM": "future"
+                }
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Delay parsing error: {str(e)}")
+
+        if not send_time:
+            raise HTTPException(status_code=500, detail="Failed to parse follow-up delay.")
+
+        followup_doc = {
+            "org_id": org_id,
+            "platform": platform,
+            "conversation_id": conversation_id,
+            "sender_id": sender_id,
+            "receiver_id": receiver_id,
+            "followup_text": followup_result.followup,
+            "delay": followup_result.delay,
+            "scheduled_time": send_time,
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc)
+        }
+
+        # Insert follow-up + update conversation
+        try:
+            scheduled_messages_collection.insert_one(followup_doc)
+            conversation_collection.update_one(
+                {"conversation_id": conversation_id},
+                {"$set": {"status": "follow-up"}}
+            )
+        except PyMongoError as e:
+            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+        return {"message": "Follow-up message scheduled successfully."}
+
+    except HTTPException:
+        # Re-raise so API layer can handle correctly
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+def abort_scheduled_message(org_id: str, conversation_id: str):
+    """
+    Mark a scheduled follow-up message as 'aborted', meaning it won't be sent
+    because the customer or the agent replied before the follow-up was sent.
+    Raises HTTPException for consistent error handling.
+    """
+    try:
+        scheduled_messages_collection = db["scheduled_messages"]
+
+        try:
+            result = scheduled_messages_collection.update_one(
+                {"conversation_id": conversation_id, "org_id": org_id},
+                {"$set": {"status": "aborted", "aborted_at": datetime.now(timezone.utc)}}
+            )
+        except PyMongoError as e:
+            raise HTTPException(status_code=500, detail=f"Database error updating scheduled message: {str(e)}")
+
+        if result.matched_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No scheduled message found for conversation_id={conversation_id}"
+            )
+
+        return {"message": "Scheduled message marked as 'aborted' successfully."}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")

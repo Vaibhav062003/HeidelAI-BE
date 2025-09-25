@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Depends
 
 # === Internal Modules ===
 from database import get_mongo_db
-from services.followup_agent_service import get_followup_message
+from services.scheduler_service import schedule_followup_message
 from schemas.models import ChatbotPromptUpdate
 from auth.dependencies import CurrentUser
 from services.ai_chatbot import update_prompt_in_cache
@@ -56,82 +56,12 @@ async def schedule_message(conversation_id: str, user: CurrentUser):
     Schedule a follow-up message for a conversation using an AI agent to determine the content and timing.
     """
     try:
-        org_id = user.org_id 
-        if not org_id:
-            raise HTTPException(status_code=400, detail="Organization ID not found.")
-
-        platform = conversation_id.split("_")[0]
-
-        scheduled_messages_collection = db["scheduled_messages"]
-
-        conversation_collection = db[f"conversations_{org_id}"]
-        conversation = conversation_collection.find_one({"conversation_id": conversation_id})
-
-        if conversation.get("status") != "open":
-            return {"message": "Follow-up can only be scheduled for open conversations."}
-        
-        if not conversation:
-            raise HTTPException(status_code=404, detail="Conversation not found.")
-
-        receiver_id = conversation.get("customer_id")
-        sender_id = conversation.get("instagram_id")
-
-        if not receiver_id or not sender_id:
-            raise HTTPException(
-                status_code=400, 
-                detail="Missing sender_id or receiver_id in conversation"
-            )
-
-        # Running through LLM follow-up agent
-        try:
-            followup_result = await get_followup_message(org_id, conversation_id)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Follow-up generation failed: {str(e)}")
-
-        # Converting delay (natural language) → ISO datetime
-        try:
-            send_time = dateparser.parse(
-                followup_result.delay,
-                settings={
-                    "TIMEZONE": "UTC",
-                    "RETURN_AS_TIMEZONE_AWARE": True,
-                    "PREFER_DATES_FROM": "future"
-                }
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Delay parsing error: {str(e)}")
-
-        if not send_time:
-            raise HTTPException(status_code=500, detail="Failed to parse follow-up delay.")
-
-        # iso_time = send_time.isoformat()
-        
-        followup_doc = {
-            "org_id": org_id,
-            "platform": platform,
-            "conversation_id": conversation_id,
-            "sender_id": sender_id,        
-            "receiver_id": receiver_id, 
-            "followup_text": followup_result.followup,
-            "delay": followup_result.delay,
-            "scheduled_time": send_time,
-            "status": "pending",
-            "created_at": datetime.now(timezone.utc)
-        }
-
-        # Store follow-up message
-        try:
-            scheduled_messages_collection.insert_one(followup_doc)
-            conversation_collection.update_one({"conversation_id": conversation_id}, {"$set": {"status": "follow-up"}})
-
-        except PyMongoError as e:
-            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-        return {"message": "Follow-up message scheduled successfully."}
-
-    except HTTPException:
-        raise
+        return schedule_followup_message(db, user.org_id, conversation_id)
+    except HTTPException as e:
+        # Graceful return for API
+        raise e
     except Exception as e:
+        # Catch anything unexpected that leaked through
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @router.get("/chat-analysis/{conversation_id}")

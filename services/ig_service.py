@@ -14,6 +14,8 @@ from core.managers import manager
 from schemas.models import MessageRole
 from database import get_mongo_db
 from core.services import services
+from services.scheduler_service import abort_scheduled_message
+from services.conversation_service import reopen_conversation
 from config.settings import (
     IG_ID, 
     IG_ACCESS_TOKEN, 
@@ -256,6 +258,13 @@ async def create_or_update_instagram_conversation(org_id: str,
     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
     
     if existing_conversation:
+        
+        abort_result = abort_scheduled_message(org_id, conversation_id)
+        print("Aborted Scheduled message: ", abort_result)
+
+        reopen_result = reopen_conversation(org_id, conversation_id)
+        print("Reopened conversation: ", reopen_result)
+
         # Update existing conversation without modifying is_ai_enabled
         ig_conversation = {
             "platform": "instagram",

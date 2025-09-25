@@ -1,105 +1,36 @@
-from datetime import datetime
-from database import get_mongo_db
+from services.conversation_service import fetch_conversations, close_conversation
 from auth.dependencies import CurrentUser
-from fastapi import APIRouter, HTTPException, Response
-
-db = get_mongo_db()
+from fastapi import APIRouter, HTTPException, Response, Query
 
 router = APIRouter(tags=["Common Routes"])
 
+
 @router.get("/api/conversations")
-async def get_instagram_conversations(user: CurrentUser):
+async def get_instagram_conversations(user: CurrentUser, status: str = Query(default=None)):
     """
-    Fetch all the Instagram conversations for a specific Organization using org_id
-    Returns them in the standard conversation format for compatibility with the frontend
+    Endpoint wrapper → delegates to service layer.
     """
     try:
         org_id = user.org_id
-
         if not org_id:
             raise HTTPException(status_code=400, detail="Invalid organization ID")
 
-        orgs_collection = db.organizations
-        org_data = orgs_collection.find_one({"org_id": org_id})
+        return fetch_conversations(org_id, status)
 
-        if not org_data:
-            raise HTTPException(status_code=404, detail="Organization not found")
-         
-        # organization specific collection name for conversations
-        org_conversations_collection_name = f"conversations_{org_id}"
-
-        # Check if collection exists in database
-        if org_conversations_collection_name not in db.list_collection_names():
-            return []
-        
-        # Get the collection
-        org_conversations_collection = db[org_conversations_collection_name]
-        
-        allowed_platforms = []
-        if org_data.get("ig_id"):
-            allowed_platforms.append("instagram")
-        if org_data.get("wa_id"):
-            allowed_platforms.append("whatsapp")
-
-        query_filter = {"platform": {"$in": allowed_platforms}, "status": {"$in": ["open", "follow-up"]}}
-
-        conversationFieldProjection = {
-            "conversation_id": 1,
-            "platform": 1,
-            "customer_username": 1,
-            "customer_name": 1,
-            "last_message": 1,
-            "last_message_timestamp": 1,
-            "unread_count": 1,
-            "is_ai_enabled": 1,
-            "assigned_agent_id": 1,
-            "priority": 1,
-            "sentiment": 1,
-            "status": 1,
-            "_id": 0
-        }
-
-        # Fetch conversations and sort by last_message_timestamp
-        raw_conversations = list(org_conversations_collection.find(
-            query_filter,
-            conversationFieldProjection  
-        ).sort("last_message_timestamp", -1))
-        
-        # Format conversations to match the required structure
-        formatted_conversations = []
-        for conv in raw_conversations:
-            # Format timestamps
-            timestamp = conv.get("last_message_timestamp")
-            if timestamp and isinstance(timestamp, datetime):
-                timestamp = timestamp.isoformat()
-            
-            # Format the conversation object to match expected structure
-            formatted_conversation = {
-                'id': conv.get('conversation_id'),
-                'platform': conv.get('platform'),
-                'customer_id': conv.get('customer_username'),
-                'customer_name': f"{conv.get('customer_name', '')}",
-                'last_message': conv.get('last_message', ''),
-                'timestamp': timestamp,
-                'unread_count': conv.get('unread_count', 0),
-                'is_ai_enabled': conv.get('is_ai_enabled', True),
-                'assigned_agent_id': conv.get('assigned_agent_id'),
-                'priority': conv.get('priority', 'medium'),  # Default to medium
-                'sentiment': conv.get('sentiment', 'neutral'),  # Default to neutral
-                'query': conv.get('query', '')  # Optional query field
-            }
-            
-            formatted_conversations.append(formatted_conversation)
-
-        return formatted_conversations
-    
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error fetching conversations for {org_id}: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to fetch conversations: {str(e)}"
-        )
+        print(f"Error fetching conversations for {user.org_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch conversations")
     
+@router.post("/api/conversations/{conversation_id}/close")
+async def close_conversation_endpoint(conversation_id: str, user: CurrentUser):
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    return close_conversation(org_id, conversation_id)
+
 @router.get("/")
 async def health_check():
     return {"status": "ok"}
