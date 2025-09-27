@@ -162,7 +162,7 @@ async def instagram_auth(request: dict, user: CurrentUser):
             access_token = long_lived_token_response["access_token"]
         
         # Get user profile data
-        profile_url = f"https://graph.instagram.com/me?fields=user_id,username,profile_picture_url&access_token={access_token}"
+        profile_url = f"https://graph.instagram.com/me?fields=user_id,biography,followers_count,follows_count,id,media_count,name,profile_picture_url,username,website&access_token={access_token}"
         profile_response = requests.get(profile_url)
         
         if profile_response.status_code != 200:
@@ -192,7 +192,6 @@ async def instagram_auth(request: dict, user: CurrentUser):
             )
 
         # Create collections for messages and conversations
-        # *** user_id is instagram_id
         messages_collection = db[f"messages_{org_id}"]
         conversations_collection = db[f"conversations_{org_id}"]
 
@@ -218,17 +217,22 @@ async def instagram_auth(request: dict, user: CurrentUser):
             {"$set": new_connection},
             upsert=True
         )
+
+        result = db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"ig_id": str(instagram_id)}}
+        )
         
         return {
             "status": "success",
-            "user_id": str(instagram_id),
+            "id": str(instagram_id),
             "username": username,
-            "access_token": access_token,
-            "profile_picture": profile_pic_url,
-            "business_info": {
-                "account_type": profile_data.get("account_type", ""),
-                "media_count": profile_data.get("media_count", 0),
-            }
+            "profile_picture_url": profile_pic_url,
+            "biography": profile_data.get("biography", ""),
+            "followers_count": profile_data.get("followers_count", 0),
+            "follows_count": profile_data.get("follows_count", 0),
+            "media_count": profile_data.get("media_count", 0),
+            "name": profile_data.get("name", ""),
         }
         
     except HTTPException as http_exc:
