@@ -182,10 +182,10 @@ async def instagram_auth(request: dict, user: CurrentUser):
         )
         
         if previously_connected:
-            return {
-                "status": "error",
-                "message": "This Instagram account is already connected to another organization. If you think this is incorrect, please contact us at support@heidelai.com for further assistance."
-            }
+            raise HTTPException(
+                status_code=400, 
+                detail="This Instagram account is already connected to another organization. If you think this is incorrect, please contact us at support@heidelai.com for further assistance."
+            )
 
         # subscribe user to our webhook
         webhook_response = requests.post(
