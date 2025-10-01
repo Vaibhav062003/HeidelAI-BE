@@ -183,7 +183,7 @@ async def instagram_auth(request: dict, user: CurrentUser):
         
         if previously_connected:
             raise HTTPException(
-                status_code=400, 
+                status_code=403, 
                 detail="This Instagram account is already connected to another organization. If you think this is incorrect, please contact us at support@heidelai.com for further assistance."
             )
 
