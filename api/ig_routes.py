@@ -175,7 +175,18 @@ async def instagram_auth(request: dict, user: CurrentUser):
         username = profile_data.get("username")
         profile_pic_url = profile_data.get("profile_picture_url", "")
         instagram_id = profile_data.get("user_id")
+
+        previously_connected = db.organizations.find_one(
+            {"ig_id": str(instagram_id)},
+            {"org_id": 1, "_id": 0}
+        )
         
+        if previously_connected:
+            return {
+                "status": "error",
+                "message": "This Instagram account is already connected to another organization. If you think this is incorrect, please contact us at support@heidelai.com for further assistance."
+            }
+
         # subscribe user to our webhook
         webhook_response = requests.post(
             f"https://graph.instagram.com/v22.0/{user_id}/subscribed_apps",
