@@ -5,7 +5,7 @@ from config.settings import MONGODB_URI, MONGODB_CLUSTER, PINECONE_API_KEY, PINE
 _client = None
 _db = None
 
-def get_client():
+def get_mongo_client():
     global _client
     if _client is None:
         _client = MongoClient(MONGODB_URI)
@@ -14,7 +14,7 @@ def get_client():
 def get_mongo_db():
     global _db
     if _db is None:
-        _db = get_client()[MONGODB_CLUSTER]
+        _db = get_mongo_client()[MONGODB_CLUSTER]
     return _db
 
 def get_pinecone_db():

@@ -1,10 +1,11 @@
 from pymongo import UpdateOne
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from services.scheduler_service import clean_expired_archives
 
 # === Internal Modules ===
 from database import get_mongo_db
-from services.messaging import instagram_service
+from services.platforms import instagram_service
 
 db = get_mongo_db()
 scheduled_collection = db["scheduled_messages"]
@@ -181,8 +182,13 @@ async def process_inactivity_for_org(org_id: str):
 async def process_time_based_tasks():
 
     # Process scheduled messages
+    print("Processing scheduled messages...")
     await process_scheduled_messages()
 
+    print("Cleaning expired archives...")
+    await clean_expired_archives()
+
+    print("Processing inactivity follow-ups and closures...")
     # Process inactivity follow-ups & closures for all orgs
     orgs = db.organizations.find({}, {"org_id": 1})
     for org in orgs:

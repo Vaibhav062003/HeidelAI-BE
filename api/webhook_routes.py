@@ -276,7 +276,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 conversation_id = message_to_delete.get("conversation_id")
                                 
                                 # Get the conversation
-                                conversation = conversations_collection.find_one({"id": conversation_id})
+                                conversation = conversations_collection.find_one({"conversation_id": conversation_id})
                                 
                                 # Check if this was the last message in the conversation
                                 was_last_message = False
@@ -303,7 +303,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     if newest_message:
                                         # Update conversation with new last message and timestamp
                                         conversations_collection.update_one(
-                                            {"id": conversation_id},
+                                            {"conversation_id": conversation_id},
                                             {"$set": {
                                                 "last_message": newest_message.get("content", ""),
                                                 "last_message_timestamp": newest_message.get("timestamp")
@@ -312,7 +312,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     else:
                                         # If no messages left, set default
                                         conversations_collection.update_one(
-                                            {"id": conversation_id},
+                                            {"conversation_id": conversation_id},
                                             {"$set": {
                                                 "last_message": "(No messages)",
                                                 "last_message_timestamp": datetime.now()

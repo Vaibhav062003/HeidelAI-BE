@@ -9,6 +9,7 @@ class Services:
     def __init__(self):
         # Constants
         self.EXPIRY_TIME_SECONDS = 86400
+        self.BATCH_SIZE = 1000
 
         # In-memory stores
         self.address_details = []

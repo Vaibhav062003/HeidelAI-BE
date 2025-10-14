@@ -1,8 +1,8 @@
 from datetime import datetime
 from core.services import services
-from .base import MessageSender, ConversationHandler
+from .base_platform_service import MessageSender, ConversationHandler, DisconnectHandler
 from database import get_mongo_db
-from services.ig_service import broadcast_instagram_message, send_ig_message
+from services.ig_service import broadcast_instagram_message, send_ig_message, revoke_instagram_access, archive_instagram_data, remove_instagram_connection
 
 db = get_mongo_db()
 
@@ -69,10 +69,31 @@ class InstagramConversationHandler(ConversationHandler):
             })
 
 
+class InstagramDisconnectHandler(DisconnectHandler):
+    """ Handles disconnection and data archiving for Instagram platform."""
+
+    async def archive_data(self, org_id, connection_id) -> None:
+        """"""
+        await archive_instagram_data(org_id, connection_id)
+    
+    async def remove_connection(self, org_id: str, connection_id: str) -> dict:
+        """Remove Instagram connection and clear linked org data."""
+        await revoke_instagram_access(org_id, connection_id)
+        return await remove_instagram_connection(org_id, connection_id)
+
+    async def disconnect(self, org_id: str, connection_id: str) -> dict:
+        
+        await self.archive_data(org_id, connection_id)
+        result = await self.remove_connection(org_id, connection_id)
+
+        return result
+
+
 class InstagramService:
     def __init__(self):
         self.sender = InstagramMessageSender()
         self.conversations = InstagramConversationHandler()
+        self.disconnect_handler = InstagramDisconnectHandler()
 
     async def send_message(self, sender_id: str, recipient_id: str, message: str):
         return await self.sender.send_message(sender_id, recipient_id, message)
@@ -83,7 +104,10 @@ class InstagramService:
         await self.conversations.broadcast_update(kwargs["recipient_id"], dict(updated))
         return conv_id
 
-    async def handle_conversation(self, org_id: str, **kwargs):
-        conversation = await self.conversations.create_or_update_conversation(org_id, **kwargs)
-        await self.conversations.broadcast_update(kwargs["recipient_id"], dict(conversation))
-        return conversation["conversation_id"]
+    # async def handle_conversation(self, org_id: str, **kwargs):
+    #     conversation = await self.conversations.create_or_update_conversation(org_id, **kwargs)
+    #     await self.conversations.broadcast_update(kwargs["recipient_id"], dict(conversation))
+    #     return conversation["conversation_id"]
+    
+    async def disconnect(self, org_id: str, connection_id: str) -> dict:
+        return await self.disconnect_handler.disconnect(org_id, connection_id)

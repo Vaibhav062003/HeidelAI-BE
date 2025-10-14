@@ -56,7 +56,7 @@ async def schedule_message(conversation_id: str, user: CurrentUser):
     Schedule a follow-up message for a conversation using an AI agent to determine the content and timing.
     """
     try:
-        return schedule_followup_message(db, user.org_id, conversation_id)
+        return schedule_followup_message(user.org_id, conversation_id)
     except HTTPException as e:
         # Graceful return for API
         raise e

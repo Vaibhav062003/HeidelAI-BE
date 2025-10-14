@@ -8,14 +8,15 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from supabase import create_client, Client
+from pymongo import UpdateOne
 
 # Internal modules
 from core.managers import manager
 from schemas.models import MessageRole
-from database import get_mongo_db
+from database import get_mongo_db, get_mongo_client
 from core.services import services
 from services.scheduler_service import abort_scheduled_message
-from services.conversation_service import reopen_conversation
+from services.common_service import reopen_conversation
 from config.settings import (
     IG_ID, 
     IG_ACCESS_TOKEN, 
@@ -29,6 +30,8 @@ from config.settings import (
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 db = get_mongo_db()
+
+mongo_client = get_mongo_client()
 
 async def send_ig_message(id, message_text, instagram_id) -> dict:
     """
@@ -100,7 +103,6 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
         print(f"Error sending Instagram message: {e}")
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
-
 
 async def store_instagram_message(
     org_id: str,
@@ -218,7 +220,6 @@ async def store_instagram_message(
     
     return message_id
 
-
 async def create_or_update_instagram_conversation(org_id: str, 
                                                   recipient_id: str, 
                                                   sender_id: str, 
@@ -259,10 +260,10 @@ async def create_or_update_instagram_conversation(org_id: str,
     
     if existing_conversation:
         
-        abort_result = abort_scheduled_message(org_id, conversation_id)
+        abort_result = await abort_scheduled_message(org_id, conversation_id)
         print("Aborted Scheduled message: ", abort_result)
 
-        reopen_result = reopen_conversation(org_id, conversation_id)
+        reopen_result = await reopen_conversation(org_id, conversation_id)
         print("Reopened conversation: ", reopen_result)
 
         # Update existing conversation without modifying is_ai_enabled
@@ -379,7 +380,6 @@ async def broadcast_instagram_message(instagram_id: str, message_type: str, data
                 services.instagram_connections_map[instagram_id].discard(client_id)
                 if not services.instagram_connections_map[instagram_id]:
                     del services.instagram_connections_map[instagram_id]
-
 
 async def get_ig_username(sender_id, page_access_token):
     if page_access_token == None:
@@ -581,3 +581,161 @@ async def process_comments_events(value, ig_account_id):
             print(f"Already responded to user_id {user_id} for media_id {media_id}. Skipping.")
     else:
         print("No matching keyword or media not tracked.")
+
+# === Disconnect and Archive helpers for Instagram ===
+
+async def revoke_instagram_access(org_id: str, user_id: str):
+    """
+    Revoke the Instagram access token for an organization
+    """
+
+    try:
+        connection = db.instagram_connections.find_one(
+            {"instagram_id": user_id, "is_active": True, "org_id": org_id}
+        )
+
+        if not connection: 
+            print("No active instagram connection found")
+            return {"message": "Instagram connection not found"}
+        
+        access_token = connection.get("page_access_token")
+        if access_token:
+            try:
+                response = requests.delete(
+                    f"https://graph.instagram.com/{user_id}/permissions",
+                    params={"access_token": access_token}
+                )
+                print(f"Token revocation response: {response.status_code} - {response.text}")
+            except Exception as revoke_error:
+                print(f"Error revoking Instagram token: {revoke_error}")
+
+    except Exception as e:
+        print(f"Error in revoke_instagram_access: {str(e)}")
+
+async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30):
+    """
+    Archive messages & conversations for a specific org and Instagram connection.
+    If a previous active archive exists for the same instagram_id, reuse and extend it.
+    """
+    try:
+        now = datetime.now()
+
+        with mongo_client.start_session() as session:
+            with session.start_transaction():
+
+                archive_id = None
+
+                existing_archive = db["archived_tracker"].find_one({
+                        "org_id": org_id,
+                        "platform": "instagram",
+                        "instagram_id": instagram_id,
+                        "status": "active",
+                    },
+                    session=session
+                )
+
+                if existing_archive:
+                    archive_id = existing_archive["archive_id"]
+                    print(f"Found existing archive {archive_id} for instagram_id {instagram_id}, extending expiration")
+
+                    db.archived_tracker.update_one(
+                        {"archive_id": archive_id},
+                        {"$set": {"expires_at": now + timedelta(days=expire_days)}},
+                        session=session
+                    )
+                else:
+
+                    archive_id = uuid.uuid4().hex
+                    print(f"Creating new archive {archive_id} for instagram_id {instagram_id}")
+
+                    db.archived_tracker.insert_one({
+                            "archive_id": archive_id,
+                            "org_id": org_id,
+                            "platform": "instagram",
+                            "instagram_id": instagram_id,
+                            "created_at": now,
+                            "expires_at": now + timedelta(days=expire_days),
+                            "status": "active",
+                        }, 
+                        session=session
+                    )
+
+                messages_collection_name = f"messages_{org_id}"
+                conversations_collection_name = f"conversations_{org_id}"
+                
+                archived_messages = f"archived_messages_{org_id}_{archive_id}"
+                archived_conversations = f"archived_conversations_{org_id}_{archive_id}"
+
+                messages_to_archive = list(
+                    db[messages_collection_name].find(
+                            {"platform": "instagram"}, 
+                            {"_id": 0},
+                            session=session
+                        )
+                    )
+                
+                if messages_to_archive:
+                    db[archived_messages].insert_many(messages_to_archive, session=session)
+                    db[messages_collection_name].delete_many({"platform": "instagram"}, session=session)
+
+                conversations_to_archive = list(
+                    db[conversations_collection_name].find(
+                            {"platform": "instagram", "instagram_id": instagram_id}, 
+                            {"_id": 0},
+                            session=session
+                        )
+                    )
+                
+                if conversations_to_archive:
+                    bulk_ops = []
+                    for convo in conversations_to_archive:
+                        bulk_ops.append(
+                            UpdateOne(
+                                {"conversation_id": convo["conversation_id"]},  
+                                {"$set": convo},
+                                upsert=True
+                            )
+                        )
+
+                    if bulk_ops:
+                        db[archived_conversations].bulk_write(bulk_ops, session=session)
+                        
+                    db[conversations_collection_name].delete_many({"platform": "instagram", "instagram_id": instagram_id}, session=session)
+
+                print(f"Archived Instagram data for org {org_id} with archive_id {archive_id}")
+
+    except Exception as e:
+         print(f"Error archiving Instagram data for org {org_id} with archive_id {archive_id}: {str(e)}")
+
+async def remove_instagram_connection(org_id: str, instagram_id: str):
+    """
+    Delete Instagram connection and clear the org's instagram_id field
+    """
+
+    try:
+        delete_result = db.instagram_connections.delete_many(
+            {"instagram_id": instagram_id, "org_id": org_id}
+            )
+        print(f"Deleted {delete_result.deleted_count} Instagram connections for org {org_id}")
+
+        org_update_result = db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"ig_id": None}}
+        )
+
+        if org_update_result.modified_count:
+            print(f"Cleared ig_id for organization {org_id}")
+        else:
+            print(f"No organization updated for org_id {org_id}")
+
+        return {
+            "deleted_connections": delete_result.deleted_count,
+            "organization_updated": org_update_result.modified_count > 0
+        }
+    
+    except Exception as e:
+        print(f"Error removing Instagram connection: {str(e)}")
+        raise
+
+async def unarchive_data(archive_id: str):
+    """Unarchive data for a given archive_id."""

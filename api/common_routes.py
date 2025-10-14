@@ -1,21 +1,43 @@
-from services.conversation_service import fetch_conversations, close_conversation
-from auth.dependencies import CurrentUser
 from fastapi import APIRouter, HTTPException, Response, Query
+
+from typing import Optional
+from auth.dependencies import CurrentUser
+from schemas.models import UnarchiveRequest
+from services.common_service import fetch_conversations, close_conversation, unarchive_data
 
 router = APIRouter(tags=["Common Routes"])
 
+@router.get("/")
+async def health_check():
+    return {"status": "ok"}
+
+@router.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204) 
 
 @router.get("/api/conversations")
-async def get_instagram_conversations(user: CurrentUser, status: str = Query(default=None)):
+async def get_conversations(
+    user: CurrentUser, 
+    status: Optional[str] = Query(default=None),
+    platform: Optional[str] = Query(default=None),
+    priority: Optional[str] = Query(default=None),
+    # unread_only: Optional[bool] = Query(default=False)
+):
     """
-    Endpoint wrapper → delegates to service layer.
+    Get conversations for the current user's organization, 
     """
     try:
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Invalid organization ID")
 
-        return fetch_conversations(org_id, status)
+        return await fetch_conversations(
+            org_id=org_id,
+            status=status,
+            platform=platform,
+            priority=priority,
+            # unread_only=unread_only,
+        )
 
     except HTTPException:
         raise
@@ -29,12 +51,17 @@ async def close_conversation_endpoint(conversation_id: str, user: CurrentUser):
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
-    return close_conversation(org_id, conversation_id)
+    return await close_conversation(org_id, conversation_id)
 
-@router.get("/")
-async def health_check():
-    return {"status": "ok"}
+@router.post("/api/unarchive-data/{platform}")
+async def unarchive(user: CurrentUser, platform: str, request: UnarchiveRequest):
+    """
+    Unarchive data for a specific platform.
+    """
+    print(type(user))
+    org_id = user.org_id
+    user_id = request.platform_id
 
-@router.get("/favicon.ico", include_in_schema=False)
-def favicon():
-    return Response(status_code=204) 
+    result = await unarchive_data(org_id, platform, user_id)
+
+    return result

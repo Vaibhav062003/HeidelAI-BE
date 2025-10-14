@@ -1,7 +1,7 @@
 # services/messaging/whatsapp_service.py
 
 from datetime import datetime
-from .base import MessageSender, ConversationHandler
+from .base_platform_service import MessageSender, ConversationHandler
 from services.wa_service import broadcast_whatsapp_message
 
 

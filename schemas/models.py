@@ -56,3 +56,6 @@ class ChatAnalysis(BaseModel):
     sentiment: Optional[Literal["positive", "neutral", "negative"]] = None
     suggestions: List[str] = Field(default_factory=list)
     last_analyzed: Optional[datetime] = None
+
+class UnarchiveRequest(BaseModel):
+    platform_id: str

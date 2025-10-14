@@ -6,8 +6,11 @@ from services.ig_service import *
 from schemas.models import InstagramDisconnectRequest, MessageRole
 from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required, require_auth
+from services.platforms.instagram_service import InstagramService
 
 from database import get_mongo_db
+
+instagram_service = InstagramService()
 
 db = get_mongo_db()
 
@@ -252,66 +255,26 @@ async def instagram_auth(request: dict, user: CurrentUser):
         print(f"Instagram authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Instagram authentication error: {str(e)}")
 
-# @router.post("/disconnect")
-# async def instagram_disconnect(request: InstagramDisconnectRequest, user: None = Depends(require_auth)):
-#     """Revoke Instagram access token and remove connection"""
-#     try:
-#         org_id = user.org_id 
-#         # Find the connection to get the access token if not provided
-#         connection = None
-#         connection = db.instagram_connections.find_one(
-#             {"instagram_id": request.user_id, "is_active": True, "org_id": org_id}
-#         )
-#         if connection:
-#             access_token = connection.get("page_access_token")
-#         else:
-#             # If no connection found, just return success (already disconnected)
-#             return {"status": "success", "message": "Instagram connection not found"}
-        
-#         # Call the Instagram Graph API to revoke the token if we have one
-#         if access_token:
-#             try:
-#                 revoke_response = requests.delete(
-#                     f"https://graph.instagram.com/{request.user_id}/permissions",
-#                     params={"access_token": access_token}
-#                 )
-#                 print(f"Instagram token revocation response: {revoke_response.status_code} - {revoke_response.text}")
-#             except Exception as revoke_error:
-#                 # Log but continue even if revocation fails
-#                 print(f"Error revoking Instagram token: {revoke_error}")
-        
-#         # Delete the Instagram-specific collections
-#         try:
-#             # Delete Instagram messages only
-#             messages_collection_name = f"messages_{org_id}"
-#             if messages_collection_name in db.list_collection_names():
-#                 deleted_messages = db[messages_collection_name].delete_many({"platform": "instagram"})
-#                 print(f"Deleted {deleted_messages.deleted_count} Instagram messages from {messages_collection_name}")
+@router.post("/disconnect")
+async def instagram_disconnect(request: InstagramDisconnectRequest, user: CurrentUser):
+    """Revoke Instagram access token and remove connection"""
+    try:
+        org_id = user.org_id
+        connection_id = request.user_id
 
-#             # Delete Instagram conversations only
-#             conversations_collection_name = f"conversations_{org_id}"
-#             if conversations_collection_name in db.list_collection_names():
-#                 deleted_conversations = db[conversations_collection_name].delete_many({"platform": "instagram"})
-#                 print(f"Deleted {deleted_conversations.deleted_count} Instagram conversations from {conversations_collection_name}")
+        removal_result = await instagram_service.disconnect(org_id, connection_id)
 
-#         except Exception as collection_error:
-#             print(f"Error deleting Instagram collections: {collection_error}")
-        
-#         # Delete all connections for this Instagram ID
-#         delete_result = db.instagram_connections.delete_many(
-#             {"instagram_id": request.user_id, "org_id": org_id}
-#         )
-        
-#         print(f"Deleted {delete_result.deleted_count} Instagram connections for ID: {request.user_id}")
-        
-#         return {
-#             "status": "success", 
-#             "message": f"Instagram connection disconnected, removed {delete_result.deleted_count} connections"
-#         }
-        
-#     except Exception as e:
-#         print(f"Error disconnecting Instagram: {str(e)}")
-#         raise HTTPException(status_code=500, detail=f"Failed to disconnect Instagram: {str(e)}")
+        return {
+            "message": (
+                f"Instagram disconnected, archived data, "
+                f"removed {removal_result['deleted_connections']} connections, "
+                f"and cleared org Instagram reference."
+            )
+        }
+       
+    except Exception as e:
+        print(f"Error disconnecting Instagram: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to disconnect Instagram: {str(e)}")
 
 # @router.get("/status")
 # async def get_instagram_status(org_id: str, instagram_id: Optional[str] = None, app_user_id: Optional[str] = None, _: None = Depends(require_auth)):
