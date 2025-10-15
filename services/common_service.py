@@ -261,3 +261,63 @@ def move_conversations_unarchive_safe(source_name: str, target_name: str):
         db[target_name].insert_many(buffer)
 
     db[source_name].delete_many({})
+
+async def create_or_update_private_note(org_id: str, conversation_id: str, note: str, updated_by: str) -> bool:
+    """
+    Create or update a private note for a specific conversation.
+    """
+
+    try:
+        conversation_collection = db[f"conversations_{org_id}"]
+
+        conversation_doc = conversation_collection.find_one({
+            "conversation_id": conversation_id
+        })        
+
+        if not conversation_doc:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        update_query = {
+            "$set": {
+                "private_note": {
+                    "text": note.strip(),
+                    "updated_by": updated_by,
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
+        }
+
+        result = conversation_collection.update_one(
+            {"conversation_id": conversation_id},
+            update_query
+        )
+
+        return result.modified_count > 0
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    
+async def delete_private_note(org_id: str, conversation_id: str) -> bool:
+    """
+    Removes the private_note field from a specific conversation document.
+    """
+
+    try:
+        conversation_collection = db[f"conversations_{org_id}"]
+    
+        conversation_doc = conversation_collection.find_one({
+            "conversation_id": conversation_id
+        })
+        
+        if not conversation_doc:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        result = conversation_collection.update_one(
+            {"conversation_id": conversation_id},
+            {"$unset": {"private_note": ""}}
+        )
+
+        return result.modified_count > 0
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")

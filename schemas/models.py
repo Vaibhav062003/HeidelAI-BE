@@ -1,5 +1,5 @@
 # Pydantic
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Literal
 from enum import Enum
 from datetime import datetime
@@ -59,3 +59,16 @@ class ChatAnalysis(BaseModel):
 
 class UnarchiveRequest(BaseModel):
     platform_id: str
+
+class PrivateNoteRequest(BaseModel):
+    note: str
+    updated_by: str
+
+    @field_validator("note")
+    def validate_note(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("Note cannot be empty")
+        if len(v) > 1000:
+            raise ValueError("Note cannot exceed 1000 characters")
+        return v
