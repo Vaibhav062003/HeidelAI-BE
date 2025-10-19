@@ -1,8 +1,10 @@
+import uuid
+from bson import ObjectId
+from typing import Optional
+from fastapi import HTTPException
+from datetime import datetime, timezone
 from pymongo.errors import PyMongoError
 from pymongo.collection import Collection
-from fastapi import HTTPException
-from typing import Optional
-from datetime import datetime, timezone
 from core.services import services
 
 from database import get_mongo_db
@@ -205,18 +207,27 @@ async def unarchive_data(org_id: str, platform: str, user_id: str):
 
         archive_messages = f"archived_messages_{org_id}_{archive_id}"
         archive_conversations = f"archived_conversations_{org_id}_{archive_id}"
+        archive_private_notes = f"archived_private_notes_{org_id}_{archive_id}"
 
         main_messages = f"messages_{org_id}"
         main_conversations = f"conversations_{org_id}"
+        main_private_notes = f"private_notes_{org_id}"
 
         move_conversations_unarchive_safe(archive_conversations, main_conversations)
 
         move_messages_unarchive_safe(archive_messages, main_messages)
 
+        move_private_notes_unarchive_safe(archive_private_notes, main_private_notes)
+
         db["archived_tracker"].update_one(
             {"archive_id": archive_id},
             {"$set": {"status": "recovered", "restored_at": datetime.utcnow()}}
         )
+
+        print(f"Dropping archived collections: {archive_conversations}, {archive_messages}")
+        db.drop_collection(archive_conversations)
+        db.drop_collection(archive_messages)
+        db.drop_collection(archive_private_notes)
 
         print(f"Unarchiving completed for org_id={org_id}, platform={platform}")
 
@@ -236,6 +247,24 @@ def move_messages_unarchive_safe(source_name, target_name):
     if buffer:
         db[target_name].insert_many(buffer)
     
+    db[source_name].delete_many({})
+
+def move_private_notes_unarchive_safe(source_name: str, target_name: str):
+    """Moves private note docs from archive to main collection."""
+    cursor = db[source_name].find({}, {"_id": 0})
+
+    buffer = []
+    for note in cursor:
+        buffer.append(note)
+
+        if len(buffer) >= services.BATCH_SIZE:
+            if buffer:
+                db[target_name].insert_many(buffer)
+                buffer = []
+
+    if buffer:
+        db[target_name].insert_many(buffer)
+
     db[source_name].delete_many({})
 
 def move_conversations_unarchive_safe(source_name: str, target_name: str):
@@ -262,62 +291,60 @@ def move_conversations_unarchive_safe(source_name: str, target_name: str):
 
     db[source_name].delete_many({})
 
-async def create_or_update_private_note(org_id: str, conversation_id: str, note: str, updated_by: str) -> bool:
+async def add_private_note(org_id: str, conversation_id: str, note: str, posted_by: str, role: str, platform: str, connection_id: str) -> bool:
     """
-    Create or update a private note for a specific conversation.
+    Adds a private note for a specific conversation.
+    Stores the note in the private_notes collection
     """
 
     try:
-        conversation_collection = db[f"conversations_{org_id}"]
+        private_notes_collection = db[f"private_notes_{org_id}"]
 
-        conversation_doc = conversation_collection.find_one({
-            "conversation_id": conversation_id
-        })        
-
-        if not conversation_doc:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-
-        update_query = {
-            "$set": {
-                "private_note": {
-                    "text": note.strip(),
-                    "updated_by": updated_by,
-                    "updated_at": datetime.now(timezone.utc)
-                }
-            }
+        note_doc = {
+            "note_id": str(uuid.uuid4()),
+            "conversation_id": conversation_id,
+            "platform": platform,
+            "connection_id": connection_id,
+            "content": note,
+            "timestamp": datetime.now(timezone.utc),
+            "user_name": posted_by,
+            "role": role
         }
 
-        result = conversation_collection.update_one(
-            {"conversation_id": conversation_id},
-            update_query
-        )
+        result = private_notes_collection.insert_one(note_doc)
 
-        return result.modified_count > 0
-
+        if not result.inserted_id:
+            raise HTTPException(status_code=500, detail="Failed to add private note")
+        
+        return True
+    
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
     
-async def delete_private_note(org_id: str, conversation_id: str) -> bool:
+async def delete_private_note(org_id: str, note_id: str) -> bool:
     """
     Removes the private_note field from a specific conversation document.
     """
 
     try:
-        conversation_collection = db[f"conversations_{org_id}"]
-    
-        conversation_doc = conversation_collection.find_one({
-            "conversation_id": conversation_id
-        })
-        
-        if not conversation_doc:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        
-        result = conversation_collection.update_one(
-            {"conversation_id": conversation_id},
-            {"$unset": {"private_note": ""}}
-        )
+        messages_collection = db[f"messages_{org_id}"]
 
-        return result.modified_count > 0
+        try:
+            _id = ObjectId(note_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid note ID")
+
+        note = messages_collection.find_one({
+            "_id": _id, "message_type": "private_note"
+        })
+
+        if not note:
+            raise HTTPException(status_code=404, detail="Private note not found")
+        
+        messages_collection.delete_one({"_id": _id})
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
+    

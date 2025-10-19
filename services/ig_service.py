@@ -149,7 +149,7 @@ async def store_instagram_message(
     # Create message object
     message = {
         "id": message_id,
-        "message_id": message_id,  # For compatibility with IG webhook format
+        "message_id": message_id, 
         "platform": "instagram",
         "conversation_id": conversation_id,
         "content": content,
@@ -662,10 +662,13 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
 
                 messages_collection_name = f"messages_{org_id}"
                 conversations_collection_name = f"conversations_{org_id}"
+                private_notes_collection_name = f"private_notes_{org_id}"
                 
                 archived_messages = f"archived_messages_{org_id}_{archive_id}"
                 archived_conversations = f"archived_conversations_{org_id}_{archive_id}"
+                archived_private_notes = f"archived_private_notes_{org_id}_{archive_id}"
 
+                # Archiving messages collection
                 messages_to_archive = list(
                     db[messages_collection_name].find(
                             {"platform": "instagram"}, 
@@ -678,6 +681,7 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
                     db[archived_messages].insert_many(messages_to_archive, session=session)
                     db[messages_collection_name].delete_many({"platform": "instagram"}, session=session)
 
+                # Archiving conversations collection
                 conversations_to_archive = list(
                     db[conversations_collection_name].find(
                             {"platform": "instagram", "instagram_id": instagram_id}, 
@@ -701,6 +705,19 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
                         db[archived_conversations].bulk_write(bulk_ops, session=session)
                         
                     db[conversations_collection_name].delete_many({"platform": "instagram", "instagram_id": instagram_id}, session=session)
+                
+                # Archiving private notes collection
+                private_notes_to_archive = list(
+                    db[private_notes_collection_name].find(
+                        {"platform": "instagram", "user_id": instagram_id},
+                        {"_id": 0},
+                        session=session
+                    )
+                )
+
+                if private_notes_to_archive:
+                    db[archived_private_notes].insert_many(private_notes_to_archive, session=session)
+                    db[private_notes_collection_name].delete_many({"platform": "instagram", "user_id": instagram_id}, session=session)
 
                 print(f"Archived Instagram data for org {org_id} with archive_id {archive_id}")
 
@@ -736,6 +753,3 @@ async def remove_instagram_connection(org_id: str, instagram_id: str):
     except Exception as e:
         print(f"Error removing Instagram connection: {str(e)}")
         raise
-
-async def unarchive_data(archive_id: str):
-    """Unarchive data for a given archive_id."""

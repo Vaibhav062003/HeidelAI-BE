@@ -62,7 +62,9 @@ class UnarchiveRequest(BaseModel):
 
 class PrivateNoteRequest(BaseModel):
     note: str
-    updated_by: str
+    posted_by: str
+    platform: str
+    user_id: str
 
     @field_validator("note")
     def validate_note(cls, v):

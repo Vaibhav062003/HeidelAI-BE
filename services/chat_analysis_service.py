@@ -36,7 +36,7 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
             messages = (
                 list(
                     messages_collection.find({"conversation_id": conversation_id})
-                    .sort("timestamp", -1)
+                    .sort("timestamp", 1)
                     .limit(40)
                 )
             )
@@ -45,9 +45,6 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
 
         if not messages:
             return result_data
-
-        # Reverse to maintain chronological order
-        messages.reverse()
 
         # Combine message content into a single string
         conversation_text = "\n".join([msg["content"] for msg in messages])

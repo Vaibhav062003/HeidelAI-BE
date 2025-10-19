@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Response, Query
 from typing import Optional
 from auth.dependencies import CurrentUser
 from schemas.models import UnarchiveRequest, PrivateNoteRequest
-from services.common_service import fetch_conversations, close_conversation, unarchive_data, create_or_update_private_note, delete_private_note
+from services.common_service import fetch_conversations, close_conversation, unarchive_data, add_private_note, delete_private_note
 
 router = APIRouter(tags=["Common Routes"])
 
@@ -66,20 +66,26 @@ async def unarchive(user: CurrentUser, platform: str, request: UnarchiveRequest)
 
     return result
 
-@router.put("/api/conversations/{conversation_id}/private-note")
-async def update_private_note(user: CurrentUser, conversation_id: str, body: PrivateNoteRequest):
+@router.post("/api/conversations/{conversation_id}/private-note")
+async def post_private_note(user: CurrentUser, conversation_id: str, body: PrivateNoteRequest):
     """
-    This endpoint creates or updates a private note for a specific conversation.
+    This endpoint adds a new private note for a specific conversation.
+    Private notes are stored in the private_notes collection.
+    Each note is immutable once created.
     """
     org_id = user.org_id
+    role = user.role
+
     note = body.note
-    updated_by = body.updated_by
+    posted_by = body.posted_by
+    platform = body.platform
+    connection_id = body.connection_id
 
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
     
     try:
-        res = await create_or_update_private_note(org_id, conversation_id, note, updated_by)
+        res = await add_private_note(org_id, conversation_id, note, posted_by, role, platform, connection_id)
 
     except HTTPException as e:
         raise e
@@ -87,26 +93,25 @@ async def update_private_note(user: CurrentUser, conversation_id: str, body: Pri
         raise HTTPException(status_code=500, detail=str(e))
     
     if not res:
-        raise HTTPException(status_code=404, detail="Failed to update private note, no match found for conversation ID")
-    
-    return {"message": "Private note updated successfully."}
+        raise HTTPException(status_code=404, detail="Failed to add private note, no match found for conversation ID")
 
-@router.delete("/api/conversations/{conversation_id}/private-note")
-async def remove_private_note(user: CurrentUser, conversation_id: str):
-    """
-    This endpoint deletes a private note for a specific conversation.
-    """
-    org_id = user.org_id
-    print(user)
+    return {"message": "Private note added successfully."}
 
-    if not org_id:
-        raise HTTPException(status_code=400, detail="Invalid organization ID")
+# @router.delete("/api/conversations/{conversation_id}/private-note")
+# async def remove_private_note(user: CurrentUser, note_id: str):
+#     """
+#     This endpoint deletes a private note for a specific conversation.
+#     """
+#     org_id = user.org_id
+
+#     if not org_id:
+#         raise HTTPException(status_code=400, detail="Invalid organization ID")
     
-    try:
-        await delete_private_note(org_id, conversation_id)
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete private note: {str(e)}")
+#     try:
+#         await delete_private_note(org_id, note_id)
+#     except HTTPException as e:
+#         raise e
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Failed to delete private note: {str(e)}")
     
-    return {"message": "Private note deleted successfully."}
+#     return {"message": "Private note deleted successfully."}

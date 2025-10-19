@@ -16,11 +16,9 @@ async def get_followup_message(org_id: str, conversation_id: str) -> dict:
 
     messages_collection = db[f"messages_{org_id}"]
 
-    # Fetch messages for the given conversation_id, sorted by timestamp (descending)
-    messages = list(messages_collection.find({"conversation_id": conversation_id}).sort("timestamp", -1).limit(30))
+    # Fetch messages for the given conversation_id, sorted by timestamp (ascending)
+    messages = list(messages_collection.find({"conversation_id": conversation_id}).sort("timestamp", 1).limit(30))
 
-    # Reverse to maintain chronological order
-    messages.reverse()
 
     # Combine message content into a single string
     conversation_text = "\n".join([f"{msg["role"]}: {msg["content"]}" for msg in messages])

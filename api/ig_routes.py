@@ -534,32 +534,44 @@ async def get_instagram_messages(conversation_id: str, user: CurrentUser):
     """Fetch messages for a specific Instagram conversation"""
     try:
         org_id = user.org_id 
-        # organization specific collection name for conversations
         org_messages_collection_name = f"messages_{org_id}"
-        
-        # Check if collection exists in database
-        if org_messages_collection_name not in db.list_collection_names():
-            return []
-        
-        # Get the collection
-        org_messages_collection = db[org_messages_collection_name]
+        private_note_collection_name = f"private_notes_{org_id}"
 
-        # Fetch messages
-        messages = list(org_messages_collection.find(
-                {"conversation_id": conversation_id,
-                "platform": "instagram"},
-                {"_id": 0}  # Exclude _id field
-            ).sort("timestamp", 1))  # Sort by timestamp ascending
+        messages = []
+        notes = []
         
-        # Format timestamps for JSON serialization
-        for msg in messages:
-            if "timestamp" in msg and isinstance(msg["timestamp"], datetime):
-                msg["timestamp"] = msg["timestamp"].isoformat()
+        # Fetching messages
+        if org_messages_collection_name in db.list_collection_names():
+            org_messages_collection = db[org_messages_collection_name]
+            messages = list(org_messages_collection.find(
+                {"conversation_id": conversation_id},
+                {"_id": 0}  
+            ).sort("timestamp", 1))  
         
-        return messages
+        #Fetching private notes
+        if private_note_collection_name in db.list_collection_names():
+            private_note_collection = db[private_note_collection_name]
+            notes = list(private_note_collection.find(
+                    {"conversation_id": conversation_id},
+                    {"_id": 0}
+                ).sort("timestamp", 1)
+            )
+
+        # Merging both messages and notes
+        combined = messages + notes
+
+        # Normalizing timestamps
+        for msg in combined:
+            ts = msg.get("timestamp")
+            if isinstance(ts, datetime):
+                msg["timestamp"] = ts.isoformat()
+
+        combined.sort(key=lambda x: x.get("timestamp"), reverse=False)
+        
+        return combined
     
     except Exception as e:
-        print(f"Error fetching Instagram messages for {conversation_id} of org {org_id}: {e}")
+        print(f"Error fetching Instagram messages or private notes for {conversation_id} of org {org_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch Instagram messages: {str(e)}"
