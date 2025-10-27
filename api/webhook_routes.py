@@ -354,16 +354,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     sender_id = message["sender"]["id"]
                     recipient_id = message["recipient"]["id"]
+                    timestamp = message["timestamp"]
                     message = message.get("message")
                     
                     if (message is None):
                         print("No message content, skipping.")
                         return {"status": "ok"}
-                    
-                    if (message.get("text") is None):
+
+                    # if no text content in the message, skip processing it
+                    if (message.get("text") is None and message.get("attachments") is None):
                         print("No message content, skipping.")
                         return {"status": "ok"}
-
+                    
+                    # Check for duplicate messages / if the message ID is already processed
                     ig_message_id = message["mid"]
 
                     if ig_message_id in services.processed_message_ids:
@@ -372,10 +375,27 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     
                     # Add message ID with the current timestamp
                     services.processed_message_ids[ig_message_id] = time.time()
+                    
+                    attachment_type = "text"
+                    attachment_payload = None
 
-                    message_text = message.get("text", None)
+                    if (message.get("attachments") is not None):
+                        print("Message has attachments")
+                        for attachment in message.get("attachments"):
+                            attachment_type = str(attachment.get("type"))
+                            attachment_payload = attachment.get("payload")
+
+                    print(f"Instagram Message Attachment Type: {attachment_type}")
+                    print(f"Instagram Message Attachment Payload: {attachment_payload}")
+
+                    message_text = message.get("text") or {
+                        "share": "Shared a post",
+                        "ig_story": "Shared a story",
+                        "ig_reel": "Shared a reel"
+                    }.get(attachment_type, f"Shared a {attachment_type}")
+
                     message_echo = message.get("is_echo", False)
-
+                    
                     if message_echo:
                         recipient_id, sender_id = sender_id, recipient_id
 
@@ -440,6 +460,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     message_id = await store_instagram_message(
                         org_id=org_id,
                         content=message_text,
+                        type=attachment_type,
+                        payload=attachment_payload,
                         conversation_id=conversation_id,
                         sender_id=sender_id,
                         sender_name=name,
@@ -465,6 +487,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "conversation_id": conversation_id,
                                             "sender_id": username,
                                             "content": message_text,
+                                            "type": attachment_type,
+                                            "payload": attachment_payload,
                                             "timestamp": datetime.now().isoformat(),
                                             "role": message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
                                         }

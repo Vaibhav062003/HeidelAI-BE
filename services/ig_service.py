@@ -109,6 +109,8 @@ async def store_instagram_message(
     content: str,
     conversation_id: str,
     sender_id: str,
+    type: Optional[str],
+    payload: Optional[dict],
     sender_name: str,
     sender_username: str,
     recipient_id: str,
@@ -123,6 +125,8 @@ async def store_instagram_message(
         content: The message content
         conversation_id: The ID of the conversation
         sender_id: Instagram user ID of the sender
+        type: Type of the message (share -> post, ig_reel, ig_story)
+        payload: Additional payload for the message (only exists if type is provided, contains attachment info)
         sender_name: Name of the sender
         sender_username: Username of the sender
         recipient_id: Instagram business account ID (page ID)
@@ -153,6 +157,8 @@ async def store_instagram_message(
         "platform": "instagram",
         "conversation_id": conversation_id,
         "content": content,
+        "type": type,
+        "payload": payload,
         "sender_id": sender_id,
         "sender_name": sender_name,
         "sender_username": sender_username,
@@ -163,6 +169,8 @@ async def store_instagram_message(
     
     # Store message in Instagram-specific collection
     messages_collection.insert_one(message)
+
+    print("Message stored:", message_id)
     
     # Keep only latest 40 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
@@ -190,6 +198,8 @@ async def store_instagram_message(
         "platform": "instagram",
         "conversation_id": conversation_id,
         "content": content,
+        "type": type,
+        "payload": payload,
         "sender_id": sender_username,  # Use username for the frontend
         "role": role,
         "timestamp": datetime.now().isoformat(),
@@ -199,7 +209,6 @@ async def store_instagram_message(
     
     
     # Broadcast to Instagram-specific WebSocket connections
-
     if recipient_id in services.instagram_connections_map:
         print(f"Broadcasting message to Instagram user {recipient_id}")
         await broadcast_instagram_message(recipient_id, "new_message", {
