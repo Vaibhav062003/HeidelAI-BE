@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Query
 from datetime import datetime
+from pymongo import ReturnDocument
 
 from config.settings import *
 from services.ig_service import *
@@ -530,12 +531,50 @@ async def get_instagram_conversations(user: CurrentUser):
 
 # Instagram-specific messages endpoint
 @router.get("/conversations/{conversation_id}/messages")
-async def get_instagram_messages(conversation_id: str, user: CurrentUser):
+async def get_instagram_messages(conversation_id: str, 
+                                 user: CurrentUser,
+                                 agent_username: str = Query(..., description="Username of the agent accessing this conversation")
+                                 ):
     """Fetch messages for a specific Instagram conversation"""
     try:
         org_id = user.org_id 
         org_messages_collection_name = f"messages_{org_id}"
         private_note_collection_name = f"private_notes_{org_id}"
+
+        # Auto assigning agent to the conversation if it is unassigned
+        org_conversations_collection_name = f"conversations_{org_id}"
+        convo_collection = db[org_conversations_collection_name]
+
+        now = datetime.now(timezone.utc)
+
+        assigned_convo = convo_collection.find_one_and_update(
+            {
+                "conversation_id": conversation_id,
+                "$or": [
+                    {"assigned_agent" : {"$exists": False}},
+                    {"assigned_agent": None}
+                ],
+                "status": "open"
+            },
+            {
+                "$set": {
+                    "assigned_agent": {
+                        "id": user.user_id,
+                        "username": agent_username,
+                        "assigned_at": now
+                    }
+                },
+                "$push": {
+                    "assignment_history": {
+                        "id": user.user_id,
+                        "username": agent_username,
+                        "assigned_at": now
+                    }
+                }
+            },
+            projection={"assigned_agent": 1, "assignment_history": 1, "_id": 0},
+            return_document=ReturnDocument.AFTER
+        )
 
         messages = []
         notes = []
@@ -567,8 +606,10 @@ async def get_instagram_messages(conversation_id: str, user: CurrentUser):
                 msg["timestamp"] = ts.isoformat()
 
         combined.sort(key=lambda x: x.get("timestamp"), reverse=False)
+
+        print(assigned_convo)
         
-        return combined
+        return {"messages": combined, "assignment": assigned_convo}
     
     except Exception as e:
         print(f"Error fetching Instagram messages or private notes for {conversation_id} of org {org_id}: {e}")

@@ -139,7 +139,8 @@ async def reopen_conversation(org_id: str, conversation_id: str):
         try:
             result = conversation_collection.update_one(
                 {"conversation_id": conversation_id},
-                {"$unset": {"closed_at": ""}}
+                {"$unset": {"closed_at": ""},
+                 "$set": {"started_at": datetime.now(timezone.utc)}}
             )
         except PyMongoError as e:
             raise HTTPException(status_code=500, detail=f"Database error updating conversation: {str(e)}")
@@ -157,23 +158,39 @@ async def reopen_conversation(org_id: str, conversation_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-async def close_conversation(org_id: str, conversation_id: str):
+async def close_conversation(org_id: str, conversation_id: str, reason: str):
     """
     Mark a conversation as closed for a given organization.
     """
     try:
         conversation_collection = db[f"conversations_{org_id}"]
 
-        result = conversation_collection.update_one(
-            {"conversation_id": conversation_id},
-            {"$set": {"status": "closed", "closed_at": datetime.now(timezone.utc)}}
-        )
+        now = datetime.now(timezone.utc)
 
-        if result.matched_count == 0:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Conversation not found for conversation_id={conversation_id}"
+        conversation =  conversation_collection.find_one({"conversation_id": conversation_id})
+
+        if conversation and "assignment_history" in conversation and conversation["assignment_history"]:
+            last_index = len(conversation["assignment_history"])-1
+            update_path = f"assignment_history.{last_index}.assigned_until"
+
+            result = conversation_collection.update_one(
+                {"conversation_id": conversation_id},
+                {
+                    "$set": {
+                            "status": "closed", 
+                            "closed_at": now,
+                            "assigned_agent": None,
+                            update_path: now,
+                            "closure_reason": reason
+                        }
+                }
             )
+
+            if result.matched_count == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Conversation not found for conversation_id={conversation_id}"
+                )
 
         return {"message": "Conversation closed successfully."}
 

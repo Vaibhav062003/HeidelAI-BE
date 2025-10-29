@@ -51,7 +51,7 @@ async def close_conversation_endpoint(user: CurrentUser, conversation_id: str):
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
-    return await close_conversation(org_id, conversation_id)
+    return await close_conversation(org_id, conversation_id, "Closed by agent")
 
 @router.post("/api/unarchive-data/{platform}")
 async def unarchive(user: CurrentUser, platform: str, request: UnarchiveRequest):

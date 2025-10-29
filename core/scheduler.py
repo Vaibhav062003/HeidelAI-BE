@@ -1,11 +1,12 @@
 from pymongo import UpdateOne
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from services.scheduler_service import clean_expired_archives
 
 # === Internal Modules ===
 from database import get_mongo_db
 from services.platforms import instagram_service
+from services.common_service import close_conversation
+from services.scheduler_service import clean_expired_archives
 
 db = get_mongo_db()
 scheduled_collection = db["scheduled_messages"]
@@ -106,7 +107,7 @@ async def process_inactivity_for_org(org_id: str):
     while True:
         conv = conv_col.find_one_and_update(
             query,
-            {"$set": {}},  # placeholder, will update per stage
+            {"$set": {}}, 
             return_document=True
         )
         if not conv:
@@ -146,7 +147,7 @@ async def process_inactivity_for_org(org_id: str):
                 {
                     "$set": {
                         "reminder_stage": 2,
-                        "next_action_at": now + timedelta(hours=12)
+                        "next_action_at": now + timedelta(hours=6)
                     }
                 }
             )
@@ -166,17 +167,8 @@ async def process_inactivity_for_org(org_id: str):
 
         elif stage == 2:
             # Close conversation
-            conv_col.update_one(
-                {"conversation_id": conv["conversation_id"]},
-                {
-                    "$set": {
-                        "reminder_stage": 3,
-                        "status": "closed",
-                        "closed_at": now,
-                        "next_action_at": None
-                    }
-                }
-            )
+            await close_conversation(org_id, conv["conversation_id"], "Closed due to inactivity")
+            
             print(f"[ORG {org_id}] Closed conversation {conv['conversation_id']} due to inactivity")
 
 async def process_time_based_tasks():
