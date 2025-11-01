@@ -386,13 +386,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             attachment_type = str(attachment.get("type"))
                             attachment_payload = attachment.get("payload")
 
+                    # Handle reply type messages 
                     if(message.get("reply_to") is not None):
+                        # Handle message replies
                         if message.get("reply_to").get("mid") is not None:
                             print(f"Message is a reply to message ID: {message.get('reply_to').get('mid')}")
                             attachment_type = "message_reply"
                             attachment_payload = {
                                 "mid": message.get("reply_to").get("mid")
                             }
+                        # Handle story replies
                         if message.get("reply_to").get("story") is not None:
                             print(f"Message is a reply to story ID: {message.get('reply_to').get('story').get('id')}")
                             attachment_type = "story_reply"
