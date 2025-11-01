@@ -255,19 +255,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             {"instagram_id": recipient_id, "is_active": True},
                             sort=[("last_updated", -1)]
                         )
-
-                        org_id = instagram_connection.org_id 
+                        
+                        print(f"Instagram Connection: {instagram_connection}")
+                        org_id = instagram_connection.get("org_id")
                         print(f"Org_id: {org_id}")
 
                         # Get the Instagram-specific collection names
                         messages_collection_name = f"messages_{org_id}"
-                        conversations_collection_name = f"conversations_{org_id}"  # Add this line
+                        conversations_collection_name = f"conversations_{org_id}" 
 
                         # Check if collection exists
                         if messages_collection_name in db.list_collection_names():
 
                             messages_collection = db[messages_collection_name]
-                            conversations_collection = db[conversations_collection_name]  # Add this line
+                            conversations_collection = db[conversations_collection_name]  
                             
                             # Find the message to be deleted
                             message_to_delete = messages_collection.find_one({"message_id": deleted_message_id})
@@ -385,8 +386,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             attachment_type = str(attachment.get("type"))
                             attachment_payload = attachment.get("payload")
 
-                    print(f"Instagram Message Attachment Type: {attachment_type}")
-                    print(f"Instagram Message Attachment Payload: {attachment_payload}")
+                    if(message.get("reply_to") is not None):
+                        if message.get("reply_to").get("mid") is not None:
+                            print(f"Message is a reply to message ID: {message.get('reply_to').get('mid')}")
+                            attachment_type = "message_reply"
+                            attachment_payload = {
+                                "mid": message.get("reply_to").get("mid")
+                            }
+                        if message.get("reply_to").get("story") is not None:
+                            print(f"Message is a reply to story ID: {message.get('reply_to').get('story').get('id')}")
+                            attachment_type = "story_reply"
+                            attachment_payload = {
+                                "id": message.get("reply_to").get("story").get("id"),
+                                "url": message.get("reply_to").get("story").get("url")
+                            }
 
                     message_text = message.get("text") or {
                         "share": "Shared a post",
@@ -514,7 +527,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         await broadcast_instagram_message(recipient_id, "conversation_updated", {
                             "conversation": conversation
                         })
-                    
+                        
+                    return {"status": "ok"}
                     # Broadcast the new message to Instagram-specific clients
                     # await broadcast_instagram_message(recipient_id, "new_message", {
                     #     "message": {

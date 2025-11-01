@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Response, Query
 from datetime import datetime
 
 from config.settings import *
@@ -727,3 +727,28 @@ async def send_instagram_message(message: dict, user: CurrentUser):
             status_code=500, 
             detail=f"Failed to send message: {str(e)}"
         )
+    
+# Proxy endpoint to fetch Instagram media content and return back to frontend
+@router.get("/proxy/instagram-media")
+def proxy_instagram_media(url: str = Query(..., description="Full Instagram CDN URL")):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+            "Connection": "keep-alive"
+        }
+        r = requests.get(url, headers=headers, stream=True, timeout=10)
+
+        print(f"Proxy fetch status: {r.status_code} for URL: {url}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail=f"CDN fetch failed ({r.status_code})")
+
+        return Response(
+            content=r.content,
+            media_type=r.headers.get("content-type", "application/octet-stream")
+        )
+
+    except Exception as e:
+        print(f"Error fetching Instagram media: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
