@@ -376,39 +376,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     
                     # Add message ID with the current timestamp
                     services.processed_message_ids[ig_message_id] = time.time()
-                    
-                    attachment_type = "text"
-                    attachment_payload = None
-
-                    if (message.get("attachments") is not None):
-                        print("Message has attachments")
-                        for attachment in message.get("attachments"):
-                            attachment_type = str(attachment.get("type"))
-                            attachment_payload = attachment.get("payload")
-
-                    # Handle reply type messages 
-                    if(message.get("reply_to") is not None):
-                        # Handle message replies
-                        if message.get("reply_to").get("mid") is not None:
-                            print(f"Message is a reply to message ID: {message.get('reply_to').get('mid')}")
-                            attachment_type = "message_reply"
-                            attachment_payload = {
-                                "mid": message.get("reply_to").get("mid")
-                            }
-                        # Handle story replies
-                        if message.get("reply_to").get("story") is not None:
-                            print(f"Message is a reply to story ID: {message.get('reply_to').get('story').get('id')}")
-                            attachment_type = "story_reply"
-                            attachment_payload = {
-                                "id": message.get("reply_to").get("story").get("id"),
-                                "url": message.get("reply_to").get("story").get("url")
-                            }
-
-                    message_text = message.get("text") or {
-                        "share": "Shared a post",
-                        "ig_story": "Shared a story",
-                        "ig_reel": "Shared a reel"
-                    }.get(attachment_type, f"Shared a {attachment_type}")
 
                     message_echo = message.get("is_echo", False)
                     
@@ -442,6 +409,46 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     if not page_access_token:
                         print(f"Page access token not found for recipient ID: {recipient_id}")
                         return {"status": "error", "message": "Page access token not found"}
+                    
+                    attachment_type = "text"
+                    attachment_payload = None
+
+                    if (message.get("attachments") is not None):
+                        print("Message has attachments")
+                        for attachment in message.get("attachments"):
+                            attachment_type = str(attachment.get("type"))
+                            attachment_payload = attachment.get("payload")
+
+                    # Handle reply type messages 
+                    if(message.get("reply_to") is not None):
+                        # Handle message replies
+                        if message.get("reply_to").get("mid") is not None:
+                            print(f"Message is a reply to message ID: {message.get('reply_to').get('mid')}")
+                            attachment_type = "message_reply"
+                            attachment_payload = {
+                                "mid": message.get("reply_to").get("mid")
+                            }
+                        # Handle story replies
+                        if message.get("reply_to").get("story") is not None:
+                            story_id = message.get("reply_to").get("story").get("id")
+                            story_url = message.get("reply_to").get("story").get("url")
+                            story_owner = await get_ig_media_owner(story_id, page_access_token)
+                            
+                            print(f"Message is a reply to story ID: {story_id}")
+
+                            attachment_type = "story_reply"
+                            attachment_payload = {
+                                "id": story_id,
+                                "url": story_url,
+                                "owner_username": story_owner.get("username"),
+                                "owner_profile_picture_url" : story_owner.get("profile_picture_url")
+                            }
+
+                    message_text = message.get("text") or {
+                        "share": "Shared a post",
+                        "ig_story": "Shared a story",
+                        "ig_reel": "Shared a reel"
+                    }.get(attachment_type, f"Shared a {attachment_type}")
 
                     # Get user-specific collection names
                     messages_collection_name = f"messages_{org_id}"
