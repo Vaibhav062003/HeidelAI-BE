@@ -428,6 +428,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             attachment_payload = {
                                 "mid": message.get("reply_to").get("mid")
                             }
+                            
                         # Handle story replies
                         if message.get("reply_to").get("story") is not None:
                             story_id = message.get("reply_to").get("story").get("id")

@@ -429,7 +429,7 @@ async def get_ig_media_owner(media_id, page_access_token):
             "profile_picture_url": profile_picture_url
         }
     return {
-        "username": "unknown_user",
+        "username": None,
         "profile_picture_url": None
     }
 
