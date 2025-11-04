@@ -804,3 +804,6 @@ async def remove_instagram_connection(org_id: str, instagram_id: str):
     except Exception as e:
         print(f"Error removing Instagram connection: {str(e)}")
         raise
+
+async def handle_reaction_messages():
+    pass

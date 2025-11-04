@@ -360,17 +360,62 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     # REACTION TYPE MESSAGES #######################################################################
                     if (message.get("reaction") is not None):
+                        """
+
+                            Incoming webhook payload: {
+                            "object": "instagram",
+                            "entry": [
+                                {
+                                "time": 1761922980065,
+                                "id": "17841438674306985",
+                                "messaging": [
+                                    {
+                                    "sender": {
+                                        "id": "3512668315705890"
+                                    },
+                                    "recipient": {
+                                        "id": "17841438674306985"
+                                    },
+                                    "timestamp": 1761922979645,
+                                    "reaction": {
+                                        "mid": "aWdfZAG1faXRlbToxOklHTWVzc2FnZAUlEOjE3ODQxNDM4Njc0MzA2OTg1OjM0MDI4MjM2Njg0MTcxMDMwMTI0NDI1OTQ5NjQ3MDEyOTY1OTQwMzozMjUwMTc0MjIxOTMyNTM0NTU2ODA2ODM4MzQ5MDk2NTUwNAZDZD",
+                                        "action": "react",
+                                        "reaction": "love",
+                                        "emoji": "\u2764\ufe0f"
+                                    }
+                                    }
+                                ]
+                            
+                            ]
+                            }
+
+                            "message": {
+                                "mid": "aWdfZAG1faXRlbToxOklHTWVzc2FnZAUlEOjE3ODQxNDM4Njc0MzA2OTg1OjM0MDI4MjM2Njg0MTcxMDMwMTI0NDI1OTQ5NjQ3MDEyOTY1OTQwMzozMjQ5MTkwMTcyMTI1MjI5NTc4MDMwOTE1Njg1Mzk3Mjk5MgZDZD",
+                                "attachments": [
+                                                  "type":                   {
+"ig_story",
+                                    "payload": {
+                                    "story_media_id": "17955419055001873",
+                                    "story_media_url": "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=17955419055001873&signature=AYdlFgzs-aeFzBoXZLqsesCaZOhKtsMfXWAeCewvoKX_OabyoOA8vpsGqLeGLrLK9jbTdQWVoCxoaVfpQmAnMhGeZGkMRxaiggpuG1mn9Ra1IS9rsrnOrnJiNNCQ9giIi6AMZbM2tra7I_Il6EpQhXiZuvg_Chl_HL5QW5PNWBqUTA4x2l09L3v5Ri_RHTHz2_aPGxgApKuqX89SxakrRA5yIApoSJw%22
+                                    }
+                                }
+                                ]
+                                            """
+                        message_timestamp = message.get("timestamp")
                         emoji = message.get("reaction").get("emoji")
                         mid = message.get("reaction").get("mid")
+                        action = message.get("reaction").get("action")
                         timestamp = datetime.now()
 
+                        key = f"{mid}_{emoji}_{action}"
+
                         # Check for duplicate messages reactions / if the message ID is already processed
-                        if mid in services.processed_message_reaction_ids:
+                        if key in services.processed_message_reaction_ids:
                             print("Duplicate message, skipping processing.")
                             continue
                         
                         # Add message ID with the current timestamp
-                        services.processed_message_reaction_ids[mid] = time.time()
+                        services.processed_message_reaction_ids[key] = timestamp
 
                         # Find the corresponding Instagram account in our connections
                         instagram_connection = db.instagram_connections.find_one(
@@ -415,31 +460,49 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                         print(f"Reaction Event: {user} reacted to message ID {mid} with emoji: {emoji}")
 
-
-                        # Update the message with the reaction info in  database and it for broadcasting
-                        try:
-                            # Update the message with the reaction info
-                            broadcast_message = messages_collection.find_one_and_update(
-                                {"message_id": mid},
-                                {"$set": {
-                                    "reaction": {
-                                        "emoji": emoji,
-                                        "username": username,
-                                        "full_name": name,
-                                        "profile_picture_url": user_details.get("profile_pic"),
-                                        "timestamp": timestamp
-                                    }
-                                }}, 
-                                return_document=ReturnDocument.AFTER
-                            )
-                            
-                            if not broadcast_message:
-                                print(f"Message with ID {mid} not found for reaction update")
-                                return {"status": "ok"}
+                        if (action == "react"):
+                            # Update the message with the reaction info in  database and it for broadcasting
+                            try:
+                                # Update the message with the reaction info
+                                broadcast_message = messages_collection.find_one_and_update(
+                                    {"message_id": mid},
+                                    {"$set": {
+                                        "reaction": {
+                                            "emoji": emoji,
+                                            "username": username,
+                                            "full_name": name,
+                                            "profile_picture_url": user_details.get("profile_pic"),
+                                            "timestamp": timestamp
+                                        }
+                                    }}, 
+                                    return_document=ReturnDocument.AFTER
+                                )
                                 
-                        except Exception as e:
-                            print(f"Error updating message with reaction: {e}")
-                            return {"status": "error", "message": str(e)}
+                                if not broadcast_message:
+                                    print(f"Message with ID {mid} not found for reaction update")
+                                    return {"status": "ok"}
+                                    
+                            except Exception as e:
+                                print(f"Error updating message with reaction: {e}")
+                                return {"status": "error", "message": str(e)}
+                            
+                        elif (action == "unreact"):
+                            # Update the message with the reaction info in  database and it for broadcasting
+                            try:
+                                # Update the message with the reaction info
+                                broadcast_message = messages_collection.find_one_and_update(
+                                    {"message_id": mid},
+                                    {"$unset": {"reaction": 1}}, 
+                                    return_document=ReturnDocument.AFTER
+                                )
+                                
+                                if not broadcast_message:
+                                    print(f"Message with ID {mid} not found for reaction update")
+                                    return {"status": "ok"}
+                                    
+                            except Exception as e:
+                                print(f"Error updating message with reaction: {e}")
+                                return {"status": "error", "message": str(e)}
                         
 
 
