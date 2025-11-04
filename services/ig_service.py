@@ -398,7 +398,7 @@ async def get_ig_username(sender_id, page_access_token):
         "Content-Type" : "application/json"
     }
     params = {
-        "fields" : "username, name",
+        "fields" : "username, name, profile_pic",
         "access_token" : page_access_token
     }
 
