@@ -8,6 +8,7 @@ from . import ai_routes
 from . import common_routes
 from . import integrations
 from . import security_routes
+from . import clerk_routes
 
 router = APIRouter()
 
@@ -19,3 +20,4 @@ router.include_router(ai_routes.router)
 router.include_router(common_routes.router)
 router.include_router(integrations.router)
 router.include_router(security_routes.router)
+router.include_router(clerk_routes.router)
