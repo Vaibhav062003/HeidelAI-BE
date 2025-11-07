@@ -406,6 +406,48 @@ async def get_ig_username(sender_id, page_access_token):
     response = response.json()
     return response
 
+async def get_ig_media_owner(media_id, page_access_token):
+    url = f"https://graph.instagram.com/{media_id}"
+    headers = {
+        "Content-Type" : "application/json"
+    }
+    params = {
+        "fields" : "username, owner",
+        "access_token" : page_access_token
+    }
+
+    response = requests.get(url, headers=headers, params=params)
+    response = response.json()
+    if 'username' in response:
+        owner_username = response['username']
+    if 'owner' in response:
+        owner_id = response['owner']['id']
+        profile_picture_url = await get_ig_profile_picture(owner_id, page_access_token)
+        return {
+            "username": owner_username,
+            "profile_picture_url": profile_picture_url
+        }
+    return {
+        "username": None,
+        "profile_picture_url": None
+    }
+
+async def get_ig_profile_picture(user_id, page_access_token):
+    url = f"https://graph.instagram.com/{user_id}"
+    headers = {
+        "Content-Type" : "application/json"
+    }
+    params = {
+        "fields" : "profile_picture_url",
+        "access_token" : page_access_token
+    }
+
+    response = requests.get(url, headers=headers, params=params)
+    response = response.json()
+    if 'profile_picture_url' in response:
+        return response['profile_picture_url']
+    return None
+
 # Fetch data from Supabase
 def fetch_media_data():
     try:
