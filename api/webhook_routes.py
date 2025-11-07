@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from datetime import datetime
 from fastapi import Request, Header
 from fastapi.responses import PlainTextResponse
+from pymongo import ReturnDocument
 
 # Internal Modules
 from core.managers import manager
@@ -356,6 +357,168 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     sender_id = message["sender"]["id"]
                     recipient_id = message["recipient"]["id"]
                     timestamp = message["timestamp"]
+
+                    # REACTION TYPE MESSAGES #######################################################################
+                    if (message.get("reaction") is not None):
+                        """
+
+                            Incoming webhook payload: {
+                            "object": "instagram",
+                            "entry": [
+                                {
+                                "time": 1761922980065,
+                                "id": "17841438674306985",
+                                "messaging": [
+                                    {
+                                    "sender": {
+                                        "id": "3512668315705890"
+                                    },
+                                    "recipient": {
+                                        "id": "17841438674306985"
+                                    },
+                                    "timestamp": 1761922979645,
+                                    "reaction": {
+                                        "mid": "aWdfZAG1faXRlbToxOklHTWVzc2FnZAUlEOjE3ODQxNDM4Njc0MzA2OTg1OjM0MDI4MjM2Njg0MTcxMDMwMTI0NDI1OTQ5NjQ3MDEyOTY1OTQwMzozMjUwMTc0MjIxOTMyNTM0NTU2ODA2ODM4MzQ5MDk2NTUwNAZDZD",
+                                        "action": "react",
+                                        "reaction": "love",
+                                        "emoji": "\u2764\ufe0f"
+                                    }
+                                    }
+                                ]
+                            
+                            ]
+                            }
+
+                            "message": {
+                                "mid": "aWdfZAG1faXRlbToxOklHTWVzc2FnZAUlEOjE3ODQxNDM4Njc0MzA2OTg1OjM0MDI4MjM2Njg0MTcxMDMwMTI0NDI1OTQ5NjQ3MDEyOTY1OTQwMzozMjQ5MTkwMTcyMTI1MjI5NTc4MDMwOTE1Njg1Mzk3Mjk5MgZDZD",
+                                "attachments": [
+                                                  "type":                   {
+"ig_story",
+                                    "payload": {
+                                    "story_media_id": "17955419055001873",
+                                    "story_media_url": "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=17955419055001873&signature=AYdlFgzs-aeFzBoXZLqsesCaZOhKtsMfXWAeCewvoKX_OabyoOA8vpsGqLeGLrLK9jbTdQWVoCxoaVfpQmAnMhGeZGkMRxaiggpuG1mn9Ra1IS9rsrnOrnJiNNCQ9giIi6AMZbM2tra7I_Il6EpQhXiZuvg_Chl_HL5QW5PNWBqUTA4x2l09L3v5Ri_RHTHz2_aPGxgApKuqX89SxakrRA5yIApoSJw%22
+                                    }
+                                }
+                                ]
+                                            """
+                        message_timestamp = message.get("timestamp")
+                        emoji = message.get("reaction").get("emoji")
+                        mid = message.get("reaction").get("mid")
+                        action = message.get("reaction").get("action")
+                        timestamp = datetime.now()
+
+                        key = f"{mid}_{emoji}_{action}"
+
+                        # Check for duplicate messages reactions / if the message ID is already processed
+                        if key in services.processed_message_reaction_ids:
+                            print("Duplicate message, skipping processing.")
+                            continue
+                        
+                        # Add message ID with the current timestamp
+                        services.processed_message_reaction_ids[key] = timestamp
+
+                        # Find the corresponding Instagram account in our connections
+                        instagram_connection = db.instagram_connections.find_one(
+                            {"instagram_id": recipient_id, "is_active": True},
+                            sort=[("last_updated", -1)]
+                        )
+
+                        if not instagram_connection:
+                            print(f"No active Instagram connection found for recipient ID: {recipient_id}")
+                            return {"status": "ok"}
+                        
+                        org_collection = db.organizations.find_one({"ig_id": recipient_id})
+
+                        if not org_collection:
+                            print(f"No active organization found for Instagram ID: {recipient_id}")
+                            return {"status": "ok"}
+
+                        org_id = org_collection.get("org_id")
+
+                        if (not org_id):
+                            print(f"No active organization ID found for Instagram ID: {recipient_id}")
+                            return {"status": "ok"}
+
+                        # get the page access token
+                        page_access_token = instagram_connection.get("page_access_token")
+                        if not page_access_token:
+                            print(f"Page access token not found for recipient ID: {recipient_id}")
+                            return {"status": "error", "message": "Page access token not found"}
+                        
+                        # Get user-specific collection names
+                        messages_collection_name = f"messages_{org_id}"
+                        conversations_collection_name = f"conversations_{org_id}"
+                        
+                        # Get or create collections
+                        messages_collection = db[messages_collection_name]
+                        conversations_collection = db[conversations_collection_name]
+                        
+                        user_details = await get_ig_username(sender_id, page_access_token)
+                        username = user_details.get('username')
+                        name = user_details.get('name')
+                        user = name + " - @" + username
+
+                        print(f"Reaction Event: {user} reacted to message ID {mid} with emoji: {emoji}")
+
+                        if (action == "react"):
+                            # Update the message with the reaction info in  database and it for broadcasting
+                            try:
+                                # Update the message with the reaction info
+                                broadcast_message = messages_collection.find_one_and_update(
+                                    {"message_id": mid},
+                                    {"$set": {
+                                        "reaction": {
+                                            "emoji": emoji,
+                                            "username": username,
+                                            "full_name": name,
+                                            "profile_picture_url": user_details.get("profile_pic"),
+                                            "timestamp": timestamp
+                                        }
+                                    }}, 
+                                    return_document=ReturnDocument.AFTER
+                                )
+                                
+                                if not broadcast_message:
+                                    print(f"Message with ID {mid} not found for reaction update")
+                                    return {"status": "ok"}
+                                    
+                            except Exception as e:
+                                print(f"Error updating message with reaction: {e}")
+                                return {"status": "error", "message": str(e)}
+                            
+                        elif (action == "unreact"):
+                            # Update the message with the reaction info in  database and it for broadcasting
+                            try:
+                                # Update the message with the reaction info
+                                broadcast_message = messages_collection.find_one_and_update(
+                                    {"message_id": mid},
+                                    {"$unset": {"reaction": 1}}, 
+                                    return_document=ReturnDocument.AFTER
+                                )
+                                
+                                if not broadcast_message:
+                                    print(f"Message with ID {mid} not found for reaction update")
+                                    return {"status": "ok"}
+                                    
+                            except Exception as e:
+                                print(f"Error updating message with reaction: {e}")
+                                return {"status": "error", "message": str(e)}
+                        
+
+
+                        if "_id" in broadcast_message:
+                            broadcast_message["_id"] = str(broadcast_message["_id"])
+
+                        # Broadcast the reaction update to connected clients
+                        if recipient_id in services.instagram_connections_map:
+                            print(f"Broadcasting message_reaction event to Frontend for {recipient_id}")
+                            await broadcast_instagram_message(recipient_id, "message_reaction", {
+                                "message": broadcast_message
+                            })
+
+                        return {"status": "ok"}
+
+
                     message = message.get("message")
                     
                     if (message is None):
@@ -364,7 +527,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     # if no text content in the message, skip processing it
                     if (message.get("text") is None and message.get("attachments") is None):
-                        print("No message content, skipping.")
+                        print("Event can't be handled (not supported), skipping processing.")
                         return {"status": "ok"}
                     
                     # Check for duplicate messages / if the message ID is already processed
@@ -410,6 +573,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         print(f"Page access token not found for recipient ID: {recipient_id}")
                         return {"status": "error", "message": "Page access token not found"}
                     
+                    # ATTACHMENT TYPE MESSAGES #######################################################################
                     attachment_type = "text"
                     attachment_payload = None
 
@@ -467,6 +631,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     user = name + " - @" + username
 
                     print(f"Message Received from {user}, Message: {message_text}")
+
+                    
+
 
                     print("Calling function create_or_update_instagram_conversation")
 
