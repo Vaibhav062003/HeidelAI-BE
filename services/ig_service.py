@@ -807,3 +807,36 @@ async def remove_instagram_connection(org_id: str, instagram_id: str):
 
 async def handle_reaction_messages():
     pass
+
+async def send_message_reaction(message_id: str, instagram_id: str, page_access_token: str, action: str, recipient_id: str):
+    """
+    Send a reaction to a message
+    """
+    try:
+        url = f"https://graph.instagram.com/v24.0/{instagram_id}/messages"
+
+        headers = {
+            "Authorization" : "Bearer " + page_access_token,
+        }
+
+        body = {
+            "recipient":{
+                "id": recipient_id
+            },
+            "sender_action": action,
+            "payload": {
+                "message_id": message_id,
+                "reaction": "love"
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=body)
+        if response.status_code != 200:
+            print(f"Error sending message reaction: {response.text}")
+            return "error"
+        print(f"Message reaction response: {response.status_code}, {response.json()}")
+        return "success"
+
+    except Exception as e:
+        print(f"Error sending message reaction: {str(e)}")
+        return "error"

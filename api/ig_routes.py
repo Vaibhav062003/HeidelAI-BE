@@ -9,6 +9,8 @@ from auth.auth_utils import admin_required, require_auth
 from services.platforms.instagram_service import InstagramService
 
 from database import get_mongo_db
+from pymongo import ReturnDocument
+
 
 instagram_service = InstagramService()
 
@@ -728,6 +730,130 @@ async def send_instagram_message(message: dict, user: CurrentUser):
             detail=f"Failed to send message: {str(e)}"
         )
     
+@router.post("/conversations/send_reaction")
+async def send_instagram_reaction(reaction: dict, user: CurrentUser):
+    """Send a reaction to an Instagram message"""
+    try:
+        org_id = user.org_id 
+        # emoji = reaction["emoji"]
+        message_id = reaction["message_id"]
+
+        messages_collection = db[f"messages_{org_id}"]
+
+        # Find the message first
+        message = messages_collection.find_one({"message_id": message_id})
+        recipient_id = message.get("sender_id")
+
+        if not message:
+            print("Message not found")
+            return {"status": "error", "message": "Message not found"}
+        
+        org_document = db.organizations.find_one({"org_id": org_id})
+        instagram_id = org_document.get("ig_id")
+
+        if not instagram_id:
+            raise HTTPException(status_code=400, detail="Instagram ID not configured for this organization")
+
+        # Get the page access token for this Instagram account
+        connection = db.instagram_connections.find_one(
+            {"instagram_id": instagram_id, "is_active": True, "org_id": org_id},
+            {"page_access_token": 1,"access_token" : 1, "page_id": 1}
+        )
+
+        if not connection or not connection.get("page_access_token"):
+            raise HTTPException(status_code=404, detail="Instagram connection not found or inactive")
+        
+        page_access_token = connection["page_access_token"]
+
+        url = f"https://graph.instagram.com/me"
+        params = {
+            "access_token": page_access_token,
+            "fields": "name,profile_picture_url,username"
+        }
+        
+        response = requests.get(url, params=params)
+        
+        if response.status_code != 200:
+            print(f"Instagram API Error: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Failed to fetch Instagram profile: {response.json().get('error', {}).get('message')}"
+            )
+        
+        owner_details = response.json()
+
+        # If reaction exists and same user reacted before → remove it
+        if message.get("reaction"):
+            current_reaction = message["reaction"]
+            if current_reaction.get("username") == owner_details.get("username") and current_reaction.get("emoji") == "❤️":
+                response = await send_message_reaction(message_id, instagram_id, page_access_token, action="unreact", recipient_id=recipient_id)
+
+                if response == "error":
+                    return {"status": "error", "message": "Failed to remove reaction IG API Exception"}
+                # Unset the reaction
+                broadcast_message = messages_collection.find_one_and_update(
+                    {"message_id": message_id},
+                    {"$unset": {"reaction": 1}}, 
+                    return_document=ReturnDocument.AFTER
+                )
+                print(f"Reaction removed for message {message_id}")
+
+                if "_id" in broadcast_message:
+                    broadcast_message["_id"] = str(broadcast_message["_id"])
+
+                # Broadcast the reaction update to connected clients
+                if instagram_id in services.instagram_connections_map:
+                    print(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
+                    await broadcast_instagram_message(instagram_id, "message_reaction", {
+                        "message": broadcast_message
+                    })
+
+                print(f"Reaction removed for message {message_id} with emoji ❤️")
+
+
+                return {"status": "success", "message": "sent"}
+
+        response = await send_message_reaction(message_id, instagram_id, page_access_token, action="react", recipient_id=recipient_id)
+
+        if response == "error":
+            return {"status": "error", "message": "Failed to remove reaction IG API Exception"}
+
+        # Otherwise set a new reaction
+        broadcast_message = messages_collection.find_one_and_update(
+            {"message_id": message_id},
+            {"$set": {
+                "reaction": {
+                    "emoji": "❤️",
+                    "username": owner_details.get("username"),
+                    "full_name": owner_details.get("name"),
+                    "profile_picture_url": owner_details.get("profile_picture_url"),
+                    "timestamp": datetime.now()
+                }
+            }}, 
+            return_document=ReturnDocument.AFTER
+        )
+
+        if "_id" in broadcast_message:
+            broadcast_message["_id"] = str(broadcast_message["_id"])
+
+        # Broadcast the reaction update to connected clients
+        if instagram_id in services.instagram_connections_map:
+            print(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
+            await broadcast_instagram_message(instagram_id, "message_reaction", {
+                "message": broadcast_message
+            })
+
+        print(f"Reaction updated for message {message_id} with emoji ❤️")
+        return {"status": "success", "message": "sent"}
+        
+    
+    except Exception as e:
+        print(f"Error sending Instagram reaction: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to send reaction: {str(e)}"
+        )
+
 # Proxy endpoint to fetch Instagram media content and return back to frontend
 @router.get("/proxy/instagram-media")
 def proxy_instagram_media(url: str = Query(..., description="Full Instagram CDN URL")):
