@@ -28,6 +28,8 @@ app.add_middleware(
         "https://development.heidelai.com",
         "https://www.testing.heidelai.com", 
         "https://testing.heidelai.com",
+        "https://www.testing2.heidelai.com", 
+        "https://testing2.heidelai.com",
         "http://localhost", 
         "http://localhost:3000", 
         "http://wordpress.local", 
