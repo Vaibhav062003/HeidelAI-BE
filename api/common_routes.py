@@ -1,9 +1,10 @@
 from fastapi import APIRouter, HTTPException, Response, Query
-
 from typing import Optional
+
 from auth.dependencies import CurrentUser
-from schemas.models import UnarchiveRequest, PrivateNoteRequest
+from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest
 from services.common_service import fetch_conversations, close_conversation, unarchive_data, add_private_note, delete_private_note
+from services.contacts_service import get_contacts_for_org, update_contact_tag_categories
 
 router = APIRouter(tags=["Common Routes"])
 
@@ -115,3 +116,28 @@ async def post_private_note(user: CurrentUser, conversation_id: str, body: Priva
 #         raise HTTPException(status_code=500, detail=f"Failed to delete private note: {str(e)}")
     
 #     return {"message": "Private note deleted successfully."}
+
+@router.get("/api/contacts")
+async def get_contacts(user: CurrentUser):
+    """
+    Retrieve contacts
+    """
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    contacts = await get_contacts_for_org(org_id)
+
+    return {"contacts": contacts}
+
+@router.post("/api/contacts/update-categories")
+async def update_contact_categories(body: UpdateCategoriesRequest, user: CurrentUser):
+    """
+    Replace the categories array for a specific contact.
+    """
+    org_id = user.org_id
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    
+    return await update_contact_tag_categories(org_id, body.conversation_id, body.categories)

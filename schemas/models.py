@@ -74,3 +74,7 @@ class PrivateNoteRequest(BaseModel):
         if len(v) > 1000:
             raise ValueError("Note cannot exceed 1000 characters")
         return v
+    
+class UpdateCategoriesRequest(BaseModel):
+    conversation_id: str = Field(..., description="Unique conversation ID of the contact")
+    categories: List[str] = Field(..., description="List of categories to assign to this contact")

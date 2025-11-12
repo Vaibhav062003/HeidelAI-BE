@@ -2,12 +2,13 @@
 import time, json, hmac, hashlib
 from fastapi import APIRouter, HTTPException
 from datetime import datetime
-from fastapi import Request, Header
+from fastapi import Request, Header, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pymongo import ReturnDocument
 
 # Internal Modules
 from core.managers import manager
+from services.contacts_service import store_contact_background
 from services.wa_service import *
 from services.ig_service import *
 from schemas.models import MessageRole
@@ -76,7 +77,7 @@ async def verify_webhook(request: Request):
     return {"status": "Verification failed"}
 
 @router.post("")
-async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None)):
+async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None), background_tasks: BackgroundTasks = None):
     """
     This weebhook accepts POST requests from 
     """
@@ -706,6 +707,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         await broadcast_instagram_message(recipient_id, "conversation_updated", {
                             "conversation": conversation
                         })
+
+                    if not message_echo:
+                        contact_data = {
+                            "instagram_id": sender_id,
+                            "full_name": name,
+                            "username": username,
+                            "country": None,
+                            "profile_url": user_details.get("profile_pic"),
+                            "conversation_id": f"instagram_{username}",
+                            "email": None,
+                            "categories": []
+                        }
+
+                        store_contact_background(background_tasks, org_id, "instagram", contact_data)
                         
                     return {"status": "ok"}
                     # Broadcast the new message to Instagram-specific clients
