@@ -46,12 +46,12 @@ db = get_mongo_db()
 router = APIRouter(prefix="/api/whatsapp", tags=["WhatsApp"])
 
 @router.post("/auth")
-async def whatsapp_auth_exchange(request: WhatsappAuthRequest, _: None = Depends(require_auth)):
+async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser):
     try:
         # Extract authorization code from request
-        code = request.code
-        redirect_uri = request.redirect_uri
-        org_id = request.org_id
+        code = request.get("code")
+        redirect_uri = request.get("redirect_uri")
+        org_id = user.org_id
         
         if not code:
             raise HTTPException(status_code=400, detail="Authorization code is required")

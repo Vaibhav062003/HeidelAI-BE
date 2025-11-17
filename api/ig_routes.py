@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException, Depends, Response, Query
+from fastapi import APIRouter, File, Form, HTTPException, Depends, Response, Query, UploadFile
 from datetime import datetime
 from pymongo import ReturnDocument
 
 from config.settings import *
+from services.cloudinary_service import check_cloudinary_storage_limit
 from services.ig_service import *
 from schemas.models import InstagramDisconnectRequest, MessageRole
 from auth.dependencies import CurrentUser
@@ -11,6 +12,7 @@ from services.platforms.instagram_service import InstagramService
 
 from database import get_mongo_db
 from pymongo import ReturnDocument
+import cloudinary
 
 
 instagram_service = InstagramService()
@@ -893,6 +895,91 @@ async def send_instagram_reaction(reaction: dict, user: CurrentUser):
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to send reaction: {str(e)}"
+        )
+    
+
+@router.post("/conversations/send_media_message")
+async def upload_and_send_instagram_media(
+    user: CurrentUser,
+    caption: str = Form(...),
+    conversation_id: str = Form(...), 
+    file: UploadFile = File(...), 
+):
+    """
+    Upload media to Cloudinary servers, get the public URL, then send it as media message to instagram via Instagram API.
+    
+    Args:
+        caption: The caption for the media (Text to be sent along with image message)
+        conversation_id: The ID of the conversation
+        file: The file to upload
+    
+    Returns:
+        Status and message ID details along with the uploaded media URL
+    """
+    print("Received request to upload and send Instagram media")
+    print(f"Caption: {caption}, Conversation ID: {conversation_id}, Filename: {file.filename}")
+
+
+    try:
+        org_id = user.org_id
+        agent_user_id = user.user_id
+
+        # Get Instagram-specific collections
+        org_conversations_collection = db[f"conversations_{org_id}"]
+        
+        # Check if conversation exists
+        conversation = org_conversations_collection.find_one({"conversation_id": conversation_id})
+        
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Get user's Instagram ID from the conversation
+        user_instagram_id = conversation.get("customer_id")
+        
+        if not user_instagram_id:
+            raise HTTPException(status_code=400, detail="No Instagram ID found for this user")
+
+        instagram_id = conversation.get("instagram_id")
+
+        # Check storage limit before uploading
+        storage_ok = await check_cloudinary_storage_limit()
+        if not storage_ok:
+            raise HTTPException(
+                status_code=507,
+                detail="Storage limit reached. Please contact support."
+            )
+        
+        # First upload the file to Cloudinary to get a public URL that we can use for IG API
+        cloudinary_result = cloudinary.uploader.upload(
+            file.file,
+            folder=f"instagram_media/{org_id}",
+            resource_type="auto"
+        )
+
+        print(f"Cloudinary upload result: {cloudinary_result}")
+        
+        # Get the secure URL for the frontend to display the image
+        media_url = cloudinary_result.get("secure_url")
+        
+        # Now send the media message via Instagram API
+        await send_ig_media_message(
+            user_instagram_id,
+            media_url,
+            caption,
+            instagram_id,
+        )
+
+        if caption : await send_ig_message(user_instagram_id, caption, instagram_id) and print(f"Caption sent: {caption}")
+
+        return {"status": "success", "message": "Message sent"}
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error uploading and sending Instagram media: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload and send media: {str(e)}"
         )
 
 # Proxy endpoint to fetch Instagram media content and return back to frontend

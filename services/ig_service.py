@@ -103,6 +103,67 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
         print(f"Error sending Instagram message: {e}")
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
+    
+async def send_ig_media_message(user_instagram_id, media_url, instagram_id) -> dict:
+    """
+    Send a media message to an Instagram user using the appropriate access token
+    
+    Args:
+        instagram_id: The recipient's Instagram user ID
+        media_url: The URL of the media to send
+        instagram_account_id: Instagram business account ID to use for sending
+    """
+    try:
+        # Query the specific Instagram connection to get its access token
+        connection = db.instagram_connections.find_one(
+            {"instagram_id": instagram_id, "is_active": True},
+            {"page_access_token": 1},
+            sort=[("last_updated", -1)]
+        )
+
+        print(f"Retrieved IG Connection: {connection}")
+        
+        if connection and connection.get("page_access_token"):
+            # Use the connection-specific token
+            access_token = connection["page_access_token"]
+            print(f"Using Instagram-specific token for {instagram_id}")
+        else:
+            # Fallback to default token if connection not found
+            access_token = IG_ACCESS_TOKEN
+            print(f"Instagram connection not found for {instagram_id}, using default token")
+    
+        url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
+
+        headers = {
+            "Authorization" : "Bearer " + access_token,
+            "Content-Type" : "application/json",
+        }
+
+        data = {
+            "recipient":{
+                "id":f"{user_instagram_id}"
+            },
+            "message":{
+                "attachment":{
+                    "type":"image",
+                    "payload":{
+                        "url":media_url
+                    }
+                }
+            }
+        }
+
+        # Send the media message
+        response = requests.post(url, headers=headers, json=data)
+        print(f"Instagram media message response: {response.status_code}, {response.json()}")
+        
+        # Return the response for further processing
+        return response.json()
+        
+    except Exception as e:
+        print(f"Error sending Instagram media message: {e}")
+        # Return an error response that can be handled by the caller
+        return {"error": str(e), "success": False}
 
 async def store_instagram_message(
     org_id: str,

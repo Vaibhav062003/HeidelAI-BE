@@ -614,7 +614,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         "share": "Shared a post",
                         "ig_story": "Shared a story",
                         "ig_reel": "Shared a reel",
-                        "story_mention": "Mentioned you in their story"
+                        "story_mention": "Mentioned you in their story",
+                        "image": "Shared an image",
+                        "video": "Shared a video",
                     }.get(attachment_type, f"Shared a {attachment_type}")
 
                     # Get user-specific collection names
