@@ -72,7 +72,7 @@ def remove_expired_message_ids():
 async def verify_webhook(request: Request):
     # This is for the webhook verification (GET request)
     args = request.query_params
-    if args.get("") == VERIFY_TOKEN:
+    if args.get("hub.verify_token") == VERIFY_TOKEN:
         return PlainTextResponse(content=str(args.get("hub.challenge")))
     return {"status": "Verification failed"}
 
