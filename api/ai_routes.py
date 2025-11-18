@@ -56,7 +56,7 @@ async def schedule_message(conversation_id: str, user: CurrentUser):
     Schedule a follow-up message for a conversation using an AI agent to determine the content and timing.
     """
     try:
-        return schedule_followup_message(user.org_id, conversation_id)
+        return await schedule_followup_message(user.org_id, conversation_id)
     except HTTPException as e:
         # Graceful return for API
         raise e
@@ -65,9 +65,10 @@ async def schedule_message(conversation_id: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @router.get("/chat-analysis/{conversation_id}")
-async def run_chat_analysis(conversation_id: str, user: CurrentUser):
+async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool = False):
     """
     This endpoint retrieves the analysis results of the chat for a specific conversation.
+    force: If true, forces re-analysis even if recent analysis exists.
     """
     org_id = user.org_id
     if not org_id:
@@ -103,7 +104,7 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser):
             if last_analysis_time.tzinfo is None:
                 last_analysis_time = last_analysis_time.replace(tzinfo=timezone.utc)
 
-        if not last_analysis_time or ((datetime.now(timezone.utc) - last_analysis_time).total_seconds() / 60 >= 20):
+        if force or not last_analysis_time or ((datetime.now(timezone.utc) - last_analysis_time).total_seconds() >= 10):
             result = await analyze_and_update_conversation(org_id, conversation_id) 
         else:
             result = conversation

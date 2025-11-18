@@ -42,7 +42,7 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
 
         # Run AI agent for follow-up
         try:
-            followup_result = get_followup_message(org_id, conversation_id)
+            followup_result = await get_followup_message(org_id, conversation_id)
             if callable(followup_result):  # if it's async, you can await outside
                 raise RuntimeError("get_followup_message should be awaited outside.")
         except Exception as e:

@@ -21,7 +21,7 @@ async def get_followup_message(org_id: str, conversation_id: str) -> dict:
 
 
     # Combine message content into a single string
-    conversation_text = "\n".join([f"{msg["role"]}: {msg["content"]}" for msg in messages])
+    conversation_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
 
     # Generate the follow-up message
     followup_object = generate_followup_message(conversation_text)
@@ -34,3 +34,4 @@ async def get_followup_message(org_id: str, conversation_id: str) -> dict:
 
 if __name__ == "__main__":
     pass
+    

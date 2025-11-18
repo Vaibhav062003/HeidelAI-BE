@@ -20,7 +20,8 @@ class ConversationSummary(BaseModel):
         ..., description="A concise summary of the conversation, limited to 2-5 bullet points."
     )
     priority: str = Field(
-        ..., description="Priority level of the customer: 'low', 'medium', or 'high'.",
+        ..., 
+        description="Priority level of the customer: 'low', 'medium', or 'high'.",
         example="high"
     )
     sentiment: str = Field(
@@ -44,6 +45,7 @@ chat_analysis_agent = Agent(
     instructions=[
         "Summarize the chat in 2-5 bullet points, keeping it concise and relevant.",
         "Ensure the 'priority' field contains only one of the following values: 'low', 'medium', or 'high' - case sensitive.",
+        "The priority should reflect the urgency to buy from the customer, or if they show intent to purchase soon.",
         "Analyze the overall sentiment of the conversation and set the 'sentiment' field to 'positive', 'neutral', or 'negative' - case sensitive.",
         "Provide exactly 3 actionable suggestions in the 'suggestions' field, each as a concise bullet point."
     ],

@@ -6,3 +6,9 @@ credentials.json
 whatsapp-chatbot-history-cf43052a413d.json
 venv
 test.py
+/backendenv
+myenv/
+
+# Temp
+test.ipynb
+defines.py
