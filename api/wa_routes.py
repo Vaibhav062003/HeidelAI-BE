@@ -49,8 +49,8 @@ router = APIRouter(prefix="/api/whatsapp", tags=["WhatsApp"])
 async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser):
     try:
         # Extract authorization code from request
-        code = request.get("code")
-        redirect_uri = request.get("redirect_uri")
+        code = request.code
+        redirect_uri = request.redirect_uri
         org_id = user.org_id
         
         if not code:
