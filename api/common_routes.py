@@ -1,10 +1,28 @@
-from fastapi import APIRouter, HTTPException, Response, Query
+from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form
+from fastapi.responses import JSONResponse
 from typing import Optional
 
 from auth.dependencies import CurrentUser
 from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest
-from services.common_service import fetch_conversations, close_conversation, unarchive_data, add_private_note, delete_private_note
-from services.contacts_service import get_contacts_for_org, update_contact_tag_categories
+from services.common_service import (
+    fetch_conversations, 
+    close_conversation, 
+    unarchive_data, 
+    add_private_note, 
+    delete_private_note)
+from services.contacts_service import (
+    get_contacts_for_org, 
+    update_contact_tag_categories,
+    add_tag_to_org_metadata,
+    remove_tag_from_org_metadata,
+    get_tags_from_org_metadata)
+from services.products_service import (
+    get_products_for_org, 
+    bulk_upload_products_from_file, 
+    add_single_product,
+    get_product_by_id,
+    delete_product_by_id
+)
 
 router = APIRouter(tags=["Common Routes"])
 
@@ -141,3 +159,99 @@ async def update_contact_categories(body: UpdateCategoriesRequest, user: Current
         raise HTTPException(status_code=400, detail="Invalid organization ID")
     
     return await update_contact_tag_categories(org_id, body.conversation_id, body.categories)
+
+@router.get("/api/products")
+def list_products(user: CurrentUser):
+    """
+    """
+    org_id = user.org_id
+
+    products = get_products_for_org(org_id)
+    
+    return {"products": products}
+
+@router.post("/api/products/bulk-upload")
+async def bulk_upload(
+    user: CurrentUser,
+    file: UploadFile = File(...)
+):
+    """
+    Bulk upload endpoint.
+    - file: xlsx or csv with columns product_name (required), description, price, stock, product_image
+    - images_zip (optional): zip file where filenames match product_image values in spreadsheet
+    """
+    org_id = user.org_id
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    result = await bulk_upload_products_from_file(org_id, file, None)
+    return JSONResponse(content=result)
+
+@router.post("/api/products")
+async def create_product(
+    user: CurrentUser,
+    product_name: str = Form(...),
+    description: str = Form(None),
+    price: float = Form(None),
+    stock: int = Form(None),
+    product_id: str = Form(None),
+    image_url: str = Form(None),            
+    image: UploadFile = File(None),         
+):
+    org_id = user.org_id
+
+    data = {
+        "product_id": product_id,
+        "product_name": product_name,
+        "description": description,
+        "price": price,
+        "stock": stock,
+        "image_url": image_url,   
+        "image": image            
+    }
+
+    product = await add_single_product(org_id, data)
+    return {"product": product}
+
+@router.get("/api/products/{product_id}")
+def get_product(user: CurrentUser, product_id: str):
+    product = get_product_by_id(user.org_id, product_id)
+    return {"product": product}
+
+@router.delete("/api/products/{product_id}")
+def delete_product(user: CurrentUser, product_id: str):
+    deleted = delete_product_by_id(user.org_id, product_id)
+    return {"deleted": deleted}
+
+@router.patch("/api/org/metadata/tags/add")
+async def add_tag(user: CurrentUser, tag: str):
+    """
+    Add a tag to the organization's metadata.
+    """
+
+    result = await add_tag_to_org_metadata(user.org_id, tag)
+
+    if result == True:
+        return {"message": "Tag added successfully."}
+    else:
+        # tag already exists
+        raise HTTPException(status_code=400, detail="Tag already exists.")
+    
+@router.patch("/api/org/metadata/tags/remove")
+async def remove_tag(user: CurrentUser, tag: str):
+    """
+    Remove a tag from the organization's metadata.
+    """
+
+    result = await remove_tag_from_org_metadata(user.org_id, tag)
+
+    return {"message": "Tag removed successfully."}
+
+@router.get("/api/org/metadata/tags")
+async def get_tags(user: CurrentUser):
+    """Get tags for the organization."""
+
+    result = await get_tags_from_org_metadata(user.org_id)
+
+    return {"tags": result}

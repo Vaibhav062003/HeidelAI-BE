@@ -106,3 +106,37 @@ async def update_contact_tag_categories(org_id: str, conversation_id: str, categ
     except Exception as e:
         print(f"[ERROR] Unexpected error in update_contact_categories: {e}")
         raise HTTPException(status_code=500, detail="Unexpected error occurred")
+    
+async def add_tag_to_org_metadata(org_id: str, tag: str):
+    """Add a tag to the organization's metadata."""
+
+    metadata = db.organizations_metadata
+    result = metadata.update_one(
+        {"org_id": org_id},
+        {"$addToSet": {"tags": tag}},
+        upsert=True
+    )
+    
+    return result.modified_count > 0
+
+async def remove_tag_from_org_metadata(org_id: str, tag: str):
+    """Remove a tag from the organization's metadata."""
+
+    metadata = db.organizations_metadata
+    metadata.update_one(
+        {"org_id": org_id},
+        {"$pull": {"tags": tag}}
+    )
+
+    return True
+
+async def get_tags_from_org_metadata(org_id: str):
+    """Get tags for the organization."""
+
+    metadata = db.organizations_metadata
+    org_metadata = metadata.find_one({"org_id": org_id}, {"_id": 0, "tags": 1})
+
+    if org_metadata and "tags" in org_metadata:
+        return org_metadata["tags"]
+    else:
+        return []

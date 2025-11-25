@@ -97,28 +97,24 @@ async def process_inactivity_for_org(org_id: str):
     conv_col = db[f"conversations_{org_id}"]
     now = datetime.now(timezone.utc)
 
-    # Only process open conversations not in follow-up
-    query = {
+    convs = list(conv_col.find({
         "status": "open",
         "last_sender": "agent",
         "next_action_at": {"$lte": now}
-    }
+    }))
 
-    while True:
-        conv = conv_col.find_one_and_update(
-            query,
-            {"$set": {}}, 
-            return_document=True
-        )
-        if not conv:
-            break
+    if not convs:
+        return 
 
+    print(f"[ORG {org_id}] Found {len(convs)} inactive conversations to process")
+
+    for conv in convs:
         stage = conv.get("reminder_stage", 0)
+        conv_id = conv["conversation_id"]
 
         if stage == 0:
-            # First 6h inactivity follow-up
             conv_col.update_one(
-                {"conversation_id": conv["conversation_id"]},
+                {"conversation_id": conv_id},
                 {
                     "$set": {
                         "reminder_stage": 1,
@@ -126,6 +122,8 @@ async def process_inactivity_for_org(org_id: str):
                     }
                 }
             )
+            print(f"[ORG {org_id}] Stage 0 → 1 for {conv_id}")
+            continue
 
             # await store_instagram_message(
             #     org_id=org_id,
@@ -143,7 +141,7 @@ async def process_inactivity_for_org(org_id: str):
         elif stage == 1:
             # Second 12h inactivity follow-up
             conv_col.update_one(
-                {"conversation_id": conv["conversation_id"]},
+                {"conversation_id": conv_id},
                 {
                     "$set": {
                         "reminder_stage": 2,
@@ -151,6 +149,8 @@ async def process_inactivity_for_org(org_id: str):
                     }
                 }
             )
+            print(f"[ORG {org_id}] Stage 1 → 2 for {conv_id}")
+            continue
             # content = "We're still here if you need assistance! 😊"
             # await store_instagram_message(
             #     org_id=org_id,
@@ -167,9 +167,10 @@ async def process_inactivity_for_org(org_id: str):
 
         elif stage == 2:
             # Close conversation
-            await close_conversation(org_id, conv["conversation_id"], "Closed due to inactivity")
+            await close_conversation(org_id, conv_id, "Closed due to inactivity")
             
-            print(f"[ORG {org_id}] Closed conversation {conv['conversation_id']} due to inactivity")
+            print(f"[ORG {org_id}] Closed conversation {conv_id} due to inactivity")
+            continue
 
 async def process_time_based_tasks():
 

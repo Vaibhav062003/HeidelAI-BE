@@ -59,3 +59,7 @@ ORG_ID = os.getenv("ORG_ID")
 #Sentence Transformers
 SENTENCE_TRANSFORMERS_MODEL = os.getenv("sentence_transformers_model")
 KOYEB2 = os.getenv("KOYEB2")
+
+# products service
+MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./media")
+BASE_MEDIA_URL = os.getenv("BASE_MEDIA_URL", "http://localhost:8000/media")  

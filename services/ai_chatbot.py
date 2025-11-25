@@ -11,25 +11,27 @@ def load_prompts_into_cache():
     Load all prompts from DB into local memory.
     Should be called once at startup or when cache needs refreshing.
     """
-    cursor = db.organizations.find({}, {"org_id": 1, "chatbot_prompt": 1})
+    cursor = db.organizations_metadata.find({"chatbot.prompt": {"$exists": True}}, {"org_id": 1, "chatbot.prompt": 1})
     services.prompt_cache = {
-        doc["org_id"]: doc.get("chatbot_prompt")
+        doc["org_id"]: doc.get("chatbot", {}).get("prompt")
         for doc in cursor
     }
 
-def get_prompt(org_id: str) -> str:
+async def get_prompt(org_id: str) -> str:
     """Get the prompt for a given org from cache.
     If not in cache, fetch from DB and update cache.
     """
     if org_id in services.prompt_cache:
         return services.prompt_cache[org_id]
 
-    doc = db.organizations.find_one(
+    doc = db.organizations_metadata.find_one(
         {"org_id": org_id},
-        {"chatbot_prompt": 1}
+        {"chatbot.prompt": 1}
     )
-    prompt = doc["chatbot_prompt"] if doc else None
-    services.prompt_cache[org_id] = prompt
+    prompt = doc.get("chatbot", {}).get("prompt") if doc else None
+    if prompt is not None:
+        services.prompt_cache[org_id] = prompt
+
     return prompt
 
 def update_prompt_in_cache(org_id: str, new_prompt: str):

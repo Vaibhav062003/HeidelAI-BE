@@ -9,12 +9,22 @@ from database import get_mongo_db
 from services.scheduler_service import schedule_followup_message
 from schemas.models import ChatbotPromptUpdate
 from auth.dependencies import CurrentUser
-from services.ai_chatbot import update_prompt_in_cache
+from services.ai_chatbot import update_prompt_in_cache, get_prompt
 from services.chat_analysis_service import analyze_and_update_conversation
 
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/ai", tags=["AI Routes"])
+
+def _org_metadata_collection():
+    return db["organizations_metadata"]
+
+@router.get("/chatbot-prompt")
+async def get_chatbot_prompt(user: CurrentUser):
+    """Get the chatbot prompt for the authenticated user's organization."""
+    prompt = await get_prompt(user.org_id)
+    
+    return prompt
 
 @router.put("/chatbot-prompt")
 async def update_chatbot_prompt(payload: ChatbotPromptUpdate, user: CurrentUser):
@@ -27,9 +37,9 @@ async def update_chatbot_prompt(payload: ChatbotPromptUpdate, user: CurrentUser)
             raise HTTPException(status_code=400, detail="Organization ID not found in user context.")
 
         try:
-            result = db.organizations.update_one(
+            result = _org_metadata_collection().update_one(
                 {"org_id": org_id},
-                {"$set": {"chatbot_prompt": payload.chatbot_prompt}}
+                {"$set": {"chatbot.prompt": payload.chatbot_prompt}}
             )
         except PyMongoError as e:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -40,10 +50,9 @@ async def update_chatbot_prompt(payload: ChatbotPromptUpdate, user: CurrentUser)
         try:
             update_prompt_in_cache(org_id, payload.chatbot_prompt)
         except Exception as e:
-            # Cache update failure should not break the API
             raise HTTPException(status_code=500, detail=f"Failed to update cache: {str(e)}")
 
-        return {"status": "success", "message": "Chatbot prompt updated successfully."}
+        return {"message": "Chatbot prompt updated successfully."}
 
     except HTTPException:
         raise

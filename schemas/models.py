@@ -1,8 +1,8 @@
 # Pydantic
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Dict, Any
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 
 class MessageRole(str, Enum):
     CUSTOMER = "customer"
@@ -78,3 +78,26 @@ class PrivateNoteRequest(BaseModel):
 class UpdateCategoriesRequest(BaseModel):
     conversation_id: str = Field(..., description="Unique conversation ID of the contact")
     categories: List[str] = Field(..., description="List of categories to assign to this contact")
+
+# Products Service
+class Product(BaseModel):
+    product_id: str = None
+    product_name: str
+    description: Optional[str] = None
+    price: float = None
+    stock: Optional[int] = None
+    product_image: Optional[str] = None
+    image_url: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    org_id: Optional[str] = None
+
+    def to_mongo(self):
+        """
+        Convert Pydantic model to a dict ready for MongoDB insertion.
+        """
+        data = self.dict()
+        # Remove None values if you want a clean DB
+        cleaned = {k: v for k, v in data.items() if v is not None}
+        return cleaned

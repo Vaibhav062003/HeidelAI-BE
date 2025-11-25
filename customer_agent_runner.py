@@ -15,7 +15,7 @@ if __name__ == "__main__":
 
     CHAT_AGENT = services.agents[ORG_ID]
 
-    prompt = get_prompt(ORG_ID)
+    prompt = await get_prompt(ORG_ID)
 
     system_message = SystemMessage(
         content=SYSTEM_MESSAGE
