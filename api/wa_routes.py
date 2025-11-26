@@ -52,6 +52,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         code = request.code
         redirect_uri = request.redirect_uri
         org_id = user.org_id
+        whatsapp_business_id = request.waba_id
         
         if not code:
             raise HTTPException(status_code=400, detail="Authorization code is required")
@@ -60,8 +61,8 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         token_url = "https://graph.facebook.com/v22.0/oauth/access_token"
         token_data = {
             "client_id": APP_ID,
-            "client_secret": APP_SECRET,  # Using your existing APP_SECRET
-            "redirect_uri": redirect_uri,
+            "client_secret": APP_SECRET, 
+            # "redirect_uri": redirect_uri, Not needed now as using FB SDK
             "grant_type": "authorization_code",
             "code": code
         }
@@ -83,24 +84,24 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
             raise HTTPException(status_code=400, detail="Failed to get valid access token")
         
         # Get WhatsApp Business Account details
-        request_data = {
-        "fields": "id,name,currency,owner_business_info",
-        "limit": 20,
-        "access_token": ACCESS_TOKEN #our system access token, not the user access token
-        }
-        url = f"https://graph.facebook.com/v22.0/{BUSINESS_ID}/client_whatsapp_business_accounts"
-        account_response = requests.get(url, params=request_data)
-        print(f"Account response : {account_response.json()}")
+        # request_data = {
+        # "fields": "id,name,currency,owner_business_info",
+        # "limit": 20,
+        # "access_token": ACCESS_TOKEN #our system access token, not the user access token
+        # }
+        # url = f"https://graph.facebook.com/v22.0/{BUSINESS_ID}/client_whatsapp_business_accounts"
+        # account_response = requests.get(url, params=request_data)
+        # print(f"Account response : {account_response.json()}")
 
-        if account_response.status_code != 200:
-            print(f"Get whatsapp account details err: {account_response.text}")
-            raise HTTPException(
-                status_code=400, 
-                detail="Failed to get WhatsApp Business Account information"
-            )
+        # if account_response.status_code != 200:
+        #     print(f"Get whatsapp account details err: {account_response.text}")
+        #     raise HTTPException(
+        #         status_code=400, 
+        #         detail="Failed to get WhatsApp Business Account information"
+        #     )
         
-        account_data = account_response.json().get("data", [{}])[0]
-        whatsapp_business_id = account_data.get("id")
+        # account_data = account_response.json().get("data", [{}])[0]
+        # whatsapp_business_id = account_data.get("id")
         
         # Get user phone number details
         params = {
