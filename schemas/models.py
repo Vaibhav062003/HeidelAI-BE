@@ -44,14 +44,14 @@ class InstagramDisconnectRequest(BaseModel):
 
 class WhatsappAuthRequest(BaseModel):
     code: str
-    redirect_uri: str
-    phone_number_id: str
-    waba_id: str
-    business_id: str
-    page_ids: List[str]
-    catalog_ids: List[str]
-    dataset_ids: List[str]
-    instagram_account_ids: List[str]
+    redirect_uri: Optional[str] = None
+    phone_number_id: Optional[str] = None
+    waba_id: Optional[str] = None
+    business_id: Optional[str] = None
+    page_ids: Optional[List[str]] = None
+    catalog_ids: Optional[List[str]] = None
+    dataset_ids: Optional[List[str]] = None
+    instagram_account_ids: Optional[List[str]] = None
 
 class ChatbotPromptUpdate(BaseModel):
     chatbot_prompt: str = Field(..., min_length=10, max_length=5000)

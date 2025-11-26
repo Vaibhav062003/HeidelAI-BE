@@ -50,7 +50,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
     try:
         # Extract authorization code from request
         code = request.code
-        redirect_uri = request.redirect_uri
+        # redirect_uri = request.redirect_uri
         org_id = user.org_id
         whatsapp_business_id = request.waba_id
         
