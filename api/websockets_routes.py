@@ -85,18 +85,22 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
 async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, whatsapp_id: str):
     """WebSocket endpoint for WhatsApp-specific connections"""
 
+    protocol = websocket.headers.get("sec-websocket-protocol")
+
+    await websocket.accept(subprotocol=protocol)
+
     # query whatsapp_connections to retrieve whatsapp_business_id based on user_id
     wa_connection = db.whatsapp_connections.find_one(
             {"user_id": whatsapp_id},
-            {"business_account_id": 1, "_id": 0}
+            {"wa_id": 1, "_id": 0}
         )
 
-    if not wa_connection or not wa_connection.get("business_account_id"):
+    if not wa_connection or not wa_connection.get("wa_id"):
         print(f"No WhatsApp connection found for user ID: {whatsapp_id}")
         await websocket.close(code=1008, reason="Invalid WhatsApp connection")
         return
     
-    whatsapp_business_id = wa_connection["business_account_id"]
+    whatsapp_business_id = wa_connection["wa_id"]
 
     # Create a combined key for WhatsApp connections
     connection_key = f"{client_id}_{whatsapp_business_id}"

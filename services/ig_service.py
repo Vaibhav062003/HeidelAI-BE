@@ -1,5 +1,3 @@
-# ig_service.py
-
 # Built-in modules
 import uuid
 import requests
@@ -9,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from supabase import create_client, Client
 from pymongo import UpdateOne
+from fastapi import HTTPException
 
 # Internal modules
 from core.managers import manager
@@ -16,7 +15,7 @@ from schemas.models import MessageRole
 from database import get_mongo_db, get_mongo_client
 from core.services import services
 from services.scheduler_service import abort_scheduled_message
-from services.common_service import reopen_conversation
+from services.conversation_utils import reopen_conversation
 from config.settings import (
     IG_ID, 
     IG_ACCESS_TOKEN, 
@@ -63,6 +62,7 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
             else:
                 # Fallback to default token if connection not found
                 print(f"No Instagram ID specified, cannot send message")
+                raise HTTPException(status_code=400, detail="Instagram ID not specified")
                 return 1
                 access_token = IG_ACCESS_TOKEN
                 page_id = IG_ID
@@ -205,11 +205,6 @@ async def store_instagram_message(
     conversation_collection_name = f"conversations_{org_id}"
     conversations_collection = db[conversation_collection_name]
     messages_collection = db[f"messages_{org_id}"]
-
-    if conversation_collection_name in db.list_collection_names():
-        print(f"Conversations collection exists: {conversation_collection_name}")
-    else:
-        print(f"Conversations collection does not exist: {conversation_collection_name}")
     
     # Create message object
     message = {
@@ -231,7 +226,7 @@ async def store_instagram_message(
     # Store message in Instagram-specific collection
     messages_collection.insert_one(message)
 
-    print("Message stored:", message_id)
+    print("Instagram message stored:", message_id)
     
     # Keep only latest 40 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
@@ -251,7 +246,7 @@ async def store_instagram_message(
         return_document=True
     )
 
-    print("Conversation updated:", conversation_id)
+    print("Instagram conversation updated:", conversation_id)
 
     # Format message for WebSocket broadcast
     broadcast_message = {
@@ -319,11 +314,6 @@ async def create_or_update_instagram_conversation(org_id: str,
     # Get the org-specific collection
     conversations_collection_name = f"conversations_{org_id}"
     conversations_collection = db[conversations_collection_name]
-    
-    if(conversations_collection_name in db.list_collection_names()):
-        print(f"Conversations collection exists: {conversations_collection_name}")
-    else:
-        print(f"Conversations collection does not exist: {conversations_collection_name}")
 
     # Check if conversation already exists
     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})

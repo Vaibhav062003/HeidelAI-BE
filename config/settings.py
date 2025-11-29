@@ -14,7 +14,7 @@ APP_ID = os.getenv("APP_ID")
 VERSION = os.getenv("VERSION")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 APP_SECRET = os.getenv("APP_SECRET")
-BUSINESS_ACCOUNT_ID = os.getenv("BUSINESS_ACCOUNT_ID")
+wa_id = os.getenv("wa_id")
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL")

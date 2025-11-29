@@ -132,14 +132,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     
                     # Find the connection to get user details
                     connection = db.whatsapp_connections.find_one(
-                        {"business_account_id": whatsapp_business_id}
+                        {"wa_id": whatsapp_business_id}
                     )
                     
                     if not connection:
                         print(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
                         continue
                     
-                    # org_id = connection.org_id 
+                    org_id = connection.get("org_id") 
 
                     # Get sender name from contacts if available
                     sender_name2 = "Unknown Sender"
@@ -167,11 +167,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             services.processed_message_ids[message_id] = time.time()
                             
                             # Extract essential data
-                            sender_id = message.get("from")
+                            customer_phone_no = message.get("from")
                             message_type = message.get("type")
                             
                             # Create conversation ID
-                            conversation_id = f"whatsapp_{sender_id}"
+                            conversation_id = f"whatsapp_{customer_phone_no}"
                             
                             # Extract message content based on message type
                             if message_type == "text":
@@ -207,22 +207,26 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             
                             # Create or update conversation
                             conversation_id = await create_or_update_whatsapp_conversation(
+                                org_id=org_id,
                                 recipient_id=whatsapp_business_id,
-                                sender_id=sender_id,
+                                customer_phone_no=customer_phone_no,
                                 customer_name=sender_name2,
-                                last_message=content
+                                last_message=content,
+                                last_sender="customer"
                             )
                             
                             # Store in WhatsApp-specific collections
                             message_id = await store_whatsapp_message(
+                                org_id=org_id,
                                 content=content,
                                 conversation_id=conversation_id,
-                                sender_id=sender_id,
+                                customer_phone_no=customer_phone_no,
+                                type=message_type,
+                                payload=message.get("payload"),
                                 sender_name=sender_name2,
                                 recipient_id=whatsapp_business_id,
                                 role=MessageRole.CUSTOMER,
                                 message_id=message_id,  # Use the ID from the webhook for deduplication
-                                message_type=message_type,
                                 raw_data=message
                             )
                             

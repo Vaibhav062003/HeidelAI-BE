@@ -6,6 +6,9 @@ from auth.dependencies import CurrentUser
 from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest
 from services.common_service import (
     fetch_conversations, 
+    fetch_conversation,
+    send_message,
+    fetch_messages,
     close_conversation, 
     unarchive_data, 
     add_private_note, 
@@ -63,7 +66,50 @@ async def get_conversations(
     except Exception as e:
         print(f"Error fetching conversations for {user.org_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch conversations")
+
+@router.get("/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str, user: CurrentUser):
+    """
+    Fetch the conversation of a specific user for the organization.
+    Returns the conversation in the standard format for compatibility with the frontend
+    """
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
     
+    try:
+        conversation = await fetch_conversation(org_id, conversation_id)
+        return conversation
+    except HTTPException as e:
+        print(f"Error fetching conversation {conversation_id} for org {org_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch conversation")
+
+@router.get("/api/conversations/{conversation_id}/messages")
+async def get_messages(conversation_id: str, 
+                       user: CurrentUser,
+                       agent_username: str = Query(..., description="Username of the agent accessing this conversation")
+                       ):
+    """Fetch messages for a specific Instagram conversation"""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    
+    return await fetch_messages(org_id, conversation_id, user.user_id, agent_username)
+
+@router.post("/api/conversations/send-message")
+async def send_message_endpoint(user: CurrentUser, body: dict):
+    """
+    Send a message to a specific conversation.
+    The body should contain the necessary fields for sending the message.
+    """
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    res = await send_message(org_id, body["platform"], body["conversation_id"], body["content"])
+
+    return {"message": "Message sent", "details": res}
+
 @router.post("/api/conversations/{conversation_id}/close")
 async def close_conversation_endpoint(user: CurrentUser, conversation_id: str):
     org_id = user.org_id

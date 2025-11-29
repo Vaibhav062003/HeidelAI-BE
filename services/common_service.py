@@ -5,7 +5,10 @@ from fastapi import HTTPException
 from datetime import datetime, timezone
 from pymongo.errors import PyMongoError
 from pymongo.collection import Collection
+from pymongo import ReturnDocument
 from core.services import services
+from services.wa_service import send_whatsapp_message
+from services.ig_service import send_ig_message
 
 from database import get_mongo_db
 
@@ -129,38 +132,138 @@ async def fetch_conversations(
 
     return formatted_conversations
 
-async def reopen_conversation(org_id: str, conversation_id: str):
+async def fetch_conversation(org_id: str, conversation_id: str):
     """
-    Reopen a closed conversation by removing the 'closed_at' field.
+    Fetch a specific conversation by its ID for a given organization.
     """
     try:
-        conversation_collection = db[f"conversations_{org_id}"]
 
-        try:
-            result = conversation_collection.update_one(
-                {"conversation_id": conversation_id},
-                {
-                    "$unset": {
-                        "closed_at": 1, 
-                        "closure_reason": 1
-                    },
-                 "$set": {"started_at": datetime.now(timezone.utc)}}
-            )
-        except PyMongoError as e:
-            raise HTTPException(status_code=500, detail=f"Database error updating conversation: {str(e)}")
+        # organization specific collection name for conversations
+        org_conversations_collection_name = f"conversations_{org_id}"
+        
+        # Check if collection exists in database
+        if org_conversations_collection_name not in db.list_collection_names():
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Get the collection
+        org_conversations_collection = db[org_conversations_collection_name]
 
-        if result.matched_count == 0:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No conversation found with conversation_id={conversation_id}"
-            )
-
-        return {"message": "'closed_at' removed, conversation reopened successfully."}
-
-    except HTTPException:
-        raise
+        conversation = org_conversations_collection.find_one(
+            {"conversation_id": conversation_id},
+            {"_id": 0}  
+        )
+        
+        if not conversation:
+            return {"message": "No conversation found"}
+        
+        # Format timestamps for JSON serialization
+        if "last_message_timestamp" in conversation and isinstance(conversation["last_message_timestamp"], datetime):
+            conversation["last_message_timestamp"] = conversation["last_message_timestamp"].isoformat()
+        if "timestamp" in conversation and isinstance(conversation["timestamp"], datetime):
+            conversation["timestamp"] = conversation["timestamp"].isoformat()
+        
+        return conversation
+    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        print(f"Error fetching conversation {conversation_id} for {org_id}: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch conversation: {str(e)}"
+        )
+
+async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent_username: str):
+    """
+    Fetch messages and private notes for a specific conversation.
+    Also auto-assigns the agent to the conversation if it is unassigned.
+    Arguments:
+    - org_id: Organization ID
+    - conversation_id: Conversation ID
+    - agent_username: Username of the agent accessing this conversation
+
+    Returns:
+    - A dictionary with 'messages' (list of messages and notes) and 'assignment' (assignment details)
+    """
+
+    try:
+        org_messages_collection_name = f"messages_{org_id}"
+        private_note_collection_name = f"private_notes_{org_id}"
+
+        # Auto assigning agent to the conversation if it is unassigned
+        org_conversations_collection_name = f"conversations_{org_id}"
+        convo_collection = db[org_conversations_collection_name]
+
+        now = datetime.now(timezone.utc)
+
+        assigned_convo = convo_collection.find_one_and_update(
+            {
+                "conversation_id": conversation_id,
+                "$or": [
+                    {"assigned_agent" : {"$exists": False}},
+                    {"assigned_agent": None}
+                ],
+                "status": "open"
+            },
+            {
+                "$set": {
+                    "assigned_agent": {
+                        "id": agent_id,
+                        "username": agent_username,
+                        "assigned_at": now
+                    }
+                },
+                "$push": {
+                    "assignment_history": {
+                        "id": agent_id,
+                        "username": agent_username,
+                        "assigned_at": now
+                    }
+                }
+            },
+            projection={"assigned_agent": 1, "assignment_history": 1, "_id": 0},
+            return_document=ReturnDocument.AFTER
+        )
+
+        messages = []
+        notes = []
+        
+        # Fetching messages
+        if org_messages_collection_name in db.list_collection_names():
+            org_messages_collection = db[org_messages_collection_name]
+            messages = list(org_messages_collection.find(
+                {"conversation_id": conversation_id},
+                {"_id": 0}  
+            ).sort("timestamp", 1))  
+        
+        #Fetching private notes
+        if private_note_collection_name in db.list_collection_names():
+            private_note_collection = db[private_note_collection_name]
+            notes = list(private_note_collection.find(
+                    {"conversation_id": conversation_id},
+                    {"_id": 0}
+                ).sort("timestamp", 1)
+            )
+
+        # Merging both messages and notes
+        combined = messages + notes
+
+        # Normalizing timestamps
+        for msg in combined:
+            ts = msg.get("timestamp")
+            if isinstance(ts, datetime):
+                msg["timestamp"] = ts.isoformat()
+
+        combined.sort(key=lambda x: x.get("timestamp"), reverse=False)
+
+        print(assigned_convo)
+        
+        return {"messages": combined, "assignment": assigned_convo}
+    
+    except Exception as e:
+        print(f"Error fetching messages or private notes for {conversation_id} of org {org_id}: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to fetch messages: {str(e)}"
+        )
 
 async def close_conversation(org_id: str, conversation_id: str, reason: str):
     """
@@ -369,4 +472,32 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
+
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str):
+    """
+    Sends a message to the specified conversation on the given platform.
+    """
+
+    if platform == "whatsapp":
+
+        wa_id = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}).get("wa_id")
+
+        res = await send_whatsapp_message({
+            "conversation_id": conversation_id,
+            "content": content,
+            "sender_id": wa_id,
+        }, org_id)
+        return res
     
+    elif platform == "instagram":
+        ig_id = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}).get("ig_id")
+
+        recipient = db[f"conversations_{org_id}"].find_one(
+            {"conversation_id": conversation_id},
+            {"customer_id": 1}
+        ).get("customer_id")
+        
+        res = await send_ig_message(recipient, content, ig_id)
+        return res
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported platform")

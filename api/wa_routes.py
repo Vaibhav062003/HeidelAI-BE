@@ -19,7 +19,7 @@ from fastapi import (
 # Internal modules
 from core.services import services
 from schemas.models import WhatsappAuthRequest, MessageRole
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
@@ -175,12 +175,17 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         # Ensure indexes for efficient querying
         messages_collection.create_index("message_id", unique=True)
         conversations_collection.create_index("conversation_id", unique=True)
+
+        db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"wa_id": str(whatsapp_business_id)}}
+        )
         
         # Store connection in database
         whatsapp_connection = {
             "user_id": user_id,
             "org_id": org_id,
-            "business_account_id": whatsapp_business_id,
+            "wa_id": whatsapp_business_id,
             "phone": phone,
             "phone_id": phone_id,
             "name": phones_data.get("verified_name", "WhatsApp Business"),
@@ -193,7 +198,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         
         # Store in your existing MongoDB database
         db.whatsapp_connections.update_one(
-            {"business_account_id": whatsapp_business_id, "user_id": user_id},
+            {"wa_id": whatsapp_business_id, "user_id": user_id},
             {"$set": whatsapp_connection},
             upsert=True
         )
@@ -279,7 +284,7 @@ async def get_whatsapp_status(org_id: str, user_id: Optional[str] = None, _: Non
             "whatsapp_data": {
                 "name": connection.get("name"),
                 "phone": connection.get("phone"),
-                "business_account_id": connection.get("business_account_id"),
+                "wa_id": connection.get("wa_id"),
                 "business_info": connection.get("business_info"),
                 "connected_at": connection.get("connected_at")
             }
@@ -306,13 +311,13 @@ async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)
         # Find the WhatsApp connection to get the access token and business account ID
         connection = db.whatsapp_connections.find_one(
             {"user_id": whatsapp_id},
-            {"business_account_id": 1, "access_token": 1, "phone_id": 1, "_id": 0}
+            {"wa_id": 1, "access_token": 1, "phone_id": 1, "_id": 0}
         )
         
         if not connection or not connection.get("access_token"):
             raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
         
-        whatsapp_business_id = connection["business_account_id"]
+        whatsapp_business_id = connection["wa_id"]
         access_token = connection["access_token"]
         phone_id = connection.get("phone_id")
         
@@ -384,7 +389,7 @@ async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)
             },
             "connection_details": {
                 "user_id": whatsapp_id,
-                "business_account_id": whatsapp_business_id,
+                "wa_id": whatsapp_business_id,
                 "phone_id": phone_id
             }
         }
@@ -423,13 +428,13 @@ async def get_whatsapp_conversation_analytics(
         # Find the WhatsApp connection to get the access token and business account ID
         connection = db.whatsapp_connections.find_one(
             {"user_id": whatsapp_id},
-            {"business_account_id": 1, "access_token": 1, "phone_id": 1, "_id": 0}
+            {"wa_id": 1, "access_token": 1, "phone_id": 1, "_id": 0}
         )
         
         if not connection or not connection.get("access_token"):
             raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
         
-        whatsapp_business_id = connection["business_account_id"]
+        whatsapp_business_id = connection["wa_id"]
         access_token = connection["access_token"]
         
         # Set default date range if not provided (last 30 days)
@@ -515,7 +520,7 @@ async def get_whatsapp_conversation_analytics(
         # Extract and format the analytics data
         result = {
             "status": "success",
-            "business_account_id": whatsapp_business_id,
+            "wa_id": whatsapp_business_id,
             "analytics_period": {
                 "start": datetime.fromtimestamp(start_date).isoformat(),
                 "end": datetime.fromtimestamp(end_date).isoformat(),
@@ -781,118 +786,21 @@ async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body
             detail=f"Failed to update AI status: {str(e)}"
         )
 
-@router.post("/{whatsapp_id}/conversations/send_message")
-async def send_whatsapp_message(whatsapp_id: str, message: dict, user: CurrentUser):
+@router.post("/conversations/send_message")
+async def send_whatsapp_message(message: dict, user: CurrentUser):
     """Send a message to a WhatsApp conversation"""
-    org_id = user.org_id 
-    wa_connection = db.whatsapp_connections.find_one(
-            {"user_id": whatsapp_id, "org_id": org_id},
-            {"business_account_id": 1, "_id": 0}
-        )
+    # Get Instagram-specific collections
+    org_id = user.org_id
+    org_conversations_collection = db[f"conversations_{org_id}"]
     
-    whatsapp_business_id = wa_connection["business_account_id"]
+    # Check if conversation exists
+    conversation = org_conversations_collection.find_one({"conversation_id": message["conversation_id"]})
     
-    try:
-        conversation_id = message["conversation_id"]
-        content = message["content"]
-        sender_id = message["sender_id"]
-        
-        # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({"business_account_id": whatsapp_business_id})
-        
-        if not connection:
-            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
-        
-        # Extract the recipient phone number from conversation ID
-        recipient_id = conversation_id.replace("whatsapp_", "")
-        
-        # Send message via WhatsApp Cloud API
-        url = f"https://graph.facebook.com/{VERSION}/{connection['phone_id']}/messages"
-        headers = {
-            "Authorization": f"Bearer {connection['access_token']}",
-            "Content-Type": "application/json",
-        }
-        data = {
-            "messaging_product": "whatsapp",
-            "to": recipient_id,
-            "type": "text",
-            "text": {"body": content}
-        }
-        
-        response = requests.post(url, headers=headers, json=data)
-        
-        if response.status_code != 200:
-            print(f"WhatsApp API error: {response.text}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail="Failed to send WhatsApp message"
-            )
-        
-        response_data = response.json()
-        message_id = response_data.get("messages", [{}])[0].get("id")
-        
-        # Get the WhatsApp-specific collections
-        messages_collection = db[f"messages_{org_id}"]
-        conversations_collection = db[f"conversations_{org_id}"]
-        
-        # Store message in WhatsApp-specific collection
-        stored_message = {
-            "id": message_id,
-            "message_id": message_id,
-            "platform": "whatsapp",
-            "conversation_id": conversation_id,
-            "content": content,
-            "sender_id": "agent",
-            "sender_name": "Agent",
-            "role": "agent",
-            "timestamp": datetime.now(),
-            "status": "sent",
-            "message_type": "text"
-        }
-        
-        messages_collection.insert_one(stored_message)
-        
-        # Update conversation with new last message
-        conversations_collection.update_one(
-            {"id": conversation_id},
-            {
-                "$set": {
-                    "last_message": content,
-                    "last_message_timestamp": datetime.now()
-                }
-            }
-        )
-        
-        # Format message for broadcast
-        broadcast_message = {
-            "id": message_id,
-            "platform": "whatsapp",
-            "conversation_id": conversation_id,
-            "content": content,
-            "sender_id": "agent",
-            "sender_name": "Agent",
-            "role": "agent",
-            "timestamp": datetime.now().isoformat(),
-            "status": "sent",
-            "message_type": "text"
-        }
-        
-        # Broadcast to WhatsApp-specific clients
-        if whatsapp_business_id in services.whatsapp_connections_map:
-            await broadcast_whatsapp_message(whatsapp_business_id, "new_message", {
-                "message": broadcast_message
-            })
-        
-        return {"status": "success", "message": "Message sent", "message_id": message_id}
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        print(f"Error sending WhatsApp message: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to send message: {str(e)}"
-        )
+    res = await send_whatsapp_message(message, org_id)
+    return res
     
 @router.post("/{whatsapp_id}/media/send")
 async def upload_and_send_whatsapp_media(
@@ -926,13 +834,13 @@ async def upload_and_send_whatsapp_media(
         # Find the WhatsApp connection to get the access token and business account ID
         connection = db.whatsapp_connections.find_one(
             {"user_id": whatsapp_id},
-            {"business_account_id": 1, "access_token": 1, "phone_id": 1, "_id": 0}
+            {"wa_id": 1, "access_token": 1, "phone_id": 1, "_id": 0}
         )
         
         if not connection or not connection.get("access_token"):
             raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
         
-        business_account_id = connection["business_account_id"]
+        wa_id = connection["wa_id"]
         access_token = connection["access_token"]
         phone_id = connection.get("phone_id")
         
@@ -1054,7 +962,7 @@ async def upload_and_send_whatsapp_media(
             conversation_id=conversation_id,
             sender_id="agent",
             sender_name="Agent",
-            recipient_id=business_account_id,
+            recipient_id=wa_id,
             role=MessageRole.AGENT,
             message_id=message_id,
             message_type=media_type,
