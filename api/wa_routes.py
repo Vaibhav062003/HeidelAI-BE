@@ -143,11 +143,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
 
         # Check if phone number is verified
         if phone_verified != "VERIFIED":
-            raise HTTPException(
-                print(f"Phone number {phone} is not verified"),
-                status_code=400, 
-                detail="Phone number is not verified. Please verify your phone number before connecting."
-            )
+             print(f"Phone number {phone} is currently {phone_verified}. Attempting registration to fix this...")
         
         phone_register_params = {
             "messaging_product": "whatsapp",
@@ -787,7 +783,7 @@ async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body
         )
 
 @router.post("/conversations/send_message")
-async def send_whatsapp_message(message: dict, user: CurrentUser):
+async def process_whatsapp_message(message: dict, user: CurrentUser):
     """Send a message to a WhatsApp conversation"""
     # Get Instagram-specific collections
     org_id = user.org_id
