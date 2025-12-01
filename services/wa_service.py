@@ -5,6 +5,7 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from fastapi import HTTPException
+from pymongo import ReturnDocument
 
 # Internal modules
 from core.managers import manager
@@ -14,6 +15,7 @@ from config.settings import IG_VERSION
 from schemas.models import MessageRole
 from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
+from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 
 db = get_mongo_db()
@@ -101,30 +103,38 @@ async def create_or_update_whatsapp_conversation(org_id: str,
             "closed_at": None
         }
     
-    # Use $set to update only specified fields
-    conversations_collection.update_one(
+    updated_conversation = conversations_collection.find_one_and_update(
         {"conversation_id": conversation_id},
         {"$set": wa_conversation},
-        upsert=True
+        upsert=True,                          # Create if it doesn't exist
+        return_document=ReturnDocument.AFTER  # Return the NEW/UPDATED document
     )
 
-    print("Whatsapp conversation updated:", wa_conversation)
+    print("Whatsapp conversation updated:", updated_conversation)
+
+    # Format the timestamp for JSON serialization
+    broadcast_conversation = dict(updated_conversation)
+    if "last_message_timestamp" in broadcast_conversation:
+        broadcast_conversation["last_message_timestamp"] = broadcast_conversation["last_message_timestamp"].isoformat()
+    if broadcast_conversation["next_action_at"] is not None:
+        broadcast_conversation["next_action_at"] = broadcast_conversation["next_action_at"].isoformat()
+    if "started_at" in broadcast_conversation:
+        broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()
+    if "_id" in broadcast_conversation:
+        broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
     
-    # Get the updated conversation for broadcasting
-    updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+    await broadcast_main_ws(
+        platform_id=recipient_id,
+        platform_type="whatsapp",
+        event_type="conversation_updated",
+        payload={"conversation": broadcast_conversation}
+    )
     
     # Broadcast to WhatsApp-specific connections
     if recipient_id in services.whatsapp_connections_map:
-        # Format the timestamp for JSON serialization
-        broadcast_conversation = dict(updated_conversation)
-        if "last_message_timestamp" in broadcast_conversation:
-            broadcast_conversation["last_message_timestamp"] = broadcast_conversation["last_message_timestamp"].isoformat()
-        if "_id" in broadcast_conversation:
-            broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
-            
-        # await broadcast_whatsapp_message(recipient_id, "conversation_updated", {
-        #     "conversation": broadcast_conversation
-        # })
+        await broadcast_whatsapp_message(recipient_id, "conversation_updated", {
+            "conversation": broadcast_conversation
+        })
         
     return conversation_id
 
@@ -224,12 +234,20 @@ async def store_whatsapp_message(
         "payload": payload
     }
 
+    await broadcast_main_ws(
+        platform_id=recipient_id,
+        platform_type="whatsapp",
+        event_type="new_message",
+        payload={"message": broadcast_message}
+    )
+    
     # Broadcast to WhatsApp-specific WebSocket connections
     if recipient_id in services.whatsapp_connections_map:
         await broadcast_whatsapp_message(recipient_id, "new_message", {
             "message": broadcast_message
         })
-    
+
+
     # Check if counter >= 10 for conversational analytics
     if conversation and conversation.get("message_counter", 0) >= 10:
         # Perform analytics tasks
@@ -356,9 +374,20 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
             "next_action_at": now + timedelta(hours=6)
         }
 
-        db[f"conversations_{org_id}"].update_one(
+        conversation = db[f"conversations_{org_id}"].find_one_and_update(
             {"conversation_id": conversation_id},
-            {"$set": wa_conversation}
+            {"$set": wa_conversation},
+            return_document=ReturnDocument.AFTER  
+        )
+
+        if "_id" in conversation:
+            conversation["_id"] = str(conversation["_id"])
+
+        await broadcast_main_ws(
+            platform_id=connection.get("wa_id"),
+            platform_type="whatsapp",
+            event_type="conversation_updated",
+            payload={"conversation": conversation}
         )
 
         # Store message in WhatsApp-specific collection

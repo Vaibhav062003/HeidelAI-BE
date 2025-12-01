@@ -5,6 +5,7 @@ import json
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
+from services.websocket_service import broadcast_main_ws
 from supabase import create_client, Client
 from pymongo import UpdateOne
 from fastapi import HTTPException
@@ -263,6 +264,13 @@ async def store_instagram_message(
         "sender_name": sender_name
     }
     
+    # Broadcast to /main-ws clients
+    await broadcast_main_ws(
+        platform_id=recipient_id,
+        platform_type="instagram",
+        event_type="new_message",
+        payload={"message": broadcast_message}
+    )
     
     # Broadcast to Instagram-specific WebSocket connections
     if recipient_id in services.instagram_connections_map:
@@ -385,18 +393,30 @@ async def create_or_update_instagram_conversation(org_id: str,
     # Get the updated conversation for broadcasting
     updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
     
+    # Format the timestamp for JSON serialization
+    broadcast_conversation = dict(updated_conversation)
+    if "last_message_timestamp" in broadcast_conversation:
+        broadcast_conversation["last_message_timestamp"] = broadcast_conversation["last_message_timestamp"].isoformat()
+    if broadcast_conversation["next_action_at"] is not None:
+        broadcast_conversation["next_action_at"] = broadcast_conversation["next_action_at"].isoformat()
+    if "started_at" in broadcast_conversation:
+        broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()
+    if "_id" in broadcast_conversation:
+        broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
+
+    await broadcast_main_ws(
+        platform_id=recipient_id,
+        platform_type="instagram",
+        event_type="conversation_updated",
+        payload={"conversation": broadcast_conversation}
+    )
+
     # Broadcast to Instagram-specific connections
     if recipient_id in services.instagram_connections_map:
-        # Format the timestamp for JSON serialization
-        broadcast_conversation = dict(updated_conversation)
-        if "last_message_timestamp" in broadcast_conversation:
-            broadcast_conversation["last_message_timestamp"] = broadcast_conversation["last_message_timestamp"].isoformat()
-        if "_id" in broadcast_conversation:
-            broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
             
-        # await broadcast_instagram_message(recipient_id, "conversation_updated", {
-        #     "conversation": broadcast_conversation
-        # })
+        await broadcast_instagram_message(recipient_id, "conversation_updated", {
+            "conversation": broadcast_conversation
+        })
         
     return conversation_id
 

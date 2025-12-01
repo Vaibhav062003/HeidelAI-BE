@@ -7,6 +7,8 @@ from auth.dependencies import get_current_user
 from fastapi.security import HTTPAuthorizationCredentials
 import json
 
+from services.websocket_service import *
+
 router = APIRouter(tags=["Websockets"])
 
 db = get_mongo_db()
@@ -139,3 +141,86 @@ async def websocket_endpoint(websocket: WebSocket):
             print(f"Received message from {client_id}: {data}")
     except WebSocketDisconnect:
         manager2.disconnect(client_id)
+
+@router.websocket("/main-ws/{client_id}")
+async def main_ws(websocket: WebSocket, client_id: str):
+    token = websocket.headers.get("sec-websocket-protocol")
+
+    # Step 1: Authenticate using the token
+    try:
+        credentials = HTTPAuthorizationCredentials(
+            scheme="Bearer", 
+            credentials=token
+        )
+        user = await get_current_user(credentials)
+    except Exception:
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+
+    # Step 2: Accept websocket
+    await websocket.accept(subprotocol=token)
+    
+    org = db.organizations.find_one(
+        {"org_id": user.org_id},
+        {"ig_id": 1, "wa_id": 1, "_id": 0}
+    )
+
+    ig_id = org.get("ig_id")
+    wa_id = org.get("wa_id")
+
+
+    # Step 3: Register connection globally
+    services.active_clients[client_id] = websocket
+    services.client_metadata[client_id] = {
+        "ig_id": ig_id,
+        "wa_id": wa_id,
+    }
+
+    if ig_id:
+        services.instagram_clients[ig_id].add(client_id)
+
+    if wa_id:
+        services.whatsapp_clients[wa_id].add(client_id)
+
+    print(f"🔵 Connected client: {client_id}", flush=True)
+    print(f"   IG: {ig_id}, WA: {wa_id}", flush=True)
+
+    heartbeat_task = asyncio.create_task(start_heartbeat(client_id, websocket))
+
+   # Step 4: Keep listening for incoming messages
+    try:
+        while True:
+            # 1. Use receive_text first to see raw data (debugs JSON errors)
+            try:
+                raw_data = await websocket.receive_text()
+                print(f"📥 Raw Data Received: {raw_data}", flush=True)
+
+                # 2. Manually parse JSON
+                import json
+                data = json.loads(raw_data)
+                
+                event_type = data.get("type")
+
+                if event_type == "typing_indicator":
+                    await handle_typing_event(client_id, data)
+                
+            except WebSocketDisconnect:
+                # 🛑 STOP the loop if the client disconnects
+                print(f"⚠️ Client {client_id} disconnected (caught in loop)", flush=True)
+                break
+
+            except json.JSONDecodeError:
+                print(f"❌ Failed to decode JSON: {raw_data}", flush=True)
+            except Exception as inner_e:
+                print(f"❌ Error processing message loop: {inner_e}", flush=True)
+                # We catch here so the loop CONTINUES even if one message fails
+
+    except WebSocketDisconnect:
+        print(f"⚠️ Client {client_id} disconnected", flush=True)
+        await cleanup_client(client_id)
+    except Exception as e:
+        print(f"❗ Critical Websocket Error: {e}", flush=True)
+        await cleanup_client(client_id)
+    finally:
+        heartbeat_task.cancel()
+        await cleanup_client(client_id)

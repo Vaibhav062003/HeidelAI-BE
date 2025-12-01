@@ -229,7 +229,29 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 message_id=message_id,  # Use the ID from the webhook for deduplication
                                 raw_data=message
                             )
-                            
+
+                            # Check if conversation exists
+                            existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+                            conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+
+                            if conversation:
+                                # Convert ObjectId to string for JSON serialization
+                                conversation["_id"] = str(conversation["_id"])
+                                # Convert datetime to ISO string format
+                                if "timestamp" in conversation:
+                                    conversation["timestamp"] = conversation["timestamp"].isoformat()
+                                if "last_message_timestamp" in conversation:
+                                    conversation["last_message_timestamp"] = conversation["last_message_timestamp"].isoformat()
+
+                            # Broadcast WhatsApp-specific notifications first
+                            if not existing_conversation:
+                                await broadcast_whatsapp_message(whatsapp_business_id, "new_conversation", {
+                                    "conversation": conversation
+                                })
+                            else:
+                                await broadcast_whatsapp_message(whatsapp_business_id, "conversation_updated", {
+                                    "conversation": conversation
+                                })
     
     if payload["object"] == "instagram": 
         if "entry" in payload and len(payload["entry"]) > 0:
@@ -611,7 +633,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         sender_id=sender_id,
                         customer_name=name,
                         username=username,
-                        last_message=message_text,
+                        last_message=message_echo and f"You: {message_text}" or message_text,
                         last_sender= message_echo and MessageRole.AGENT or MessageRole.CUSTOMER
                     )
                     
@@ -633,7 +655,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     # Check if conversation exists
                     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
                     conversation = conversations_collection.find_one({"conversation_id": conversation_id})
-
 
                     if recipient_id in services.instagram_connections_map:
                         for connection_key in services.instagram_connections_map[recipient_id]:

@@ -1,6 +1,6 @@
 # services.py
 from typing import Dict, Set, List
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from fastapi import WebSocket
 from langgraph.graph.state import CompiledStateGraph
 
@@ -26,6 +26,12 @@ class Services:
         self.websocket_product_data_ig = {}
         self.flag = False
         self.search_term = ""
+
+         # === New Main WebSocket State ===
+        self.active_clients = {}    # GLOBAL: All connected WebSocket connections -> { client_id: WebSocket }
+        self.instagram_clients = defaultdict(set) # For Instagram event broadcasting -> { ig_id: { client_id1, client_id2 } }
+        self.whatsapp_clients = defaultdict(set) # For WhatsApp event broadcasting -> { wa_id: { client_id1, client_id2 } }
+        self.client_metadata = {}  # Reverse mapping (for cleanup) -> { client_id: { "ig_id": "...", "wa_id": "..." } }
 
         # === Agents ===
         self.prompt_cache = {}
