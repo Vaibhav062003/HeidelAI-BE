@@ -14,7 +14,7 @@ if not INSTAGRAM_APP_ID or not INSTAGRAM_APP_SECRET:
 else:
     print(f"Using Instagram App ID: {INSTAGRAM_APP_ID[:5]}... (truncated)")
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, redoc_url=None)
 
 app.include_router(router)
 
