@@ -145,7 +145,7 @@ async def bulk_upload_products_from_file(
     try:
         df = _read_spreadsheet_bytes(file.filename, content)
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=400, detail=f"{str(e)}")
 
     df = _normalize_columns(df)
     canonical = {"product_name", "description", "price", "stock", "product_image", "product_id"}
