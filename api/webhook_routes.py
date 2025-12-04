@@ -373,7 +373,26 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         conversation["timestamp"] = conversation["timestamp"].isoformat()
                                     if "last_message_timestamp" in conversation:
                                         conversation["last_message_timestamp"] = conversation["last_message_timestamp"].isoformat()
-                                    
+
+                                    await broadcast_main_ws(
+                                        platform_id=recipient_id,
+                                        platform_type="instagram",
+                                        event_type="message_deleted",
+                                        payload={
+                                            "message_id": deleted_message_id,
+                                            "conversation_id": conversation_id
+                                        }
+                                    )
+
+                                    await broadcast_main_ws(
+                                        platform_id=recipient_id,
+                                        platform_type="instagram",
+                                        event_type="conversation_updated",
+                                        payload={
+                                            "conversation": conversation
+                                        }
+                                    )
+
                                     # Broadcast both the deletion event and updated conversation
                                     if recipient_id in services.instagram_connections_map and conversation_id:
                                         await broadcast_instagram_message(recipient_id, "message_deleted", {
@@ -508,6 +527,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                         if "_id" in broadcast_message:
                             broadcast_message["_id"] = str(broadcast_message["_id"])
+
+                        await broadcast_main_ws(
+                            platform_id=recipient_id,
+                            platform_type="instagram",
+                            event_type="message_reaction",
+                            payload={"message": broadcast_message}
+                            )
 
                         # Broadcast the reaction update to connected clients
                         if recipient_id in services.instagram_connections_map:

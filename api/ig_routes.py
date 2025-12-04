@@ -844,6 +844,13 @@ async def send_instagram_reaction(reaction: dict, user: CurrentUser):
                 if "_id" in broadcast_message:
                     broadcast_message["_id"] = str(broadcast_message["_id"])
 
+                await broadcast_main_ws(
+                    platform_id=instagram_id,
+                    platform_type="instagram",
+                    event_type="message_reaction",
+                    payload={"message": broadcast_message}
+                )
+
                 # Broadcast the reaction update to connected clients
                 if instagram_id in services.instagram_connections_map:
                     print(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
@@ -878,6 +885,13 @@ async def send_instagram_reaction(reaction: dict, user: CurrentUser):
 
         if "_id" in broadcast_message:
             broadcast_message["_id"] = str(broadcast_message["_id"])
+
+        await broadcast_main_ws(
+            platform_id=instagram_id,
+            platform_type="instagram",
+            event_type="message_reaction",
+            payload={"message": broadcast_message}
+        )
 
         # Broadcast the reaction update to connected clients
         if instagram_id in services.instagram_connections_map:
