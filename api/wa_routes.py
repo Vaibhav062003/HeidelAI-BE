@@ -968,14 +968,14 @@ async def get_whatsapp_profile(user: CurrentUser):
 
         org_document = db.organizations.find_one({"org_id": org_id})
 
-        whatsapp_id = org_document.get("wa_id")
+        wa_id = org_document.get("wa_id")
     
-        if not whatsapp_id:
+        if not wa_id:
             raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
 
         # Get the page access token for this WhatsApp account
         connection = db.whatsapp_connections.find_one(
-            {"whatsapp_id": whatsapp_id, "is_active": True, "org_id": org_id}
+            {"wa_id": wa_id, "is_active": True, "org_id": org_id}
         )
 
         if not connection or not connection.get("access_token"):
