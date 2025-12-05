@@ -254,44 +254,6 @@ async def whatsapp_disconnect(request: dict, _: None = Depends(require_auth)):
         print(f"Error disconnecting WhatsApp: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
 
-@router.get("/status")
-async def get_whatsapp_status(org_id: str, user_id: Optional[str] = None, _: None = Depends(require_auth)):
-    """Check if WhatsApp Business account is connected and return connection details"""
-    try:
-        if not user_id:
-            raise HTTPException(status_code=400, detail="user_id parameter is required")
-        
-        # Query WhatsApp connection by user_id
-        connection = db.whatsapp_connections.find_one(
-            {"user_id": user_id, "org_id": org_id},  # Assuming org_id is 'default' for simplicity
-        )
-        
-        # If no connection found
-        if not connection:
-            return {
-                "whatsapp_connected": False,
-                "whatsapp_data": None
-            }
-        
-        # Return connection details (excluding sensitive information)
-        return {
-            "whatsapp_connected": True,
-            "org_id": org_id,
-            "whatsapp_data": {
-                "name": connection.get("name"),
-                "phone": connection.get("phone"),
-                "wa_id": connection.get("wa_id"),
-                "business_info": connection.get("business_info"),
-                "connected_at": connection.get("connected_at")
-            }
-        }
-            
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        print(f"Error checking WhatsApp status: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to check WhatsApp connection status: {str(e)}")
-    
 @router.get("/{whatsapp_id}/details")
 async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)):
     """
@@ -992,3 +954,37 @@ async def upload_and_send_whatsapp_media(
             status_code=500,
             detail=f"Failed to upload and send media: {str(e)}"
         )
+
+@router.get("/profile")
+async def get_whatsapp_profile(user: CurrentUser):
+    """
+    Fetch detailed WhatsApp profile information
+    
+    Returns:
+        WhatsApp profile information.
+    """
+    try:
+        org_id = user.org_id 
+
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        whatsapp_id = org_document.get("wa_id")
+    
+        if not whatsapp_id:
+            raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
+
+        # Get the page access token for this WhatsApp account
+        connection = db.whatsapp_connections.find_one(
+            {"whatsapp_id": whatsapp_id, "is_active": True, "org_id": org_id}
+        )
+
+        if not connection or not connection.get("access_token"):
+            raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
+
+        return connection
+    
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error fetching Instagram profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram profile: {str(e)}")
