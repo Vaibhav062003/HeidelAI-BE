@@ -706,31 +706,31 @@ async def toggle_instagram_ai_status(conversation_id: str, body: dict, user: Cur
         )
 
 # Instagram-specific unread count reset endpoint
-@router.get("/conversations/{conversation_id}/read")
-async def update_instagram_unread_count(conversation_id: str, user: CurrentUser):
-    """Reset unread count for a specific Instagram conversation"""
-    try:
-        org_id = user.org_id 
-        # Get the Instagram-specific collection
-        org_conversations_collection = db[f"conversations_{org_id}"]
+# @router.get("/conversations/{conversation_id}/read")
+# async def update_instagram_unread_count(conversation_id: str, user: CurrentUser):
+#     """Reset unread count for a specific Instagram conversation"""
+#     try:
+#         org_id = user.org_id 
+#         # Get the Instagram-specific collection
+#         org_conversations_collection = db[f"conversations_{org_id}"]
 
-        # Update the conversation
-        result = org_conversations_collection.update_one(
-            {"conversation_id": conversation_id},
-            {"$set": {"unread_count": 0}}
-        )
+#         # Update the conversation
+#         result = org_conversations_collection.update_one(
+#             {"conversation_id": conversation_id},
+#             {"$set": {"unread_count": 0}}
+#         )
         
-        if result.matched_count == 0:
-            return {"status": "error", "message": "No conversation found"}
+#         if result.matched_count == 0:
+#             return {"status": "error", "message": "No conversation found"}
         
-        return {"status": "success", "message": f"Unread count reset to 0 for conversation {conversation_id}"}
+#         return {"status": "success", "message": f"Unread count reset to 0 for conversation {conversation_id}"}
     
-    except Exception as e:
-        print(f"Error resetting Instagram unread count: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to reset unread count: {str(e)}"
-        )
+#     except Exception as e:
+#         print(f"Error resetting Instagram unread count: {e}")
+#         raise HTTPException(
+#             status_code=500, 
+#             detail=f"Failed to reset unread count: {str(e)}"
+#         )
 
 # Instagram-specific send message endpoint
 @router.post("/conversations/send_message")

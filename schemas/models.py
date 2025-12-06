@@ -88,7 +88,6 @@ class UpdateCategoriesRequest(BaseModel):
 
 # Products Service
 class Product(BaseModel):
-    product_id: str = None
     product_name: str
     description: Optional[str] = None
     price: float = None

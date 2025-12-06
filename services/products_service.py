@@ -69,8 +69,6 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             colmap[c] = "stock"
         elif cc in ("product_image", "image", "image_name", "image_filename"):
             colmap[c] = "product_image"
-        elif cc in ("id", "_id", "product_id"):
-            colmap[c] = "product_id"
         else:
             colmap[c] = c
     return df.rename(columns=colmap)
@@ -90,10 +88,9 @@ def _row_to_product(row: pd.Series, extra_cols: List[str]) -> Tuple[Optional[Pro
 
     name = row.get("product_name")
     if not isinstance(name, str) or name.strip() == "":
-        return None, "missing product_name"
+        return None, "missing product_name" 
 
     product_data = {
-        "product_id": None,
         "product_name": name.strip(),
         "description": None if pd.isna(row.get("description")) else str(row.get("description")),
         "price": None,
@@ -102,16 +99,12 @@ def _row_to_product(row: pd.Series, extra_cols: List[str]) -> Tuple[Optional[Pro
         "metadata": {},
     }
 
-    product_id = row.get("product_id")
-    if product_id is not None and not pd.isna(product_id):
-        product_data["product_id"] = str(product_id).strip()
-
     price_val = row.get("price")
     if price_val is not None and not pd.isna(price_val):
         try:
             product_data["price"] = float(price_val)
         except:
-            product_data["price"] = None
+            return None, "invalid price value"
 
     stock_val = row.get("stock")
     if stock_val is not None and not pd.isna(stock_val):
@@ -148,11 +141,11 @@ async def bulk_upload_products_from_file(
         raise HTTPException(status_code=400, detail=f"{str(e)}")
 
     df = _normalize_columns(df)
-    canonical = {"product_name", "description", "price", "stock", "product_image", "product_id"}
+    canonical = {"product_name", "description", "price", "stock", "product_image"}
     extra_cols = [c for c in df.columns if c not in canonical]
 
     products_to_insert = []
-    current_product_ids = set()
+    current_product_names = set()
     errors = []
     inserted_count = 0
     collection = _products_collection(org_id)
@@ -164,24 +157,23 @@ async def bulk_upload_products_from_file(
             errors.append({"row": idx + 1, "reason": reason})
             continue
 
-        if product_obj.product_id in current_product_ids:
+        if product_obj.product_name in current_product_names:
             errors.append({
                 "row": idx + 1,
-                "reason": f"duplicate product_id {product_obj.product_id} in upload file"
+                "reason": f"duplicate product_name {product_obj.product_name} in upload file"
             })
             continue
 
-        current_product_ids.add(product_obj.product_id)
-
+        current_product_names.add(product_obj.product_name)
         product_obj.product_image = None
-        product_obj.image_url = None
+        # product_obj.image_url = None
 
-        if product_obj.product_id:
-            exists = collection.find_one({"product_id": product_obj.product_id})
+        if product_obj.product_name:
+            exists = collection.find_one({"product_name": product_obj.product_name})
             if exists:
                 errors.append({
                     "row": idx + 1,
-                    "reason": f"duplicate product_id {product_obj.product_id}"
+                    "reason": f"duplicate product_name {product_obj.product_name}"
                 })
                 continue
 
@@ -224,37 +216,24 @@ async def bulk_upload_products_from_file(
 async def add_single_product(org_id: str, data: dict) -> dict:
     collection = _products_collection(org_id)
 
-    if data.get("product_id"):
-        if collection.find_one({"product_id": data["product_id"]}):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Product with product_id '{data['product_id']}' already exists."
-            )
+    product_name = data["product_name"]
 
-    image_file = data.get("image")
-    direct_url = data.get("image_url")
+    existing_product = collection.find_one({"product_name": product_name})
+    if existing_product:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Product with product_name '{product_name}' already exists. Please delete the existing product to upload it again."
+        )
 
-    if image_file and image_file.filename:
-
-        # upload_url = upload_image_to_storage(
-        #     org_id,
-        #     source_path=image_file.file,
-        #     filename=image_file.filename,
-        # )
-        # final_image_url = upload_url
-        pass
-
-    else:
-        final_image_url = direct_url if direct_url else None
+    final_image_url = data.get("image_url")
 
     product = Product(
-        product_id=data.get("product_id"),
-        product_name=data["product_name"],
+        product_name=product_name,
         description=data.get("description"),
         price=data.get("price"),
         stock=data.get("stock"),
-        product_image=None,        
-        image_url=final_image_url,
+        product_image=None, 
+        image_url=final_image_url, 
         metadata={}
     )
 

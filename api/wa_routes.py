@@ -642,33 +642,33 @@ async def get_whatsapp_messages(conversation_id: str, user: CurrentUser):
             detail=f"Failed to fetch WhatsApp messages: {str(e)}"
         )
 
-@router.get("/conversations/{conversation_id}/read")
-async def update_whatsapp_unread_count(conversation_id: str, user: CurrentUser):
-    """Reset unread count for a specific WhatsApp conversation"""
+# @router.get("/conversations/{conversation_id}/read")
+# async def update_whatsapp_unread_count(conversation_id: str, user: CurrentUser):
+#     """Reset unread count for a specific WhatsApp conversation"""
 
-    try:
-        org_id = user.org_id 
+#     try:
+#         org_id = user.org_id 
 
-        # Get the WhatsApp-specific collection
-        conversations_collection = db[f"conversations_{org_id}"]
+#         # Get the WhatsApp-specific collection
+#         conversations_collection = db[f"conversations_{org_id}"]
         
-        # Update the conversation
-        result = conversations_collection.update_one(
-            {"conversation_id": conversation_id},
-            {"$set": {"unread_count": 0}}
-        )
+#         # Update the conversation
+#         result = conversations_collection.update_one(
+#             {"conversation_id": conversation_id},
+#             {"$set": {"unread_count": 0}}
+#         )
         
-        if result.matched_count == 0:
-            return {"status": "error", "message": "No conversation found"}
+#         if result.matched_count == 0:
+#             return {"status": "error", "message": "No conversation found"}
         
-        return {"status": "success", "message": "Unread count reset to 0"}
+#         return {"status": "success", "message": "Unread count reset to 0"}
     
-    except Exception as e:
-        print(f"Error resetting WhatsApp unread count: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to reset unread count: {str(e)}"
-        )
+#     except Exception as e:
+#         print(f"Error resetting WhatsApp unread count: {e}")
+#         raise HTTPException(
+#             status_code=500, 
+#             detail=f"Failed to reset unread count: {str(e)}"
+#         )
 
 @router.get("/conversations/{conversation_id}/ai")
 async def get_whatsapp_ai_status(conversation_id: str, user: CurrentUser):
@@ -975,7 +975,7 @@ async def get_whatsapp_profile(user: CurrentUser):
 
         # Get the page access token for this WhatsApp account
         connection = db.whatsapp_connections.find_one(
-            {"wa_id": wa_id, "is_active": True, "org_id": org_id}
+            {"wa_id": wa_id, "org_id": org_id}
         )
 
         if not connection or not connection.get("access_token"):

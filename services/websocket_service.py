@@ -9,6 +9,19 @@ async def cleanup_client(client_id: str):
     """
     print(f"🔴 Disconnecting client {client_id}")
 
+    # Retrieve and remove the entry from the reverse map
+    convo_key = services.client_convo_map.pop(client_id, None)
+    
+    if convo_key:
+        print(f"Cleaning up presence data for conversation {convo_key}")
+        # Remove client_id from the conversation viewers set
+        if convo_key in services.convo_viewers:
+            services.convo_viewers[convo_key].discard(client_id)
+            
+            # Cleanup: Remove the conversation entry if the set is empty
+            if not services.convo_viewers[convo_key]:
+                del services.convo_viewers[convo_key]
+
     meta = services.client_metadata.get(client_id)
     if not meta:
         return
@@ -146,3 +159,53 @@ async def start_heartbeat(client_id: str, websocket: WebSocket):
                 break
     except asyncio.CancelledError:
         pass
+
+def handle_unread_event(org_id: str, client_id: str, data: dict):
+    """
+    Handles join and leave conversation events for unread message tracking.
+    """
+
+    if data.get("type") == "join_conversation":
+        conversation_id = data.get("conversation_id")
+        join_conversation_presence(org_id, conversation_id, client_id)
+    elif data.get("type") == "leave_conversation":
+        conversation_id = data.get("conversation_id")
+        leave_conversation_presence(org_id, conversation_id, client_id)
+    else:
+        print(f"Unknown unread event type: {data.get('type')}")
+
+def join_conversation_presence(org_id: str, conversation_id: str, client_id: str):
+    """
+    Adds a client to the presence tracker for a specific conversation 
+    using the multi-tenant key (org_id, conversation_id).
+    """
+    convo_key = (org_id, conversation_id)
+    
+    # Updating forward map (convo_viewers: (org, convo) -> {clients})
+    if convo_key not in services.convo_viewers:
+        services.convo_viewers[convo_key] = set()
+    services.convo_viewers[convo_key].add(client_id)
+    
+    # Updating reverse map (client_convo_map: client -> (org, convo))
+    services.client_convo_map[client_id] = convo_key
+    
+    print(f"Client {client_id} JOINED conversation {convo_key}")
+
+def leave_conversation_presence(org_id: str, conversation_id: str, client_id: str):
+    """
+    Removes a client from the presence tracker and cleans up the maps.
+    """
+    convo_key = (org_id, conversation_id)
+    
+    # Updating forward map (convo_viewers)
+    if convo_key in services.convo_viewers:
+        services.convo_viewers[convo_key].discard(client_id)
+        
+        # Cleanup: Removing the conversation entry if no one is viewing it
+        if not services.convo_viewers[convo_key]:
+            del services.convo_viewers[convo_key]
+    
+    # Removing from reverse map (client_convo_map)
+    services.client_convo_map.pop(client_id, None)
+    
+    print(f"Client {client_id} LEFT conversation {convo_key}")

@@ -223,6 +223,23 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
             return_document=ReturnDocument.AFTER
         )
 
+        if assigned_convo is None:
+             # The conversation was already assigned or closed. Fetch the current assignment details.
+             current_convo = convo_collection.find_one(
+                 {"conversation_id": conversation_id},
+                 projection={"assigned_agent": 1, "assignment_history": 1, "_id": 0}
+             )
+             assigned_convo = current_convo
+
+        convo_collection.update_one(
+            {"conversation_id": conversation_id},
+            {
+                "$set": {
+                    "unread_count": 0
+                }
+            }
+        )
+
         messages = []
         notes = []
         
@@ -253,8 +270,6 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
                 msg["timestamp"] = ts.isoformat()
 
         combined.sort(key=lambda x: x.get("timestamp"), reverse=False)
-
-        print(assigned_convo)
         
         return {"messages": combined, "assignment": assigned_convo}
     

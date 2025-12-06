@@ -240,12 +240,13 @@ async def store_instagram_message(
         if oldest_message:
             messages_collection.delete_one({"_id": oldest_message["_id"]})
     
-    # Update message counter for the conversation
-    conversation = conversations_collection.find_one_and_update(
-        {"conversation_id": conversation_id},
-        {"$inc": {"message_counter": 1, "unread_count": 1}},
-        return_document=True
-    )
+
+    # # Update message counter for the conversation
+    # conversation = conversations_collection.find_one_and_update(
+    #     {"conversation_id": conversation_id},
+    #     {"$inc": {"message_counter": 1, "unread_count": 1}},
+    #     return_document=True
+    # )
 
     print("Instagram conversation updated:", conversation_id)
 
@@ -280,16 +281,16 @@ async def store_instagram_message(
         })
     
     # Check if counter >= 10 for conversational analytics
-    if conversation and conversation.get("message_counter", 0) >= 10:
-        # Perform analytics tasks
-        # await analyze_conversation_messages(conversation_id)
-        # await update_product_recommendations(conversation_id)
+    # if conversation and conversation.get("message_counter", 0) >= 10:
+    #     # Perform analytics tasks
+    #     # await analyze_conversation_messages(conversation_id)
+    #     # await update_product_recommendations(conversation_id)
         
-        # Reset the counter to 0
-        conversations_collection.update_one(
-            {"conversation_id": conversation_id},
-            {"$set": {"message_counter": 0}}
-        )
+    #     # Reset the counter to 0
+    #     conversations_collection.update_one(
+    #         {"conversation_id": conversation_id},
+    #         {"$set": {"message_counter": 0}}
+    #     )
     
     return message_id
 
@@ -326,6 +327,10 @@ async def create_or_update_instagram_conversation(org_id: str,
     # Check if conversation already exists
     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
     
+    convo_key = (org_id, conversation_id)
+
+    is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
+
     if existing_conversation:
         
         abort_result = await abort_scheduled_message(org_id, conversation_id)
@@ -346,8 +351,8 @@ async def create_or_update_instagram_conversation(org_id: str,
             "last_message_timestamp": now,
             "last_sender": last_sender,
             "status": "open",
-            # NOTE: Preserve existing values for fields below
-            # "unread_count" and "is_ai_enabled" will keep their existing values
+            "message_counter": existing_conversation.get("message_counter", 0) + 1,
+            "unread_count": existing_conversation.get("unread_count", 0) + (0 if is_being_viewed else 1)
         }
 
         if last_sender == "customer":

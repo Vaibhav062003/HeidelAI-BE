@@ -1,3 +1,4 @@
+import json
 from core.managers import manager, manager2
 from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -193,13 +194,16 @@ async def main_ws(websocket: WebSocket, client_id: str):
             # 1. Use receive_text first to see raw data (debugs JSON errors)
             try:
                 raw_data = await websocket.receive_text()
-                print(f"📥 Raw Data Received: {raw_data}", flush=True)
+                print(f"Raw Data Received: {raw_data}", flush=True)
 
                 # 2. Manually parse JSON
-                import json
                 data = json.loads(raw_data)
                 
                 event_type = data.get("type")
+
+                if event_type == "join_conversation" or event_type == "leave_conversation":
+                    org_id = user.org_id
+                    handle_unread_event(org_id, client_id, data)
 
                 if event_type == "typing_indicator":
                     await handle_typing_event(client_id, data)

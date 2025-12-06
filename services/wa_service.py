@@ -49,6 +49,11 @@ async def create_or_update_whatsapp_conversation(org_id: str,
     
     # Check if conversation already exists
     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+
+    convo_key = (org_id, conversation_id)
+    
+    # Check if the viewers set exists and is not empty
+    is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
     
     if existing_conversation:
 
@@ -68,10 +73,9 @@ async def create_or_update_whatsapp_conversation(org_id: str,
             "last_message": last_message,
             "last_message_timestamp": now,
             "last_sender": last_sender,
-            # NOTE: Preserve existing values for fields below
-            # "unread_count" and "is_ai_enabled" will keep their existing values
+            "message_counter": existing_conversation.get("message_counter", 0) + 1,
+            "unread_count": existing_conversation.get("unread_count", 0) + (0 if is_being_viewed else 1),
         }
-
         
         if last_sender == "customer":
             # Reset inactivity reminders on customer reply
@@ -94,7 +98,8 @@ async def create_or_update_whatsapp_conversation(org_id: str,
             "last_message": last_message,
             "last_message_timestamp": now,
             "unread_count": 1,
-            "is_ai_enabled": False,  # Default for new conversations
+            "message_counter": 1,
+            "is_ai_enabled": False,  
             "status": "open",
             "last_sender": last_sender,
             "started_at": now,
@@ -209,13 +214,13 @@ async def store_whatsapp_message(
         )
         if oldest_message:
             messages_collection.delete_one({"_id": oldest_message["_id"]})
-    
+
     # Update message counter and unread count for the conversation
-    conversation = conversations_collection.find_one_and_update(
-        {"conversation_id": conversation_id},
-        {"$inc": {"message_counter": 1, "unread_count": 1}},
-        return_document=True
-    )
+    # conversation = conversations_collection.find_one_and_update(
+    #     {"conversation_id": conversation_id},
+    #     {"$inc": {"message_counter": 1, "unread_count": 1}},
+    #     return_document=True
+    # )
 
     print("Whatsapp conversation updated:", conversation_id)
     
@@ -249,19 +254,19 @@ async def store_whatsapp_message(
 
 
     # Check if counter >= 10 for conversational analytics
-    if conversation and conversation.get("message_counter", 0) >= 10:
-        # Perform analytics tasks
-        try:
-            # await analyze_conversation_messages(conversation_id)
-            # await update_product_recommendations(conversation_id)
+    # if conversation and conversation.get("message_counter", 0) >= 10:
+    #     # Perform analytics tasks
+    #     try:
+    #         # await analyze_conversation_messages(conversation_id)
+    #         # await update_product_recommendations(conversation_id)
             
-            # Reset the counter to 0
-            conversations_collection.update_one(
-                {"conversation_id": conversation_id},
-                {"$set": {"message_counter": 0}}
-            )
-        except Exception as e:
-            print(f"Error during WhatsApp conversation analysis: {e}")
+    #         # Reset the counter to 0
+    #         conversations_collection.update_one(
+    #             {"conversation_id": conversation_id},
+    #             {"$set": {"message_counter": 0}}
+    #         )
+    #     except Exception as e:
+    #         print(f"Error during WhatsApp conversation analysis: {e}")
     
     return message_id
 

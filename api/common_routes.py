@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from typing import Optional
 
 from auth.dependencies import CurrentUser
+from core.services import services
 from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest
 from services.common_service import (
     fetch_conversations, 
@@ -239,35 +240,31 @@ async def create_product(
     user: CurrentUser,
     product_name: str = Form(...),
     description: str = Form(None),
-    price: float = Form(None),
+    price: float = Form(...),
     stock: int = Form(None),
-    product_id: str = Form(None),
-    image_url: str = Form(None),            
-    image: UploadFile = File(None),         
+    image_url: str = Form(None),                 
 ):
     org_id = user.org_id
 
     data = {
-        "product_id": product_id,
         "product_name": product_name,
         "description": description,
         "price": price,
         "stock": stock,
-        "image_url": image_url,   
-        "image": image            
+        "image_url": image_url            
     }
 
     product = await add_single_product(org_id, data)
     return {"product": product}
 
-@router.get("/api/products/{product_id}")
-def get_product(user: CurrentUser, product_id: str):
-    product = get_product_by_id(user.org_id, product_id)
+@router.get("/api/products/{product_mongo_id}")
+def get_product(user: CurrentUser, product_mongo_id: str):
+    product = get_product_by_id(user.org_id, product_mongo_id)
     return {"product": product}
 
-@router.delete("/api/products/{product_id}")
-def delete_product(user: CurrentUser, product_id: str):
-    deleted = delete_product_by_id(user.org_id, product_id)
+@router.delete("/api/products/{product_mongo_id}")
+def delete_product(user: CurrentUser, product_mongo_id: str):
+    deleted = delete_product_by_id(user.org_id, product_mongo_id)
     return {"deleted": deleted}
 
 @router.patch("/api/org/metadata/tags/add")
@@ -301,3 +298,24 @@ async def get_tags(user: CurrentUser):
     result = await get_tags_from_org_metadata(user.org_id)
 
     return {"tags": result}
+
+@router.get("/api/agents-on-conversation")
+async def get_agents_on_conversation():
+    """
+    For get_agents_on_conversation
+    Returns the presence maps with string keys for JSON compatibility.
+    """
+    json_convo_viewers = {
+        f"{org_id}|{convo_id}": list(client_ids)
+        for (org_id, convo_id), client_ids in services.convo_viewers.items()
+    }
+    
+    json_client_convo_map = {
+        client_id: f"{org_id}|{convo_id}"
+        for client_id, (org_id, convo_id) in services.client_convo_map.items()
+    }
+    
+    return { 
+        "convo_viewers": json_convo_viewers, 
+        "client_convo_map": json_client_convo_map 
+    }
