@@ -32,6 +32,9 @@ class RevokeInviteRequest(BaseModel):
 class DeleteMemberRequest(BaseModel):
     user_id: str
 
+class WaitList(BaseModel):
+    email: str
+
 @router.post("/invite-agent")
 def invite_agent(req: InviteAgentRequest, user: CurrentUser):  
     ORG_ID = user.org_id
@@ -80,5 +83,33 @@ def delete_member(user: CurrentUser, user_id: str = Query(...)):
             detail = data.get("errors", [{}])[0].get("long_message", "Failed to delete member")
             raise HTTPException(status_code=resp.status_code, detail={"error": detail, "details": data})
         return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": "Internal server error", "details": str(e)})
+
+@router.post("/waitlist")
+def waitlist_enroll(email: WaitList):
+    url = f"{base_url}/waitlist_entries"
+    payload = {
+        "email_address": email.email,
+        "notify": True
+    }
+
+    try:
+        resp = requests.post(url, headers=clerk_headers(), json=payload)
+        print("Clerk API response:", resp.status_code, resp.text)
+
+        data = resp.json()
+
+        # Clerk returns 201 on success
+        if resp.status_code not in (200, 201):
+            detail = data.get("errors", [{}])[0].get("long_message", "Failed to enroll in waitlist")
+            raise HTTPException(status_code=resp.status_code, detail={"error": detail, "details": data})
+
+        return {
+            "status": "success",
+            "message": "You have been added to the waitlist.",
+            "data": data
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": "Internal server error", "details": str(e)})
