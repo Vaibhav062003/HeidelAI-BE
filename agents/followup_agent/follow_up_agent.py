@@ -18,10 +18,14 @@ class FollowUpAgentResponse(BaseModel):
     delay: str = Field(
         ...,
         description=(
-            "How long to wait before sending the follow-up message. "
-            "Must be one of: '12 hours', '1 day', '2 days', '3 days', '5 days', '1 week', '2 weeks'. "
-            "If the customer clearly mentioned a timeframe (e.g., 'I'll check tomorrow'), choose the closest match. "
-            "If no timeframe is mentioned, default to '2 days'."
+            "How long to wait before sending the follow-up message, expressed in natural language "
+            "that can be parsed into a future time (e.g., '30 minutes', '2 hours', '6 hours', '1 day'). "
+            "The minimum delay is 30 minutes and the maximum delay is 20 hours. "
+            "If the customer explicitly mentions a timeframe (for example, 'I'll reply in an hour' or "
+            "'check back tomorrow'), choose a delay that closely matches their intent. "
+            "If no timeframe is mentioned, infer a reasonable delay based on conversation context, "
+            "urgency, and last message tone. Default to a moderate delay (e.g., '6 hours' or '12 hours') "
+            "rather than the extremes."
         )
     )
 
@@ -40,9 +44,8 @@ follow_up_agent = Agent(
         "This message will be sent to the user directly without any modification or review, so don't add any placeholders.",
         "Keep it friendly, professional, and encourage a reply without being pushy.",
         "Decide how long to wait before sending the follow-up message:",
-        " - If the customer mentioned a timeframe (e.g., 'I'll reply tomorrow'), pick the closest matching option.",
-        " - If no timeframe is mentioned, use the default: '2 days'.",
-        "Only choose from these fixed options: '12 hours', '1 day', '2 days', '3 days', '5 days', '1 week', '2 weeks'.",
+        " - If the customer mentioned a timeframe (e.g., 'I'll reply in a few hours'), pick the closest matching option.",
+        " - If no timeframe is mentioned, use the default: '12 hours'.",
         "Do not invent custom durations.",
         "Always return both the follow-up message and the chosen delay."
     ],

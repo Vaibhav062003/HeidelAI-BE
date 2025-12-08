@@ -113,7 +113,7 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
             if last_analysis_time.tzinfo is None:
                 last_analysis_time = last_analysis_time.replace(tzinfo=timezone.utc)
 
-        if force or not last_analysis_time or ((datetime.now(timezone.utc) - last_analysis_time).total_seconds() >= 10):
+        if force or not last_analysis_time or ((datetime.now(timezone.utc) - last_analysis_time).total_seconds() >= 20):
             result = await analyze_and_update_conversation(org_id, conversation_id) 
         else:
             result = conversation

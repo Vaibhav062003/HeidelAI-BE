@@ -73,6 +73,7 @@ async def create_or_update_whatsapp_conversation(org_id: str,
             "last_message": last_message,
             "last_message_timestamp": now,
             "last_sender": last_sender,
+            "status": "open",
             "message_counter": existing_conversation.get("message_counter", 0) + 1,
             "unread_count": existing_conversation.get("unread_count", 0) + (0 if is_being_viewed else 1),
         }

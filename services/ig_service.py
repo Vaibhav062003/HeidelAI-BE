@@ -64,10 +64,10 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
                 # Fallback to default token if connection not found
                 print(f"No Instagram ID specified, cannot send message")
                 raise HTTPException(status_code=400, detail="Instagram ID not specified")
-                return 1
-                access_token = IG_ACCESS_TOKEN
-                page_id = IG_ID
-                print(f"Instagram connection not found for {instagram_id}, using default token")
+                # return 1
+                # access_token = IG_ACCESS_TOKEN
+                # page_id = IG_ID
+                # print(f"Instagram connection not found for {instagram_id}, using default token")
         else:
             # Use default token if no Instagram ID specified
             print(f"No Instagram ID specified, cannot send message")
