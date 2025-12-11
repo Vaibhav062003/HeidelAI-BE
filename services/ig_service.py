@@ -40,8 +40,7 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
     Args:
         id: The recipient's Instagram user ID
         message_text: The message content to send
-        instagram_id: Optional Instagram business account ID to use for sending
-                     (if not provided, will use default IG_ID and IG_ACCESS_TOKEN)
+        instagram_id: Instagram business account ID to use for sending
     """
     try:
         # If an Instagram business account ID is provided, look up its access token
@@ -357,6 +356,7 @@ async def create_or_update_instagram_conversation(org_id: str,
 
         if last_sender == "customer":
             # Reset inactivity reminders on customer reply
+            ig_conversation["reply_window_ends_at"] = now + timedelta(hours=72)
             ig_conversation["reminder_stage"] = 0
             ig_conversation["next_action_at"] = None
 
@@ -406,6 +406,8 @@ async def create_or_update_instagram_conversation(org_id: str,
         broadcast_conversation["next_action_at"] = broadcast_conversation["next_action_at"].isoformat()
     if "started_at" in broadcast_conversation:
         broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()
+    if broadcast_conversation["reply_window_ends_at"]:
+        broadcast_conversation["reply_window_ends_at"] = broadcast_conversation["reply_window_ends_at"].isoformat()
     if "_id" in broadcast_conversation:
         broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
 
@@ -712,7 +714,7 @@ async def process_comments_events(value, ig_account_id):
 
 async def revoke_instagram_access(org_id: str, user_id: str):
     """
-    Revoke the Instagram access token for an organization
+    Revoke the Instagram access token through Meta App for an organization
     """
 
     try:
@@ -744,7 +746,7 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
     If a previous active archive exists for the same instagram_id, reuse and extend it.
     """
     try:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         with mongo_client.start_session() as session:
             with session.start_transaction():

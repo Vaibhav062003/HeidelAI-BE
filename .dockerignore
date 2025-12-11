@@ -13,3 +13,4 @@ build/
 .ipynb_checkpoints/
 test_env
 venv/
+test.py

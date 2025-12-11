@@ -5,6 +5,7 @@ from typing import Optional
 from auth.dependencies import CurrentUser
 from core.services import services
 from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest
+from services.conversation_utils import reopen_conversation
 from services.common_service import (
     fetch_conversations, 
     fetch_conversation,
@@ -110,6 +111,14 @@ async def send_message_endpoint(user: CurrentUser, body: dict):
     res = await send_message(org_id, body["platform"], body["conversation_id"], body["content"])
 
     return {"message": "Message sent", "details": res}
+
+@router.post("/api/conversations/{conversation_id}/reopen")
+async def reopen_conversation_endpoint(user: CurrentUser, conversation_id: str):
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    return await reopen_conversation(org_id, conversation_id)
 
 @router.post("/api/conversations/{conversation_id}/close")
 async def close_conversation_endpoint(user: CurrentUser, conversation_id: str):

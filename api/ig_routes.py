@@ -5,7 +5,7 @@ from pymongo import ReturnDocument
 from config.settings import *
 from services.cloudinary_service import check_cloudinary_storage_limit
 from services.ig_service import *
-from schemas.models import InstagramDisconnectRequest, MessageRole
+from schemas.models import PlatformDisconnectRequest, MessageRole
 from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required, require_auth
 from services.platforms.instagram_service import InstagramService
@@ -261,7 +261,7 @@ async def instagram_auth(request: dict, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Instagram authentication error: {str(e)}")
 
 @router.post("/disconnect")
-async def instagram_disconnect(request: InstagramDisconnectRequest, user: CurrentUser):
+async def instagram_disconnect(request: PlatformDisconnectRequest, user: CurrentUser):
     """Revoke Instagram access token and remove connection"""
     try:
         org_id = user.org_id

@@ -18,8 +18,10 @@ from fastapi import (
 
 # Internal modules
 from core.services import services
-from schemas.models import WhatsappAuthRequest, MessageRole
+from services.utils import serialize_mongo
+from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest
 from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message
+from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
@@ -40,6 +42,8 @@ cloudinary.config(
     api_key=CLOUDINARY_API_KEY,
     api_secret=CLOUDINARY_API_SECRET
 )
+
+whatsapp_service = WhatsAppService()
 
 db = get_mongo_db()
 
@@ -217,42 +221,26 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         print(f"WhatsApp authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"WhatsApp authentication error: {str(e)}")
     
-@router.post("/disconnect")
-async def whatsapp_disconnect(request: dict, _: None = Depends(require_auth)):
-    try:
-        user_id = request.get("user_id")
-        org_id = request.org_id 
-        
-        if not user_id:
-            raise HTTPException(status_code=400, detail="User ID is required")
-            
-        # Find the connection
-        connection = db.whatsapp_connections.find_one({"user_id": user_id, "org_id": org_id})
-        
-        if not connection:
-            return {"status": "success", "message": "WhatsApp connection not found"}
-            
-        # Revoke access token if available
-        access_token = connection.get("access_token")
-        if access_token:
-            try:
-                # Call Facebook's token revocation endpoint
-                revoke_url = "https://graph.facebook.com/v17.0/me/permissions"
-                params = {"access_token": access_token}
-                requests.delete(revoke_url, params=params)
-            except Exception as e:
-                print(f"Error revoking token: {e}")
-        
-        # Remove from database
-        db.whatsapp_connections.delete_one({"user_id": user_id, "org_id": org_id})
-        
-        return {"status": "success", "message": "WhatsApp connection removed successfully"}
-        
-    except HTTPException as http_exc:
-        raise http_exc
-    except Exception as e:
-        print(f"Error disconnecting WhatsApp: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
+# @router.post("/disconnect")
+# async def whatsapp_disconnect(request: PlatformDisconnectRequest, user: CurrentUser):
+#     """Disconnect a WhatsApp Account from the system"""
+#     try:
+#         org_id = user.org_id
+#         connection_id = request.user_id
+
+#         removal_result = await whatsapp_service.disconnect(org_id, connection_id)
+
+#         return {
+#             "message": (
+#                 f"WhatsApp disconnected, archived data, "
+#                 f"removed {removal_result['deleted_connections']} connections, "
+#                 f"and cleared org WhatsApp reference."
+#             )
+#         }
+       
+#     except Exception as e:
+#         print(f"Error disconnecting WhatsApp: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
 
 @router.get("/{whatsapp_id}/details")
 async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)):
@@ -975,11 +963,14 @@ async def get_whatsapp_profile(user: CurrentUser):
 
         # Get the page access token for this WhatsApp account
         connection = db.whatsapp_connections.find_one(
-            {"wa_id": wa_id, "org_id": org_id}
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0}
         )
 
         if not connection or not connection.get("access_token"):
             raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
+        
+        connection = serialize_mongo(connection)
 
         return connection
     

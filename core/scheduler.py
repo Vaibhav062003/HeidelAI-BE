@@ -4,7 +4,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # === Internal Modules ===
 from database import get_mongo_db
-from services.platforms import instagram_service
+from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
 
@@ -14,6 +14,7 @@ scheduled_collection = db["scheduled_messages"]
 # mapping of platforms -> service instance
 messaging_services = {
     "instagram": instagram_service.InstagramService(),
+    "whatsapp": whatsapp_service.WhatsAppService()
 }
 
 async def process_scheduled_messages():
@@ -37,6 +38,8 @@ async def process_scheduled_messages():
         sender_id = msg["sender_id"]
         receiver_id = msg["receiver_id"]
         message = msg["followup_text"]
+        conversation_id = msg["conversation_id"]
+        org_id = msg["org_id"]
 
         service = messaging_services.get(platform)
         if not service:
@@ -56,7 +59,15 @@ async def process_scheduled_messages():
             continue
 
         try:
-            await service.send_message(sender_id, receiver_id, message)
+            await service.send_message(
+                sender_id=sender_id, 
+                recipient_id=receiver_id, 
+                message=message,
+                # These kwargs are vital for WhatsApp, ignored by Instagram
+                org_id=org_id,
+                conversation_id=conversation_id
+            )
+
             updates.append(
                 UpdateOne(
                     {"_id": msg["_id"]},

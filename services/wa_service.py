@@ -5,11 +5,11 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from fastapi import HTTPException
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, UpdateOne
 
 # Internal modules
 from core.managers import manager
-from database import get_mongo_db
+from database import get_mongo_db, get_mongo_client
 from core.services import services
 from config.settings import IG_VERSION
 from schemas.models import MessageRole
@@ -19,6 +19,7 @@ from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 
 db = get_mongo_db()
+mongo_client = get_mongo_client()
 
 async def create_or_update_whatsapp_conversation(org_id: str, 
                                                  recipient_id, 
@@ -80,6 +81,7 @@ async def create_or_update_whatsapp_conversation(org_id: str,
         
         if last_sender == "customer":
             # Reset inactivity reminders on customer reply
+            wa_conversation["reply_window_ends_at"] = now + timedelta(hours=24)
             wa_conversation["reminder_stage"] = 0
             wa_conversation["next_action_at"] = None
 
@@ -126,6 +128,8 @@ async def create_or_update_whatsapp_conversation(org_id: str,
         broadcast_conversation["next_action_at"] = broadcast_conversation["next_action_at"].isoformat()
     if "started_at" in broadcast_conversation:
         broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()
+    if broadcast_conversation["reply_window_ends_at"]:
+        broadcast_conversation["reply_window_ends_at"] = broadcast_conversation["reply_window_ends_at"].isoformat()
     if "_id" in broadcast_conversation:
         broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
     
@@ -421,3 +425,174 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
             status_code=500, 
             detail=f"Failed to send message: {str(e)}"
         )
+    
+async def archive_whatsapp_data(org_id: str, wa_id: str, expire_days=30):
+    """
+    Archives Whatsapp converstions, messages and private notes for a specific connection of an org.
+    If a previous active archive exists for the same wa_id, reuse and extend it.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+
+        with mongo_client.start_session() as session:
+            with session.start_transaction():
+
+                archived_id = None
+
+                existing_archive = db["archived_tracker"].find_one({
+                        "org_id": org_id,
+                        "platform": "whatsapp",
+                        "whatsapp_id": wa_id,
+                        "status": "active",
+                    },
+                    session=session
+                )
+
+                if existing_archive:
+                    archived_id = existing_archive["archive_id"]
+                    print(f"Found existing archive {archived_id} for whatsapp_id {wa_id}, extending expiration")
+
+                    new_expiry = now + timedelta(days=expire_days)
+
+                    db.archived_tracker.update_one(
+                        {"archive_id": archived_id},
+                        {"$set": {"expires_at": new_expiry}},
+                        session=session
+                    )
+                else:
+                    archive_id = uuid.uuid4().hex
+                    print(f"Creating new archive {archive_id} for whatsapp_id {wa_id}")
+
+                    db.archived_tracker.insert_one({
+                            "archive_id": archive_id,
+                            "org_id": org_id,
+                            "platform": "whatsapp",
+                            "whatsapp_id": wa_id,
+                            "created_at": now,
+                            "expires_at": now + timedelta(days=expire_days),
+                            "status": "active",
+                        }, 
+                        session=session
+                    )
+
+                messages_collection_name = f"messages_{org_id}"
+                conversations_collection_name = f"conversations_{org_id}"
+                private_notes_collection_name = f"private_notes_{org_id}"
+                
+                archived_messages = f"archived_messages_{org_id}_{archive_id}"
+                archived_conversations = f"archived_conversations_{org_id}_{archive_id}"
+                archived_private_notes = f"archived_private_notes_{org_id}_{archive_id}"
+
+                # Archiving messages collection
+                messages_to_archive = list(
+                    db[messages_collection_name].find(
+                            {"platform": "whatsapp"}, 
+                            {"_id": 0},
+                            session=session
+                        )
+                    )
+                
+                if messages_to_archive:
+                    db[archived_messages].insert_many(messages_to_archive, session=session)
+                    db[messages_collection_name].delete_many({"platform": "whatsapp"}, session=session)
+
+                # Archiving conversations collection
+                conversations_to_archive = list(
+                    db[conversations_collection_name].find(
+                            {"platform": "whatsapp", "whatsapp_id": wa_id}, 
+                            {"_id": 0},
+                            session=session
+                        )
+                    )
+                
+                if conversations_to_archive:
+                    bulk_ops = []
+                    for convo in conversations_to_archive:
+                        bulk_ops.append(
+                            UpdateOne(
+                                {"conversation_id": convo["conversation_id"]},  
+                                {"$set": convo},
+                                upsert=True
+                            )
+                        )
+
+                    if bulk_ops:
+                        db[archived_conversations].bulk_write(bulk_ops, session=session)
+                        
+                    db[conversations_collection_name].delete_many({"platform": "whatsapp", "whatsapp_id": wa_id}, session=session)
+                
+                # Archiving private notes collection
+                private_notes_to_archive = list(
+                    db[private_notes_collection_name].find(
+                        {"platform": "whatsapp", "user_id": wa_id},
+                        {"_id": 0},
+                        session=session
+                    )
+                )
+
+                if private_notes_to_archive:
+                    db[archived_private_notes].insert_many(private_notes_to_archive, session=session)
+                    db[private_notes_collection_name].delete_many({"platform": "whatsapp", "user_id": wa_id}, session=session)
+
+                print(f"Archived WhatsApp data for org {org_id} with archive_id {archive_id}")
+
+    except Exception as e:
+         print(f"Error archiving WhatsApp data for org {org_id} with archive_id {archive_id}: {str(e)}")
+
+async def revoke_whatsapp_access(org_id: str, wa_id: str):
+    """
+    Revoke whatsapp access token through Meta App for an organization
+    """
+    try:
+        connection = db.whatsapp_connections.find_one({"wa_id": wa_id, "is_active": True, "org_id": org_id})
+
+        if not connection:
+            print(f"No active WhatsApp connection found for org and wa_id")
+            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+        
+        access_token = connection.get("access_token")
+        if access_token:
+            try:
+                # Call Facebook's token revocation endpoint
+                revoke_url = "https://graph.facebook.com/v17.0/me/permissions"
+                params = {"access_token": access_token}
+                requests.delete(revoke_url, params=params)
+            except Exception as e:
+                print(f"Error revoking token: {e}")
+
+        return {"message": "WhatsApp connection removed successfully"}
+        
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Error disconnecting WhatsApp: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
+    
+async def remove_whatsapp_connection(org_id: str, wa_id: str):
+    """
+    Remove WhatsApp connection record from the organizations collection and whatsapp_connections collection
+    """
+    try:
+        delete_result = db.whatsapp_connections.delete_many(
+            {"wa_id": wa_id, "org_id": org_id}
+            )
+        print(f"Deleted {delete_result.deleted_count} whatsapp connections for org {org_id}")
+
+        org_update_result = db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"wa_id": None}}
+        )
+
+        if org_update_result.modified_count:
+            print(f"Cleared wa_id for organization {org_id}")
+        else:
+            print(f"No organization updated for org_id {org_id}")
+
+        return {
+            "deleted_connections": delete_result.deleted_count,
+            "organization_updated": org_update_result.modified_count > 0
+        }
+    
+    except Exception as e:
+        print(f"Error removing WhatsApp connection: {str(e)}")
+        raise

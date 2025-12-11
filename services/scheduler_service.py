@@ -32,7 +32,11 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
             return {"message": "Follow-up can only be scheduled for open conversations."}
 
         receiver_id = conversation.get("customer_id")
-        sender_id = conversation.get("instagram_id")
+
+        if platform == "whatsapp":
+            sender_id = conversation.get("whatsapp_id")
+        else:
+            sender_id = conversation.get("instagram_id")
 
         if not receiver_id or not sender_id:
             raise HTTPException(
@@ -43,7 +47,7 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
         # Run AI agent for follow-up
         try:
             followup_result = await get_followup_message(org_id, conversation_id)
-            if callable(followup_result):  # if it's async, you can await outside
+            if callable(followup_result):  
                 raise RuntimeError("get_followup_message should be awaited outside.")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Follow-up generation failed: {str(e)}")
@@ -90,7 +94,6 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
         return {"message": "Follow-up message scheduled successfully."}
 
     except HTTPException:
-        # Re-raise so API layer can handle correctly
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")

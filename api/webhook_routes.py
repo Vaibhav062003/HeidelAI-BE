@@ -656,7 +656,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     user_details = await get_ig_username(sender_id, page_access_token)
                     username = user_details.get('username')
                     name = user_details.get('name')
-                    user = name + " - @" + username
+                    user = ""
+                    if name is not None:
+                        user = name
+                    if username is not None:
+                        user = user + " - @" + username
 
                     print(f"Message Received from {user}, Message: {message_text}")
 

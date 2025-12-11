@@ -38,7 +38,7 @@ class InstagramAuthRequest(BaseModel):
     code: str
     redirect_uri: Optional[str] = "https://www.heidelai.com/auth/instagram/callback"
 
-class InstagramDisconnectRequest(BaseModel):
+class PlatformDisconnectRequest(BaseModel):
     user_id: str
 
 

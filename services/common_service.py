@@ -9,6 +9,7 @@ from pymongo import ReturnDocument
 from core.services import services
 from services.wa_service import send_whatsapp_message
 from services.ig_service import send_ig_message
+from services.utils import serialize_mongo
 
 from database import get_mongo_db
 
@@ -294,7 +295,7 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
         if not conversation:
             return {"message": "Conversation not found. Nothing to close."}
 
-        conversation_collection.update_one(
+        result = conversation_collection.find_one_and_update(
             {"conversation_id": conversation_id},
             {
                 "$set": {
@@ -303,19 +304,22 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
                     "assigned_agent": None,
                     "closure_reason": reason
                 }
-            }
+            },
+            return_document=ReturnDocument.AFTER
         )
 
         if "assignment_history" in conversation and conversation["assignment_history"]:
             last_index = len(conversation["assignment_history"]) - 1
             update_path = f"assignment_history.{last_index}.assigned_until"
 
-            conversation_collection.update_one(
+            result = conversation_collection.find_one_and_update(
                 {"conversation_id": conversation_id},
-                {"$set": {update_path: now}}
+                {"$set": {update_path: now}},
+                return_document=ReturnDocument.AFTER
             )
 
-        return {"message": "Conversation closed successfully."}
+        convo = serialize_mongo(result)
+        return {"conversation": convo}
 
     except PyMongoError as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
