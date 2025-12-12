@@ -957,6 +957,7 @@ async def get_whatsapp_profile(user: CurrentUser):
         org_document = db.organizations.find_one({"org_id": org_id})
 
         wa_id = org_document.get("wa_id")
+        print(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
     
         if not wa_id:
             raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
@@ -966,16 +967,22 @@ async def get_whatsapp_profile(user: CurrentUser):
             {"wa_id": wa_id, "org_id": org_id},
             {"_id": 0}
         )
+        print(f"Fetched WhatsApp connection: {connection} for wa_id: {wa_id}")
 
         if not connection or not connection.get("access_token"):
             raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
         
         connection = serialize_mongo(connection)
 
-        return connection
+        return {
+            "user_id": connection.get("user_id"),
+            "business_info": connection.get("business_info", {}),
+            "name" : connection.get("name"),
+            "phone" : connection.get("phone"),
+        }
     
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error fetching Instagram profile: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram profile: {str(e)}")
+        print(f"Error fetching WhatsApp profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch WhatsApp profile: {str(e)}")
