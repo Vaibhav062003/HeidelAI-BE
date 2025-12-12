@@ -474,7 +474,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         
                         user_details = await get_ig_username(sender_id, page_access_token)
                         username = user_details.get('username')
-                        name = user_details.get('name')
+                        name = user_details.get('name', username)
                         user = name + " - @" + username
 
                         print(f"Reaction Event: {user} reacted to message ID {mid} with emoji: {emoji}")
@@ -655,7 +655,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     # Get user details
                     user_details = await get_ig_username(sender_id, page_access_token)
                     username = user_details.get('username')
-                    name = user_details.get('name')
+                    name = user_details.get('name', username)
                     user = ""
                     if name is not None:
                         user = name
