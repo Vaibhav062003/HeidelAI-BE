@@ -1,10 +1,11 @@
 import uuid
 from bson import ObjectId
 from typing import Optional
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 from datetime import datetime, timezone
 from pymongo.errors import PyMongoError
 from pymongo.collection import Collection
+from schemas.models import CannedResponse
 from pymongo import ReturnDocument
 from core.services import services
 from services.wa_service import send_whatsapp_message
@@ -520,3 +521,63 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         return res
     else:
         raise HTTPException(status_code=400, detail="Unsupported platform")
+
+async def get_canned_responses_for_org(org_id):
+    """
+    Retrieves canned responess of an organization 
+    """
+
+    collection = db["canned_responses"]
+
+    canned_responses = list(collection.find(
+        {"org_id": org_id}))
+
+    canned_responses = [serialize_mongo(cr) for cr in canned_responses]
+
+    return canned_responses
+
+async def create_canned_response_for_org(org_id: str, data: CannedResponse):
+    """
+    Creates a canned response for an organization.
+    Args:
+        org_id (str): The organization ID.
+        data (CannedResponse): 
+            shortcut (str): The /shortcut keyword
+            response: The text to replace the shortcut
+    """
+    shortcut = data.shortcut
+    response = data.response
+
+    now = datetime.now(timezone.utc)
+
+    if not shortcut.startswith("/"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"The shortcut should start with / - {shortcut}",
+        )
+
+    try:
+        canned_responses_col = db.canned_responses
+
+        document = {
+            "org_id": org_id,
+            "shortcut": shortcut,
+            "response": response,
+            "updated_at": now,
+        }
+
+        canned_responses_col.insert_one(document)
+
+        canned_responses = list(
+            canned_responses_col.find({"org_id": org_id})
+        )
+
+        canned_responses = [serialize_mongo(cr) for cr in canned_responses]
+
+        return canned_responses
+
+    except PyMongoError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}",
+        )

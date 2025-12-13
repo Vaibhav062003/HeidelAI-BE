@@ -107,3 +107,7 @@ class Product(BaseModel):
         # Remove None values if you want a clean DB
         cleaned = {k: v for k, v in data.items() if v is not None}
         return cleaned
+    
+class CannedResponse(BaseModel):
+    shortcut: str
+    response: str
