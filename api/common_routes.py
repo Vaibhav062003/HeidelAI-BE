@@ -14,8 +14,6 @@ from services.common_service import (
     close_conversation, 
     unarchive_data, 
     add_private_note, 
-    get_canned_responses_for_org,
-    create_canned_response_for_org,
     delete_private_note)
 from services.contacts_service import (
     get_contacts_for_org, 
@@ -330,30 +328,3 @@ async def get_agents_on_conversation():
         "convo_viewers": json_convo_viewers, 
         "client_convo_map": json_client_convo_map 
     }
-
-@router.get("/api/canned_responses")
-async def get_canned_responses(user: CurrentUser):
-    """
-    Retrieve canned responses for the organization.
-    """
-    org_id = user.org_id
-    if not org_id:
-        raise HTTPException(status_code=400, detail="Invalid organization ID")
-
-    canned_responses = await get_canned_responses_for_org(org_id)
-
-    return {"canned_responses": canned_responses}
-
-@router.post("/api/canned_responses")
-async def create_canned_response(user: CurrentUser, body: CannedResponse):
-    """
-    Create a single canned respones for the organization.
-    """
-
-    org_id = user.org_id
-    if not org_id:
-        raise HTTPException(status_code=400, detail="Invalid organization ID")
-    
-    canned_responses = await create_canned_response_for_org(org_id, body)
-
-    return {"canned_responses": canned_responses}

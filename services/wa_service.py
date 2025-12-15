@@ -86,7 +86,6 @@ async def create_or_update_whatsapp_conversation(
         
         if last_sender == "customer":
             # Reset inactivity reminders on customer reply
-            wa_conversation["reply_window_ends_at"] = now + timedelta(hours=24)
             wa_conversation["reminder_stage"] = 0
             wa_conversation["next_action_at"] = None
 
@@ -115,6 +114,9 @@ async def create_or_update_whatsapp_conversation(
             "next_action_at": now + timedelta(hours=6),
             "closed_at": None
         }
+
+    if last_sender == "customer":
+        wa_conversation["reply_window_ends_at"] = now + timedelta(hours=24)
     
     updated_conversation = conversations_collection.find_one_and_update(
         {"conversation_id": conversation_id},

@@ -356,7 +356,6 @@ async def create_or_update_instagram_conversation(org_id: str,
 
         if last_sender == "customer":
             # Reset inactivity reminders on customer reply
-            ig_conversation["reply_window_ends_at"] = now + timedelta(hours=72)
             ig_conversation["reminder_stage"] = 0
             ig_conversation["next_action_at"] = None
 
@@ -385,6 +384,10 @@ async def create_or_update_instagram_conversation(org_id: str,
             "next_action_at": now + timedelta(hours=6),
             "closed_at": None
         }
+
+    
+    if last_sender == "customer":
+        ig_conversation["reply_window_ends_at"] = now + timedelta(hours=24)
  
     # Use $set to update only specified fields
     conversations_collection.update_one(
@@ -406,7 +409,7 @@ async def create_or_update_instagram_conversation(org_id: str,
         broadcast_conversation["next_action_at"] = broadcast_conversation["next_action_at"].isoformat()
     if "started_at" in broadcast_conversation:
         broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()
-    if broadcast_conversation["reply_window_ends_at"]:
+    if broadcast_conversation.get("reply_window_ends_at"):
         broadcast_conversation["reply_window_ends_at"] = broadcast_conversation["reply_window_ends_at"].isoformat()
     if "_id" in broadcast_conversation:
         broadcast_conversation["_id"] = str(broadcast_conversation["_id"])

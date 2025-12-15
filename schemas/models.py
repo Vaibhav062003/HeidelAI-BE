@@ -111,3 +111,13 @@ class Product(BaseModel):
 class CannedResponse(BaseModel):
     shortcut: str
     response: str
+
+class UpdateCannedResponseRequest(BaseModel):
+    response: str
+
+class CannedResponseOut(BaseModel):
+    id: str
+    org_id: str
+    shortcut: str
+    response: str
+    updated_at: datetime
