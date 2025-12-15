@@ -1,6 +1,9 @@
 # Built-in modules
 import asyncio
+import httpx
+from typing import Optional
 import requests
+import io
 import cloudinary
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -11,6 +14,8 @@ from config.settings import (
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
 )
+from services.wa_service import create_or_update_whatsapp_conversation, store_whatsapp_message
+from schemas.models import MessageRole
 
 # Cloudinary configuration
 cloudinary.config(
@@ -77,7 +82,7 @@ async def cleanup_old_cloudinary_media(days_threshold=30):
         cutoff_str = cutoff_date.strftime('%d-%m-%Y')
         
         # Delete old resources in the whatsapp_media folder
-        response = cloudinary.api.delete_resources_by_prefix(
+        wa_image_response = cloudinary.api.delete_resources_by_prefix(
             prefix="whatsapp_media",
             resource_type="image",
             type="upload",
@@ -85,8 +90,24 @@ async def cleanup_old_cloudinary_media(days_threshold=30):
         )
         
         # Also clean up videos
-        video_response = cloudinary.api.delete_resources_by_prefix(
+        wa_video_response = cloudinary.api.delete_resources_by_prefix(
             prefix="whatsapp_media",
+            resource_type="video",
+            type="upload",
+            created_at={"lte": cutoff_str}
+        )
+
+        # Delete old resources in the instagram_media folder
+        ig_image_response = cloudinary.api.delete_resources_by_prefix(
+            prefix="instagram_media",
+            resource_type="image",
+            type="upload",
+            created_at={"lte": cutoff_str}
+        )
+        
+        # Also clean up videos
+        ig_video_response = cloudinary.api.delete_resources_by_prefix(
+            prefix="instagram_media",
             resource_type="video",
             type="upload",
             created_at={"lte": cutoff_str}
@@ -94,8 +115,8 @@ async def cleanup_old_cloudinary_media(days_threshold=30):
         
         return {
             "status": "success",
-            "deleted_images": len(response.get("deleted", {})),
-            "deleted_videos": len(video_response.get("deleted", {}))
+            "deleted_images": len(wa_image_response.get("deleted", {})) + len(ig_image_response.get("deleted", {})),
+            "deleted_videos": len(wa_video_response.get("deleted", {})) + len(ig_video_response.get("deleted", {}))
         }
         
     except Exception as e:
@@ -142,3 +163,97 @@ async def check_cloudinary_storage_limit():
     except Exception:
         return True  # Allow uploads if check fails
     
+
+async def upload_and_send_whatsapp_media_background(
+    media_url: str, 
+    media_id: str, 
+    org_id: str, 
+    mime_type: str, 
+    access_token: str, 
+    content: str,
+    message_type: str,
+    whatsapp_business_id: str,
+    customer_phone_no: str,
+    sender_name2: str,
+    message_id: str,
+    conversation_id: str
+) -> Optional[str]:
+    """
+    Downloads media from WhatsApp and uploads to Cloudinary.
+    This is designed to be run as a BackgroundTask.
+    """
+    print(f"Background Task Started: Processing media {media_id}")
+    
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    try:
+        # 1. Download from WhatsApp (Async)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(media_url, headers=headers)
+            
+            if response.status_code != 200:
+                print(f"❌ Error downloading from WhatsApp: {response.text}")
+                return
+
+        # 2. Prepare file in memory
+        file_obj = io.BytesIO(response.content)
+        file_obj.name = media_id # Helps Cloudinary identify the file
+
+        # 3. Upload to Cloudinary
+        result = cloudinary.uploader.upload(
+            file_obj,
+            folder=f"whatsapp_media/{org_id}/customer/", 
+            public_id=media_id,
+            resource_type=mime_type.split('/')[0],  # 'image' or 'video'
+        )
+
+        secure_url = result.get("secure_url")
+        print(f"✅ Upload Successful: {secure_url}")
+
+        # ---------------------------------------------------------
+        # Here I am storing & broadcasting this type of message after upload is completed.
+        # TODO: In future we want to notify frontend on new message
+        # have this process in background, after upload send a new message
+        # that image is ready with the Cloudinary URL.
+        # Till then frontend will show loading
+
+        # This is because -> 
+        # Frontend immmediately receives message that a new image has arrived
+        # but the image is not yet uploaded to Cloudinary, so it shows loading.
+        # ---------------------------------------------------------
+        payload = {
+            "url": secure_url,
+            "media_id": media_id,
+            "mime_type": mime_type
+        }
+
+        # Create or update conversation
+        await create_or_update_whatsapp_conversation(
+            org_id=org_id,
+            recipient_id=whatsapp_business_id,
+            customer_phone_no=customer_phone_no,
+            customer_name=sender_name2,
+            last_message=content,
+            last_sender="customer"
+        )
+        
+        # Store in WhatsApp-specific collections
+        await store_whatsapp_message(
+            org_id=org_id,
+            content=content,
+            conversation_id=conversation_id,
+            customer_phone_no=customer_phone_no,
+            type=message_type,
+            payload=payload,
+            sender_name=sender_name2,
+            recipient_id=whatsapp_business_id,
+            role=MessageRole.CUSTOMER,
+            message_id=message_id,  # Use the ID from the webhook for deduplication
+        )
+
+        
+
+    except Exception as e:
+        print(f"❌ Background Upload Failed: {e}")

@@ -8,6 +8,7 @@ from pymongo import ReturnDocument
 
 # Internal Modules
 from core.managers import manager
+from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.wa_service import *
 from services.ig_service import *
@@ -140,6 +141,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         continue
                     
                     org_id = connection.get("org_id") 
+                    access_token = connection.get("access_token")
 
                     # Get sender name from contacts if available
                     sender_name2 = "Unknown Sender"
@@ -147,7 +149,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     if contacts:
                         for contact in contacts:
                             sender_name2 = contact.get("profile", {}).get("name", "Unknown Sender")
-                            print(f"Sender Name: {sender_name2}")
 
                     # Process messages in the webhook
                     messages = value.get("messages", [])
@@ -169,32 +170,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract essential data
                             customer_phone_no = message.get("from")
                             message_type = message.get("type")
-                            
-                            # Create conversation ID
-                            conversation_id = f"whatsapp_{customer_phone_no}"
-                            
-                            # Extract message content based on message type
-                            if message_type == "text":
-                                content = message.get("text", {}).get("body", "")
-                            elif message_type == "image":
-                                content = "[Image]"
-                            elif message_type == "video":
-                                content = "[Video]"
-                            elif message_type == "audio":
-                                content = "[Audio]"
-                            elif message_type == "document":
-                                content = "[Document]"
-                            elif message_type == "location":
-                                content = "[Location]"
-                            elif message_type == "button":
-                                content = f"[Button: {message.get('button', {}).get('payload', 'Unknown')}]"
-                            elif message_type == "order":
-                                content = "[Order]"
-                            elif message_type == "interactive":
-                                content = "[Interactive Message]"
-                            else:
-                                content = f"[Unsupported message type: {message_type}]"
-                                
+
                             # Get user-specific collections
                             messages_collection_name = f"messages_{org_id}"
                             conversations_collection_name = f"conversations_{org_id}"
@@ -202,7 +178,66 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Get or create collections
                             messages_collection = db[messages_collection_name]
                             conversations_collection = db[conversations_collection_name]
+                            
+                            # Create conversation ID
+                            conversation_id = f"whatsapp_{customer_phone_no}"
+                            
+                            # Extract message content based on message type
+                            if message_type == "text":
+                                content = message.get("text", {}).get("body", "")
+                            elif message_type in ["image", "video"]:
+                                media_data = message[message_type]
+                                media_url = media_data["url"]
+                                media_id = media_data["id"]
+                                mime_type = media_data["mime_type"]
 
+                                background_tasks.add_task(
+                                    upload_and_send_whatsapp_media_background,
+                                    media_url=media_url,
+                                    media_id=media_id,
+                                    org_id=org_id,
+                                    mime_type=mime_type,
+                                    access_token=access_token,
+                                    content="Shared an image" if message_type == "image" else "Shared a video",
+                                    message_type=message_type,
+                                    whatsapp_business_id=whatsapp_business_id,
+                                    customer_phone_no=customer_phone_no,
+                                    sender_name2=sender_name2,
+                                    message_id=message_id,
+                                    conversation_id=conversation_id
+                                )
+
+                                contact_data = {
+                                "whatsapp_id": whatsapp_business_id,
+                                "full_name": sender_name2,
+                                "phone_number": customer_phone_no,
+                                "country": None,
+                                "profile_url": None,
+                                "conversation_id": f"whatsapp_{customer_phone_no}",
+                                "email": None,
+                                "categories": []
+                                }
+
+                                store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
+
+                                return {"status": "ok"}
+                            elif message_type == "audio":
+                                content = "Shared an audio"
+                            elif message_type == "document":
+                                content = "Shared a document"
+                            elif message_type == "location":
+                                content = "Shared a location"
+                            elif message_type == "button":
+                                content = f"[Button: {message.get('button', {}).get('payload', 'Unknown')}]"
+                            elif message_type == "order":
+                                content = "Shared an order"
+                            elif message_type == "interactive":
+                                content = "[Interactive Message]"
+                            elif message_type == "unsupported":
+                                continue  # Skip unsupported messages
+                            else:
+                                content = f"[Unsupported message type: {message_type}]"
+                           
                             print(f"WhatsApp Message Received from {sender_name2}, Message: {content}")
                             
                             # Create or update conversation
@@ -253,18 +288,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     "conversation": conversation
                                 })
 
-                            contact_data = {
-                                "whatsapp_id": whatsapp_business_id,
-                                "full_name": sender_name2,
-                                "phone_number": customer_phone_no,
-                                "country": None,
-                                "profile_url": None,
-                                "conversation_id": f"whatsapp_{customer_phone_no}",
-                                "email": None,
-                                "categories": []
-                            }
+                            
 
-                            store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
+                            return {"status": "ok"}
     
     if payload["object"] == "instagram": 
         if "entry" in payload and len(payload["entry"]) > 0:

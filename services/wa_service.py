@@ -1,6 +1,9 @@
 # Built-in modules
+import httpx
 import json, requests
 import uuid
+import io
+import cloudinary.uploader
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
@@ -21,13 +24,15 @@ from services.websocket_service import broadcast_main_ws
 db = get_mongo_db()
 mongo_client = get_mongo_client()
 
-async def create_or_update_whatsapp_conversation(org_id: str, 
-                                                 recipient_id, 
-                                                 customer_phone_no, 
-                                                 customer_name, 
-                                                 last_message, 
-                                                 last_sender,
-                                                 is_auto_followup: bool = False) -> str:
+async def create_or_update_whatsapp_conversation(
+    org_id: str, 
+    recipient_id, 
+    customer_phone_no, 
+    customer_name, 
+    last_message, 
+    last_sender,
+    is_auto_followup: bool = False
+) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
     
@@ -596,3 +601,39 @@ async def remove_whatsapp_connection(org_id: str, wa_id: str):
     except Exception as e:
         print(f"Error removing WhatsApp connection: {str(e)}")
         raise
+
+async def upload_whatsapp_media_to_cloudinary(media_url: str, org_id: str, media_id: str, access_token: str) -> Optional[str]:
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    # 1. Download bytes from WhatsApp
+    async with httpx.AsyncClient() as client:
+        response = await client.get(media_url, headers=headers)
+        
+        if response.status_code != 200:
+            print(f"Failed to download from WhatsApp: {response.text}")
+            return None
+
+    # 2. Convert bytes to a file-like object
+    # Cloudinary expects a file object or path. We use BytesIO for in-memory files.
+    file_obj = io.BytesIO(response.content)
+    file_obj.name = media_id 
+
+    try:
+        # 3. Upload to Cloudinary
+        # Note: Cloudinary SDK is synchronous, so this blocks the thread slightly.
+        # For high-scale, you might want to run this in a background task.
+        cloudinary_result = cloudinary.uploader.upload(
+            file_obj,
+            folder=f"instagram_media/{org_id}", # Or whatsapp_media
+            public_id=media_id,                 # Optional: use WhatsApp ID as Cloudinary ID
+            resource_type="auto"
+        )
+        
+        # 4. Return the new public URL
+        return cloudinary_result.get("secure_url")
+
+    except Exception as e:
+        print(f"Cloudinary upload error: {e}")
+        return None
