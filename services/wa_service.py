@@ -128,7 +128,7 @@ async def create_or_update_whatsapp_conversation(org_id: str,
         broadcast_conversation["next_action_at"] = broadcast_conversation["next_action_at"].isoformat()
     if "started_at" in broadcast_conversation:
         broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()
-    if broadcast_conversation["reply_window_ends_at"]:
+    if broadcast_conversation.get("reply_window_ends_at"):
         broadcast_conversation["reply_window_ends_at"] = broadcast_conversation["reply_window_ends_at"].isoformat()
     if "_id" in broadcast_conversation:
         broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
