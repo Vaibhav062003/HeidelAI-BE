@@ -228,9 +228,9 @@ async def store_instagram_message(
 
     print("Instagram message stored:", message_id)
     
-    # Keep only latest 40 messages per conversation
+    # Keep only latest 500 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
-    if messages_count > 40:
+    if messages_count > 500:
         # Find and delete oldest message
         oldest_message = messages_collection.find_one(
             {"conversation_id": conversation_id},
