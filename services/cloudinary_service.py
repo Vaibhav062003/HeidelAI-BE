@@ -74,49 +74,55 @@ async def get_cloudinary_stats():
 
 async def cleanup_old_cloudinary_media(days_threshold=30):
     """
-    Delete Cloudinary resources older than the specified threshold
+    Delete Cloudinary resources (image, video, raw) older than the specified threshold.
+    Uses Search API to safely find files by date before deleting.
     """
     try:
-        # Calculate cutoff date
+        # 1. Calculate cutoff date in YYYY-MM-DD format (Required for Cloudinary Search)
         cutoff_date = datetime.now() - timedelta(days=days_threshold)
-        cutoff_str = cutoff_date.strftime('%d-%m-%Y')
+        cutoff_str = cutoff_date.strftime('%Y-%m-%d')
         
-        # Delete old resources in the whatsapp_media folder
-        wa_image_response = cloudinary.api.delete_resources_by_prefix(
-            prefix="whatsapp_media",
-            resource_type="image",
-            type="upload",
-            created_at={"lte": cutoff_str}
-        )
+        folders = ["whatsapp_media", "instagram_media"]
+        resource_types = ["image", "video", "raw"] # 'raw' covers PDFs, DOCs, etc.
         
-        # Also clean up videos
-        wa_video_response = cloudinary.api.delete_resources_by_prefix(
-            prefix="whatsapp_media",
-            resource_type="video",
-            type="upload",
-            created_at={"lte": cutoff_str}
-        )
+        total_deleted = 0
+        deleted_details = {}
 
-        # Delete old resources in the instagram_media folder
-        ig_image_response = cloudinary.api.delete_resources_by_prefix(
-            prefix="instagram_media",
-            resource_type="image",
-            type="upload",
-            created_at={"lte": cutoff_str}
-        )
-        
-        # Also clean up videos
-        ig_video_response = cloudinary.api.delete_resources_by_prefix(
-            prefix="instagram_media",
-            resource_type="video",
-            type="upload",
-            created_at={"lte": cutoff_str}
-        )
-        
+        for folder in folders:
+            for r_type in resource_types:
+                # 2. Build Search Expression
+                # Syntax: folder:name/* AND resource_type:type AND created_at<=date
+                expression = f"folder:{folder}/* AND resource_type:{r_type} AND created_at<={cutoff_str}"
+                
+                # 3. Search for matching files (Limit 500 per run to be safe)
+                # Note: If you have >500 old files, this runs daily so it will catch up eventually.
+                search_result = cloudinary.Search()\
+                    .expression(expression)\
+                    .max_results(500)\
+                    .execute()
+                
+                resources = search_result.get('resources', [])
+                public_ids = [res['public_id'] for res in resources]
+                
+                if public_ids:
+                    print(f"Deleting {len(public_ids)} {r_type}s from {folder}...")
+                    
+                    # 4. Delete by Public IDs
+                    delete_response = cloudinary.api.delete_resources(
+                        public_ids, 
+                        resource_type=r_type
+                    )
+                    
+                    count = len(delete_response.get("deleted", {}))
+                    total_deleted += count
+                    deleted_details[f"{folder}_{r_type}"] = count
+                else:
+                    deleted_details[f"{folder}_{r_type}"] = 0
+
         return {
             "status": "success",
-            "deleted_images": len(wa_image_response.get("deleted", {})) + len(ig_image_response.get("deleted", {})),
-            "deleted_videos": len(wa_video_response.get("deleted", {})) + len(ig_video_response.get("deleted", {}))
+            "total_deleted": total_deleted,
+            "details": deleted_details
         }
         
     except Exception as e:
@@ -176,7 +182,8 @@ async def upload_and_send_whatsapp_media_background(
     customer_phone_no: str,
     sender_name2: str,
     message_id: str,
-    conversation_id: str
+    conversation_id: str,
+    media_name: str
 ) -> Optional[str]:
     """
     Downloads media from WhatsApp and uploads to Cloudinary.
@@ -187,6 +194,9 @@ async def upload_and_send_whatsapp_media_background(
     headers = {
         "Authorization": f"Bearer {access_token}"
     }
+
+    if mime_type == "application/pdf":
+        mime_type = "pdf"
 
     try:
         # 1. Download from WhatsApp (Async)
@@ -201,16 +211,59 @@ async def upload_and_send_whatsapp_media_background(
         file_obj = io.BytesIO(response.content)
         file_obj.name = media_id # Helps Cloudinary identify the file
 
+        cld_resource_type = "raw" 
+    
+        if "image" in mime_type:
+            cld_resource_type = "image"
+        elif "video" in mime_type:
+            cld_resource_type = "video"
+        elif "pdf" in mime_type:
+            # Cloudinary allows PDFs as 'image' to enable page previews/thumbnails
+            cld_resource_type = "image" 
+            format_for_preview = "jpg"
+        else:
+            # For DOCX, XLSX, ZIP, etc.
+            cld_resource_type = "raw"
+
         # 3. Upload to Cloudinary
         result = cloudinary.uploader.upload(
             file_obj,
             folder=f"whatsapp_media/{org_id}/customer/", 
             public_id=media_id,
-            resource_type=mime_type.split('/')[0],  # 'image' or 'video'
+            resource_type=cld_resource_type
         )
 
         secure_url = result.get("secure_url")
+        file_format = result.get("format")
+        file_size = result.get("bytes")
+        file_pages = result.get("pages")
+
         print(f"✅ Upload Successful: {secure_url}")
+
+        # 4. Generate Thumbnail URL
+        # If we uploaded as image/video (including PDF), we can swap extension
+        thumbnail_url = None
+        
+        if cld_resource_type == "image" and mime_type == "pdf":
+            # Convert .../upload/v123/file.pdf -> .../upload/v123/file.jpg
+            # Cloudinary usually returns the PDF link, so we force JPG for thumbnail
+            if secure_url.endswith(".pdf"):
+                thumbnail_url = secure_url[:-4] + ".jpg"
+
+        # 5. Prepare Payload with Thumbnail
+        payload = {
+            "url": secure_url,
+            "thumbnail_url": thumbnail_url, 
+            "file_name": media_name,
+            "file_size": file_size,
+            "file_format" : file_format,
+            "file_pages": file_pages,
+            "media_id": media_id,
+            "mime_type": mime_type
+        }
+
+        print(f"✅ Uploaded: {secure_url}")
+        print(f"🖼️ Preview:  {thumbnail_url}")
 
         # ---------------------------------------------------------
         # Here I am storing & broadcasting this type of message after upload is completed.
@@ -223,11 +276,6 @@ async def upload_and_send_whatsapp_media_background(
         # Frontend immmediately receives message that a new image has arrived
         # but the image is not yet uploaded to Cloudinary, so it shows loading.
         # ---------------------------------------------------------
-        payload = {
-            "url": secure_url,
-            "media_id": media_id,
-            "mime_type": mime_type
-        }
 
         # Create or update conversation
         await create_or_update_whatsapp_conversation(

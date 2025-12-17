@@ -185,11 +185,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
-                            elif message_type in ["image", "video"]:
+                            elif message_type in ["image", "video", "document"]:
                                 media_data = message[message_type]
                                 media_url = media_data["url"]
                                 media_id = media_data["id"]
                                 mime_type = media_data["mime_type"]
+                                media_name = media_data.get("filename", f"{message_type}_{media_id}")
+
+                                if message_type == "image":
+                                    content = "Shared an image"
+                                elif message_type == "video":
+                                    content = "Shared a video"
+                                elif message_type == "document":
+                                    content = "Shared a document"
 
                                 background_tasks.add_task(
                                     upload_and_send_whatsapp_media_background,
@@ -198,13 +206,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     org_id=org_id,
                                     mime_type=mime_type,
                                     access_token=access_token,
-                                    content="Shared an image" if message_type == "image" else "Shared a video",
+                                    content=content,
                                     message_type=message_type,
                                     whatsapp_business_id=whatsapp_business_id,
                                     customer_phone_no=customer_phone_no,
                                     sender_name2=sender_name2,
                                     message_id=message_id,
-                                    conversation_id=conversation_id
+                                    conversation_id=conversation_id,
+                                    media_name=media_name
                                 )
 
                                 contact_data = {
@@ -223,8 +232,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 return {"status": "ok"}
                             elif message_type == "audio":
                                 content = "Shared an audio"
-                            elif message_type == "document":
-                                content = "Shared a document"
                             elif message_type == "location":
                                 content = "Shared a location"
                             elif message_type == "button":
