@@ -13,7 +13,7 @@ from auth.dependencies import CurrentUser
 
 router = APIRouter(prefix="/api/canned_responses", tags=["Canned Responses"])
 
-@router.get("/")
+@router.get("")
 async def get_canned_responses(user: CurrentUser):
     """
     Retrieve canned responses for the organization.
@@ -26,7 +26,7 @@ async def get_canned_responses(user: CurrentUser):
 
     return {"canned_responses": canned_responses}
 
-@router.post("/")
+@router.post("")
 async def create_canned_response(user: CurrentUser, body: CannedResponse):
     """
     Create a single canned respones for the organization.
