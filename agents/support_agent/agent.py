@@ -62,17 +62,14 @@ async def analyze_conversation(conversation: str) -> Optional[ConversationSummar
     Returns:
         ConversationSummary: The summary and priority level.
     """
-    try:
-        response: RunResponse = await chat_analysis_agent.arun(conversation)
-        # print(type(response))
-        if isinstance(response.content, ConversationSummary):
-            return response.content
 
-        print("Error: AI response is not in the expected format.")
-        return None
-    except Exception as e:
-        print(f"Chat Analysis Agent error: {e}")
-        return None
+    response: RunResponse = await chat_analysis_agent.arun(conversation)
+    # print(type(response))
+    if isinstance(response.content, ConversationSummary):
+        return response.content
+
+    print( "LLM Error: ",response)
+    raise RuntimeError("AI response is not in expected format")
 
 if __name__ == "__main__":
     pass

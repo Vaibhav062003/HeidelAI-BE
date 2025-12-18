@@ -43,18 +43,15 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
         except PyMongoError as e:
             raise RuntimeError(f"Database error fetching messages: {e}")
 
-        if not messages:
+        if not messages or len(messages) < 5:
             return result_data
 
         # Combine message content into a single string
         conversation_text = "\n".join([msg["content"] for msg in messages])
 
         # Call LLM to analyze
-        try:
-            analysis_result = await analyze_conversation(conversation_text)
-        except Exception as e:
-            print(f"LLM analysis error for conversation {conversation_id}: {e}")
-            return result_data  
+
+        analysis_result = await analyze_conversation(conversation_text)
 
         if analysis_result:
             timestamp = datetime.now(timezone.utc)
@@ -68,13 +65,10 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
                 "last_analyzed": timestamp,
             }
 
-            try:
-                conversations_collection.update_one(
-                    {"conversation_id": conversation_id},
-                    {"$set": update_fields},
-                )
-            except PyMongoError as e:
-                print(f"Failed to update conversation {conversation_id}: {e}")
+            conversations_collection.update_one(
+                {"conversation_id": conversation_id},
+                {"$set": update_fields},
+            )
 
             # Update result_data to return
             result_data.summary = analysis_result.summary
@@ -83,10 +77,11 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
             result_data.suggestions = analysis_result.suggestions
             result_data.last_analyzed = timestamp
 
-    except Exception as e:
-        print(f"Unexpected error processing conversation {conversation_id}: {e}")
+            return result_data
 
-    return result_data
+    except Exception as e:
+        print(f"LLM analysis failed for {conversation_id}: {e}")
+        return None
 
 if __name__ == "__main__":
     pass

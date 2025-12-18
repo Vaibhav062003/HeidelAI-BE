@@ -1,6 +1,6 @@
 from services.utils import serialize_mongo
 from bson import ObjectId
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError
 from datetime import datetime, timezone
 from pymongo import ReturnDocument
 from fastapi import HTTPException, status
@@ -37,7 +37,6 @@ async def create_canned_response_for_org(org_id: str, data: CannedResponse):
     """
     shortcut = data.shortcut
     response = data.response
-
     now = datetime.now(timezone.utc)
 
     if not shortcut.startswith("/"):
@@ -46,31 +45,28 @@ async def create_canned_response_for_org(org_id: str, data: CannedResponse):
             detail=f"The shortcut should start with / - {shortcut}",
         )
 
+    canned_responses_col = db.canned_responses
+
+    document = {
+        "org_id": org_id,
+        "shortcut": shortcut,
+        "response": response,
+        "updated_at": now,
+    }
+    
     try:
-        canned_responses_col = db.canned_responses
-
-        document = {
-            "org_id": org_id,
-            "shortcut": shortcut,
-            "response": response,
-            "updated_at": now,
-        }
-
         canned_responses_col.insert_one(document)
-
-        canned_responses = list(
-            canned_responses_col.find({"org_id": org_id})
-        )
-
-        canned_responses = [serialize_mongo(cr) for cr in canned_responses]
-
-        return canned_responses
-
-    except PyMongoError as e:
+    except DuplicateKeyError:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {str(e)}",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Canned response with shortcut {shortcut} already exists",
         )
+
+    canned_responses = list(
+        canned_responses_col.find({"org_id": org_id})
+    )
+
+    return [serialize_mongo(cr) for cr in canned_responses]
     
 async def delete_canned_response_for_org(org_id: str, shortcut_id: str):
     """

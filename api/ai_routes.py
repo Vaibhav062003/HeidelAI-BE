@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Depends
 # === Internal Modules ===
 from database import get_mongo_db
 from services.scheduler_service import schedule_followup_message
-from schemas.models import ChatbotPromptUpdate
+from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
 from services.ai_chatbot import update_prompt_in_cache, get_prompt
 from services.chat_analysis_service import analyze_and_update_conversation
@@ -18,6 +18,16 @@ router = APIRouter(prefix="/api/ai", tags=["AI Routes"])
 
 def _org_metadata_collection():
     return db["organizations_metadata"]
+
+def conversation_doc_to_analysis(doc: dict) -> ChatAnalysis:
+    return ChatAnalysis(
+        conversation_id=doc.get("conversation_id"),
+        summary=doc.get("summary", []),
+        priority=doc.get("priority"),
+        sentiment=doc.get("sentiment"),
+        suggestions=doc.get("suggestions", []),
+        last_analyzed=doc.get("last_analyzed"),
+    )
 
 @router.get("/chatbot-prompt")
 async def get_chatbot_prompt(user: CurrentUser):
@@ -104,6 +114,8 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
 
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found.")
+        
+        cached_analysis = conversation_doc_to_analysis(conversation)
 
         # check last analysis time
         last_analysis_time = conversation.get("last_analyzed", None)
@@ -113,12 +125,13 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
             if last_analysis_time.tzinfo is None:
                 last_analysis_time = last_analysis_time.replace(tzinfo=timezone.utc)
 
-        if force or not last_analysis_time or ((datetime.now(timezone.utc) - last_analysis_time).total_seconds() >= 20):
-            result = await analyze_and_update_conversation(org_id, conversation_id) 
-        else:
-            result = conversation
+        if force or not last_analysis_time or ((datetime.now(timezone.utc) - last_analysis_time).total_seconds()/60 >= 10):
+            new_result = await analyze_and_update_conversation(org_id, conversation_id) 
 
-        return result
+            if new_result is None:
+                return cached_analysis
+                
+        return cached_analysis
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
