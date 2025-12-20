@@ -143,12 +143,11 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
                 detail="Failed to subscribe WhatsApp account to webhook"
             )
         
-        # Register phone on WhatsApp Cloud API
-
         # Check if phone number is verified
         if phone_verified != "VERIFIED":
-             print(f"Phone number {phone} is currently {phone_verified}. Attempting registration to fix this...")
+            print(f"Phone number {phone} is currently {phone_verified}. Attempting registration to fix this...")
         
+        # Register phone on WhatsApp Cloud API
         phone_register_params = {
             "messaging_product": "whatsapp",
             "pin": "000000",
