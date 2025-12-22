@@ -1,3 +1,6 @@
+# === Built-in Modules ===
+import os
+
 # === Third-party Modules ===
 import uvicorn
 from fastapi import FastAPI
@@ -14,29 +17,30 @@ if not INSTAGRAM_APP_ID or not INSTAGRAM_APP_SECRET:
 else:
     print(f"Using Instagram App ID: {INSTAGRAM_APP_ID[:5]}... (truncated)")
 
-app = FastAPI(lifespan=lifespan, redoc_url=None)
+ENV = os.getenv("ENV", "prod")
+print(f"Running in {ENV} environment.")
+
+app = FastAPI(
+    lifespan=lifespan, 
+    redoc_url="/redoc" if ENV != "prod" else None,
+    # docs_url="/docs" if ENV != "prod" else None,
+    title="HeidelAI Backend API",
+    )
 
 app.include_router(router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://egeniestores.com", 
         "https://www.heidelai.com", 
         "https://heidelai.com",
         "https://www.deveopment.heidelai.com", 
         "https://development.heidelai.com",
         "https://www.testing.heidelai.com", 
         "https://testing.heidelai.com",
-        "https://www.testing2.heidelai.com", 
-        "https://testing2.heidelai.com",
         "http://localhost", 
         "http://localhost:3000", 
-        "http://wordpress.local", 
-        "http://wordpress.local:10004", 
-        "http://localhost:3000",
         # Add www subdomain
-        "https://www.heidelai.com"  
     ],
     allow_credentials=True,
     allow_methods=["*"],
