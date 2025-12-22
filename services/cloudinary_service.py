@@ -14,7 +14,6 @@ from config.settings import (
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
 )
-from services.wa_service import create_or_update_whatsapp_conversation, store_whatsapp_message
 from schemas.models import MessageRole
 
 # Cloudinary configuration
@@ -169,7 +168,6 @@ async def check_cloudinary_storage_limit():
     except Exception:
         return True  # Allow uploads if check fails
     
-
 async def upload_and_send_whatsapp_media_background(
     media_url: str, 
     media_id: str, 
@@ -189,6 +187,7 @@ async def upload_and_send_whatsapp_media_background(
     Downloads media from WhatsApp and uploads to Cloudinary.
     This is designed to be run as a BackgroundTask.
     """
+    from services.wa_service import create_or_update_whatsapp_conversation, store_whatsapp_message
     print(f"Background Task Started: Processing media {media_id}")
     
     headers = {
@@ -301,7 +300,51 @@ async def upload_and_send_whatsapp_media_background(
             message_id=message_id,  # Use the ID from the webhook for deduplication
         )
 
-        
-
     except Exception as e:
         print(f"❌ Background Upload Failed: {e}")
+
+async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> str:
+    """
+    Uploads a media file to Cloudinary under the specified platform folder.
+    Returns the secure URL of the uploaded media.
+    """
+    storage_ok = await check_cloudinary_storage_limit()
+
+    if not storage_ok:
+        print("Cloudinary storage limit approaching. Upload aborted.")
+        return None
+
+    try:
+        if platform == "whatsapp":
+            folder = f"whatsapp_media/{org_id}/user"
+        elif platform == "instagram":
+            folder = f"instagram_media/{org_id}/user"
+        else:
+            folder = f"other_media/{org_id}/user"
+        # Determine resource type based on MIME type
+        mime_type = file.content_type
+        cld_resource_type = "raw" 
+
+        if "image" in mime_type:
+            cld_resource_type = "image"
+        elif "video" in mime_type:
+            cld_resource_type = "video"
+        elif "pdf" in mime_type:
+            cld_resource_type = "image"  # PDFs as images for previews
+        else:
+            cld_resource_type = "raw"
+
+        # Upload to Cloudinary
+        result = cloudinary.uploader.upload(
+            file.file,
+            folder=folder, 
+            public_id=file.filename.split('.')[0],
+            resource_type=cld_resource_type
+        )
+
+        secure_url = result.get("secure_url")
+        return {"file_url": secure_url, "file_type": cld_resource_type}
+
+    except Exception as e:
+        print(f"Error uploading media to Cloudinary: {e}")
+        return None

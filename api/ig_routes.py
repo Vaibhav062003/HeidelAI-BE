@@ -3,7 +3,7 @@ from datetime import datetime
 from pymongo import ReturnDocument
 
 from config.settings import *
-from services.cloudinary_service import check_cloudinary_storage_limit
+from services.cloudinary_service import upload_media_to_cloudinary
 from services.ig_service import *
 from schemas.models import PlatformDisconnectRequest, MessageRole
 from auth.dependencies import CurrentUser
@@ -953,26 +953,15 @@ async def upload_and_send_instagram_media(
             raise HTTPException(status_code=400, detail="No Instagram ID found for this user")
 
         instagram_id = conversation.get("instagram_id")
-
-        # Check storage limit before uploading
-        storage_ok = await check_cloudinary_storage_limit()
-        if not storage_ok:
-            raise HTTPException(
-                status_code=507,
-                detail="Storage limit reached. Please contact support."
-            )
-        
-        # First upload the file to Cloudinary to get a public URL that we can use for IG API
-        cloudinary_result = cloudinary.uploader.upload(
-            file.file,
-            folder=f"instagram_media/{org_id}",
-            resource_type="auto"
-        )
-
-        print(f"Cloudinary upload result: {cloudinary_result}")
         
         # Get the secure URL for the frontend to display the image
-        media_url = cloudinary_result.get("secure_url")
+        media_url = upload_media_to_cloudinary(file, platform="instagram", org_id=org_id)
+
+        if not media_url:
+            raise HTTPException(
+                status_code=500,
+                detail="Media upload failed"
+            )
         
         # Now send the media message via Instagram API
         await send_ig_media_message(

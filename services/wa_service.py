@@ -16,6 +16,7 @@ from database import get_mongo_db, get_mongo_client
 from core.services import services
 from config.settings import IG_VERSION
 from schemas.models import MessageRole
+from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
@@ -432,7 +433,75 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
             status_code=500, 
             detail=f"Failed to send message: {str(e)}"
         )
+
+async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str) -> dict:
+    """
+    Send a media message via WhatsApp Cloud API
+    """
+    try:
+        # Find the WhatsApp connection to get the access token
+        connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
+        
+        if not connection:
+            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+        
+        # Send media message via WhatsApp Cloud API
+        url = f"https://graph.facebook.com/{IG_VERSION}/{connection.get('phone_id')}/messages"
+        headers = {
+            "Authorization": f"Bearer {connection.get('access_token')}",
+            "Content-Type": "application/json",
+        }
+        data = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient_id,
+            "type": "image",
+            "image": {"link": media_url}
+        }
+        
+        response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code != 200:
+            print(f"WhatsApp API error: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Failed to send WhatsApp media message"
+            )
+        
+        response_data = response.json()
+        print(f"WhatsApp media message response: {response.status_code}, {response_data}")
+        
+        return response_data
     
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print(f"Error sending WhatsApp media message: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to send media message: {str(e)}"
+        )
+
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str) -> dict:
+    """
+    Upload media to Cloudinary and send it as a media message
+    """
+    try:
+        # Upload media to Cloudinary
+        media_url = await upload_media_to_cloudinary(file, platform="whatsapp", org_id=org_id)
+
+        if not media_url:
+            print("Media upload failed, cannot send Instagram media message.")
+            return {"error": "Media upload failed", "success": False}
+        
+        # Send the media message via WhatsApp API
+        response = await send_wa_media_message(recipient_id, media_url, wa_id)
+        
+        return response
+    except Exception as e:
+        print(f"Error in upload_and_send_wa_media_message: {e}")
+        return {"error": str(e), "success": False}
+ 
 async def archive_whatsapp_data(org_id: str, wa_id: str, expire_days=30):
     """
     Archives Whatsapp converstions, messages and private notes for a specific connection of an org.

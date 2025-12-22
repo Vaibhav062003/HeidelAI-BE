@@ -7,8 +7,8 @@ from pymongo.errors import PyMongoError
 from pymongo.collection import Collection
 from pymongo import ReturnDocument
 from core.services import services
-from services.wa_service import send_whatsapp_message
-from services.ig_service import send_ig_message
+from services.wa_service import send_whatsapp_message, upload_and_send_wa_media_message
+from services.ig_service import send_ig_message, upload_and_send_ig_media_message
 from services.utils import serialize_mongo
 
 from database import get_mongo_db
@@ -492,20 +492,33 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, file: Optional[any] = None, temp_id: Optional[str] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
+    res = {"status": "no_action"}
 
     if platform == "whatsapp":
 
         wa_id = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}).get("wa_id")
 
-        res = await send_whatsapp_message({
-            "conversation_id": conversation_id,
-            "content": content,
-            "sender_id": wa_id,
-        }, org_id)
+        if file:
+            recipient_id = conversation_id.replace("whatsapp_", "")
+            
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id)
+
+            if res.get("error"):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to send media message: {res['error']}"
+                )
+
+        if content:
+            res = await send_whatsapp_message({
+                "conversation_id": conversation_id,
+                "content": content,
+                "sender_id": wa_id,
+            }, org_id)
         return res
     
     elif platform == "instagram":
@@ -515,8 +528,19 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             {"conversation_id": conversation_id},
             {"customer_id": 1}
         ).get("customer_id")
+
+
+        if file:
+            res = await upload_and_send_ig_media_message(recipient, file, ig_id, org_id, temp_id)
+
+            if res.get("error"):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to send media message: {res['error']}"
+                )
         
-        res = await send_ig_message(recipient, content, ig_id)
+        if content :
+            res = await send_ig_message(recipient, content, ig_id)
         return res
     else:
         raise HTTPException(status_code=400, detail="Unsupported platform")

@@ -99,7 +99,14 @@ async def get_messages(conversation_id: str,
     return await fetch_messages(org_id, conversation_id, user.user_id, agent_username)
 
 @router.post("/api/conversations/send-message")
-async def send_message_endpoint(user: CurrentUser, body: dict):
+async def send_message_endpoint(
+    user: CurrentUser,
+    conversation_id: str = Form(...),
+    content: Optional[str] = Form(None),
+    platform: str = Form(...),
+    temp_id: Optional[str] = Form(None), 
+    file: Optional[UploadFile] = File(None)
+):    
     """
     Send a message to a specific conversation.
     The body should contain the necessary fields for sending the message.
@@ -108,7 +115,14 @@ async def send_message_endpoint(user: CurrentUser, body: dict):
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
-    res = await send_message(org_id, body["platform"], body["conversation_id"], body["content"])
+    res = await send_message(
+        org_id, 
+        platform, 
+        conversation_id, 
+        content if content else None, 
+        file if file else None, 
+        temp_id if temp_id else None
+    )
 
     return {"message": "Message sent", "details": res}
 
