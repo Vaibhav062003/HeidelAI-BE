@@ -166,7 +166,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                         if status_type == "sent" and broadcast_message:
                             await broadcast_main_ws(
-                                platform_id=recipient_id,
+                                platform_id=whatsapp_business_id,
                                 platform_type="whatsapp",
                                 event_type="new_message",
                                 payload={"message": broadcast_message}
