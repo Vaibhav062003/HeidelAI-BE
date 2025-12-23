@@ -439,7 +439,7 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str, content: Optional[str], org_id: str) -> dict:
+async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """
@@ -447,11 +447,11 @@ async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str, c
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
 
-        image_payload = {
+        media_payload = {
             "link": media_url,
         }
         if content:
-            image_payload["caption"] = content
+            media_payload["caption"] = content
         
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
@@ -466,8 +466,8 @@ async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str, c
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": recipient_id,
-            "type": "image",
-            "image": image_payload
+            "type": media_type,
+            media_type: media_payload
         }
         
         response = requests.post(url, headers=headers, json=data)
@@ -541,14 +541,17 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
     """
     try:
         # Upload media to Cloudinary
-        media_url = await upload_media_to_cloudinary(file, platform="whatsapp", org_id=org_id)
+        result = await upload_media_to_cloudinary(file, platform="whatsapp", org_id=org_id)
+
+        media_url = result.get("file_url")
+        media_type = result.get("file_type")
 
         if not media_url:
             print("Media upload failed, cannot send Instagram media message.")
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, wa_id, content, org_id)
+        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id)
         
         return response
     except Exception as e:
