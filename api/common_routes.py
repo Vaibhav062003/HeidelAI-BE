@@ -7,7 +7,7 @@ from core.services import services
 from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, CannedResponse
 from services.conversation_utils import reopen_conversation
 from services.common_service import (
-    fetch_conversations, 
+    fetch_conversations_new, 
     fetch_conversation,
     send_message,
     fetch_messages,
@@ -41,11 +41,7 @@ def favicon():
 
 @router.get("/api/conversations")
 async def get_conversations(
-    user: CurrentUser, 
-    status: Optional[str] = Query(default=None),
-    platform: Optional[str] = Query(default=None),
-    priority: Optional[str] = Query(default=None),
-    # unread_only: Optional[bool] = Query(default=False)
+    user: CurrentUser
 ):
     """
     Get conversations for the current user's organization, 
@@ -55,12 +51,8 @@ async def get_conversations(
         if not org_id:
             raise HTTPException(status_code=400, detail="Invalid organization ID")
 
-        return await fetch_conversations(
-            org_id=org_id,
-            status=status,
-            platform=platform,
-            priority=priority,
-            # unread_only=unread_only,
+        return await fetch_conversations_new(
+            org_id=org_id
         )
 
     except HTTPException:

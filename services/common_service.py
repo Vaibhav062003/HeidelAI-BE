@@ -1,7 +1,9 @@
 import uuid
+import time
 from bson import ObjectId
-from typing import Optional
+from typing import Optional, List, Dict
 from fastapi import HTTPException, status
+from motor.motor_asyncio import AsyncIOMotorCollection
 from datetime import datetime, timezone
 from pymongo.errors import PyMongoError
 from pymongo.collection import Collection
@@ -11,88 +13,23 @@ from services.wa_service import send_whatsapp_message, upload_and_send_wa_media_
 from services.ig_service import send_ig_message, upload_and_send_ig_media_message
 from services.utils import serialize_mongo
 
-from database import get_mongo_db
+from database import get_mongo_db, get_async_mongo_db
 
 db = get_mongo_db()
 
-async def fetch_conversations(
-    org_id: str,
-    status: Optional[str] = None,
-    platform: Optional[str] = None,
-    priority: Optional[str] = None,
-    # unread_only: Optional[bool] = False,
-):
-    """
-    Fetch conversations for a given org_id with optional filters.
-    Status -
-    - status=None: return all conversations
-    - status='open': return conversations with status 'open' or 'follow-up'
-    - status='closed': return conversations with status 'closed'
+async def fetch_conversations_new(org_id: str) -> List[Dict]:
+    start_time = time.time()
 
-    Platform - 
-    - platform=None: return all connected platforms
-    - platform='whatsapp' or 'instagram': filter by platform
-    Priority -
-    - priority=None: return all conversations regardless of priority
-    - priority='low', 'medium', 'high': filter by priority
-    """
+    async_db = get_async_mongo_db()
 
-    orgs_collection: Collection = db.organizations
-    org_data = orgs_collection.find_one({"org_id": org_id})
-    if not org_data:
-        raise HTTPException(status_code=404, detail="Organization not found")
 
-    org_conversations_collection_name = f"conversations_{org_id}"
-    if org_conversations_collection_name not in db.list_collection_names():
-        return []
+    collection = async_db[f"conversations_{org_id}"]
 
-    org_conversations_collection: Collection = db[org_conversations_collection_name]
-
-    query_filter = {}
-
-    # Platform filter
-    if platform:
-        platform = platform.lower()
-        if platform not in ["whatsapp", "instagram"]:
-            raise HTTPException(status_code=400, detail="Invalid platform parameter")
-        query_filter["platform"] = platform
-    else:
-        # Determine connected platforms
-        connected_platforms = []
-        if org_data.get("ig_id"):
-            connected_platforms.append("instagram")
-        if org_data.get("wa_id"):
-            connected_platforms.append("whatsapp")
-
-        query_filter = {
-            "platform": {"$in": connected_platforms},
-        }
-
-    # Status filter
-    if status is None:
-        query_filter["status"] = {"$in": ["open", "follow-up", "closed"]}
-    elif status.lower() == "open":
-        query_filter["status"] = {"$in": ["open", "follow-up"]}
-    elif status.lower() == "closed":
-        query_filter["status"] = "closed"
-    else:
-        raise HTTPException(status_code=400, detail="Invalid status query parameter")
-    
-    # Priority filter
-    if priority:
-        priority = priority.lower()
-        if priority not in ["low", "medium", "high"]:
-            raise HTTPException(status_code=400, detail="Invalid priority parameter")
-        query_filter["priority"] = priority
-
-    # Unread filter
-    # if unread_only:
-    #     query_filter["unread_count"] = {"$gt": 0}
-
-    conversationFieldProjection = {
+    projection = {
         "conversation_id": 1,
         "platform": 1,
         "customer_username": 1,
+        "customer_id": 1,
         "customer_name": 1,
         "last_message": 1,
         "last_message_timestamp": 1,
@@ -105,71 +42,85 @@ async def fetch_conversations(
         "_id": 0,
     }
 
-    raw_conversations = list(
-        org_conversations_collection.find(query_filter, conversationFieldProjection)
+    cursor = (
+        collection
+        .find({}, projection)
         .sort("last_message_timestamp", -1)
+        .batch_size(1000)
     )
 
-    formatted_conversations = []
-    for conv in raw_conversations:
-        timestamp = conv.get("last_message_timestamp")
-        if timestamp and isinstance(timestamp, datetime):
-            timestamp = timestamp.isoformat()
+    # Fetch all docs
+    raw_docs = await cursor.to_list(length=None)
 
-        formatted_conversations.append({
-            "id": conv.get("conversation_id"),
-            "platform": conv.get("platform"),
-            "customer_id": conv.get("customer_username"),
-            "customer_name": f"{conv.get('customer_name', '')}",
-            "last_message": conv.get("last_message", ""),
-            "timestamp": timestamp,
-            "unread_count": conv.get("unread_count", 0),
-            "is_ai_enabled": conv.get("is_ai_enabled", True),
-            "assigned_agent_id": conv.get("assigned_agent_id"),
-            "priority": conv.get("priority", "medium"),
-            "sentiment": conv.get("sentiment", "neutral"),
-            "query": conv.get("query", ""),
-        })
+    fetch_time = time.time()
+    print(f"[TIMING] Mongo fetch: {fetch_time - start_time:.4f}s")
 
-    return formatted_conversations
+    # Transform (keep it simple and fast)
+    result = [
+        {
+            "id": doc.get("conversation_id"),
+            "platform": doc.get("platform"),
+            "customer_id": doc.get("customer_username"),
+            "phone_number": doc.get("customer_id") if doc.get("platform") == "whatsapp" else None,
+            "customer_name": doc.get("customer_name") or "",
+            "last_message": doc.get("last_message") or "",
+            "timestamp": (
+                doc["last_message_timestamp"].isoformat()
+                if isinstance(doc.get("last_message_timestamp"), datetime)
+                else None
+            ),
+            "unread_count": doc.get("unread_count", 0),
+            "status": doc.get("status"),
+            "priority": doc.get("priority"),
+            "sentiment": doc.get("sentiment"),
+            "assigned_agent_id": doc.get("assigned_agent_id"),
+            "is_ai_enabled": doc.get("is_ai_enabled"),
+        }
+        for doc in raw_docs
+    ]
+
+    end_time = time.time()
+    print(f"[TIMING] Python transform: {end_time - fetch_time:.4f}s")
+    print(f"[TIMING] Total: {end_time - start_time:.4f}s")
+
+    return result
 
 async def fetch_conversation(org_id: str, conversation_id: str):
     """
     Fetch a specific conversation by its ID for a given organization.
     """
     try:
+        async_db = get_async_mongo_db()
 
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
         
-        # Check if collection exists in database
-        if org_conversations_collection_name not in db.list_collection_names():
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        
         # Get the collection
-        org_conversations_collection = db[org_conversations_collection_name]
+        org_conversations_collection = async_db[org_conversations_collection_name]
 
-        conversation = org_conversations_collection.find_one(
+        conversation = await org_conversations_collection.find_one(
             {"conversation_id": conversation_id},
             {"_id": 0}  
         )
         
         if not conversation:
-            return {"message": "No conversation found"}
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
         
-        # Format timestamps for JSON serialization
-        if "last_message_timestamp" in conversation and isinstance(conversation["last_message_timestamp"], datetime):
-            conversation["last_message_timestamp"] = conversation["last_message_timestamp"].isoformat()
-        if "timestamp" in conversation and isinstance(conversation["timestamp"], datetime):
-            conversation["timestamp"] = conversation["timestamp"].isoformat()
+        for field in conversation:
+            if isinstance(conversation[field], datetime):
+                conversation[field] = conversation[field].isoformat()
         
         return conversation
     
+    except HTTPException:
+        raise
+    
     except Exception as e:
-        print(f"Error fetching conversation {conversation_id} for {org_id}: {e}")
+        print(f"[fetch_conversation] {org_id=} {conversation_id=} error={e}")
         raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to fetch conversation: {str(e)}"
+            status_code=500,
+            detail="Failed to fetch conversation"
         )
 
 async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent_username: str):

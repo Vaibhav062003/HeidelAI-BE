@@ -220,26 +220,26 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         print(f"WhatsApp authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"WhatsApp authentication error: {str(e)}")
     
-# @router.post("/disconnect")
-# async def whatsapp_disconnect(request: PlatformDisconnectRequest, user: CurrentUser):
-#     """Disconnect a WhatsApp Account from the system"""
-#     try:
-#         org_id = user.org_id
-#         connection_id = request.user_id
+@router.post("/disconnect")
+async def whatsapp_disconnect(request: PlatformDisconnectRequest, user: CurrentUser):
+    """Disconnect a WhatsApp Account from the system"""
+    try:
+        org_id = user.org_id
+        connection_id = request.user_id
 
-#         removal_result = await whatsapp_service.disconnect(org_id, connection_id)
+        removal_result = await whatsapp_service.disconnect(org_id, connection_id)
 
-#         return {
-#             "message": (
-#                 f"WhatsApp disconnected, archived data, "
-#                 f"removed {removal_result['deleted_connections']} connections, "
-#                 f"and cleared org WhatsApp reference."
-#             )
-#         }
+        return {
+            "message": (
+                f"WhatsApp disconnected, archived data, "
+                f"removed {removal_result['deleted_connections']} connections, "
+                f"and cleared org WhatsApp reference."
+            )
+        }
        
-#     except Exception as e:
-#         print(f"Error disconnecting WhatsApp: {str(e)}")
-#         raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
+    except Exception as e:
+        print(f"Error disconnecting WhatsApp: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
 
 @router.get("/{whatsapp_id}/details")
 async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)):

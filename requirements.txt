@@ -53,6 +53,7 @@ langsmith==0.4.11
 markdown-it-py==3.0.0
 mdurl==0.1.2
 multidict==6.6.3
+motor==3.7.1
 numpy==2.3.5
 openpyxl==3.1.5
 orjson==3.11.1
