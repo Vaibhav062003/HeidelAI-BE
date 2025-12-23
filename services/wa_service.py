@@ -167,7 +167,8 @@ async def store_whatsapp_message(
     recipient_id: str,
     role: MessageRole,
     message_id: Optional[str] = None,
-    raw_data: Optional[dict] = None
+    raw_data: Optional[dict] = None,
+    status: Optional[str] = "received"
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -208,7 +209,7 @@ async def store_whatsapp_message(
         "sender_name": sender_name,
         "role": role,
         "timestamp": datetime.now(timezone.utc),
-        "status": "received",
+        "status": status,
         "raw_data": raw_data  # Store the raw message for reference
     }   
     
@@ -236,6 +237,9 @@ async def store_whatsapp_message(
     # )
 
     print("Whatsapp conversation updated:", conversation_id)
+    
+    if status == "sending":
+        return
     
     # Format message for WebSocket broadcast
     broadcast_message = {
@@ -420,7 +424,8 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
             recipient_id=whatsapp_business_id,
             role=MessageRole.AGENT,
             message_id=message_id,
-            raw_data=response_data
+            raw_data=response_data,
+            status="sending"
         )
         
         return {"message": "Message sent", "message_id": mid}
@@ -502,6 +507,27 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
         print(f"Error in upload_and_send_wa_media_message: {e}")
         return {"error": str(e), "success": False}
  
+async def update_whatsapp_message_status(org_id: str, message_id: str, status: str):
+    """
+    Update the status of a WhatsApp message in the database
+    """
+    try:
+        messages_collection = db[f"messages_{org_id}"]
+        
+        result = messages_collection.find_one_and_update(
+            {"message_id": message_id, "platform": "whatsapp"},
+            {"$set": {"status": status}},
+            return_document=ReturnDocument.AFTER
+        )
+        
+        if result:
+            print(f"WhatsApp message {message_id} status updated to {status}")
+            return result
+        return None
+    
+    except Exception as e:
+        print(f"Error updating WhatsApp message status: {e}")
+
 async def archive_whatsapp_data(org_id: str, wa_id: str, expire_days=30):
     """
     Archives Whatsapp converstions, messages and private notes for a specific connection of an org.

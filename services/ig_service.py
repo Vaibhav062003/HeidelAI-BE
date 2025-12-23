@@ -319,7 +319,7 @@ async def store_instagram_message(
         "role": role,
         "timestamp": datetime.now().isoformat(),
         "status": "sent",
-        "sender_name": sender_name
+        "sender_name": sender_name,
     }
     
     # Broadcast to /main-ws clients

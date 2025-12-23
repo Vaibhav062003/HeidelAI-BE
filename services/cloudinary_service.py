@@ -343,6 +343,7 @@ async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> s
         )
 
         secure_url = result.get("secure_url")
+        print(f"Media uploaded to Cloudinary: {secure_url}")
         return {"file_url": secure_url, "file_type": cld_resource_type}
 
     except Exception as e:

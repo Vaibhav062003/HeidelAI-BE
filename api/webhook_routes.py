@@ -125,7 +125,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                 for change in changes:
                     value = change.get("value", {})
                     
-                    
                     # Validate whatsapp_business_id exists
                     if not whatsapp_business_id:
                         print("Missing WhatsApp business ID in webhook payload")
@@ -139,6 +138,42 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     if not connection:
                         print(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
                         continue
+
+                    # ============================================================================
+                    # Handle status updates (message delivery/read receipts)
+                    # ============================================================================
+                    statuses = value.get("statuses", [])
+                    for status in statuses:
+                        message_id = status.get("id")
+                        status_type = status.get("status")
+                        
+                        if not message_id or not status_type:
+                            continue
+                        
+                        print(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
+                        
+                        # Update the message status in the database
+                        broadcast_message = await update_whatsapp_message_status(
+                            org_id=connection.get("org_id"),
+                            message_id=message_id,
+                            status=status_type,
+                            # status_timestamp=status.get("timestamp")
+                        )
+
+                        if not broadcast_message:
+                            print(f"No message found with ID {message_id} to update status.")
+                            continue
+
+                        if status_type == "sent" and broadcast_message:
+                            await broadcast_main_ws(
+                                platform_id=recipient_id,
+                                platform_type="whatsapp",
+                                event_type="new_message",
+                                payload={"message": broadcast_message}
+                            )
+
+                        return {"status": "ok"}
+                    # ============================================================================
                     
                     org_id = connection.get("org_id") 
                     access_token = connection.get("access_token")
