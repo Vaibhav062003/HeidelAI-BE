@@ -439,13 +439,19 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str) -> dict:
+async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str, content: Optional[str], org_id: str) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """
     try:
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
+
+        image_payload = {
+            "link": media_url,
+        }
+        if content:
+            image_payload["caption"] = content
         
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
@@ -461,7 +467,7 @@ async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str) -
             "recipient_type": "individual",
             "to": recipient_id,
             "type": "image",
-            "image": {"link": media_url}
+            "image": image_payload
         }
         
         response = requests.post(url, headers=headers, json=data)
@@ -475,8 +481,50 @@ async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str) -
         
         response_data = response.json()
         print(f"WhatsApp media message response: {response.status_code}, {response_data}")
+
+        message_id = response_data.get("messages", [{}])[0].get("id")
+        now = datetime.now(timezone.utc)
+
+        wa_conversation = {
+            "last_message": f"You: {content if content else 'Shared an image'}",
+            "last_message_timestamp": now,
+            "last_sender": "agent",
+            "reminder_stage": 0,
+            "next_action_at": now + timedelta(hours=6)
+        }
+
+        conversation = db[f"conversations_{org_id}"].find_one_and_update(
+            {"conversation_id": f"whatsapp_{recipient_id}"},
+            {"$set": wa_conversation},
+            return_document=ReturnDocument.AFTER  
+        )
+
+        if "_id" in conversation:
+            conversation["_id"] = str(conversation["_id"])
+
+        await broadcast_main_ws(
+            platform_id=connection.get("wa_id"),
+            platform_type="whatsapp",
+            event_type="conversation_updated",
+            payload={"conversation": conversation}
+        )
+
+        mid = await store_whatsapp_message(
+            org_id=org_id,
+            content=content,
+            conversation_id=f"whatsapp_{recipient_id}",
+            customer_phone_no=recipient_id,
+            type="image",
+            payload={"url": media_url},
+            sender_name="Agent",
+            recipient_id=recipient_id,
+            role=MessageRole.AGENT,
+            message_id=message_id,
+            raw_data=response_data,
+            status="sending"
+        )
         
-        return response_data
+        return {"message": "Sending message", "message_id": mid}
     
     except HTTPException as e:
         raise e
@@ -487,7 +535,7 @@ async def send_wa_media_message(recipient_id: str, media_url: str, wa_id: str) -
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str) -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str]) -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
@@ -500,7 +548,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, wa_id)
+        response = await send_wa_media_message(recipient_id, media_url, wa_id, content, org_id)
         
         return response
     except Exception as e:

@@ -160,6 +160,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # status_timestamp=status.get("timestamp")
                         )
 
+                        if "_id" in broadcast_message:
+                            broadcast_message["_id"] = str(broadcast_message["_id"])
+
                         if not broadcast_message:
                             print(f"No message found with ID {message_id} to update status.")
                             continue

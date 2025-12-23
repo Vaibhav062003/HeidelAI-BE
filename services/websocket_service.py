@@ -124,6 +124,7 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
                     **safe_payload
                 }
             })
+            print(f"[Broadcast Main WS] ✅ Sent {event_type} to {client_id}")
         except Exception as e:
             print(f"[Broadcast Main WS] ⚠️ Failed to send to {client_id}: {e}, marking as disconnected")
         except WebSocketDisconnect:

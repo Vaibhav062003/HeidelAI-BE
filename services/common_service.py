@@ -505,7 +505,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         if file:
             recipient_id = conversation_id.replace("whatsapp_", "")
             
-            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id)
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content)
 
             if res.get("error"):
                 raise HTTPException(
@@ -513,7 +513,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                     detail=f"Failed to send media message: {res['error']}"
                 )
 
-        if content:
+        if content and not file:
             res = await send_whatsapp_message({
                 "conversation_id": conversation_id,
                 "content": content,
