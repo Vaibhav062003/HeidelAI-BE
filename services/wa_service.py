@@ -21,7 +21,9 @@ from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
+from core.logger import get_logger
 
+logger = get_logger(__name__)
 db = get_mongo_db()
 mongo_client = get_mongo_client()
 
@@ -65,10 +67,10 @@ async def create_or_update_whatsapp_conversation(
     if existing_conversation:
 
         abort_result = await abort_scheduled_message(org_id, conversation_id)
-        print("Aborted Scheduled message: ", abort_result)
+        logger.success(f"Aborted Scheduled message: {abort_result}")
 
         reopen_result = await reopen_conversation(org_id, conversation_id)
-        print("Reopened conversation: ", reopen_result)
+        logger.success(f"Reopened conversation: {reopen_result}")
 
         # Update existing conversation without modifying is_ai_enabled
         wa_conversation = {
@@ -126,7 +128,7 @@ async def create_or_update_whatsapp_conversation(
         return_document=ReturnDocument.AFTER  # Return the NEW/UPDATED document
     )
 
-    print("Whatsapp conversation updated:", updated_conversation)
+    logger.success(f"Whatsapp conversation updated: {updated_conversation}")
 
     # Format the timestamp for JSON serialization
     broadcast_conversation = dict(updated_conversation)
@@ -216,7 +218,7 @@ async def store_whatsapp_message(
     # Store message in WhatsApp-specific collection
     messages_collection.insert_one(message)
 
-    print("Whatsapp message stored:", message_id)
+    logger.success(f"Whatsapp message stored: {message_id}")
     
     # Keep only latest 500 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
@@ -236,7 +238,7 @@ async def store_whatsapp_message(
     #     return_document=True
     # )
 
-    print("Whatsapp conversation updated:", conversation_id)
+    logger.success(f"Whatsapp conversation updated: {conversation_id}")
     
     if status == "sending":
         return
@@ -313,9 +315,9 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
                         "platform": "whatsapp",
                         **serializable_data
                     })
-                    print(f"WhatsApp notification sent to {connection_key}: {message_type}")
+                    logger.success(f"WhatsApp notification sent to {connection_key}: {message_type}")
             except Exception as e:
-                print(f"Error notifying WhatsApp connection {connection_key}: {e}")
+                logger.error(f"Error notifying WhatsApp connection {connection_key}: {e}")
                 disconnected_clients.append(connection_key)
         
         # Clean up disconnected clients
@@ -377,7 +379,7 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
         response = requests.post(url, headers=headers, json=data)
         
         if response.status_code != 200:
-            print(f"WhatsApp API error: {response.text}")
+            logger.error(f"WhatsApp API error: {response.text}")
             raise HTTPException(
                 status_code=response.status_code,
                 detail="Failed to send WhatsApp message"
@@ -433,7 +435,7 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error sending WhatsApp message: {e}")
+        logger.error(f"Error sending WhatsApp message: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to send message: {str(e)}"
@@ -473,14 +475,14 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
         response = requests.post(url, headers=headers, json=data)
         
         if response.status_code != 200:
-            print(f"WhatsApp API error: {response.text}")
+            logger.error(f"WhatsApp API error: {response.text}")
             raise HTTPException(
                 status_code=response.status_code,
                 detail="Failed to send WhatsApp media message"
             )
         
         response_data = response.json()
-        print(f"WhatsApp media message response: {response.status_code}, {response_data}")
+        logger.info(f"WhatsApp media message response: {response.status_code}, {response_data}")
 
         message_id = response_data.get("messages", [{}])[0].get("id")
         now = datetime.now(timezone.utc)
@@ -529,7 +531,7 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error sending WhatsApp media message: {e}")
+        logger.error(f"Error sending WhatsApp media message: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to send media message: {str(e)}"
@@ -547,7 +549,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
         media_type = result.get("file_type")
 
         if not media_url:
-            print("Media upload failed, cannot send Instagram media message.")
+            logger.error("Media upload failed, cannot send WhatsApp media message.")
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
@@ -555,7 +557,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
         
         return response
     except Exception as e:
-        print(f"Error in upload_and_send_wa_media_message: {e}")
+        logger.error(f"Error in upload_and_send_wa_media_message: {e}")
         return {"error": str(e), "success": False}
  
 async def update_whatsapp_message_status(org_id: str, message_id: str, status: str):
@@ -572,12 +574,12 @@ async def update_whatsapp_message_status(org_id: str, message_id: str, status: s
         )
         
         if result:
-            print(f"WhatsApp message {message_id} status updated to {status}")
+            logger.success(f"WhatsApp message {message_id} status updated to {status}")
             return result
         return None
     
     except Exception as e:
-        print(f"Error updating WhatsApp message status: {e}")
+        logger.error(f"Error updating WhatsApp message status: {e}")
 
 async def archive_whatsapp_data(org_id: str, wa_id: str, expire_days=30):
     """
@@ -603,7 +605,7 @@ async def archive_whatsapp_data(org_id: str, wa_id: str, expire_days=30):
 
                 if existing_archive:
                     archived_id = existing_archive["archive_id"]
-                    print(f"Found existing archive {archived_id} for whatsapp_id {wa_id}, extending expiration")
+                    logger.success(f"Found existing archive {archived_id} for whatsapp_id {wa_id}, extending expiration")
 
                     new_expiry = now + timedelta(days=expire_days)
 
@@ -614,7 +616,7 @@ async def archive_whatsapp_data(org_id: str, wa_id: str, expire_days=30):
                     )
                 else:
                     archive_id = uuid.uuid4().hex
-                    print(f"Creating new archive {archive_id} for whatsapp_id {wa_id}")
+                    logger.success(f"Creating new archive {archive_id} for whatsapp_id {wa_id}")
 
                     db.archived_tracker.insert_one({
                             "archive_id": archive_id,
@@ -687,10 +689,10 @@ async def archive_whatsapp_data(org_id: str, wa_id: str, expire_days=30):
                     db[archived_private_notes].insert_many(private_notes_to_archive, session=session)
                     db[private_notes_collection_name].delete_many({"platform": "whatsapp", "user_id": wa_id}, session=session)
 
-                print(f"Archived WhatsApp data for org {org_id} with archive_id {archive_id}")
+                logger.success(f"Archived WhatsApp data for org {org_id} with archive_id {archive_id}")
 
     except Exception as e:
-         print(f"Error archiving WhatsApp data for org {org_id} with archive_id {archive_id}: {str(e)}")
+         logger.error(f"Error archiving WhatsApp data for org {org_id} with archive_id {archive_id}: {str(e)}")
 
 async def revoke_whatsapp_access(org_id: str, wa_id: str):
     """
@@ -700,7 +702,7 @@ async def revoke_whatsapp_access(org_id: str, wa_id: str):
         connection = db.whatsapp_connections.find_one({"wa_id": wa_id, "is_active": True, "org_id": org_id})
 
         if not connection:
-            print(f"No active WhatsApp connection found for org and wa_id")
+            logger.error(f"No active WhatsApp connection found for org {org_id} and wa_id {wa_id}")
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
         
         access_token = connection.get("access_token")
@@ -711,14 +713,14 @@ async def revoke_whatsapp_access(org_id: str, wa_id: str):
                 params = {"access_token": access_token}
                 requests.delete(revoke_url, params=params)
             except Exception as e:
-                print(f"Error revoking token: {e}")
+                logger.error(f"Error revoking token: {e}")
 
         return {"message": "WhatsApp connection removed successfully"}
         
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Error disconnecting WhatsApp: {str(e)}")
+        logger.error(f"Error disconnecting WhatsApp: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
     
 async def remove_whatsapp_connection(org_id: str, wa_id: str):
@@ -729,7 +731,7 @@ async def remove_whatsapp_connection(org_id: str, wa_id: str):
         delete_result = db.whatsapp_connections.delete_many(
             {"wa_id": wa_id, "org_id": org_id}
             )
-        print(f"Deleted {delete_result.deleted_count} whatsapp connections for org {org_id}")
+        logger.success(f"Deleted {delete_result.deleted_count} whatsapp connections for org {org_id}")
 
         org_update_result = db.organizations.update_one(
             {"org_id": org_id},
@@ -737,9 +739,9 @@ async def remove_whatsapp_connection(org_id: str, wa_id: str):
         )
 
         if org_update_result.modified_count:
-            print(f"Cleared wa_id for organization {org_id}")
+            logger.success(f"Cleared wa_id for organization {org_id}")
         else:
-            print(f"No organization updated for org_id {org_id}")
+            logger.info(f"No organization updated for org_id {org_id}")
 
         return {
             "deleted_connections": delete_result.deleted_count,
@@ -747,7 +749,7 @@ async def remove_whatsapp_connection(org_id: str, wa_id: str):
         }
     
     except Exception as e:
-        print(f"Error removing WhatsApp connection: {str(e)}")
+        logger.error(f"Error removing WhatsApp connection: {str(e)}")
         raise
 
 async def upload_whatsapp_media_to_cloudinary(media_url: str, org_id: str, media_id: str, access_token: str) -> Optional[str]:
@@ -760,7 +762,7 @@ async def upload_whatsapp_media_to_cloudinary(media_url: str, org_id: str, media
         response = await client.get(media_url, headers=headers)
         
         if response.status_code != 200:
-            print(f"Failed to download from WhatsApp: {response.text}")
+            logger.error(f"Failed to download from WhatsApp: {response.text}")
             return None
 
     # 2. Convert bytes to a file-like object
@@ -783,5 +785,5 @@ async def upload_whatsapp_media_to_cloudinary(media_url: str, org_id: str, media
         return cloudinary_result.get("secure_url")
 
     except Exception as e:
-        print(f"Cloudinary upload error: {e}")
+        logger.error(f"Cloudinary upload error: {e}")
         return None

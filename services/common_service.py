@@ -15,6 +15,10 @@ from services.utils import serialize_mongo
 
 from database import get_mongo_db, get_async_mongo_db
 
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
 db = get_mongo_db()
 
 async def fetch_conversations_new(org_id: str) -> List[Dict]:
@@ -53,7 +57,7 @@ async def fetch_conversations_new(org_id: str) -> List[Dict]:
     raw_docs = await cursor.to_list(length=None)
 
     fetch_time = time.time()
-    print(f"[TIMING] Mongo fetch: {fetch_time - start_time:.4f}s")
+    logger.info(f"[TIMING] Mongo fetch: {fetch_time - start_time:.4f}s")
 
     # Transform (keep it simple and fast)
     result = [
@@ -80,8 +84,8 @@ async def fetch_conversations_new(org_id: str) -> List[Dict]:
     ]
 
     end_time = time.time()
-    print(f"[TIMING] Python transform: {end_time - fetch_time:.4f}s")
-    print(f"[TIMING] Total: {end_time - start_time:.4f}s")
+    logger.info(f"[TIMING] Python transform: {end_time - fetch_time:.4f}s")
+    logger.info(f"[TIMING] Total: {end_time - start_time:.4f}s")
 
     return result
 
@@ -117,7 +121,7 @@ async def fetch_conversation(org_id: str, conversation_id: str):
         raise
     
     except Exception as e:
-        print(f"[fetch_conversation] {org_id=} {conversation_id=} error={e}")
+        logger.error(f"[fetch_conversation] {org_id=} {conversation_id=} error={e}")
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch conversation"
@@ -226,7 +230,7 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
         return {"messages": combined, "assignment": assigned_convo}
     
     except Exception as e:
-        print(f"Error fetching messages or private notes for {conversation_id} of org {org_id}: {e}")
+        logger.error(f"Error fetching messages or private notes for {conversation_id} of org {org_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch messages: {str(e)}"
@@ -319,12 +323,12 @@ async def unarchive_data(org_id: str, platform: str, user_id: str):
             {"$set": {"status": "recovered", "restored_at": datetime.utcnow()}}
         )
 
-        print(f"Dropping archived collections: {archive_conversations}, {archive_messages}")
+        logger.info(f"Dropping archived collections: {archive_conversations}, {archive_messages}")
         db.drop_collection(archive_conversations)
         db.drop_collection(archive_messages)
         db.drop_collection(archive_private_notes)
 
-        print(f"Unarchiving completed for org_id={org_id}, platform={platform}")
+        logger.success(f"Unarchiving completed for org_id={org_id}, platform={platform}")
 
         return {"message": "Unarchiving completed successfully."}
 

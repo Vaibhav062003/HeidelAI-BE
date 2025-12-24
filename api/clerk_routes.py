@@ -5,6 +5,10 @@ from dotenv import load_dotenv
 
 from auth.dependencies import CurrentUser
 
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
 load_dotenv()
 
 router = APIRouter(prefix="/api/clerk", tags=["clerk"])
@@ -42,7 +46,7 @@ def invite_agent(req: InviteAgentRequest, user: CurrentUser):
     payload = {"email_address": req.email_address, "role": req.role, "redirect_url": req.redirect_url}
     try:
         resp = requests.post(url, headers=clerk_headers(), json=payload)
-        print("Clerk API response:", resp.status_code, resp.text)  # Add this line
+        logger.info(f"Clerk API response: {resp.status_code}, {resp.text}")  # Add this line
         data = resp.json()
         if resp.status_code != 200:
             detail = data.get("errors", [{}])[0].get("long_message", "Failed to invite agent")
@@ -58,7 +62,7 @@ def revoke_invite(req: RevokeInviteRequest, user: CurrentUser):
     payload = {"requesting_user_id": req.requesting_user_id}
     try:
         resp = requests.post(url, headers=clerk_headers(), json=payload)
-        print("Clerk API response:", resp.status_code, resp.text)
+        logger.info(f"Clerk API response: {resp.status_code}, {resp.text}")
         data = resp.json()
         if resp.status_code != 200:
             detail = data.get("errors", [{}])[0].get("long_message", "Failed to revoke invite")
@@ -74,7 +78,7 @@ def delete_member(user: CurrentUser, user_id: str = Query(...)):
     url = f"{base_url}/organizations/{ORG_ID}/memberships/{user_id}"
     try:
         resp = requests.delete(url, headers=clerk_headers())
-        print("Clerk API response:", resp.status_code, resp.text)
+        logger.info(f"Clerk API response: {resp.status_code}, {resp.text}")
         data = resp.json()
         if resp.status_code == 404:
             detail = data.get("errors", [{}])[0].get("long_message", "Member not found")
@@ -96,7 +100,7 @@ def waitlist_enroll(email: WaitList):
 
     try:
         resp = requests.post(url, headers=clerk_headers(), json=payload)
-        print("Clerk API response:", resp.status_code, resp.text)
+        logger.info(f"Clerk API response: {resp.status_code}, {resp.text}")
 
         data = resp.json()
 

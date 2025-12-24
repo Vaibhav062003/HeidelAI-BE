@@ -36,6 +36,9 @@ from config.settings import (
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET
 )
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD_NAME,
@@ -81,7 +84,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
             )
         
         token_info = token_response.json()
-        print("WhatsApp token response:", token_info)
+        logger.info(f"WhatsApp exchange auth code for token response: {token_info}")
         access_token = token_info.get("access_token")
         
         if not access_token:
@@ -114,10 +117,10 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         }
         phone_url = f"https://graph.facebook.com/v22.0/{whatsapp_business_id}/phone_numbers"
         phone_response = requests.get(phone_url, params=params)
-        print(f"Phone response: {phone_response.json()}")
+        logger.info(f"Phone response: {phone_response.json()}")
         
         if phone_response.status_code != 200:
-            print(f"get phone number details err: {phone_response.text}")
+            logger.error(f"get phone number details err: {phone_response.text}")
             raise HTTPException(
                 status_code=400, 
                 detail="Failed to get phone number information"
@@ -137,7 +140,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         webhook_response = requests.post(webhook_url, json=webhook_params)
 
         if webhook_response.status_code != 200:
-            print(f"Subscribe to webhook err: {webhook_response.text}")
+            logger.error(f"Subscribe to webhook err: {webhook_response.text}")
             raise HTTPException(
                 status_code=400, 
                 detail="Failed to subscribe WhatsApp account to webhook"
@@ -145,7 +148,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         
         # Check if phone number is verified
         if phone_verified != "VERIFIED":
-            print(f"Phone number {phone} is currently {phone_verified}. Attempting registration to fix this...")
+            logger.warning(f"Phone number {phone} is currently {phone_verified}. Attempting registration to fix this...")
         
         # Register phone on WhatsApp Cloud API
         phone_register_params = {
@@ -155,10 +158,10 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         }
         phone_register_url = f"https://graph.facebook.com/v22.0/{phone_id}/register"
         phone_register_response = requests.post(phone_register_url, json=phone_register_params)
-        print(f"Phone register response: {phone_register_response.json()}")
+        logger.info(f"Phone register response: {phone_register_response.json()}")
 
         if phone_register_response.status_code != 200:
-            print(f"Register phone number error: {phone_register_response.text}")
+            logger.error(f"Register phone number error: {phone_register_response.text}")
             raise HTTPException(
                 status_code=400, 
                 detail="Failed to register phone number. Please ensure the phone number is valid/verified and try again."
@@ -217,7 +220,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"WhatsApp authentication error: {str(e)}")
+        logger.error(f"WhatsApp authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"WhatsApp authentication error: {str(e)}")
     
 @router.post("/disconnect")
@@ -238,7 +241,7 @@ async def whatsapp_disconnect(request: PlatformDisconnectRequest, user: CurrentU
         }
        
     except Exception as e:
-        print(f"Error disconnecting WhatsApp: {str(e)}")
+        logger.error(f"Error disconnecting WhatsApp: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
 
 @router.get("/{whatsapp_id}/details")
@@ -283,7 +286,7 @@ async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)
         account_response = requests.get(account_url, params=account_params)
         
         if account_response.status_code != 200:
-            print(f"WhatsApp API Error: {account_response.text}")
+            logger.error(f"WhatsApp API Error: {account_response.text}")
             raise HTTPException(
                 status_code=account_response.status_code,
                 detail=f"Failed to fetch WhatsApp account details: {account_response.json().get('error', {}).get('message')}"
@@ -344,7 +347,7 @@ async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error fetching WhatsApp details: {str(e)}")
+        logger.error(f"Error fetching WhatsApp details: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch WhatsApp details: {str(e)}")
 
 @router.get("/{whatsapp_id}/analytics/conversations")
@@ -420,7 +423,7 @@ async def get_whatsapp_conversation_analytics(
         response = requests.get(url, params=params)
         
         if response.status_code != 200:
-            print(f"WhatsApp API Error: {response.text}")
+            logger.error(f"WhatsApp API Error: {response.text}")
             raise HTTPException(
                 status_code=response.status_code,
                 detail=f"Failed to fetch WhatsApp conversation analytics: {response.json().get('error', {}).get('message')}"
@@ -486,7 +489,7 @@ async def get_whatsapp_conversation_analytics(
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error fetching WhatsApp conversation analytics: {str(e)}")
+        logger.error(f"Error fetching WhatsApp conversation analytics: {str(e)}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch WhatsApp conversation analytics: {str(e)}"
@@ -545,7 +548,7 @@ async def get_whatsapp_conversations(user: CurrentUser):
         return formatted_conversations
     
     except Exception as e:
-        print(f"Error fetching WhatsApp conversations for org {org_id}: {e}")
+        logger.error(f"Error fetching WhatsApp conversations for org {org_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch WhatsApp conversations: {str(e)}"
@@ -587,7 +590,7 @@ async def get_whatsapp_conversation(conversation_id: str, user: CurrentUser):
         return conversation
     
     except Exception as e:
-        print(f"Error fetching Instagram conversation {conversation_id}: {e}")
+        logger.error(f"Error fetching Instagram conversation {conversation_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch Instagram conversation: {str(e)}"
@@ -623,7 +626,7 @@ async def get_whatsapp_messages(conversation_id: str, user: CurrentUser):
         return messages
     
     except Exception as e:
-        print(f"Error fetching WhatsApp messages for {conversation_id}: {e}")
+        logger.error(f"Error fetching WhatsApp messages for {conversation_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch WhatsApp messages: {str(e)}"
@@ -651,7 +654,7 @@ async def get_whatsapp_messages(conversation_id: str, user: CurrentUser):
 #         return {"status": "success", "message": "Unread count reset to 0"}
     
 #     except Exception as e:
-#         print(f"Error resetting WhatsApp unread count: {e}")
+#         logger.error(f"Error resetting WhatsApp unread count: {e}")
 #         raise HTTPException(
 #             status_code=500, 
 #             detail=f"Failed to reset unread count: {str(e)}"
@@ -676,7 +679,7 @@ async def get_whatsapp_ai_status(conversation_id: str, user: CurrentUser):
         return {"status": "Error", "message": "No conversation found"}
     
     except Exception as e:
-        print(f"Error checking WhatsApp AI status: {e}")
+        logger.error(f"Error checking WhatsApp AI status: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to check AI status: {str(e)}"
@@ -725,7 +728,7 @@ async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body
         return {"status": "success", "message": f"AI status updated to {ai_enabled}"}
     
     except Exception as e:
-        print(f"Error updating WhatsApp AI status: {e}")
+        logger.error(f"Error updating WhatsApp AI status: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to update AI status: {str(e)}"
@@ -844,7 +847,7 @@ async def upload_and_send_whatsapp_media(
             )
             
             if upload_response.status_code != 200:
-                print(f"WhatsApp Media Upload Error: {upload_response.text}")
+                logger.error(f"WhatsApp Media Upload Error: {upload_response.text}")
                 raise HTTPException(
                     status_code=upload_response.status_code,
                     detail=f"Failed to upload media to WhatsApp: {upload_response.text}"
@@ -889,7 +892,7 @@ async def upload_and_send_whatsapp_media(
             )
             
             if send_response.status_code != 200:
-                print(f"WhatsApp Media Send Error: {send_response.text}")
+                logger.error(f"WhatsApp Media Send Error: {send_response.text}")
                 raise HTTPException(
                     status_code=send_response.status_code,
                     detail=f"Failed to send WhatsApp media message: {send_response.text}"
@@ -936,7 +939,7 @@ async def upload_and_send_whatsapp_media(
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading and sending WhatsApp media: {e}")
+        logger.error(f"Error uploading and sending WhatsApp media: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to upload and send media: {str(e)}"
@@ -956,7 +959,7 @@ async def get_whatsapp_profile(user: CurrentUser):
         org_document = db.organizations.find_one({"org_id": org_id})
 
         wa_id = org_document.get("wa_id")
-        print(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
+        logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
     
         if not wa_id:
             raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
@@ -966,7 +969,7 @@ async def get_whatsapp_profile(user: CurrentUser):
             {"wa_id": wa_id, "org_id": org_id},
             {"_id": 0}
         )
-        print(f"Fetched WhatsApp connection: {connection} for wa_id: {wa_id}")
+        logger.success(f"Fetched WhatsApp connection: {connection} for wa_id: {wa_id}")
 
         if not connection or not connection.get("access_token"):
             raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
@@ -983,5 +986,5 @@ async def get_whatsapp_profile(user: CurrentUser):
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error fetching WhatsApp profile: {str(e)}")
+        logger.error(f"Error fetching WhatsApp profile: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch WhatsApp profile: {str(e)}")

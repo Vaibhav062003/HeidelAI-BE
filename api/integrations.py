@@ -1,6 +1,9 @@
 from auth.dependencies import CurrentUser
 from fastapi import APIRouter, Depends, HTTPException
 from database import get_mongo_db
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 db = get_mongo_db()
 
@@ -32,7 +35,7 @@ async def get_integrations_status(user: CurrentUser):
         return integration_status
 
     except Exception as e:
-        print(f"Error fetching integrations status for {org_id}: {e}")
+        logger.error(f"Error fetching integrations status for {org_id}: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to fetch integrations status: {str(e)}"

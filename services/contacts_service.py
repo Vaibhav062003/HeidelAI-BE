@@ -5,6 +5,9 @@ from pymongo.errors import PyMongoError
 # Internal Modules
 from core.services import services
 from database import get_mongo_db
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 db = get_mongo_db()
 
@@ -31,16 +34,15 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
     elif platform == "whatsapp":
         unique_filter = {"phone_number": contact_data["phone_number"]}
     else:
-        print(f"Unknown platform {platform} - skipping contact storage.")
+        logger.warning(f"Unknown platform {platform} - skipping contact storage.")
         return
 
     if contacts_collection.find_one(unique_filter):
-        print(f"[Contacts] Contact already exists for {platform}: {unique_filter}")
+        logger.info(f"Contact already exists for {platform}: {unique_filter}")
         return
     
     contacts_collection.insert_one(contact_data)
-    print(f"[Contacts] Added new contact for {platform}: {unique_filter}")
-
+    logger.success(f"Added new contact for {platform}: {unique_filter}")
 async def get_contacts_for_org(org_id: str):
     """
     Retrieve all contacts for a given organization.
@@ -49,7 +51,7 @@ async def get_contacts_for_org(org_id: str):
         collection_name = f"contacts_{org_id}"
 
         if collection_name not in db.list_collection_names():
-            print(f"[INFO] Collection {collection_name} does not exist.")
+            logger.info(f"Collection {collection_name} does not exist.")
             return []
 
         contacts_collection = db[collection_name]
@@ -62,15 +64,15 @@ async def get_contacts_for_org(org_id: str):
         for contact in cursor:
             contacts.append(contact)
 
-        print(f"[INFO] Retrieved {len(contacts)} contacts for org {org_id}.")
+        logger.info(f"Retrieved {len(contacts)} contacts for org {org_id}.")
         return contacts
 
     except PyMongoError as e:
-        print(f"[ERROR] MongoDB error while fetching contacts for {org_id}: {e}")
+        logger.error(f"MongoDB error while fetching contacts for {org_id}: {e}")
         return []
 
     except Exception as e:
-        print(f"[ERROR] Unexpected error in get_contacts_for_org({org_id}): {e}")
+        logger.error(f"Unexpected error in get_contacts_for_org({org_id}): {e}")
         return []
 
 async def update_contact_tag_categories(org_id: str, conversation_id: str, categories: list):
@@ -100,11 +102,11 @@ async def update_contact_tag_categories(org_id: str, conversation_id: str, categ
         return {"contact": result}
 
     except PyMongoError as e:
-        print(f"[ERROR] MongoDB error while updating categories for {org_id}: {e}")
+        logger.error(f"MongoDB error while updating categories for {org_id}: {e}")
         raise HTTPException(status_code=500, detail="Database error occurred")
 
     except Exception as e:
-        print(f"[ERROR] Unexpected error in update_contact_categories: {e}")
+        logger.error(f"Unexpected error in update_contact_categories: {e}")
         raise HTTPException(status_code=500, detail="Unexpected error occurred")
     
 async def add_tag_to_org_metadata(org_id: str, tag: str):

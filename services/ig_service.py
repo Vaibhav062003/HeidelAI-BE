@@ -27,6 +27,9 @@ from config.settings import (
     SUPABASE_INSTA_DM_TABLE,  
     IG_ACCESS_TOKEN
 )
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -53,16 +56,16 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
                 sort=[("last_updated", -1)]
             )
 
-            print(f"Retrieved IG Connection: {connection}")
+            logger.success(f"Retrieved IG Connection: {connection}")
             
             if connection and connection.get("page_access_token"):
                 # Use the connection-specific token and page ID
                 access_token = connection["page_access_token"]
                 # page_id = connection.get("page_id", instagram_id)
-                print(f"Using Instagram-specific token for {instagram_id}")
+                logger.info(f"Using Instagram-specific token for {instagram_id}")
             else:
                 # Fallback to default token if connection not found
-                print(f"No Instagram ID specified, cannot send message")
+                logger.error(f"No Instagram ID specified, cannot send message")
                 raise HTTPException(status_code=400, detail="Instagram ID not specified")
                 # return 1
                 # access_token = IG_ACCESS_TOKEN
@@ -70,7 +73,7 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
                 # print(f"Instagram connection not found for {instagram_id}, using default token")
         else:
             # Use default token if no Instagram ID specified
-            print(f"No Instagram ID specified, cannot send message")
+            logger.error(f"No Instagram ID specified, cannot send message")
             return 1
             # access_token = IG_ACCESS_TOKEN
             # page_id = IG_ID
@@ -95,13 +98,13 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
 
         # Send the message
         response = requests.post(url, headers=headers, json=data)
-        print(f"Instagram message response: {response.status_code}, {response.json()}")
+        logger.info(f"Instagram message response: {response.status_code}, {response.json()}")
         
         # Return the response for further processing
         return response.json()
         
     except Exception as e:
-        print(f"Error sending Instagram message: {e}")
+        logger.error(f"Error sending Instagram message: {e}")
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
     
@@ -122,16 +125,16 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
             sort=[("last_updated", -1)]
         )
 
-        print(f"Retrieved IG Connection: {connection}")
+        logger.success(f"Retrieved IG Connection: {connection}")
         
         if connection and connection.get("page_access_token"):
             # Use the connection-specific token
             access_token = connection["page_access_token"]
-            print(f"Using Instagram-specific token for {instagram_id}")
+            logger.info(f"Using Instagram-specific token for {instagram_id}")
         else:
             # Fallback to default token if connection not found
             access_token = IG_ACCESS_TOKEN
-            print(f"Instagram connection not found for {instagram_id}, using default token")
+            logger.error(f"Instagram connection not found for {instagram_id}, using default token")
     
         url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
 
@@ -156,13 +159,13 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
 
         # Send the media message
         response = requests.post(url, headers=headers, json=data)
-        print(f"Instagram media message response: {response.status_code}, {response.json()}")
+        logger.info(f"Instagram media message response: {response.status_code}, {response.json()}")
         
         # Return the response for further processing
         return response.json()
         
     except Exception as e:
-        print(f"Error sending Instagram media message: {e}")
+        logger.error(f"Error sending Instagram media message: {e}")
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
 
@@ -185,14 +188,14 @@ async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id
         file_type = result.get("file_type")
         
         if not file_url:
-            print("Media upload failed, cannot send Instagram media message.")
+            logger.error("Media upload failed, cannot send Instagram media message.")
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via Instagram API
         response = await send_ig_media_message(recipient, file_url, file_type, instagram_id, temp_id)
         
         if response.get("message_id"):
-            print("Instagram media message sent successfully.")
+            logger.success("Instagram media message sent successfully.")
 
             await store_instagram_message(
                 message_id=response.get("message_id"),
@@ -215,7 +218,7 @@ async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id
         return {"error": "Sending media message failed", "success": False}
         
     except Exception as e:
-        print(f"Error in upload_and_send_ig_media_message: {e}")
+        logger.error(f"Error in upload_and_send_ig_media_message: {e}")
         return {"error": str(e), "success": False}
 
 async def store_instagram_message(
@@ -281,7 +284,7 @@ async def store_instagram_message(
     # Store message in Instagram-specific collection
     messages_collection.insert_one(message)
 
-    print("Instagram message stored:", message_id)
+    logger.success(f"Instagram message stored: {message_id}")
     
     # Keep only latest 500 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
@@ -302,7 +305,7 @@ async def store_instagram_message(
     #     return_document=True
     # )
 
-    print("Instagram conversation updated:", conversation_id)
+    logger.success(f"Instagram conversation updated: {conversation_id}")
 
     if temp_id:
         return
@@ -332,7 +335,7 @@ async def store_instagram_message(
     
     # Broadcast to Instagram-specific WebSocket connections
     if recipient_id in services.instagram_connections_map:
-        print(f"Broadcasting message to Instagram user {recipient_id}")
+        logger.info(f"Broadcasting message to Instagram user {recipient_id}")
         await broadcast_instagram_message(recipient_id, "new_message", {
             "message": broadcast_message
         })
@@ -391,10 +394,10 @@ async def create_or_update_instagram_conversation(org_id: str,
     if existing_conversation:
         
         abort_result = await abort_scheduled_message(org_id, conversation_id)
-        print("Aborted Scheduled message: ", abort_result)
+        logger.success(f"Aborted Scheduled message: {abort_result}")
 
         reopen_result = await reopen_conversation(org_id, conversation_id)
-        print("Reopened conversation: ", reopen_result)
+        logger.success(f"Reopened conversation: {reopen_result}")
 
         # Update existing conversation without modifying is_ai_enabled
         ig_conversation = {
@@ -454,7 +457,7 @@ async def create_or_update_instagram_conversation(org_id: str,
         upsert=True
     )
 
-    print("Conversation updated:", ig_conversation)
+    logger.success(f"Conversation updated: {ig_conversation}")
     
     # Get the updated conversation for broadcasting
     updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
@@ -514,9 +517,9 @@ async def broadcast_instagram_message(instagram_id: str, message_type: str, data
                         "platform": "instagram",
                         **serializable_data
                     })
-                    print(f"Instagram notification sent to {connection_key}: {message_type}")
+                    logger.success(f"Instagram notification sent to {connection_key}: {message_type}")
             except Exception as e:
-                print(f"Error notifying Instagram connection {connection_key}: {e}")
+                logger.error(f"Error notifying Instagram connection {connection_key}: {e}")
                 disconnected_clients.append(connection_key)
         
         # Clean up disconnected clients
@@ -541,7 +544,7 @@ async def get_ig_username(sender_id, page_access_token):
     }
 
     response = requests.get(url, headers=headers, params=params)
-    print(f"Response: {response.status_code}, {response.json()}")
+    logger.info(f"Response: {response.status_code}, {response.json()}")
     response = response.json()
     return response
 
@@ -602,10 +605,10 @@ def fetch_media_data():
                 for item in response.data
             }
         else:
-            print("No data found in Supabase table.")
+            logger.warning("No data found in Supabase table.")
             return {}
     except Exception as e:
-        print(f"Error fetching data from Supabase: {e}")
+        logger.error(f"Error fetching data from Supabase: {e}")
         return {}
 
 media_data = fetch_media_data()
@@ -619,17 +622,16 @@ async def reply_to_comment(comment_id, message, ig_account_id):
             sort=[("last_updated", -1)]
         )
 
-        print(f"Retrieved IG Connection: {connection}")
+        logger.success(f"Retrieved IG Connection: {connection}")
         
         if connection and connection.get("page_access_token"):
             # Use the connection-specific token
             access_token = connection["page_access_token"]
-            print(f"Using Instagram-specific token for {ig_account_id}")
+            logger.info(f"Using Instagram-specific token for {ig_account_id}")
         else:
             # Fallback to default token if connection not found
             access_token = IG_ACCESS_TOKEN
-            print(f"Instagram connection not found for {ig_account_id}, using default token")
-
+            logger.error(f"Instagram connection not found for {ig_account_id}, using default token")
     url = f"https://graph.facebook.com/v21.0/{comment_id}/replies"
     payload= {
       "message": message,
@@ -637,7 +639,7 @@ async def reply_to_comment(comment_id, message, ig_account_id):
     }
 
     response = requests.post(url, data=payload)
-    print("Comment reply response:", response.json())
+    logger.info(f"Comment reply response: {response.json()}")
 
 async def send_private_reply(comment_id,ig_account_id, message_text=None, link_url=None, button_title="View Offer"):
     """Send private message to user who commented"""
@@ -649,16 +651,16 @@ async def send_private_reply(comment_id,ig_account_id, message_text=None, link_u
             sort=[("last_updated", -1)]
         )
 
-        print(f"Retrieved IG Connection: {connection}")
+        logger.success(f"Retrieved IG Connection: {connection}")
         
         if connection and connection.get("page_access_token"):
             # Use the connection-specific token
             access_token = connection["page_access_token"]
-            print(f"Using Instagram-specific token for {ig_account_id}")
+            logger.info(f"Using Instagram-specific token for {ig_account_id}")
         else:
             # Fallback to default token if connection not found
             access_token = IG_ACCESS_TOKEN
-            print(f"Instagram connection not found for {ig_account_id}, using default token")
+            logger.error(f"Instagram connection not found for {ig_account_id}, using default token")
     
     url = f"https://graph.instagram.com/v23.0/{ig_account_id}/messages"
 
@@ -700,7 +702,7 @@ async def send_private_reply(comment_id,ig_account_id, message_text=None, link_u
             },
             "access_token": access_token
         }
-        print(f"Sending button message with link: {link_url}")
+        logger.info(f"Sending button message with link: {link_url}")
     else:
         # Send simple text message when no valid link is provided
         payload = {
@@ -712,21 +714,21 @@ async def send_private_reply(comment_id,ig_account_id, message_text=None, link_u
             },
             "access_token": access_token
         }
-        print("Sending simple text message (no valid link provided)")
+        logger.info("Sending simple text message (no valid link provided)")
 
     try:
         response = requests.post(url, json=payload)
-        print(f"Private message response: {response.status_code}")
+        logger.info(f"Private message response: {response.status_code}")
         
         if response.status_code == 200:
-            print("Message sent successfully!")
+            logger.success("Message sent successfully!")
             return True
         else:
-            print(f"Error sending message: {response.json()}")
+            logger.error(f"Error sending message: {response.json()}")
             return False
             
     except Exception as e:
-        print(f"Exception while sending message: {e}")
+        logger.error(f"Exception while sending message: {e}")
         return False
 
 async def process_comments_events(value, ig_account_id): 
@@ -736,10 +738,10 @@ async def process_comments_events(value, ig_account_id):
     media_id = value.get('media', {}).get('id')
     user_id = value.get('from', {}).get('id')
 
-    print(f"new comment by @{from_user}: {text} on media_id {media_id}")
+    logger.info(f"new comment by @{from_user}: {text} on media_id {media_id}")
 
     if not media_id or not user_id:
-        print("Missing media_id or user_id.")
+        logger.error("Missing media_id or user_id.")
         return
 
     media_info = media_data.get(str(media_id))
@@ -750,7 +752,7 @@ async def process_comments_events(value, ig_account_id):
             services.responded_users_by_media[str(media_id)] = set()
 
         if user_id not in services.responded_users_by_media[str(media_id)]:
-            print(f"Keyword match found: '{media_info['keyword']}' in comment text. First time responding.")
+            logger.success(f"Keyword match found: '{media_info['keyword']}' in comment text. First time responding.")
             reply_message = media_info['reply']
             link_url = media_info.get('link')
             button_title = media_info.get('button_title', 'View Offer')
@@ -767,9 +769,9 @@ async def process_comments_events(value, ig_account_id):
 
             services.responded_users_by_media[str(media_id)].add(user_id)
         else:
-            print(f"Already responded to user_id {user_id} for media_id {media_id}. Skipping.")
+            logger.info(f"Already responded to user_id {user_id} for media_id {media_id}. Skipping.")
     else:
-        print("No matching keyword or media not tracked.")
+        logger.warning("No matching keyword or media not tracked.")
 
 # === Disconnect and Archive helpers for Instagram ===
 
@@ -784,7 +786,7 @@ async def revoke_instagram_access(org_id: str, user_id: str):
         )
 
         if not connection: 
-            print("No active instagram connection found")
+            logger.error("No active instagram connection found")
             return {"message": "Instagram connection not found"}
         
         access_token = connection.get("page_access_token")
@@ -794,12 +796,12 @@ async def revoke_instagram_access(org_id: str, user_id: str):
                     f"https://graph.instagram.com/{user_id}/permissions",
                     params={"access_token": access_token}
                 )
-                print(f"Token revocation response: {response.status_code} - {response.text}")
+                logger.info(f"Token revocation response: {response.status_code} - {response.text}")
             except Exception as revoke_error:
-                print(f"Error revoking Instagram token: {revoke_error}")
+                logger.error(f"Error revoking Instagram token: {revoke_error}")
 
     except Exception as e:
-        print(f"Error in revoke_instagram_access: {str(e)}")
+        logger.error(f"Error in revoke_instagram_access: {str(e)}")
 
 async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30):
     """
@@ -825,7 +827,7 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
 
                 if existing_archive:
                     archive_id = existing_archive["archive_id"]
-                    print(f"Found existing archive {archive_id} for instagram_id {instagram_id}, extending expiration")
+                    logger.info(f"Found existing archive {archive_id} for instagram_id {instagram_id}, extending expiration")
 
                     db.archived_tracker.update_one(
                         {"archive_id": archive_id},
@@ -835,7 +837,7 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
                 else:
 
                     archive_id = uuid.uuid4().hex
-                    print(f"Creating new archive {archive_id} for instagram_id {instagram_id}")
+                    logger.info(f"Creating new archive {archive_id} for instagram_id {instagram_id}")
 
                     db.archived_tracker.insert_one({
                             "archive_id": archive_id,
@@ -908,10 +910,10 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
                     db[archived_private_notes].insert_many(private_notes_to_archive, session=session)
                     db[private_notes_collection_name].delete_many({"platform": "instagram", "user_id": instagram_id}, session=session)
 
-                print(f"Archived Instagram data for org {org_id} with archive_id {archive_id}")
+                logger.success(f"Archived Instagram data for org {org_id} with archive_id {archive_id}")
 
     except Exception as e:
-         print(f"Error archiving Instagram data for org {org_id} with archive_id {archive_id}: {str(e)}")
+         logger.error(f"Error archiving Instagram data for org {org_id} with archive_id {archive_id}: {str(e)}")
 
 async def remove_instagram_connection(org_id: str, instagram_id: str):
     """
@@ -922,7 +924,7 @@ async def remove_instagram_connection(org_id: str, instagram_id: str):
         delete_result = db.instagram_connections.delete_many(
             {"instagram_id": instagram_id, "org_id": org_id}
             )
-        print(f"Deleted {delete_result.deleted_count} Instagram connections for org {org_id}")
+        logger.success(f"Deleted {delete_result.deleted_count} Instagram connections for org {org_id}")
 
         org_update_result = db.organizations.update_one(
             {"org_id": org_id},
@@ -930,9 +932,9 @@ async def remove_instagram_connection(org_id: str, instagram_id: str):
         )
 
         if org_update_result.modified_count:
-            print(f"Cleared ig_id for organization {org_id}")
+            logger.success(f"Cleared ig_id for organization {org_id}")
         else:
-            print(f"No organization updated for org_id {org_id}")
+            logger.warning(f"No organization updated for org_id {org_id}")
 
         return {
             "deleted_connections": delete_result.deleted_count,
@@ -940,7 +942,7 @@ async def remove_instagram_connection(org_id: str, instagram_id: str):
         }
     
     except Exception as e:
-        print(f"Error removing Instagram connection: {str(e)}")
+        logger.error(f"Error removing Instagram connection: {str(e)}")
         raise
 
 async def handle_reaction_messages():
@@ -970,11 +972,11 @@ async def send_message_reaction(message_id: str, instagram_id: str, page_access_
 
         response = requests.post(url, headers=headers, json=body)
         if response.status_code != 200:
-            print(f"Error sending message reaction: {response.text}")
+            logger.error(f"Error sending message reaction: {response.text}")
             return "error"
-        print(f"Message reaction response: {response.status_code}, {response.json()}")
+        logger.info(f"Message reaction response: {response.status_code}, {response.json()}")
         return "success"
 
     except Exception as e:
-        print(f"Error sending message reaction: {str(e)}")
+        logger.error(f"Error sending message reaction: {str(e)}")
         return "error"

@@ -16,9 +16,11 @@ from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET
 from core.services import services
+from core.logger import get_logger
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
+logger = get_logger(__name__)
 
 def validate_signature(payload, signature):
     # Hash the payload with the app secret
@@ -87,7 +89,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         # print("APP SECRET:", APP_SECRET)
         raise HTTPException(status_code=403, detail="Invalid signature")
     else:
-        print("Signature validated successfully.")
+        logger.success("Signature validated successfully.")
 
     # First, validate the signature
     body = await request.body()
@@ -96,18 +98,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     # payload_str = request.state.payload_body.decode('utf-8')
     # payload = json.loads(payload_str)
 
-    # print("Incoming webhook payload:", json.dumps(payload, indent=2))
+    # logger.info("Incoming webhook payload:", json.dumps(payload, indent=2))
     
     # Validate signature
     # if not x_hub_signature_256:
-    #     print(f"NO Signature: {payload_str}")
+    #     logger.error(f"NO Signature: {payload_str}")
     #     raise HTTPException(status_code=403, detail="Signature missing")
     
     # if not validate_signature(payload_str, x_hub_signature_256):
-    #     print(f"Validate Signature: {x_hub_signature_256}")
+    #     logger.warning(f"Validate Signature: {x_hub_signature_256}")
     #     raise HTTPException(status_code=403, detail="Invalid signature")
     
-    # print("RECEIVED CORRECT SIGNATURE:", x_hub_signature_256)
+    # logger.success(f"RECEIVED CORRECT SIGNATURE: {x_hub_signature_256}")
 
     # Now parse the payload
     payload = json.loads(payload_str)
@@ -115,7 +117,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     # Remove expired message IDs
     remove_expired_message_ids()
 
-    print("Incoming webhook payload:", json.dumps(payload, indent=2))
+    logger.info("Incoming webhook payload:", json.dumps(payload, indent=2))
 
     if payload["object"] == "whatsapp_business_account":
         if "entry" in payload and len(payload["entry"]) > 0:
@@ -127,7 +129,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     
                     # Validate whatsapp_business_id exists
                     if not whatsapp_business_id:
-                        print("Missing WhatsApp business ID in webhook payload")
+                        logger.warning("Missing WhatsApp business ID in webhook payload")
                         continue
                     
                     # Find the connection to get user details
@@ -136,7 +138,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     )
                     
                     if not connection:
-                        print(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
+                        logger.error(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
                         continue
 
                     # ============================================================================
@@ -150,7 +152,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         if not message_id or not status_type:
                             continue
                         
-                        print(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
+                        logger.info(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
                         
                         # Update the message status in the database
                         broadcast_message = await update_whatsapp_message_status(
@@ -164,7 +166,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             broadcast_message["_id"] = str(broadcast_message["_id"])
 
                         if not broadcast_message:
-                            print(f"No message found with ID {message_id} to update status.")
+                            logger.warning(f"No message found with ID {message_id} to update status.")
                             continue
 
                         if status_type == "sent" and broadcast_message:
@@ -199,7 +201,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Check if message ID is already processed
                             message_id = message["id"]
                             if message_id in services.processed_message_ids:
-                                print("Duplicate WhatsApp message, skipping processing.")
+                                logger.info("Duplicate WhatsApp message, skipping processing.")
                                 continue
                                 
                             # Add message ID with the current timestamp
@@ -283,7 +285,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             else:
                                 content = f"[Unsupported message type: {message_type}]"
                            
-                            print(f"WhatsApp Message Received from {sender_name2}, Message: {content}")
+                            logger.info(f"WhatsApp Message Received from {sender_name2}, Message: {content}")
                             
                             # Create or update conversation
                             conversation_id = await create_or_update_whatsapp_conversation(
@@ -360,7 +362,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         recipient_id = message["recipient"]["id"]  # Instagram business account ID
                         sender_id = message["sender"]["id"]        # Instagram user ID who deleted the message
                         
-                        print(f"Message deletion event detected - mid: {deleted_message_id}")
+                        logger.info(f"Message deletion event detected - mid: {deleted_message_id}")
 
                         # Find the corresponding Instagram account in our connections
                         instagram_connection = db.instagram_connections.find_one(
@@ -368,9 +370,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             sort=[("last_updated", -1)]
                         )
                         
-                        print(f"Instagram Connection: {instagram_connection}")
+                        logger.info(f"Instagram Connection: {instagram_connection}")
                         org_id = instagram_connection.get("org_id")
-                        print(f"Org_id: {org_id}")
+                        logger.info(f"Org_id: {org_id}")
 
                         # Get the Instagram-specific collection names
                         messages_collection_name = f"messages_{org_id}"
@@ -481,7 +483,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     # Check if the message is a read event
                     if "read" in message:
-                        print("Message read event")
+                        logger.info("Message read event")
                         continue
 
                     sender_id = message["sender"]["id"]
@@ -501,7 +503,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                         # Check for duplicate messages reactions / if the message ID is already processed
                         if key in services.processed_message_reaction_ids:
-                            print("Duplicate message, skipping processing.")
+                            logger.info("Duplicate message, skipping processing.")
                             continue
                         
                         # Add message ID with the current timestamp
@@ -514,25 +516,25 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         )
 
                         if not instagram_connection:
-                            print(f"No active Instagram connection found for recipient ID: {recipient_id}")
+                            logger.error(f"No active Instagram connection found for recipient ID: {recipient_id}")
                             return {"status": "ok"}
                         
                         org_collection = db.organizations.find_one({"ig_id": recipient_id})
 
                         if not org_collection:
-                            print(f"No active organization found for Instagram ID: {recipient_id}")
+                            logger.error(f"No active organization found for Instagram ID: {recipient_id}")
                             return {"status": "ok"}
 
                         org_id = org_collection.get("org_id")
 
                         if (not org_id):
-                            print(f"No active organization ID found for Instagram ID: {recipient_id}")
+                            logger.error(f"No active organization ID found for Instagram ID: {recipient_id}")
                             return {"status": "ok"}
 
                         # get the page access token
                         page_access_token = instagram_connection.get("page_access_token")
                         if not page_access_token:
-                            print(f"Page access token not found for recipient ID: {recipient_id}")
+                            logger.error(f"Page access token not found for recipient ID: {recipient_id}")
                             return {"status": "error", "message": "Page access token not found"}
                         
                         # Get user-specific collection names
@@ -548,7 +550,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         name = user_details.get('name', username)
                         user = name + " - @" + username
 
-                        print(f"Reaction Event: {user} reacted to message ID {mid} with emoji: {emoji}")
+                        logger.info(f"Reaction Event: {user} reacted to message ID {mid} with emoji: {emoji}")
 
                         if (action == "react"):
                             # Update the message with the reaction info in  database and it for broadcasting
@@ -569,11 +571,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 )
                                 
                                 if not broadcast_message:
-                                    print(f"Message with ID {mid} not found for reaction update")
+                                    logger.warning(f"Message with ID {mid} not found for reaction update")
                                     return {"status": "ok"}
                                     
                             except Exception as e:
-                                print(f"Error updating message with reaction: {e}")
+                                logger.error(f"Error updating message with reaction: {e}")
                                 return {"status": "error", "message": str(e)}
                             
                         elif (action == "unreact"):
@@ -587,11 +589,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 )
                                 
                                 if not broadcast_message:
-                                    print(f"Message with ID {mid} not found for reaction update")
+                                    logger.warning(f"Message with ID {mid} not found for reaction update")
                                     return {"status": "ok"}
                                     
                             except Exception as e:
-                                print(f"Error updating message with reaction: {e}")
+                                logger.error(f"Error updating message with reaction: {e}")
                                 return {"status": "error", "message": str(e)}
                         
 
@@ -608,7 +610,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                         # Broadcast the reaction update to connected clients
                         if recipient_id in services.instagram_connections_map:
-                            print(f"Broadcasting message_reaction event to Frontend for {recipient_id}")
+                            logger.success(f"Broadcasting message_reaction event to Frontend for {recipient_id}")
                             await broadcast_instagram_message(recipient_id, "message_reaction", {
                                 "message": broadcast_message
                             })
@@ -619,19 +621,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     message = message.get("message")
                     
                     if (message is None):
-                        print("No message content, skipping.")
+                        logger.warning("No message content, skipping.")
                         return {"status": "ok"}
 
                     # if no text content in the message, skip processing it
                     if (message.get("text") is None and message.get("attachments") is None):
-                        print("Event can't be handled (not supported), skipping processing.")
+                        logger.warning("Event can't be handled (not supported), skipping processing.")
                         return {"status": "ok"}
                     
                     # Check for duplicate messages / if the message ID is already processed
                     ig_message_id = message["mid"]
 
                     if ig_message_id in services.processed_message_ids:
-                        print("Duplicate message, skipping processing.")
+                        logger.warning("Duplicate message, skipping processing.")
                         continue
                     
                     # Add message ID with the current timestamp
@@ -649,25 +651,25 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     )
 
                     if not instagram_connection:
-                        print(f"No active Instagram connection found for recipient ID: {recipient_id}")
+                        logger.error(f"No active Instagram connection found for recipient ID: {recipient_id}")
                         return {"status": "ok"}
                     
                     org_collection = db.organizations.find_one({"ig_id": recipient_id})
 
                     if not org_collection:
-                        print(f"No active organization found for Instagram ID: {recipient_id}")
+                        logger.error(f"No active organization found for Instagram ID: {recipient_id}")
                         return {"status": "ok"}
 
                     org_id = org_collection.get("org_id")
 
                     if (not org_id):
-                        print(f"No active organization ID found for Instagram ID: {recipient_id}")
+                        logger.error(f"No active organization ID found for Instagram ID: {recipient_id}")
                         return {"status": "ok"}
 
                     # get the page access token
                     page_access_token = instagram_connection.get("page_access_token")
                     if not page_access_token:
-                        print(f"Page access token not found for recipient ID: {recipient_id}")
+                        logger.error(f"Page access token not found for recipient ID: {recipient_id}")
                         return {"status": "error", "message": "Page access token not found"}
                     
                     # ATTACHMENT TYPE MESSAGES #######################################################################
@@ -675,7 +677,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     attachment_payload = None
 
                     if (message.get("attachments") is not None):
-                        print("Message has attachments")
+                        logger.info("Message has attachments")
                         for attachment in message.get("attachments"):
                             attachment_type = str(attachment.get("type"))
                             attachment_payload = attachment.get("payload")
@@ -684,7 +686,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     if(message.get("reply_to") is not None):
                         # Handle message replies
                         if message.get("reply_to").get("mid") is not None:
-                            print(f"Message is a reply to message ID: {message.get('reply_to').get('mid')}")
+                            logger.info(f"Message is a reply to message ID: {message.get('reply_to').get('mid')}")
                             attachment_type = "message_reply"
                             attachment_payload = {
                                 "mid": message.get("reply_to").get("mid")
@@ -696,7 +698,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             story_url = message.get("reply_to").get("story").get("url")
                             story_owner = await get_ig_media_owner(story_id, page_access_token)
                             
-                            print(f"Message is a reply to story ID: {story_id}")
+                            logger.info(f"Message is a reply to story ID: {story_id}")
 
                             attachment_type = "story_reply"
                             attachment_payload = {
@@ -733,12 +735,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     if username is not None:
                         user = user + " - @" + username
 
-                    print(f"Message Received from {user}, Message: {message_text}")
+                    logger.info(f"Message Received from {user}, Message: {message_text}")
 
                     
 
 
-                    print("Calling function create_or_update_instagram_conversation")
+                    logger.success("Calling function create_or_update_instagram_conversation")
 
                     # Create or update conversation
                     conversation_id = await create_or_update_instagram_conversation(
@@ -788,7 +790,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         }
                                     })
                             except Exception as e:
-                                print(f"Error notifying connection {connection_key}: {e}")
+                                logger.error(f"Error notifying connection {connection_key}: {e}")
                     
                     if conversation:
                     # Convert ObjectId to string for JSON serialization

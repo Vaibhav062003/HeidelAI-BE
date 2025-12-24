@@ -5,6 +5,9 @@ from agno.models.google import Gemini
 from pydantic import BaseModel, Field
 from agno.agent import Agent, RunResponse
 from pymongo import MongoClient
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
@@ -68,7 +71,7 @@ async def analyze_conversation(conversation: str) -> Optional[ConversationSummar
     if isinstance(response.content, ConversationSummary):
         return response.content
 
-    print( "LLM Error: ",response)
+    logger.error("LLM Error: " + str(response))
     raise RuntimeError("AI response is not in expected format")
 
 if __name__ == "__main__":

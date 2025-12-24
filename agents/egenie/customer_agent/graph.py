@@ -9,6 +9,10 @@ from langgraph.graph.message import add_messages
 from typing import TypedDict, Sequence, Annotated, Union
 from langchain_core.messages import BaseMessage
 
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     final_response: Union[ProductResponse, None]
@@ -66,7 +70,7 @@ workflow.add_edge("product_agent", END)
 
 EGENIE_CHAT_AGENT = workflow.compile()
 
-print(EGENIE_CHAT_AGENT.get_graph().draw_ascii())
+logger.info(EGENIE_CHAT_AGENT.get_graph().draw_ascii())
 
 if __name__ == "__main__":
     pass

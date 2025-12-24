@@ -2,18 +2,21 @@ import asyncio
 from fastapi.encoders import jsonable_encoder
 from core.services import services
 from fastapi import WebSocket, WebSocketDisconnect
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 async def cleanup_client(client_id: str):
     """
     Clean up all references to a disconnected client.
     """
-    print(f"🔴 Disconnecting client {client_id}")
+    logger.info(f"Disconnecting client {client_id}")
 
     # Retrieve and remove the entry from the reverse map
     convo_key = services.client_convo_map.pop(client_id, None)
     
     if convo_key:
-        print(f"Cleaning up presence data for conversation {convo_key}")
+        logger.info(f"Cleaning up presence data for conversation {convo_key}")
         # Remove client_id from the conversation viewers set
         if convo_key in services.convo_viewers:
             services.convo_viewers[convo_key].discard(client_id)
@@ -42,14 +45,14 @@ async def cleanup_client(client_id: str):
     services.active_clients.pop(client_id, None)
     services.client_metadata.pop(client_id, None)
 
-    print(f"✅ Cleaned up client {client_id}")
+    logger.success(f"Cleaned up client {client_id}")
 
 async def handle_typing_event(client_id: str, data: dict):
     """
     Broadcast typing indicators to all users under the same IG or WA account,
     excluding the sender.
     """
-    print(f"[Typing Event] Client {client_id} sending typing: {data}")
+    logger.info(f"[Typing Event] Client {client_id} sending typing: {data}")
     
     meta = services.client_metadata.get(client_id)
     if not meta:
@@ -92,7 +95,7 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
         payload         --> dict containing data
         exclude_client_id --> client_id to exclude from broadcast (usually the sender) (usually only set for typing indicators)
     """
-    print(f"[Broadcast Main WS] 📡 Broadcasting {event_type} to {platform_type} clients under ID {platform_id}")
+    logger.info(f"📡 Broadcasting {event_type} to {platform_type} clients under ID {platform_id}")
     if platform_type == "instagram":
         target_map = services.instagram_clients
     else:
@@ -116,7 +119,7 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
             continue
 
         try:
-            print(f"[Broadcast Main WS] ➡️ Sending {event_type} to client {client_id}")
+            logger.info(f"Sending {event_type} to client {client_id}")
             await ws.send_json({
                 "type": event_type,
                 "data":{
@@ -124,11 +127,11 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
                     **safe_payload
                 }
             })
-            print(f"[Broadcast Main WS] ✅ Sent {event_type} to {client_id}")
+            logger.success(f"Sent {event_type} to {client_id}")
         except Exception as e:
-            print(f"[Broadcast Main WS] ⚠️ Failed to send to {client_id}: {e}, marking as disconnected")
+            logger.error(f"Failed to send to {client_id}: {e}, marking as disconnected")
         except WebSocketDisconnect:
-            print(f"[Broadcast Main WS] ⚠️ Client {client_id} disconnected, marking as disconnected")
+            logger.error(f"Client {client_id} disconnected, marking as disconnected")
             disconnected_clients.append(client_id)
 
     # Cleanup
@@ -154,7 +157,7 @@ async def start_heartbeat(client_id: str, websocket: WebSocket):
                 try:
                     await websocket.send_json({"type": "ping", "data": {}})
                 except Exception:
-                    print(f"Start Heartbeat: Failed to ping {client_id}")
+                    logger.error(f"Start Heartbeat: Failed to ping {client_id}")
                     break
             else:
                 break
@@ -173,7 +176,7 @@ def handle_unread_event(org_id: str, client_id: str, data: dict):
         conversation_id = data.get("conversation_id")
         leave_conversation_presence(org_id, conversation_id, client_id)
     else:
-        print(f"Unknown unread event type: {data.get('type')}")
+        logger.error(f"Unknown unread event type: {data.get('type')}")
 
 def join_conversation_presence(org_id: str, conversation_id: str, client_id: str):
     """
@@ -190,7 +193,7 @@ def join_conversation_presence(org_id: str, conversation_id: str, client_id: str
     # Updating reverse map (client_convo_map: client -> (org, convo))
     services.client_convo_map[client_id] = convo_key
     
-    print(f"Client {client_id} JOINED conversation {convo_key}")
+    logger.info(f"Client {client_id} JOINED conversation {convo_key}")
 
 def leave_conversation_presence(org_id: str, conversation_id: str, client_id: str):
     """
@@ -209,4 +212,4 @@ def leave_conversation_presence(org_id: str, conversation_id: str, client_id: st
     # Removing from reverse map (client_convo_map)
     services.client_convo_map.pop(client_id, None)
     
-    print(f"Client {client_id} LEFT conversation {convo_key}")
+    logger.info(f"Client {client_id} LEFT conversation {convo_key}")

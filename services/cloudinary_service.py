@@ -15,6 +15,9 @@ from config.settings import (
     CLOUDINARY_API_SECRET,
 )
 from schemas.models import MessageRole
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 # Cloudinary configuration
 cloudinary.config(
@@ -68,7 +71,7 @@ async def get_cloudinary_stats():
         }
         
     except Exception as e:
-        print(f"Error fetching Cloudinary stats: {e}")
+        logger.error(f"Error fetching Cloudinary stats: {e}")
         return {"status": "error", "message": str(e)}
 
 async def cleanup_old_cloudinary_media(days_threshold=30):
@@ -104,7 +107,7 @@ async def cleanup_old_cloudinary_media(days_threshold=30):
                 public_ids = [res['public_id'] for res in resources]
                 
                 if public_ids:
-                    print(f"Deleting {len(public_ids)} {r_type}s from {folder}...")
+                    logger.info(f"Deleting {len(public_ids)} {r_type}s from {folder}...")
                     
                     # 4. Delete by Public IDs
                     delete_response = cloudinary.api.delete_resources(
@@ -125,7 +128,7 @@ async def cleanup_old_cloudinary_media(days_threshold=30):
         }
         
     except Exception as e:
-        print(f"Error cleaning up Cloudinary resources: {e}")
+        logger.error(f"Error cleaning up Cloudinary resources: {e}")
         return {"status": "error", "message": str(e)}
 
 # @app.on_event("startup")
@@ -152,7 +155,7 @@ async def alert_if_storage_high():
     stats = await get_cloudinary_stats()
     if stats.get("status") == "success" and stats["storage"]["percentage_of_limit"] > 75:
         # Send alert (email, Slack, etc.)
-        print(f"⚠️ WARNING: Cloudinary storage at {stats['storage']['percentage_of_limit']}% of 25GB limit")
+        logger.warning(f"Cloudinary storage at {stats['storage']['percentage_of_limit']}% of 25GB limit")
         # Implement notification system here
 
 async def check_cloudinary_storage_limit():
@@ -188,7 +191,7 @@ async def upload_and_send_whatsapp_media_background(
     This is designed to be run as a BackgroundTask.
     """
     from services.wa_service import create_or_update_whatsapp_conversation, store_whatsapp_message
-    print(f"Background Task Started: Processing media {media_id}")
+    logger.success(f"Background Task Started: Processing media {media_id}")
     
     headers = {
         "Authorization": f"Bearer {access_token}"
@@ -203,7 +206,7 @@ async def upload_and_send_whatsapp_media_background(
             response = await client.get(media_url, headers=headers)
             
             if response.status_code != 200:
-                print(f"❌ Error downloading from WhatsApp: {response.text}")
+                logger.error(f"Error downloading from WhatsApp: {response.text}")
                 return
 
         # 2. Prepare file in memory
@@ -237,7 +240,7 @@ async def upload_and_send_whatsapp_media_background(
         file_size = result.get("bytes")
         file_pages = result.get("pages")
 
-        print(f"✅ Upload Successful: {secure_url}")
+        logger.success(f"Upload Successful: {secure_url}")
 
         # 4. Generate Thumbnail URL
         # If we uploaded as image/video (including PDF), we can swap extension
@@ -261,8 +264,8 @@ async def upload_and_send_whatsapp_media_background(
             "mime_type": mime_type
         }
 
-        print(f"✅ Uploaded: {secure_url}")
-        print(f"🖼️ Preview:  {thumbnail_url}")
+        logger.success(f"Uploaded: {secure_url}")
+        logger.success(f"Preview:  {thumbnail_url}")
 
         # ---------------------------------------------------------
         # Here I am storing & broadcasting this type of message after upload is completed.
@@ -301,7 +304,7 @@ async def upload_and_send_whatsapp_media_background(
         )
 
     except Exception as e:
-        print(f"❌ Background Upload Failed: {e}")
+        logger.error(f"Background Upload Failed: {e}")
 
 async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> str:
     """
@@ -311,7 +314,7 @@ async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> s
     storage_ok = await check_cloudinary_storage_limit()
 
     if not storage_ok:
-        print("Cloudinary storage limit approaching. Upload aborted.")
+        logger.error("Cloudinary storage limit approaching. Upload aborted.")
         return None
 
     try:
@@ -343,9 +346,9 @@ async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> s
         )
 
         secure_url = result.get("secure_url")
-        print(f"Media uploaded to Cloudinary: {secure_url}")
+        logger.success(f"Media uploaded to Cloudinary: {secure_url}")
         return {"file_url": secure_url, "file_type": cld_resource_type}
 
     except Exception as e:
-        print(f"Error uploading media to Cloudinary: {e}")
+        logger.error(f"Error uploading media to Cloudinary: {e}")
         return None

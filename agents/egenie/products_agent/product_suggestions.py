@@ -6,6 +6,9 @@ import aiohttp
 from fastapi import HTTPException
 from typing import List
 from config.settings import KOYEB2, MONGODB_URI
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client['Cluster0']
@@ -21,7 +24,7 @@ async def get_query_vector(query: str) -> List[float]:
         List[float]: Encoded vector for the query.
     """
     url = f"{KOYEB2}/encode"  
-    print("hitting donella")
+    logger.info("hitting donella")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -33,10 +36,10 @@ async def get_query_vector(query: str) -> List[float]:
                     # print("response", data["vector"])
                     return data["vector"]
                 else:
-                    print(f"Error from encoding service: {await response.text()}")
+                    logger.error(f"Error from encoding service: {await response.text()}")
                     raise HTTPException(status_code=response.status, detail="Encoding service error")
     except Exception as e:
-        print(f"Error calling encoding service: {e}")
+        logger.error(f"Error calling encoding service: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def initialize_pinecone():
@@ -93,8 +96,8 @@ async def get_products(org_id: str, conversation_id: str):
     conversation = conversations_collection.find_one({"id": conversation_id})
     search_phrase = conversation.get("query", None)
     if conversation and search_phrase:
-        print("Found conversation for product_recommendations")
-        print("Searching pinecone for ", search_phrase)
+        logger.success("Found conversation for product_recommendations")
+        logger.info("Searching pinecone for " + search_phrase)
         search_results = await search_pinecone(search_phrase)
         products = []
 
@@ -103,7 +106,7 @@ async def get_products(org_id: str, conversation_id: str):
             products.append(product)
             # print(product["name"])
         
-        print("Total fetched recommended products: ", len(products))
+        logger.success("Total fetched recommended products: " + str(len(products)))
 
         update_fields = {
             "product_recommendations": products,
@@ -116,8 +119,8 @@ async def get_products(org_id: str, conversation_id: str):
             {"$set": update_fields}
         )
 
-        print(f"Updated recommended products for {conversation_id}.")
+        logger.success(f"Updated recommended products for {conversation_id}.")
  
         return True
-    print("No conversation found or no search phrase available.")
+    logger.warning("No conversation found or no search phrase available.")
     return False

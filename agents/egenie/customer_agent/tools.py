@@ -8,6 +8,9 @@ import aiohttp
 # from config.settings import SENTENCE_TRANSFORMERS_MODEL
 
 from config.settings import KOYEB2
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 index = get_pinecone_db()
 # model = SentenceTransformer(SENTENCE_TRANSFORMERS_MODEL)
@@ -44,7 +47,7 @@ async def get_query_vector(query: str) -> List[float]:
         List[float]: Encoded vector for the query.
     """
     url = f"{KOYEB2}/encode"  
-    print("hitting donella")
+    logger.info("hitting donella")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -56,10 +59,10 @@ async def get_query_vector(query: str) -> List[float]:
                     # print("response", data["vector"])
                     return data["vector"]
                 else:
-                    print(f"Error from encoding service: {await response.text()}")
+                    logger.error(f"Error from encoding service: {await response.text()}")
                     raise HTTPException(status_code=response.status, detail="Encoding service error")
     except Exception as e:
-        print(f"Error calling encoding service: {e}")
+        logger.error(f"Error calling encoding service: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @tool

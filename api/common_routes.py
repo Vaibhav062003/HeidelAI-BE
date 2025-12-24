@@ -29,6 +29,10 @@ from services.products_service import (
     delete_product_by_id
 )
 
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
 router = APIRouter(tags=["Common Routes"])
 
 @router.get("/")
@@ -58,7 +62,7 @@ async def get_conversations(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error fetching conversations for {user.org_id}: {e}")
+        logger.error(f"Error fetching conversations for {user.org_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch conversations")
 
 @router.get("/api/conversations/{conversation_id}")
@@ -75,7 +79,7 @@ async def get_conversation(conversation_id: str, user: CurrentUser):
         conversation = await fetch_conversation(org_id, conversation_id)
         return conversation
     except HTTPException as e:
-        print(f"Error fetching conversation {conversation_id} for org {org_id}: {e}")
+        logger.error(f"Error fetching conversation {conversation_id} for org {org_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch conversation")
 
 @router.get("/api/conversations/{conversation_id}/messages")
@@ -139,7 +143,7 @@ async def unarchive(user: CurrentUser, platform: str, request: UnarchiveRequest)
     """
     Unarchive data for a specific platform.
     """
-    print(type(user))
+    logger.info(f"Unarchiving data for user: {user}")
     org_id = user.org_id
     user_id = request.platform_id
 

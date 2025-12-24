@@ -9,6 +9,9 @@ from fastapi.security import HTTPAuthorizationCredentials
 import json
 
 from services.websocket_service import *
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 router = APIRouter(tags=["Websockets"])
 
@@ -32,7 +35,7 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
         instagram_id = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}).get("ig_id")
         
         if not instagram_id:
-            print("No Instagram ID found for organization")
+            logger.error("No Instagram ID found for organization")
             await websocket.close(code=1008, reason="No Instagram ID configured")
             return
 
@@ -41,7 +44,7 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
 
     except Exception as e:
         import traceback
-        print(f"Authentication error: {str(e)}")
+        logger.error(f"Authentication error: {str(e)}")
         # print(traceback.format_exc())  # Print full stack trace
         await websocket.close(code=1008, reason="Authentication failed")
         return
@@ -52,16 +55,16 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
             services.instagram_connections_map[instagram_id] = set()
         services.instagram_connections_map[instagram_id].add(client_id)
 
-        print(f"Registered Instagram connection for ID: {instagram_id}")
+        logger.success(f"Registered Instagram connection for ID: {instagram_id}")
         
         # Handle incoming messages
         while True:
             data = await websocket.receive_json()
-            print(f"Received message from Instagram connection {client_id}: {data}")
+            logger.info(f"Received message from Instagram connection {client_id}: {data}")
             msg_type = data.get("type")
                           
             if msg_type == "typing_indicator":
-                print(f"✍️ Typing event from Instagram {client_id}: {data}")
+                logger.info(f"✍️ Typing event from Instagram {client_id}: {data}")
                 if instagram_id in services.instagram_connections_map:
                     for other_client_id in services.instagram_connections_map[instagram_id]:
                         if other_client_id != client_id:
@@ -71,7 +74,7 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
                                 try:
                                     await other_ws.send_json(data)
                                 except Exception as e:
-                                    print(f"Error sending typing indicator to {other_client_id}: {e}")
+                                    logger.error(f"Error sending typing indicator to {other_client_id}: {e}")
 
 
 
@@ -99,7 +102,7 @@ async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, what
         )
 
     if not wa_connection or not wa_connection.get("wa_id"):
-        print(f"No WhatsApp connection found for user ID: {whatsapp_id}")
+        logger.error(f"No WhatsApp connection found for user ID: {whatsapp_id}")
         await websocket.close(code=1008, reason="Invalid WhatsApp connection")
         return
     
@@ -117,12 +120,12 @@ async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, what
                 services.whatsapp_connections_map[whatsapp_business_id] = set()
             services.whatsapp_connections_map[whatsapp_business_id].add(connection_key)
 
-            print(f"Registered WhatsApp connection for ID: {connection_key}")
+            logger.success(f"Registered WhatsApp connection for ID: {connection_key}")
         
         # Handle incoming messages
         while True:
             data = await websocket.receive_json()
-            print(f"Received message from WhatsApp connection {connection_key}: {data}")
+            logger.info(f"Received message from WhatsApp connection {connection_key}: {data}")
     except WebSocketDisconnect:
         manager.disconnect(connection_key)
         # Clean up WhatsApp ID mapping
@@ -139,7 +142,7 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_json()
-            print(f"Received message from {client_id}: {data}")
+            logger.info(f"Received message from {client_id}: {data}")
     except WebSocketDisconnect:
         manager2.disconnect(client_id)
 
@@ -183,8 +186,8 @@ async def main_ws(websocket: WebSocket, client_id: str):
     if wa_id:
         services.whatsapp_clients[wa_id].add(client_id)
 
-    print(f"🔵 Connected client: {client_id}", flush=True)
-    print(f"   IG: {ig_id}, WA: {wa_id}", flush=True)
+    logger.success(f"Connected client: {client_id}")
+    logger.success(f"IG: {ig_id}, WA: {wa_id}")
 
     heartbeat_task = asyncio.create_task(start_heartbeat(client_id, websocket))
 
@@ -194,7 +197,7 @@ async def main_ws(websocket: WebSocket, client_id: str):
             # 1. Use receive_text first to see raw data (debugs JSON errors)
             try:
                 raw_data = await websocket.receive_text()
-                print(f"Raw Data Received: {raw_data}", flush=True)
+                logger.info(f"Raw Data Received: {raw_data}")
 
                 # 2. Manually parse JSON
                 data = json.loads(raw_data)
@@ -210,20 +213,20 @@ async def main_ws(websocket: WebSocket, client_id: str):
                 
             except WebSocketDisconnect:
                 # 🛑 STOP the loop if the client disconnects
-                print(f"⚠️ Client {client_id} disconnected (caught in loop)", flush=True)
+                logger.warning(f"Client {client_id} disconnected (caught in loop)")
                 break
 
             except json.JSONDecodeError:
-                print(f"❌ Failed to decode JSON: {raw_data}", flush=True)
+                logger.error(f"❌ Failed to decode JSON: {raw_data}")
             except Exception as inner_e:
-                print(f"❌ Error processing message loop: {inner_e}", flush=True)
+                logger.error(f"❌ Error processing message loop: {inner_e}")
                 # We catch here so the loop CONTINUES even if one message fails
 
     except WebSocketDisconnect:
-        print(f"⚠️ Client {client_id} disconnected", flush=True)
+        logger.warning(f"Client {client_id} disconnected")
         await cleanup_client(client_id)
     except Exception as e:
-        print(f"❗ Critical Websocket Error: {e}", flush=True)
+        logger.error(f"❗ Critical Websocket Error: {e}")
         await cleanup_client(client_id)
     finally:
         heartbeat_task.cancel()

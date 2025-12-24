@@ -5,6 +5,10 @@ from database import get_mongo_db
 from schemas.models import ChatAnalysis
 from agents.support_agent.agent import analyze_conversation
 
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
 db = get_mongo_db()
 
 async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> ChatAnalysis:
@@ -80,7 +84,7 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
             return result_data
 
     except Exception as e:
-        print(f"LLM analysis failed for {conversation_id}: {e}")
+        logger.error(f"LLM analysis failed for {conversation_id}: {e}")
         return None
 
 if __name__ == "__main__":

@@ -4,6 +4,10 @@ from agents.egenie.customer_agent.graph import EGENIE_CHAT_AGENT
 
 from database import get_mongo_db
 
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
 db = get_mongo_db()
 
 def load_prompts_into_cache():
@@ -40,12 +44,12 @@ def update_prompt_in_cache(org_id: str, new_prompt: str):
 
 def load_agents():
     """Load all agents into memory."""
-    print("Loading agents...")
+    logger.info("Loading agents...")
     services.agents[ORG_ID] = EGENIE_CHAT_AGENT
-    print("Agents loaded.")
+    logger.success("Agents loaded.")
 
 def clear_agents():
     """Clear all agents from memory."""
-    print("Clearing agents...")
+    logger.info("Clearing agents...")
     services.agents.clear()
-    print("Agents cleared.")
+    logger.success("Agents cleared.")

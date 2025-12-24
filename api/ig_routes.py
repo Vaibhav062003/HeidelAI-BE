@@ -14,6 +14,10 @@ from database import get_mongo_db
 from pymongo import ReturnDocument
 import cloudinary
 
+from core.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 instagram_service = InstagramService()
 
@@ -43,8 +47,8 @@ def exchange_for_long_lived_token(short_lived_token):
         # Make the GET request
         response = requests.get(url, params=params)
         
-        print(f"Long-lived token exchange status: {response.status_code}")
-        print(f"Long-lived token exchange response: {response.text}")
+        logger.info(f"Long-lived token exchange status: {response.status_code}")
+        logger.info(f"Long-lived token exchange response: {response.text}")
         
         # Check for successful response
         if response.status_code == 200:
@@ -61,7 +65,7 @@ def exchange_for_long_lived_token(short_lived_token):
                 "error": response.text
             }
     except Exception as e:
-        print(f"Error exchanging token: {str(e)}")
+        logger.error(f"Error exchanging token: {str(e)}")
         return {
             "success": False,
             "error": str(e)
@@ -111,7 +115,7 @@ async def get_instagram_profile(user: CurrentUser):
         response = requests.get(url, params=params)
         
         if response.status_code != 200:
-            print(f"Instagram API Error: {response.text}")
+            logger.error(f"Instagram API Error: {response.text}")
             raise HTTPException(
                 status_code=response.status_code,
                 detail=f"Failed to fetch Instagram profile: {response.json().get('error', {}).get('message')}"
@@ -124,7 +128,7 @@ async def get_instagram_profile(user: CurrentUser):
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error fetching Instagram profile: {str(e)}")
+        logger.error(f"Error fetching Instagram profile: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram profile: {str(e)}")
 
 @router.post("/auth")
@@ -158,7 +162,7 @@ async def instagram_auth(request: dict, user: CurrentUser):
             )
         
         token_info = token_response.json()
-        print("Instagram token response:", token_info)
+        logger.info(f"Instagram token response: {token_info}")
         access_token = token_info.get("access_token")
         user_id = token_info.get("user_id")
         
@@ -257,7 +261,7 @@ async def instagram_auth(request: dict, user: CurrentUser):
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Instagram authentication error: {str(e)}")
+        logger.error(f"Instagram authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Instagram authentication error: {str(e)}")
 
 @router.post("/disconnect")
@@ -278,7 +282,7 @@ async def instagram_disconnect(request: PlatformDisconnectRequest, user: Current
         }
        
     except Exception as e:
-        print(f"Error disconnecting Instagram: {str(e)}")
+        logger.error(f"Error disconnecting Instagram: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to disconnect Instagram: {str(e)}")
 
 # @router.get("/status")
@@ -395,7 +399,7 @@ async def get_instagram_posts(user: CurrentUser, limit: int = 24):
         response = requests.get(url, params=params)
         
         if response.status_code != 200:
-            print(f"Instagram API Error: {response.text}")
+            logger.error(f"Instagram API Error: {response.text}")
             raise HTTPException(
                 status_code=response.status_code,
                 detail=f"Failed to fetch Instagram posts: {response.json().get('error', {}).get('message')}"
@@ -428,7 +432,7 @@ async def get_instagram_posts(user: CurrentUser, limit: int = 24):
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error fetching Instagram posts: {str(e)}")
+        logger.error(f"Error fetching Instagram posts: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram posts: {str(e)}")
 
 @router.get("/conversations/{conversation_id}")
@@ -468,7 +472,7 @@ async def get_instagram_conversation(conversation_id: str, user: CurrentUser):
         return conversation
     
     except Exception as e:
-        print(f"Error fetching Instagram conversation {conversation_id} for {org_id}: {e}")
+        logger.error(f"Error fetching Instagram conversation {conversation_id} for {org_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch Instagram conversation: {str(e)}"
@@ -527,7 +531,7 @@ async def get_instagram_conversations(user: CurrentUser):
         return formatted_conversations
     
     except Exception as e:
-        print(f"Error fetching Instagram conversations for {org_id}: {e}")
+        logger.error(f"Error fetching Instagram conversations for {org_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch Instagram conversations: {str(e)}"
@@ -611,12 +615,12 @@ async def get_instagram_messages(conversation_id: str,
 
         combined.sort(key=lambda x: x.get("timestamp"), reverse=False)
 
-        print(assigned_convo)
+        logger.info(f"Assigned conversation details: {assigned_convo}")
         
         return {"messages": combined, "assignment": assigned_convo}
     
     except Exception as e:
-        print(f"Error fetching Instagram messages or private notes for {conversation_id} of org {org_id}: {e}")
+        logger.error(f"Error fetching Instagram messages or private notes for {conversation_id} of org {org_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to fetch Instagram messages: {str(e)}"
@@ -644,7 +648,7 @@ async def get_instagram_ai_status(conversation_id: str, user: CurrentUser):
         return {"status": "Error", "message": "No conversation found"}
     
     except Exception as e:
-        print(f"Error checking Instagram AI status for conversation {conversation_id}: {e}")
+        logger.error(f"Error checking Instagram AI status for conversation {conversation_id}: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to check AI status: {str(e)}"
@@ -699,7 +703,7 @@ async def toggle_instagram_ai_status(conversation_id: str, body: dict, user: Cur
         return {"status": "success", "message": f"AI status updated to {ai_enabled} for conversation {conversation_id}"}
     
     except Exception as e:
-        print(f"Error updating Instagram AI status: {e} for conversation {conversation_id}")
+        logger.error(f"Error updating Instagram AI status: {e} for conversation {conversation_id}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to update AI status: {str(e)}"
@@ -767,7 +771,7 @@ async def send_instagram_message(message: dict, user: CurrentUser):
         return {"status": "success", "message": "Message sent"}
     
     except Exception as e:
-        print(f"Error sending Instagram message: {e}")
+        logger.error(f"Error sending Instagram message: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to send message: {str(e)}"
@@ -788,7 +792,7 @@ async def send_instagram_reaction(reaction: dict, user: CurrentUser):
         recipient_id = message.get("sender_id")
 
         if not message:
-            print("Message not found")
+            logger.error("Message not found")
             return {"status": "error", "message": "Message not found"}
         
         org_document = db.organizations.find_one({"org_id": org_id})
@@ -817,7 +821,7 @@ async def send_instagram_reaction(reaction: dict, user: CurrentUser):
         response = requests.get(url, params=params)
         
         if response.status_code != 200:
-            print(f"Instagram API Error: {response.text}")
+            logger.error(f"Instagram API Error: {response.text}")
             raise HTTPException(
                 status_code=response.status_code,
                 detail=f"Failed to fetch Instagram profile: {response.json().get('error', {}).get('message')}"
@@ -839,7 +843,7 @@ async def send_instagram_reaction(reaction: dict, user: CurrentUser):
                     {"$unset": {"reaction": 1}}, 
                     return_document=ReturnDocument.AFTER
                 )
-                print(f"Reaction removed for message {message_id}")
+                logger.success(f"Reaction removed for message {message_id}")
 
                 if "_id" in broadcast_message:
                     broadcast_message["_id"] = str(broadcast_message["_id"])
@@ -853,12 +857,12 @@ async def send_instagram_reaction(reaction: dict, user: CurrentUser):
 
                 # Broadcast the reaction update to connected clients
                 if instagram_id in services.instagram_connections_map:
-                    print(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
+                    logger.info(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
                     await broadcast_instagram_message(instagram_id, "message_reaction", {
                         "message": broadcast_message
                     })
 
-                print(f"Reaction removed for message {message_id} with emoji ❤️")
+                logger.success(f"Reaction removed for message {message_id} with emoji ❤️")
 
 
                 return {"status": "success", "message": "sent"}
@@ -895,17 +899,17 @@ async def send_instagram_reaction(reaction: dict, user: CurrentUser):
 
         # Broadcast the reaction update to connected clients
         if instagram_id in services.instagram_connections_map:
-            print(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
+            logger.info(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
             await broadcast_instagram_message(instagram_id, "message_reaction", {
                 "message": broadcast_message
             })
 
-        print(f"Reaction updated for message {message_id} with emoji ❤️")
+        logger.success(f"Reaction updated for message {message_id} with emoji ❤️")
         return {"status": "success", "message": "sent"}
         
     
     except Exception as e:
-        print(f"Error sending Instagram reaction: {e}")
+        logger.error(f"Error sending Instagram reaction: {e}")
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to send reaction: {str(e)}"
@@ -929,8 +933,8 @@ async def upload_and_send_instagram_media(
     Returns:
         Status and message ID details along with the uploaded media URL
     """
-    print("Received request to upload and send Instagram media")
-    print(f"Caption: {caption}, Conversation ID: {conversation_id}, Filename: {file.filename}")
+    logger.info("Received request to upload and send Instagram media")
+    logger.info(f"Caption: {caption}, Conversation ID: {conversation_id}, Filename: {file.filename}")
 
 
     try:
@@ -971,14 +975,14 @@ async def upload_and_send_instagram_media(
             instagram_id,
         )
 
-        if caption : await send_ig_message(user_instagram_id, caption, instagram_id) and print(f"Caption sent: {caption}")
+        if caption : await send_ig_message(user_instagram_id, caption, instagram_id) and logger.success(f"Caption sent: {caption}")
 
         return {"status": "success", "message": "Message sent"}
         
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"Error uploading and sending Instagram media: {e}")
+        logger.error(f"Error uploading and sending Instagram media: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to upload and send media: {str(e)}"
@@ -996,7 +1000,7 @@ def proxy_instagram_media(url: str = Query(..., description="Full Instagram CDN 
         }
         r = requests.get(url, headers=headers, stream=True, timeout=10)
 
-        print(f"Proxy fetch status: {r.status_code} for URL: {url}")
+        logger.info(f"Proxy fetch status: {r.status_code} for URL: {url}")
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=f"CDN fetch failed ({r.status_code})")
 
@@ -1006,5 +1010,5 @@ def proxy_instagram_media(url: str = Query(..., description="Full Instagram CDN 
         )
 
     except Exception as e:
-        print(f"Error fetching Instagram media: {e}")
+        logger.error(f"Error fetching Instagram media: {e}")
         raise HTTPException(status_code=500, detail=str(e))

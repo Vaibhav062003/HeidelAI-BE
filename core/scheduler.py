@@ -7,6 +7,9 @@ from database import get_mongo_db
 from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 db = get_mongo_db()
 scheduled_collection = db["scheduled_messages"]
@@ -27,10 +30,10 @@ async def process_scheduled_messages():
     )
 
     if not pending:
-        print(f"[{now}] No scheduled messages due.")
+        logger.success("No scheduled messages due.")
         return
 
-    print(f"[{now}] Found {len(pending)} messages to send.")
+    logger.success(f"Found {len(pending)} messages to send.")
 
     updates = []
     for msg in pending:
@@ -43,7 +46,7 @@ async def process_scheduled_messages():
 
         service = messaging_services.get(platform)
         if not service:
-            print(f"No service found for platform: {platform}")
+            logger.error(f"No service found for platform: {platform}")
             updates.append(
                 UpdateOne(
                     {"_id": msg["_id"]},
@@ -80,10 +83,10 @@ async def process_scheduled_messages():
                     }
                 )
             )
-            print(f"Sent message to {receiver_id} on {platform}")
+            logger.success(f"Sent message to {receiver_id} on {platform}")
         except Exception as e:
             error_msg = str(e)
-            print(f"Failed to send to {receiver_id} on {platform}: {error_msg}")
+            logger.error(f"Failed to send to {receiver_id} on {platform}: {error_msg}")
             updates.append(
                 UpdateOne(
                     {"_id": msg["_id"]},
@@ -100,9 +103,9 @@ async def process_scheduled_messages():
     if updates:
         try:
             result = scheduled_collection.bulk_write(updates)
-            print(f"Updated {result.modified_count} message statuses")
+            logger.success(f"Updated {result.modified_count} message statuses")
         except Exception as e:
-            print(f"Error updating message statuses: {e}")
+            logger.error(f"Error updating message statuses: {e}")
 
 async def process_inactivity_for_org(org_id: str):
     conv_col = db[f"conversations_{org_id}"]
@@ -117,7 +120,7 @@ async def process_inactivity_for_org(org_id: str):
     if not convs:
         return 
 
-    print(f"[ORG {org_id}] Found {len(convs)} inactive conversations to process")
+    logger.success(f"[ORG {org_id[:6]}...] Found {len(convs)} inactive conversations to process")
 
     for conv in convs:
         stage = conv.get("reminder_stage", 0)
@@ -133,7 +136,7 @@ async def process_inactivity_for_org(org_id: str):
                     }
                 }
             )
-            print(f"[ORG {org_id}] Stage 0 → 1 for {conv_id}")
+            logger.info(f"[ORG {org_id[:6]}...] Stage 0 → 1 for {conv_id}")
             continue
 
             # await store_instagram_message(
@@ -160,7 +163,7 @@ async def process_inactivity_for_org(org_id: str):
                     }
                 }
             )
-            print(f"[ORG {org_id}] Stage 1 → 2 for {conv_id}")
+            logger.info(f"[ORG {org_id[:6]}...] Stage 1 → 2 for {conv_id}")
             continue
             # content = "We're still here if you need assistance! 😊"
             # await store_instagram_message(
@@ -180,19 +183,19 @@ async def process_inactivity_for_org(org_id: str):
             # Close conversation
             await close_conversation(org_id, conv_id, "Closed due to inactivity")
             
-            print(f"[ORG {org_id}] Closed conversation {conv_id} due to inactivity")
+            logger.info(f"[ORG {org_id[:6]}...] Closed conversation {conv_id} due to inactivity")
             continue
 
 async def process_time_based_tasks():
 
     # Process scheduled messages
-    print("Processing scheduled messages...")
+    logger.info("Processing scheduled messages...")
     await process_scheduled_messages()
 
-    print("Cleaning expired archives...")
+    logger.info("Cleaning expired archives...")
     await clean_expired_archives()
 
-    print("Processing inactivity follow-ups and closures...")
+    logger.info("Processing inactivity follow-ups and closures...")
     # Process inactivity follow-ups & closures for all orgs
     orgs = db.organizations.find({}, {"org_id": 1})
     for org in orgs:
@@ -203,4 +206,4 @@ def start_scheduler():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
     scheduler.start()
-    print("APScheduler started (interval = 6 hours).")
+    logger.success("APScheduler started (interval = 6 hours).")

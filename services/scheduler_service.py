@@ -7,6 +7,9 @@ from pymongo.errors import PyMongoError
 # === Internal Modules ===
 from database import get_mongo_db
 from .followup_agent_service import get_followup_message
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 db = get_mongo_db()
 
@@ -142,16 +145,16 @@ async def clean_expired_archives():
             }))
 
         if not expired_docs:
-            print("No expired archived data entries found.")
+            logger.warning("No expired archived data entries found.")
             return
         
-        print(f"Found {len(expired_docs)} expired archive records. Starting cleanup...")
+        logger.success(f"Found {len(expired_docs)} expired archive records. Starting cleanup...")
 
         for doc in expired_docs:
             await purge_archived_data(doc)
 
     except Exception as e:
-        print(f"Error during clean_expired_archives: {str(e)}")
+        logger.error(f"Error during clean_expired_archives: {str(e)}")
 
 async def purge_archived_data(doc: dict):   
     """Delete specific archive data safely using archive_id."""
@@ -181,11 +184,11 @@ async def purge_archived_data(doc: dict):
             }
         )
 
-        print(
-            f"[Archive Cleanup] org_id={org_id}, platform={doc['platform']}: "
+        logger.success(
+            f"org_id={org_id}, platform={doc['platform']}: "
             f"deleted {deleted_counts['messages']} messages and "
             f"{deleted_counts['conversations']} conversations (marked as purged)."
         )
         
     except Exception as e:
-         print(f"Error purging archive for org_id={org_id}, platform={doc['platform']}: {str(e)}")
+         logger.error(f"Error purging archive for org_id={org_id}, platform={doc['platform']}: {str(e)}")
