@@ -69,8 +69,12 @@ class CustomLogger(logging.Logger):
         return f"{message} " + " ".join(formatted_args)
 
     def info(self, message, *args, **kwargs):
-        message = self._join_args(message, args)
-        super().info(message, **kwargs)
+        if args:
+            # Let logging handle formatting (needed for uvicorn)
+            super().info(message, *args, **kwargs)
+        else:
+            super().info(message, **kwargs)
+
 
     def warning(self, message, *args, **kwargs):
         message = self._join_args(message, args)

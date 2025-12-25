@@ -145,7 +145,7 @@ async def clean_expired_archives():
             }))
 
         if not expired_docs:
-            logger.warning("No expired archived data entries found.")
+            logger.info("No expired archived data entries found.")
             return
         
         logger.success(f"Found {len(expired_docs)} expired archive records. Starting cleanup...")

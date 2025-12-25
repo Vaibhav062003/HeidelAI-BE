@@ -20,7 +20,9 @@ from services.contacts_service import (
     update_contact_tag_categories,
     add_tag_to_org_metadata,
     remove_tag_from_org_metadata,
-    get_tags_from_org_metadata)
+    get_tags_from_org_metadata,
+    process_bulk_wa_contact_upload
+    )
 from services.products_service import (
     get_products_for_org, 
     bulk_upload_products_from_file, 
@@ -338,3 +340,26 @@ async def get_agents_on_conversation():
         "convo_viewers": json_convo_viewers, 
         "client_convo_map": json_client_convo_map 
     }
+
+@router.post("/api/contacts/bulk-upload")
+async def bulk_upload_whatsapp_contacts(user: CurrentUser, file: UploadFile = File(...)):
+    """
+    Endpoint to upload CSV or Excel file for bulk whatsapp contact storage.
+    """
+    try:
+        org_id = user.org_id
+
+        content = await file.read()
+        
+        stats = process_bulk_wa_contact_upload(org_id, content, file.filename)
+        
+        return {
+            "message": f"Successfully processed {file.filename}",
+            "data": stats
+        }
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Bulk upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error during processing.")
