@@ -70,11 +70,15 @@ class CustomLogger(logging.Logger):
 
     def info(self, message, *args, **kwargs):
         if args:
-            # Let logging handle formatting (needed for uvicorn)
-            super().info(message, *args, **kwargs)
+            # Check if message is likely a format string (contains %)
+            # This preserves uvicorn logging while allowing print-style logging
+            if isinstance(message, str) and "%" in message:
+                super().info(message, *args, **kwargs)
+            else:
+                message = self._join_args(message, args)
+                super().info(message, **kwargs)
         else:
             super().info(message, **kwargs)
-
 
     def warning(self, message, *args, **kwargs):
         message = self._join_args(message, args)
