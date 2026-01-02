@@ -184,7 +184,8 @@ async def upload_and_send_whatsapp_media_background(
     sender_name2: str,
     message_id: str,
     conversation_id: str,
-    media_name: str
+    media_name: str,
+    caption: Optional[str] = None
 ) -> Optional[str]:
     """
     Downloads media from WhatsApp and uploads to Cloudinary.
@@ -255,6 +256,7 @@ async def upload_and_send_whatsapp_media_background(
         # 5. Prepare Payload with Thumbnail
         payload = {
             "url": secure_url,
+            "caption": caption,
             "thumbnail_url": thumbnail_url, 
             "file_name": media_name,
             "file_size": file_size,
@@ -292,7 +294,7 @@ async def upload_and_send_whatsapp_media_background(
         # Store in WhatsApp-specific collections
         await store_whatsapp_message(
             org_id=org_id,
-            content=content,
+            content=caption,
             conversation_id=conversation_id,
             customer_phone_no=customer_phone_no,
             type=message_type,

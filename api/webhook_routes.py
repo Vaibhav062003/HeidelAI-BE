@@ -234,11 +234,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 media_name = media_data.get("filename", f"{message_type}_{media_id}")
 
                                 if message_type == "image":
-                                    content = "Shared an image"
+                                    content = media_data.get("caption", "Shared an image")
                                 elif message_type == "video":
-                                    content = "Shared a video"
+                                    content = media_data.get("caption", "Shared a video")
                                 elif message_type == "document":
-                                    content = "Shared a document"
+                                    content = media_data.get("caption", "Shared a document")
 
                                 background_tasks.add_task(
                                     upload_and_send_whatsapp_media_background,
@@ -254,7 +254,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     sender_name2=sender_name2,
                                     message_id=message_id,
                                     conversation_id=conversation_id,
-                                    media_name=media_name
+                                    media_name=media_name,
+                                    caption=media_data.get("caption", None)
                                 )
 
                                 contact_data = {
