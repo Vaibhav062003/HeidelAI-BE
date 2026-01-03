@@ -460,7 +460,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         if file:
             recipient_id = conversation_id.replace("whatsapp_", "")
             
-            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content)
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id)
 
             if res.get("error"):
                 raise HTTPException(
@@ -473,7 +473,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 "conversation_id": conversation_id,
                 "content": content,
                 "sender_id": wa_id,
-            }, org_id)
+            }, org_id, temp_id)
         return res
     
     elif platform == "instagram":

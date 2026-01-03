@@ -169,7 +169,7 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
 
-async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id, temp_id) -> dict:
+async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id, temp_id : Optional[str] = None) -> dict:
     """
     Upload media to Cloudinary and send it as an Instagram message
     
@@ -192,7 +192,7 @@ async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via Instagram API
-        response = await send_ig_media_message(recipient, file_url, file_type, instagram_id, temp_id)
+        response = await send_ig_media_message(recipient, file_url, file_type, instagram_id)
         
         if response.get("message_id"):
             logger.success("Instagram media message sent successfully.")
@@ -278,7 +278,7 @@ async def store_instagram_message(
         "role": role,
         "timestamp": datetime.now(),
         "status": "sent",
-        "temp_id" : temp_id if temp_id else None
+        "temp_id" : temp_id
     }
     
     # Store message in Instagram-specific collection

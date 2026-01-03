@@ -170,7 +170,8 @@ async def store_whatsapp_message(
     role: MessageRole,
     message_id: Optional[str] = None,
     raw_data: Optional[dict] = None,
-    status: Optional[str] = "received"
+    status: Optional[str] = "received",
+    temp_id: Optional[str] = None
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -212,6 +213,7 @@ async def store_whatsapp_message(
         "role": role,
         "timestamp": datetime.now(timezone.utc),
         "status": status,
+        "temp_id": temp_id,
         "raw_data": raw_data  # Store the raw message for reference
     }   
     
@@ -255,6 +257,7 @@ async def store_whatsapp_message(
         "status": "received",
         "sender_name": sender_name,
         "type": type,
+        "temp_id": temp_id,
         "payload": payload
     }
 
@@ -329,7 +332,7 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
                 if not services.whatsapp_connections_map[whatsapp_id]:
                     del services.whatsapp_connections_map[whatsapp_id]
 
-async def send_whatsapp_message(message: dict, org_id: str) -> dict:
+async def send_whatsapp_message(message: dict, org_id: str, temp_id: Optional[str] = None) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
     
@@ -427,7 +430,8 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
             role=MessageRole.AGENT,
             message_id=message_id,
             raw_data=response_data,
-            status="sending"
+            status="sending",
+            temp_id=temp_id
         )
         
         return {"message": "Message sent", "message_id": mid}
@@ -441,7 +445,7 @@ async def send_whatsapp_message(message: dict, org_id: str) -> dict:
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str) -> dict:
+async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str, temp_id: Optional[str]) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """
@@ -517,13 +521,14 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
             conversation_id=f"whatsapp_{recipient_id}",
             customer_phone_no=recipient_id,
             type="image",
-            payload={"url": media_url},
+            payload={"url": media_url, "caption": content} if content else {"url": media_url},
             sender_name="Agent",
             recipient_id=recipient_id,
             role=MessageRole.AGENT,
             message_id=message_id,
             raw_data=response_data,
-            status="sending"
+            status="sending",
+            temp_id=temp_id
         )
         
         return {"message": "Sending message", "message_id": mid}
@@ -537,7 +542,7 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str]) -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str]) -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
@@ -553,7 +558,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id)
+        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id)
         
         return response
     except Exception as e:
