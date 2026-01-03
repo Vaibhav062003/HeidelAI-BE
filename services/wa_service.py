@@ -520,7 +520,7 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
             content=content,
             conversation_id=f"whatsapp_{recipient_id}",
             customer_phone_no=recipient_id,
-            type="image",
+            type=media_type,
             payload={"url": media_url, "caption": content} if content else {"url": media_url},
             sender_name="Agent",
             recipient_id=recipient_id,
