@@ -108,7 +108,7 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
     
-async def send_ig_media_message(recipient, media_url, media_type, instagram_id, temp_id) -> dict:
+async def send_ig_media_message(recipient, media_url, media_type, instagram_id) -> dict:
     """
     Send a media message to an Instagram user using the appropriate access token
     
