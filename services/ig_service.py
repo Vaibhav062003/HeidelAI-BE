@@ -101,6 +101,7 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
         logger.info(f"Instagram message response: {response.status_code}, {response.json()}")
         
         # Return the response for further processing
+        sent_message_id = response.json().get("message_id")
         return response.json()
         
     except Exception as e:
@@ -169,7 +170,7 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id) 
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
 
-async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id, temp_id : Optional[str] = None) -> dict:
+async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id) -> dict:
     """
     Upload media to Cloudinary and send it as an Instagram message
     
@@ -178,7 +179,6 @@ async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id
         file: The media file to upload and send
         instagram_id: Instagram business account ID to use for sending
         org_id: Organization ID for context
-        temp_id: Temporary ID for tracking the message
     """
     try:
         # Upload media to Cloudinary
@@ -196,21 +196,6 @@ async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id
         
         if response.get("message_id"):
             logger.success("Instagram media message sent successfully.")
-
-            await store_instagram_message(
-                message_id=response.get("message_id"),
-                conversation_id=f"instagram_{recipient}",
-                content=None,
-                type=file_type,
-                payload={"url": file_url},
-                sender_id=instagram_id,
-                sender_name="Instagram Bot", #Who?
-                sender_username="instagram_bot", #Who?
-                recipient_id=recipient,
-                role="agent",
-                temp_id=temp_id,
-                org_id=org_id,
-            )
 
             return {"success": True, "response": response}
 
@@ -232,9 +217,8 @@ async def store_instagram_message(
     sender_username: str,
     recipient_id: str,
     role: MessageRole,
-    message_id: Optional[str] = None,
-    temp_id: Optional[str] = None
-) -> str:
+    message_id: Optional[str] = None
+    ) -> str:
     """
     Store a message in the Instagram-specific collection and notify appropriate WebSocket clients
     
@@ -278,7 +262,6 @@ async def store_instagram_message(
         "role": role,
         "timestamp": datetime.now(),
         "status": "sent",
-        "temp_id" : temp_id
     }
     
     # Store message in Instagram-specific collection
@@ -306,9 +289,6 @@ async def store_instagram_message(
     # )
 
     logger.success(f"Instagram conversation updated: {conversation_id}")
-
-    if temp_id:
-        return
 
     # Format message for WebSocket broadcast
     broadcast_message = {

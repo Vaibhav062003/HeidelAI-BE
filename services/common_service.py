@@ -486,7 +486,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
 
 
         if file:
-            res = await upload_and_send_ig_media_message(recipient, file, ig_id, org_id, temp_id)
+            res = await upload_and_send_ig_media_message(recipient, file, ig_id, org_id)
 
             if res.get("error"):
                 raise HTTPException(
