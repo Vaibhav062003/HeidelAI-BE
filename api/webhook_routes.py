@@ -165,16 +165,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         if not broadcast_message:
                             logger.warning(f"No message found with ID {message_id} to update status.")
                             continue
-                        
-                        if "_id" in broadcast_message:
-                            broadcast_message["_id"] = str(broadcast_message["_id"])
 
+                        if broadcast_message:
+                            if "_id" in broadcast_message:
+                                broadcast_message["_id"] = str(broadcast_message["_id"])
 
-                        if status_type == "sent" and broadcast_message:
                             await broadcast_main_ws(
                                 platform_id=whatsapp_business_id,
                                 platform_type="whatsapp",
-                                event_type="new_message",
+                                event_type="message_status_update",
                                 payload={"message": broadcast_message}
                             )
 
