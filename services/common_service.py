@@ -30,19 +30,13 @@ async def fetch_conversations_new(org_id: str) -> List[Dict]:
     collection = async_db[f"conversations_{org_id}"]
 
     projection = {
-        "conversation_id": 1,
-        "platform": 1,
-        "customer_username": 1,
-        "customer_id": 1,
-        "customer_name": 1,
-        "last_message": 1,
-        "last_message_timestamp": 1,
-        "unread_count": 1,
-        "is_ai_enabled": 1,
-        "assigned_agent_id": 1,
-        "priority": 1,
-        "sentiment": 1,
-        "status": 1,
+        "whatsapp_id": 0,
+        "instagram_id": 0,
+        "last_sender": 0,
+        "message_counter": 0,
+        "next_action_at": 0,
+        "reminder_stage": 0,
+        "started_at": 0,
         "_id": 0,
     }
 
