@@ -37,7 +37,7 @@ db = get_mongo_db()
 
 mongo_client = get_mongo_client()
 
-async def send_ig_message(id, message_text, instagram_id) -> dict:
+async def send_ig_message(id, message_text, instagram_id, mode, org_id) -> dict:
     """
     Send a message to an Instagram user using the appropriate access token
     
@@ -79,37 +79,74 @@ async def send_ig_message(id, message_text, instagram_id) -> dict:
             # page_id = IG_ID
             # print("Using default Instagram token")
         
-        # Build the API URL using the appropriate page_id
-        url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
+        if mode == "reply":
+            # Build the API URL using the appropriate page_id
+            url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
 
-        headers = {
-            "Authorization" : "Bearer " + access_token,
-            "Content-Type" : "application/json",
-        }
-        
-        data = {
-            "recipient":{
-                "id":f"{id}"
-            },
-            "message":{
-                "text":f"{message_text}"
+            headers = {
+                "Authorization" : "Bearer " + access_token,
+                "Content-Type" : "application/json",
             }
-        }
+            
+            data = {
+                "recipient":{
+                    "id":f"{id}"
+                },
+                "message":{
+                    "text":f"{message_text}"
+                }
+            }
 
-        # Send the message
-        response = requests.post(url, headers=headers, json=data)
-        logger.info(f"Instagram message response: {response.status_code}, {response.json()}")
-        
-        # Return the response for further processing
-        sent_message_id = response.json().get("message_id")
-        return response.json()
+            # Send the message
+            response = requests.post(url, headers=headers, json=data)
+            logger.info(f"Instagram message response: {response.status_code}, {response.json()}")
+            
+            # Return the response for further processing
+            sent_message_id = response.json().get("message_id")
+            return response.json()
+        else:
+            message_id = f"privatenote_{uuid.uuid4()}"
+
+            user_details = await get_ig_username(id, access_token)
+            username = user_details.get('username')
+            name = user_details.get('name', username)
+
+            # Create or update conversation
+            conversation_id = await create_or_update_instagram_conversation(
+                org_id=org_id,
+                recipient_id=instagram_id,
+                sender_id=id,
+                customer_name=name,
+                username=username,
+                last_message=f"Private Note: {message_text}",
+                last_sender=MessageRole.AGENT,
+                mode=mode
+            )
+            
+            # Store in Instagram-specific collections
+            await store_instagram_message(
+                org_id=org_id,
+                content=message_text,
+                type="text",
+                payload=None,
+                conversation_id=conversation_id,
+                sender_id=id,
+                sender_name="Agent",
+                sender_username="agent_username",
+                recipient_id=instagram_id,
+                role= MessageRole.AGENT,
+                message_id=message_id,  # Use the ID from the webhook for deduplication
+                mode=mode
+            )
+
+            return {"message_id": message_id, "success": True, "status": "sent"}
         
     except Exception as e:
         logger.error(f"Error sending Instagram message: {e}")
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
     
-async def send_ig_media_message(recipient, media_url, media_type, instagram_id) -> dict:
+async def send_ig_media_message(recipient, media_url, media_type, instagram_id, mode, org_id) -> dict:
     """
     Send a media message to an Instagram user using the appropriate access token
     
@@ -119,7 +156,6 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id) 
         instagram_id: Instagram business account ID to use for sending
     """
     try:
-        # Query the specific Instagram connection to get its access token
         connection = db.instagram_connections.find_one(
             {"instagram_id": instagram_id, "is_active": True},
             {"page_access_token": 1},
@@ -136,41 +172,83 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id) 
             # Fallback to default token if connection not found
             access_token = IG_ACCESS_TOKEN
             logger.error(f"Instagram connection not found for {instagram_id}, using default token")
-    
-        url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
 
-        headers = {
-            "Authorization" : "Bearer " + access_token,
-            "Content-Type" : "application/json",
-        }
+        if mode == "reply":
+            # Query the specific Instagram connection to get its access token
+        
+            url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
 
-        data = {
-            "recipient":{
-                "id":f"{recipient}"
-            },
-            "message":{
-                "attachment":{
-                    "type":media_type,
-                    "payload":{
-                        "url":media_url
+            headers = {
+                "Authorization" : "Bearer " + access_token,
+                "Content-Type" : "application/json",
+            }
+
+            data = {
+                "recipient":{
+                    "id":f"{recipient}"
+                },
+                "message":{
+                    "attachment":{
+                        "type":media_type,
+                        "payload":{
+                            "url":media_url
+                        }
                     }
                 }
             }
-        }
 
-        # Send the media message
-        response = requests.post(url, headers=headers, json=data)
-        logger.info(f"Instagram media message response: {response.status_code}, {response.json()}")
-        
-        # Return the response for further processing
-        return response.json()
+            # Send the media message
+            response = requests.post(url, headers=headers, json=data)
+            logger.info(f"Instagram media message response: {response.status_code}, {response.json()}")
+            
+            # Return the response for further processing
+            return response.json()
+        else:
+            message_id = f"privatenote_{uuid.uuid4()}"
+
+            if media_type == "image":
+                content = "Shared an image"
+            elif media_type == "video":
+                content = "Shared a video"
+
+            user_details = await get_ig_username(recipient, access_token)
+            username = user_details.get('username')
+            name = user_details.get('name', username)
+
+            # Create or update conversation
+            conversation_id = await create_or_update_instagram_conversation(
+                org_id=org_id,
+                recipient_id=instagram_id,
+                sender_id=recipient,
+                customer_name=name,
+                username=username,
+                last_message=f"Private Note: {content}",
+                last_sender=MessageRole.AGENT,
+                mode=mode
+            )
+            
+            # Store in Instagram-specific collections
+            await store_instagram_message(
+                org_id=org_id,
+                content=content,
+                type=media_type,
+                payload={"url": media_url},
+                conversation_id=conversation_id,
+                sender_id=recipient,
+                sender_name="Agent",
+                sender_username="agent_username",
+                recipient_id=instagram_id,
+                role= MessageRole.AGENT,
+                message_id=message_id,  # Use the ID from the webhook for deduplication
+                mode=mode
+            )
         
     except Exception as e:
         logger.error(f"Error sending Instagram media message: {e}")
         # Return an error response that can be handled by the caller
         return {"error": str(e), "success": False}
 
-async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id) -> dict:
+async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id, mode) -> dict:
     """
     Upload media to Cloudinary and send it as an Instagram message
     
@@ -192,7 +270,7 @@ async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via Instagram API
-        response = await send_ig_media_message(recipient, file_url, file_type, instagram_id)
+        response = await send_ig_media_message(recipient, file_url, file_type, instagram_id, mode, org_id)
         
         if response.get("message_id"):
             logger.success("Instagram media message sent successfully.")
@@ -217,6 +295,7 @@ async def store_instagram_message(
     sender_username: str,
     recipient_id: str,
     role: MessageRole,
+    mode: Optional[str] = None,
     message_id: Optional[str] = None
     ) -> str:
     """
@@ -262,6 +341,7 @@ async def store_instagram_message(
         "role": role,
         "timestamp": datetime.now(),
         "status": "sent",
+        "mode": mode
     }
     
     # Store message in Instagram-specific collection
@@ -290,6 +370,9 @@ async def store_instagram_message(
 
     logger.success(f"Instagram conversation updated: {conversation_id}")
 
+    if mode == "private":
+        return
+
     # Format message for WebSocket broadcast
     broadcast_message = {
         "id": message_id,
@@ -303,6 +386,7 @@ async def store_instagram_message(
         "timestamp": datetime.now().isoformat(),
         "status": "sent",
         "sender_name": sender_name,
+        "mode": mode
     }
     
     # Broadcast to /main-ws clients
@@ -341,6 +425,7 @@ async def create_or_update_instagram_conversation(org_id: str,
                                                   username: str, 
                                                   last_message: str, 
                                                   last_sender: str,
+                                                  mode: Optional[str] = None,
                                                   is_auto_followup: bool = False) -> str:
     """
     Create or update a conversation in the Instagram-specific conversations collection
@@ -392,7 +477,9 @@ async def create_or_update_instagram_conversation(org_id: str,
             "last_sender": last_sender,
             "status": "open",
             "message_counter": existing_conversation.get("message_counter", 0) + 1,
-            "unread_count": existing_conversation.get("unread_count", 0) + (0 if is_being_viewed else 1)
+            "unread_count": existing_conversation.get("unread_count", 0) + (0 if is_being_viewed else 1),
+            "last_message_is_private_note": mode == "private"
+
         }
 
         if last_sender == "customer":
@@ -423,7 +510,8 @@ async def create_or_update_instagram_conversation(org_id: str,
             "started_at": now,
             "reminder_stage": 0,
             "next_action_at": now + timedelta(hours=6),
-            "closed_at": None
+            "closed_at": None,
+            "last_message_is_private_note": mode == "private"
         }
 
     

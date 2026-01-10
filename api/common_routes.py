@@ -102,6 +102,7 @@ async def send_message_endpoint(
     conversation_id: str = Form(...),
     content: Optional[str] = Form(None),
     platform: str = Form(...),
+    mode: str = Form(...),
     temp_id: Optional[str] = Form(None), 
     file: Optional[UploadFile] = File(None)
 ):    
@@ -118,8 +119,9 @@ async def send_message_endpoint(
         platform, 
         conversation_id, 
         content if content else None, 
+        mode,
         file if file else None, 
-        temp_id if temp_id else None
+        temp_id if temp_id else None,
     )
 
     return {"message": "Message sent", "details": res}

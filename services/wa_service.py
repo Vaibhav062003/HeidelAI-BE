@@ -34,7 +34,8 @@ async def create_or_update_whatsapp_conversation(
     customer_name, 
     last_message, 
     last_sender,
-    is_auto_followup: bool = False
+    is_auto_followup: bool = False,
+    mode: Optional[str] = None
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -81,6 +82,7 @@ async def create_or_update_whatsapp_conversation(
             "customer_name": customer_name,
             "last_message": last_message,
             "last_message_timestamp": now,
+            "last_message_is_private_note": mode == "private",
             "last_sender": last_sender,
             "status": "open",
             "message_counter": existing_conversation.get("message_counter", 0) + 1,
@@ -107,6 +109,7 @@ async def create_or_update_whatsapp_conversation(
             "customer_name": customer_name,
             "last_message": last_message,
             "last_message_timestamp": now,
+            "last_message_is_private_note": mode == "private",
             "unread_count": 1,
             "message_counter": 1,
             "is_ai_enabled": False,  
@@ -168,10 +171,11 @@ async def store_whatsapp_message(
     sender_name: str,
     recipient_id: str,
     role: MessageRole,
+    mode: Optional[str] = None,
     message_id: Optional[str] = None,
     raw_data: Optional[dict] = None,
     status: Optional[str] = "received",
-    temp_id: Optional[str] = None
+    temp_id: Optional[str] = None,
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -214,7 +218,8 @@ async def store_whatsapp_message(
         "timestamp": datetime.now(timezone.utc),
         "status": status,
         "temp_id": temp_id,
-        "raw_data": raw_data  # Store the raw message for reference
+        "raw_data": raw_data,
+        "mode": mode
     }   
     
     # Store message in WhatsApp-specific collection
@@ -254,11 +259,12 @@ async def store_whatsapp_message(
         "sender_id": customer_phone_no,
         "role": role,
         "timestamp": datetime.now().isoformat(),
-        "status": "received",
+        "status": status,
         "sender_name": sender_name,
         "type": type,
         "temp_id": temp_id,
-        "payload": payload
+        "payload": payload,
+        "mode": mode
     }
 
     await broadcast_main_ws(
@@ -332,7 +338,7 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
                 if not services.whatsapp_connections_map[whatsapp_id]:
                     del services.whatsapp_connections_map[whatsapp_id]
 
-async def send_whatsapp_message(message: dict, org_id: str, temp_id: Optional[str] = None) -> dict:
+async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: Optional[str] = None) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
     
@@ -362,43 +368,49 @@ async def send_whatsapp_message(message: dict, org_id: str, temp_id: Optional[st
         
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
-        
+
         # Extract the recipient phone number from conversation ID
         recipient_id = conversation_id.replace("whatsapp_", "")
         
-        # Send message via WhatsApp Cloud API
-        url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
-        headers = {
-            "Authorization": f"Bearer {connection['access_token']}",
-            "Content-Type": "application/json",
-        }
-        data = {
-            "messaging_product": "whatsapp",
-            "to": recipient_id,
-            "type": "text",
-            "text": {"body": content}
-        }
-        
-        response = requests.post(url, headers=headers, json=data)
-        
-        if response.status_code != 200:
-            logger.error(f"WhatsApp API error: {response.text}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail="Failed to send WhatsApp message"
-            )
-        
-        response_data = response.json()
-        message_id = response_data.get("messages", [{}])[0].get("id")
+        if mode == "reply":
+            
+            # Send message via WhatsApp Cloud API
+            url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
+            headers = {
+                "Authorization": f"Bearer {connection['access_token']}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "messaging_product": "whatsapp",
+                "to": recipient_id,
+                "type": "text",
+                "text": {"body": content}
+            }
+            
+            response = requests.post(url, headers=headers, json=data)
+            
+            if response.status_code != 200:
+                logger.error(f"WhatsApp API error: {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Failed to send WhatsApp message"
+                )
+            
+            response_data = response.json()
+            message_id = response_data.get("messages", [{}])[0].get("id")
+        else: 
+            message_id = f"privatenote_{uuid.uuid4()}"
+            response_data = {"status": "Private note created, no API call made"}
         
         now = datetime.now(timezone.utc)
 
         wa_conversation = {
-            "last_message": f"You: {content}",
+            "last_message": f"Private Note: {content}" if mode == "private" else f"You: {content}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
-            "next_action_at": now + timedelta(hours=6)
+            "next_action_at": now + timedelta(hours=6),
+            "last_message_is_private_note": mode == "private"
         }
 
         conversation = db[f"conversations_{org_id}"].find_one_and_update(
@@ -428,10 +440,11 @@ async def send_whatsapp_message(message: dict, org_id: str, temp_id: Optional[st
             sender_name="Agent",
             recipient_id=whatsapp_business_id,
             role=MessageRole.AGENT,
+            mode=mode,
             message_id=message_id,
             raw_data=response_data,
-            status="sending",
-            temp_id=temp_id
+            status="delivered" if mode == "private" else "sending",
+            temp_id=temp_id,
         )
         
         return {"message": "Message sent", "message_id": mid}
@@ -445,7 +458,7 @@ async def send_whatsapp_message(message: dict, org_id: str, temp_id: Optional[st
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str, temp_id: Optional[str]) -> dict:
+async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str, temp_id: Optional[str], mode: str) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """
@@ -461,42 +474,48 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
         
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
-        
-        # Send media message via WhatsApp Cloud API
-        url = f"https://graph.facebook.com/{IG_VERSION}/{connection.get('phone_id')}/messages"
-        headers = {
-            "Authorization": f"Bearer {connection.get('access_token')}",
-            "Content-Type": "application/json",
-        }
-        data = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": recipient_id,
-            "type": media_type,
-            media_type: media_payload
-        }
-        
-        response = requests.post(url, headers=headers, json=data)
-        
-        if response.status_code != 200:
-            logger.error(f"WhatsApp API error: {response.text}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail="Failed to send WhatsApp media message"
-            )
-        
-        response_data = response.json()
-        logger.info(f"WhatsApp media message response: {response.status_code}, {response_data}")
 
-        message_id = response_data.get("messages", [{}])[0].get("id")
+        if mode == "reply":
+            # Send media message via WhatsApp Cloud API
+            url = f"https://graph.facebook.com/{IG_VERSION}/{connection.get('phone_id')}/messages"
+            headers = {
+                "Authorization": f"Bearer {connection.get('access_token')}",
+                "Content-Type": "application/json",
+            }
+            data = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": recipient_id,
+                "type": media_type,
+                media_type: media_payload
+            }
+            
+            response = requests.post(url, headers=headers, json=data)
+            
+            if response.status_code != 200:
+                logger.error(f"WhatsApp API error: {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Failed to send WhatsApp media message"
+                )
+            
+            response_data = response.json()
+            logger.info(f"WhatsApp media message response: {response.status_code}, {response_data}")
+
+            message_id = response_data.get("messages", [{}])[0].get("id")
+        else:
+            message_id = f"privatenote_{uuid.uuid4()}"
+            response_data = {"status": "Private note created, no API call made"}
+
         now = datetime.now(timezone.utc)
 
         wa_conversation = {
-            "last_message": f"You: {content if content else 'Shared an image'}",
+            "last_message": f"Private Note: {content if content else 'Shared an image'}" if mode == "private" else f"You: {content if content else 'Shared an image'}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
-            "next_action_at": now + timedelta(hours=6)
+            "next_action_at": now + timedelta(hours=6),
+            "last_message_is_private_note": mode == "private"
         }
 
         conversation = db[f"conversations_{org_id}"].find_one_and_update(
@@ -525,10 +544,11 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
             sender_name="Agent",
             recipient_id=recipient_id,
             role=MessageRole.AGENT,
+            mode=mode,
             message_id=message_id,
             raw_data=response_data,
-            status="sending",
-            temp_id=temp_id
+            status="delivered" if mode == "private" else "sending",
+            temp_id=temp_id,
         )
         
         return {"message": "Sending message", "message_id": mid}
@@ -542,7 +562,7 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str]) -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str) -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
@@ -558,7 +578,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id)
+        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode)
         
         return response
     except Exception as e:

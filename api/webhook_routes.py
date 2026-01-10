@@ -295,7 +295,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 customer_phone_no=customer_phone_no,
                                 customer_name=sender_name2,
                                 last_message=content,
-                                last_sender="customer"
+                                last_sender="customer",
+                                mode="reply"
                             )
                             
                             # Store in WhatsApp-specific collections
@@ -310,7 +311,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 recipient_id=whatsapp_business_id,
                                 role=MessageRole.CUSTOMER,
                                 message_id=message_id,  # Use the ID from the webhook for deduplication
-                                raw_data=message
+                                raw_data=message,
+                                mode="reply"
                             )
 
                             # Check if conversation exists
@@ -751,7 +753,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         customer_name=name,
                         username=username,
                         last_message=message_echo and f"You: {message_text}" or message_text,
-                        last_sender= message_echo and MessageRole.AGENT or MessageRole.CUSTOMER
+                        last_sender= message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
                     )
                     
                     # Store in Instagram-specific collections

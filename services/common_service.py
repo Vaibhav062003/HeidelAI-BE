@@ -37,6 +37,7 @@ async def fetch_conversations_new(org_id: str) -> List[Dict]:
         "next_action_at": 0,
         "reminder_stage": 0,
         "started_at": 0,
+        "last_analyzed": 0,
         "_id": 0,
     }
 
@@ -62,6 +63,7 @@ async def fetch_conversations_new(org_id: str) -> List[Dict]:
             "phone_number": doc.get("customer_id") if doc.get("platform") == "whatsapp" else None,
             "customer_name": doc.get("customer_name") or "",
             "last_message": doc.get("last_message") or "",
+            "last_message_is_private_note": doc.get("last_message_is_private_note", False),
             "timestamp": (
                 doc["last_message_timestamp"].isoformat()
                 if isinstance(doc.get("last_message_timestamp"), datetime)
@@ -73,6 +75,11 @@ async def fetch_conversations_new(org_id: str) -> List[Dict]:
             "sentiment": doc.get("sentiment"),
             "assigned_agent_id": doc.get("assigned_agent_id"),
             "is_ai_enabled": doc.get("is_ai_enabled"),
+            "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
+            "assigned_agent": doc.get("assigned_agent", {}),
+            "assignment_history": doc.get("assignment_history", []),
+            "suggestions": doc.get("suggestions", []),
+            "summary": doc.get("summary", []),
         }
         for doc in raw_docs
     ]
@@ -441,7 +448,7 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str, file: Optional[any] = None, temp_id: Optional[str] = None):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, file: Optional[any] = None, temp_id: Optional[str] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
@@ -454,7 +461,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         if file:
             recipient_id = conversation_id.replace("whatsapp_", "")
             
-            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id)
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode)
 
             if res.get("error"):
                 raise HTTPException(
@@ -467,7 +474,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 "conversation_id": conversation_id,
                 "content": content,
                 "sender_id": wa_id,
-            }, org_id, temp_id)
+            }, org_id, mode, temp_id)
         return res
     
     elif platform == "instagram":
@@ -480,7 +487,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
 
 
         if file:
-            res = await upload_and_send_ig_media_message(recipient, file, ig_id, org_id)
+            res = await upload_and_send_ig_media_message(recipient, file, ig_id, org_id, mode)
 
             if res.get("error"):
                 raise HTTPException(
@@ -489,7 +496,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 )
         
         if content :
-            res = await send_ig_message(recipient, content, ig_id)
+            res = await send_ig_message(recipient, content, ig_id, mode, org_id)
         return res
     else:
         raise HTTPException(status_code=400, detail="Unsupported platform")
