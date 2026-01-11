@@ -194,6 +194,109 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     messages = value.get("messages", [])
                     if messages:
                         for message in messages:
+
+                            # REACTION TYPE MESSAGES #######################################################################
+                            if (message.get("reaction") is not None):
+
+                                # message_timestamp = message.get("timestamp")
+                                emoji = message.get("reaction").get("emoji")
+                                message_id = message.get("reaction").get("message_id")
+                                action = "react" if emoji else "unreact"
+                                timestamp = datetime.now()
+
+                                key = f"{message_id}_{emoji}_{action}"
+
+                                # Check for duplicate messages reactions / if the message ID is already processed
+                                if key in services.processed_message_reaction_ids:
+                                    logger.info("Duplicate message, skipping processing.")
+                                    continue
+                                
+                                # Add message ID with the current timestamp
+                                services.processed_message_reaction_ids[key] = timestamp
+
+                                # Extract essential data
+                                customer_phone_no = message.get("from")
+                                customer_name = sender_name2
+                                message_type = message.get("type")
+
+                                # Get user-specific collections
+                                messages_collection_name = f"messages_{org_id}"
+                                conversations_collection_name = f"conversations_{org_id}"
+                                
+                                # Get or create collections
+                                messages_collection = db[messages_collection_name]
+                                conversations_collection = db[conversations_collection_name]
+                                
+                                # Create conversation ID
+                                conversation_id = f"whatsapp_{customer_phone_no}"
+
+                                logger.info(f"Reaction Event: {customer_name} {action} to message ID {message_id} {f'with emoji: {emoji}' if action == 'react' else ''} ")
+
+                                if (action == "react"):
+                                    # Update the message with the reaction info in  database and it for broadcasting
+                                    try:
+                                        # Update the message with the reaction info
+                                        broadcast_message = messages_collection.find_one_and_update(
+                                            {"message_id": message_id},
+                                            {"$set": {
+                                                "reaction": {
+                                                    "emoji": emoji,
+                                                    "username": customer_phone_no,
+                                                    "full_name": customer_name,
+                                                    # "profile_picture_url": user_details.get("profile_pic"),
+                                                    "timestamp": timestamp
+                                                }
+                                            }}, 
+                                            return_document=ReturnDocument.AFTER
+                                        )
+                                        
+                                        if not broadcast_message:
+                                            logger.warning(f"Message with ID {message_id} not found for reaction update")
+                                            return {"status": "ok"}
+                                            
+                                    except Exception as e:
+                                        logger.error(f"Error updating message with reaction: {e}")
+                                        return {"status": "error", "message": str(e)}
+                                    
+                                elif (action == "unreact"):
+                                    # Update the message with the reaction info in  database and it for broadcasting
+                                    try:
+                                        # Update the message with the reaction info
+                                        broadcast_message = messages_collection.find_one_and_update(
+                                            {"message_id": message_id},
+                                            {"$unset": {"reaction": 1}}, 
+                                            return_document=ReturnDocument.AFTER
+                                        )
+                                        
+                                        if not broadcast_message:
+                                            logger.warning(f"Message with ID {message_id} not found for reaction update")
+                                            return {"status": "ok"}
+                                            
+                                    except Exception as e:
+                                        logger.error(f"Error updating message with reaction: {e}")
+                                        return {"status": "error", "message": str(e)}
+                                
+
+
+                                if "_id" in broadcast_message:
+                                    broadcast_message["_id"] = str(broadcast_message["_id"])
+
+                                await broadcast_main_ws(
+                                    platform_id=whatsapp_business_id,
+                                    platform_type="whatsapp",
+                                    event_type="message_reaction",
+                                    payload={"message": broadcast_message}
+                                    )
+
+                                # Broadcast the reaction update to connected clients
+                                if whatsapp_business_id in services.whatsapp_connections_map:
+                                    logger.success(f"Broadcasting message_reaction event to Frontend for {whatsapp_business_id}")
+                                    await broadcast_whatsapp_message(whatsapp_business_id, "message_reaction", {
+                                        "message": broadcast_message
+                                    })
+
+                                return {"status": "ok"}
+
                             # Skip processing if not a message
                             if "id" not in message:
                                 continue
@@ -283,6 +386,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 content = "[Interactive Message]"
                             elif message_type == "unsupported":
                                 continue  # Skip unsupported messages
+                            elif message_type == "reaction":
+                                continue  # Handled above
                             else:
                                 content = f"[Unsupported message type: {message_type}]"
                            
