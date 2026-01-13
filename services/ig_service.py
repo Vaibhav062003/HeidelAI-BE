@@ -296,7 +296,9 @@ async def store_instagram_message(
     recipient_id: str,
     role: MessageRole,
     mode: Optional[str] = None,
-    message_id: Optional[str] = None
+    message_id: Optional[str] = None,
+    context_type: Optional[str] = None,
+    context: Optional[dict] = None
     ) -> str:
     """
     Store a message in the Instagram-specific collection and notify appropriate WebSocket clients
@@ -335,6 +337,8 @@ async def store_instagram_message(
         "content": content,
         "type": type,
         "payload": payload,
+        "context_type": context_type,
+        "context": context,
         "sender_id": sender_id,
         "sender_name": sender_name,
         "sender_username": sender_username,
@@ -381,6 +385,8 @@ async def store_instagram_message(
         "content": content,
         "type": type,
         "payload": payload,
+        "context_type": context_type,
+        "context": context,
         "sender_id": sender_username,  # Use username for the frontend
         "role": role,
         "timestamp": datetime.now().isoformat(),

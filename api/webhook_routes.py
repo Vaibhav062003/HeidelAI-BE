@@ -313,6 +313,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract essential data
                             customer_phone_no = message.get("from")
                             message_type = message.get("type")
+                            message_context = message.get("context")
 
                             # Get user-specific collections
                             messages_collection_name = f"messages_{org_id}"
@@ -324,6 +325,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             
                             # Create conversation ID
                             conversation_id = f"whatsapp_{customer_phone_no}"
+
+                            context_type = None
+                            context = None
+
+                            if message_context:
+                                replied_message_id = message_context.get("id")
+
+                                if replied_message_id:
+                                    logger.info(f"Message is a reply to message ID: {replied_message_id}")
+
+                                    context_type = "message_reply"
+                                    context = {
+                                        "mid": replied_message_id
+                                    }
                             
                             # Extract message content based on message type
                             if message_type == "text":
@@ -417,7 +432,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 role=MessageRole.CUSTOMER,
                                 message_id=message_id,  # Use the ID from the webhook for deduplication
                                 raw_data=message,
-                                mode="reply"
+                                mode="reply",
+                                context_type=context_type,
+                                context=context
                             )
 
                             # Check if conversation exists
@@ -784,6 +801,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     attachment_type = "text"
                     attachment_payload = None
 
+                    context_type = None
+                    context = None
+
                     if (message.get("attachments") is not None):
                         logger.info("Message has attachments")
                         for attachment in message.get("attachments"):
@@ -795,8 +815,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         # Handle message replies
                         if message.get("reply_to").get("mid") is not None:
                             logger.info(f"Message is a reply to message ID: {message.get('reply_to').get('mid')}")
-                            attachment_type = "message_reply"
-                            attachment_payload = {
+                            context_type = "message_reply"
+                            context = {
                                 "mid": message.get("reply_to").get("mid")
                             }
                             
@@ -873,7 +893,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         sender_username=username,
                         recipient_id=recipient_id,
                         role= message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
-                        message_id=ig_message_id  # Use the ID from the webhook for deduplication
+                        message_id=ig_message_id,  # Use the ID from the webhook for deduplication
+                        context_type=context_type,
+                        context=context,
                     )
                     
                     # Check if conversation exists

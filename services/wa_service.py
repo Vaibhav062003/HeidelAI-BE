@@ -176,6 +176,8 @@ async def store_whatsapp_message(
     raw_data: Optional[dict] = None,
     status: Optional[str] = "received",
     temp_id: Optional[str] = None,
+    context_type: Optional[str] = None,
+    context: Optional[dict] = None
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -212,6 +214,8 @@ async def store_whatsapp_message(
         "content": content,
         "type": type,
         "payload": payload,
+        "context_type": context_type,
+        "context": context,
         "sender_id": customer_phone_no,
         "sender_name": sender_name,
         "role": role,
@@ -264,7 +268,9 @@ async def store_whatsapp_message(
         "type": type,
         "temp_id": temp_id,
         "payload": payload,
-        "mode": mode
+        "mode": mode,
+        "context_type": context_type,
+        "context": context
     }
 
     await broadcast_main_ws(
