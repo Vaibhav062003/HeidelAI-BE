@@ -14,7 +14,7 @@ from pymongo import ReturnDocument, UpdateOne
 from core.managers import manager
 from database import get_mongo_db, get_mongo_client
 from core.services import services
-from config.settings import IG_VERSION
+from config.settings import IG_VERSION, VERSION
 from schemas.models import MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
@@ -344,7 +344,7 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
                 if not services.whatsapp_connections_map[whatsapp_id]:
                     del services.whatsapp_connections_map[whatsapp_id]
 
-async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: Optional[str] = None) -> dict:
+async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
     
@@ -377,6 +377,18 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
 
         # Extract the recipient phone number from conversation ID
         recipient_id = conversation_id.replace("whatsapp_", "")
+
+        data = {
+            "messaging_product": "whatsapp",
+            "to": recipient_id,
+            "type": "text",
+            "text": {"body": content}
+        }
+
+        if context_type and context:
+            data["context"] = {
+                "message_id": context.get("mid")
+            }
         
         if mode == "reply":
             
@@ -386,12 +398,7 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
                 "Authorization": f"Bearer {connection['access_token']}",
                 "Content-Type": "application/json",
             }
-            data = {
-                "messaging_product": "whatsapp",
-                "to": recipient_id,
-                "type": "text",
-                "text": {"body": content}
-            }
+            
             
             response = requests.post(url, headers=headers, json=data)
             
@@ -451,6 +458,8 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
             raw_data=response_data,
             status="delivered" if mode == "private" else "sending",
             temp_id=temp_id,
+            context=context,
+            context_type=context_type
         )
         
         return {"message": "Message sent", "message_id": mid}
@@ -464,7 +473,7 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str, temp_id: Optional[str], mode: str) -> dict:
+async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """
@@ -477,6 +486,18 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
         }
         if content:
             media_payload["caption"] = content
+
+        data = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient_id,
+            "type": media_type,
+            media_type: media_payload
+        }
+        if context_type and context:
+            data["context"] = {
+                "message_id": context.get("mid")
+            }
         
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
@@ -488,13 +509,7 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
                 "Authorization": f"Bearer {connection.get('access_token')}",
                 "Content-Type": "application/json",
             }
-            data = {
-                "messaging_product": "whatsapp",
-                "recipient_type": "individual",
-                "to": recipient_id,
-                "type": media_type,
-                media_type: media_payload
-            }
+            
             
             response = requests.post(url, headers=headers, json=data)
             
@@ -555,6 +570,8 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
             raw_data=response_data,
             status="delivered" if mode == "private" else "sending",
             temp_id=temp_id,
+            context=context,
+            context_type=context_type
         )
         
         return {"message": "Sending message", "message_id": mid}
@@ -568,7 +585,7 @@ async def send_wa_media_message(recipient_id: str, media_url: str, media_type: s
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str) -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
@@ -584,7 +601,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode)
+        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode, context_type, context)
         
         return response
     except Exception as e:
@@ -818,3 +835,188 @@ async def upload_whatsapp_media_to_cloudinary(media_url: str, org_id: str, media
     except Exception as e:
         logger.error(f"Cloudinary upload error: {e}")
         return None
+    
+
+async def send_whatsapp_reaction(org_id, message_id, emoji):
+    """Send a reaction to a WhatsApp message"""
+    try: 
+
+        messages_collection = db[f"messages_{org_id}"]
+
+        # Find the message first
+        message = messages_collection.find_one({"message_id": message_id})
+        recipient_id = message.get("sender_id")
+
+        if not message:
+            logger.error("Message not found")
+            return {"status": "error", "message": "Message not found"}
+        
+        org_document = db.organizations.find_one({"org_id": org_id})
+        whatsapp_id = org_document.get("wa_id")
+
+        logger.info(f"whatsapp_id for org {org_id}: {whatsapp_id}")
+
+        if not whatsapp_id:
+            raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
+
+        # Get the page access token for this WhatsApp account
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": whatsapp_id, "org_id": org_id},
+            {"access_token" : 1, "phone_id": 1, "name": 1, "phone": 1,"_id": 0}
+        )
+
+        logger.info(f"Found WhatsApp connection for reaction: {connection}")
+
+        logger.info(f"access_token: {connection.get('access_token')}, phone_id: {connection.get('phone_id')}")
+
+        if not connection or not connection.get("access_token") or not connection.get("phone_id"):
+            raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
+        
+        access_token = connection["access_token"]
+        phone_id = connection["phone_id"]
+        name = connection["name"]
+        phone = connection["phone"]
+
+        url = f"https://graph.facebook.com/{VERSION}/{phone_id}/whatsapp_business_profile"
+        params = {
+            "access_token": access_token,
+            "fields": "profile_picture_url"
+        }
+        
+        response = requests.get(url, params=params)
+        
+        if response.status_code != 200:
+            logger.error(f"WhatsApp API Error: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Failed to fetch WhatsApp profile: {response.json().get('error', {}).get('message')}"
+            )
+        
+        owner_details = response.json()
+        owner_details = owner_details.get("data")
+        profile_picture_url = None
+        for data in owner_details:
+            if data.get("profile_picture_url"):
+                profile_picture_url = data.get("profile_picture_url")
+                break
+        
+
+        # If reaction exists and same user reacted before → remove it
+        if message.get("reaction"):
+            current_reaction = message["reaction"]
+            if current_reaction.get("username") == phone and current_reaction.get("emoji") == emoji:
+
+                response = await send_message_reaction(message_id, phone_id, access_token, action="unreact", recipient_id=recipient_id, emoji=emoji)
+
+                if response == "error":
+                    return {"status": "error", "message": "Failed to remove reaction WhatsApp API Exception"}
+                # Unset the reaction
+                broadcast_message = messages_collection.find_one_and_update(
+                    {"message_id": message_id},
+                    {"$unset": {"reaction": 1}}, 
+                    return_document=ReturnDocument.AFTER
+                )
+                logger.success(f"Reaction removed for message {message_id}")
+
+                if "_id" in broadcast_message:
+                    broadcast_message["_id"] = str(broadcast_message["_id"])
+
+                await broadcast_main_ws(
+                    platform_id=whatsapp_id,
+                    platform_type="whatsapp",
+                    event_type="message_reaction",
+                    payload={"message": broadcast_message}
+                )
+
+                # Broadcast the reaction update to connected clients
+                if whatsapp_id in services.whatsapp_connections_map:
+                    logger.info(f"Broadcasting message_reaction event to Frontend for {whatsapp_id}")
+                    await broadcast_whatsapp_message(whatsapp_id, "message_reaction", {
+                        "message": broadcast_message
+                    })
+
+                logger.success(f"Reaction removed for message {message_id} with emoji {emoji}")
+
+                return {"status": "success", "message": "sent"}
+
+        response = await send_message_reaction(message_id, phone_id, access_token, action="react", recipient_id=recipient_id, emoji=emoji)
+
+        if response == "error":
+            return {"status": "error", "message": "Failed to remove reaction WhatsApp API Exception"}
+
+        # Otherwise set a new reaction
+        broadcast_message = messages_collection.find_one_and_update(
+            {"message_id": message_id},
+            {"$set": {
+                "reaction": {
+                    "emoji": emoji,
+                    "username": phone,
+                    "full_name": name,
+                    "profile_picture_url": profile_picture_url,
+                    "timestamp": datetime.now()
+                }
+            }}, 
+            return_document=ReturnDocument.AFTER
+        )
+
+        if "_id" in broadcast_message:
+            broadcast_message["_id"] = str(broadcast_message["_id"])
+
+        await broadcast_main_ws(
+            platform_id=whatsapp_id,
+            platform_type="whatsapp",
+            event_type="message_reaction",
+            payload={"message": broadcast_message}
+        )
+
+        # Broadcast the reaction update to connected clients
+        if whatsapp_id in services.whatsapp_connections_map:
+            logger.info(f"Broadcasting message_reaction event to Frontend for {whatsapp_id}")
+            await broadcast_whatsapp_message(whatsapp_id, "message_reaction", {
+                "message": broadcast_message
+            })
+
+        logger.success(f"Reaction updated for message {message_id} with emoji {emoji}")
+        return {"status": "success", "message": "sent"}
+        
+    
+    except Exception as e:
+        logger.error(f"Error sending WhatsApp reaction: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to send reaction: {str(e)}"
+        )
+
+async def send_message_reaction(message_id: str, phone_id: str, access_token: str, action: str, recipient_id: str, emoji: str):
+    """
+    Send a reaction to a message
+    """
+    try:
+        url = f"https://graph.facebook.com/v24.0/{phone_id}/messages"
+
+        headers = {
+            "Authorization" : "Bearer " + access_token,
+            "Content-Type": "application/json"
+        }
+
+        body = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient_id,
+            "type": "reaction",
+            "reaction": {
+                "message_id": message_id,
+                "emoji": emoji if action == "react" else "",
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=body)
+        if response.status_code != 200:
+            logger.error(f"Error sending message reaction: {response.text}")
+            return "error"
+        logger.info(f"Message reaction response: {response.status_code}, {response.json()}")
+        return "success"
+
+    except Exception as e:
+        logger.error(f"Error sending message reaction: {str(e)}")
+        return "error"

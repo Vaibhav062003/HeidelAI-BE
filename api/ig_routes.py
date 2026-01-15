@@ -777,143 +777,143 @@ async def send_instagram_message(message: dict, user: CurrentUser):
             detail=f"Failed to send message: {str(e)}"
         )
     
-@router.post("/conversations/send_reaction")
-async def send_instagram_reaction(reaction: dict, user: CurrentUser):
-    """Send a reaction to an Instagram message"""
-    try:
-        org_id = user.org_id 
-        # emoji = reaction["emoji"]
-        message_id = reaction["message_id"]
+# @router.post("/conversations/send_reaction")
+# async def send_instagram_reaction(reaction: dict, user: CurrentUser):
+#     """Send a reaction to an Instagram message"""
+#     try:
+#         org_id = user.org_id 
+#         # emoji = reaction["emoji"]
+#         message_id = reaction["message_id"]
 
-        messages_collection = db[f"messages_{org_id}"]
+#         messages_collection = db[f"messages_{org_id}"]
 
-        # Find the message first
-        message = messages_collection.find_one({"message_id": message_id})
-        recipient_id = message.get("sender_id")
+#         # Find the message first
+#         message = messages_collection.find_one({"message_id": message_id})
+#         recipient_id = message.get("sender_id")
 
-        if not message:
-            logger.error("Message not found")
-            return {"status": "error", "message": "Message not found"}
+#         if not message:
+#             logger.error("Message not found")
+#             return {"status": "error", "message": "Message not found"}
         
-        org_document = db.organizations.find_one({"org_id": org_id})
-        instagram_id = org_document.get("ig_id")
+#         org_document = db.organizations.find_one({"org_id": org_id})
+#         instagram_id = org_document.get("ig_id")
 
-        if not instagram_id:
-            raise HTTPException(status_code=400, detail="Instagram ID not configured for this organization")
+#         if not instagram_id:
+#             raise HTTPException(status_code=400, detail="Instagram ID not configured for this organization")
 
-        # Get the page access token for this Instagram account
-        connection = db.instagram_connections.find_one(
-            {"instagram_id": instagram_id, "is_active": True, "org_id": org_id},
-            {"page_access_token": 1,"access_token" : 1, "page_id": 1}
-        )
+#         # Get the page access token for this Instagram account
+#         connection = db.instagram_connections.find_one(
+#             {"instagram_id": instagram_id, "is_active": True, "org_id": org_id},
+#             {"page_access_token": 1,"access_token" : 1, "page_id": 1}
+#         )
 
-        if not connection or not connection.get("page_access_token"):
-            raise HTTPException(status_code=404, detail="Instagram connection not found or inactive")
+#         if not connection or not connection.get("page_access_token"):
+#             raise HTTPException(status_code=404, detail="Instagram connection not found or inactive")
         
-        page_access_token = connection["page_access_token"]
+#         page_access_token = connection["page_access_token"]
 
-        url = f"https://graph.instagram.com/me"
-        params = {
-            "access_token": page_access_token,
-            "fields": "name,profile_picture_url,username"
-        }
+#         url = f"https://graph.instagram.com/me"
+#         params = {
+#             "access_token": page_access_token,
+#             "fields": "name,profile_picture_url,username"
+#         }
         
-        response = requests.get(url, params=params)
+#         response = requests.get(url, params=params)
         
-        if response.status_code != 200:
-            logger.error(f"Instagram API Error: {response.text}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Failed to fetch Instagram profile: {response.json().get('error', {}).get('message')}"
-            )
+#         if response.status_code != 200:
+#             logger.error(f"Instagram API Error: {response.text}")
+#             raise HTTPException(
+#                 status_code=response.status_code,
+#                 detail=f"Failed to fetch Instagram profile: {response.json().get('error', {}).get('message')}"
+#             )
         
-        owner_details = response.json()
+#         owner_details = response.json()
 
-        # If reaction exists and same user reacted before → remove it
-        if message.get("reaction"):
-            current_reaction = message["reaction"]
-            if current_reaction.get("username") == owner_details.get("username") and current_reaction.get("emoji") == "❤️":
-                response = await send_message_reaction(message_id, instagram_id, page_access_token, action="unreact", recipient_id=recipient_id)
+#         # If reaction exists and same user reacted before → remove it
+#         if message.get("reaction"):
+#             current_reaction = message["reaction"]
+#             if current_reaction.get("username") == owner_details.get("username") and current_reaction.get("emoji") == "❤️":
+#                 response = await send_message_reaction(message_id, instagram_id, page_access_token, action="unreact", recipient_id=recipient_id)
 
-                if response == "error":
-                    return {"status": "error", "message": "Failed to remove reaction IG API Exception"}
-                # Unset the reaction
-                broadcast_message = messages_collection.find_one_and_update(
-                    {"message_id": message_id},
-                    {"$unset": {"reaction": 1}}, 
-                    return_document=ReturnDocument.AFTER
-                )
-                logger.success(f"Reaction removed for message {message_id}")
+#                 if response == "error":
+#                     return {"status": "error", "message": "Failed to remove reaction IG API Exception"}
+#                 # Unset the reaction
+#                 broadcast_message = messages_collection.find_one_and_update(
+#                     {"message_id": message_id},
+#                     {"$unset": {"reaction": 1}}, 
+#                     return_document=ReturnDocument.AFTER
+#                 )
+#                 logger.success(f"Reaction removed for message {message_id}")
 
-                if "_id" in broadcast_message:
-                    broadcast_message["_id"] = str(broadcast_message["_id"])
+#                 if "_id" in broadcast_message:
+#                     broadcast_message["_id"] = str(broadcast_message["_id"])
 
-                await broadcast_main_ws(
-                    platform_id=instagram_id,
-                    platform_type="instagram",
-                    event_type="message_reaction",
-                    payload={"message": broadcast_message}
-                )
+#                 await broadcast_main_ws(
+#                     platform_id=instagram_id,
+#                     platform_type="instagram",
+#                     event_type="message_reaction",
+#                     payload={"message": broadcast_message}
+#                 )
 
-                # Broadcast the reaction update to connected clients
-                if instagram_id in services.instagram_connections_map:
-                    logger.info(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
-                    await broadcast_instagram_message(instagram_id, "message_reaction", {
-                        "message": broadcast_message
-                    })
+#                 # Broadcast the reaction update to connected clients
+#                 if instagram_id in services.instagram_connections_map:
+#                     logger.info(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
+#                     await broadcast_instagram_message(instagram_id, "message_reaction", {
+#                         "message": broadcast_message
+#                     })
 
-                logger.success(f"Reaction removed for message {message_id} with emoji ❤️")
+#                 logger.success(f"Reaction removed for message {message_id} with emoji ❤️")
 
 
-                return {"status": "success", "message": "sent"}
+#                 return {"status": "success", "message": "sent"}
 
-        response = await send_message_reaction(message_id, instagram_id, page_access_token, action="react", recipient_id=recipient_id)
+#         response = await send_message_reaction(message_id, instagram_id, page_access_token, action="react", recipient_id=recipient_id)
 
-        if response == "error":
-            return {"status": "error", "message": "Failed to remove reaction IG API Exception"}
+#         if response == "error":
+#             return {"status": "error", "message": "Failed to remove reaction IG API Exception"}
 
-        # Otherwise set a new reaction
-        broadcast_message = messages_collection.find_one_and_update(
-            {"message_id": message_id},
-            {"$set": {
-                "reaction": {
-                    "emoji": "❤️",
-                    "username": owner_details.get("username"),
-                    "full_name": owner_details.get("name"),
-                    "profile_picture_url": owner_details.get("profile_picture_url"),
-                    "timestamp": datetime.now()
-                }
-            }}, 
-            return_document=ReturnDocument.AFTER
-        )
+#         # Otherwise set a new reaction
+#         broadcast_message = messages_collection.find_one_and_update(
+#             {"message_id": message_id},
+#             {"$set": {
+#                 "reaction": {
+#                     "emoji": "❤️",
+#                     "username": owner_details.get("username"),
+#                     "full_name": owner_details.get("name"),
+#                     "profile_picture_url": owner_details.get("profile_picture_url"),
+#                     "timestamp": datetime.now()
+#                 }
+#             }}, 
+#             return_document=ReturnDocument.AFTER
+#         )
 
-        if "_id" in broadcast_message:
-            broadcast_message["_id"] = str(broadcast_message["_id"])
+#         if "_id" in broadcast_message:
+#             broadcast_message["_id"] = str(broadcast_message["_id"])
 
-        await broadcast_main_ws(
-            platform_id=instagram_id,
-            platform_type="instagram",
-            event_type="message_reaction",
-            payload={"message": broadcast_message}
-        )
+#         await broadcast_main_ws(
+#             platform_id=instagram_id,
+#             platform_type="instagram",
+#             event_type="message_reaction",
+#             payload={"message": broadcast_message}
+#         )
 
-        # Broadcast the reaction update to connected clients
-        if instagram_id in services.instagram_connections_map:
-            logger.info(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
-            await broadcast_instagram_message(instagram_id, "message_reaction", {
-                "message": broadcast_message
-            })
+#         # Broadcast the reaction update to connected clients
+#         if instagram_id in services.instagram_connections_map:
+#             logger.info(f"Broadcasting message_reaction event to Frontend for {instagram_id}")
+#             await broadcast_instagram_message(instagram_id, "message_reaction", {
+#                 "message": broadcast_message
+#             })
 
-        logger.success(f"Reaction updated for message {message_id} with emoji ❤️")
-        return {"status": "success", "message": "sent"}
+#         logger.success(f"Reaction updated for message {message_id} with emoji ❤️")
+#         return {"status": "success", "message": "sent"}
         
     
-    except Exception as e:
-        logger.error(f"Error sending Instagram reaction: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to send reaction: {str(e)}"
-        )
+#     except Exception as e:
+#         logger.error(f"Error sending Instagram reaction: {e}")
+#         raise HTTPException(
+#             status_code=500, 
+#             detail=f"Failed to send reaction: {str(e)}"
+#         )
     
 @router.post("/conversations/send_media_message")
 async def upload_and_send_instagram_media(

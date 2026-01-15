@@ -86,6 +86,11 @@ class UpdateCategoriesRequest(BaseModel):
     conversation_id: str = Field(..., description="Unique conversation ID of the contact")
     categories: List[str] = Field(..., description="List of categories to assign to this contact")
 
+class SendReactionRequest(BaseModel):
+    message_id: str = Field(..., description="Message ID of the message to react to")
+    emoji: str = Field(..., description="Emoji to react with")
+    platform: str = Field(..., description="Platform of the message (e.g., whatsapp, instagram)")
+
 # Products Service
 class Product(BaseModel):
     product_name: str

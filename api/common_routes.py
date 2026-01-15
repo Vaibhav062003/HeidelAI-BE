@@ -1,10 +1,11 @@
+import json
 from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from typing import Optional
 
 from auth.dependencies import CurrentUser
 from core.services import services
-from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, CannedResponse
+from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, CannedResponse, SendReactionRequest
 from services.conversation_utils import reopen_conversation
 from services.common_service import (
     fetch_conversations_new, 
@@ -23,6 +24,7 @@ from services.contacts_service import (
     get_tags_from_org_metadata,
     process_bulk_wa_contact_upload
     )
+from services.ig_service import send_instagram_reaction
 from services.products_service import (
     get_products_for_org, 
     bulk_upload_products_from_file, 
@@ -32,6 +34,7 @@ from services.products_service import (
 )
 
 from core.logger import get_logger
+from services.wa_service import send_whatsapp_reaction
 
 logger = get_logger(__name__)
 
@@ -104,7 +107,9 @@ async def send_message_endpoint(
     platform: str = Form(...),
     mode: str = Form(...),
     temp_id: Optional[str] = Form(None), 
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
+    context_type: Optional[str] = Form(None),
+    context: Optional[str] = Form(None)
 ):    
     """
     Send a message to a specific conversation.
@@ -114,6 +119,13 @@ async def send_message_endpoint(
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
+    context_dict = None
+    if context:
+        try:
+            context_dict = json.loads(context)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON format in context field")
+
     res = await send_message(
         org_id, 
         platform, 
@@ -122,9 +134,46 @@ async def send_message_endpoint(
         mode,
         file if file else None, 
         temp_id if temp_id else None,
+        context_type if context_type else None,
+        context_dict
     )
 
     return {"message": "Message sent", "details": res}
+
+@router.post("/api/conversations/send_reaction")
+async def send_reaction_endpoint(
+    user: CurrentUser,
+    data: SendReactionRequest
+):
+    """
+    Send a reaction to a specific message in a conversation.
+    """
+    message_id = data.message_id
+    emoji = data.emoji
+    platform = data.platform
+    org_id = user.org_id
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    if platform == "instagram":
+        res = await send_instagram_reaction(
+            org_id,
+            message_id,
+            emoji
+        )
+    elif platform == "whatsapp":
+        res = await send_whatsapp_reaction(
+            org_id,
+            message_id,
+            emoji
+        )
+    response_status = res.get("status")
+    response_message = res.get("message", "")
+    if response_status == "error":
+        raise HTTPException(status_code=500, detail="Failed to send reaction : " + response_message)
+
+    return {"message": "Reaction sent", "details": res}
 
 @router.post("/api/conversations/{conversation_id}/reopen")
 async def reopen_conversation_endpoint(user: CurrentUser, conversation_id: str):
