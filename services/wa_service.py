@@ -854,7 +854,6 @@ async def send_whatsapp_reaction(org_id, message_id, emoji):
         org_document = db.organizations.find_one({"org_id": org_id})
         whatsapp_id = org_document.get("wa_id")
 
-        logger.info(f"whatsapp_id for org {org_id}: {whatsapp_id}")
 
         if not whatsapp_id:
             raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
@@ -865,9 +864,7 @@ async def send_whatsapp_reaction(org_id, message_id, emoji):
             {"access_token" : 1, "phone_id": 1, "name": 1, "phone": 1,"_id": 0}
         )
 
-        logger.info(f"Found WhatsApp connection for reaction: {connection}")
 
-        logger.info(f"access_token: {connection.get('access_token')}, phone_id: {connection.get('phone_id')}")
 
         if not connection or not connection.get("access_token") or not connection.get("phone_id"):
             raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")
