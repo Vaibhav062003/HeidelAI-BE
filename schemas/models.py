@@ -126,3 +126,10 @@ class CannedResponseOut(BaseModel):
     shortcut: str
     response: str
     updated_at: datetime
+
+class SubscriptionRequest(BaseModel):
+    plan_id: Literal["free", "growth", "enterprise"]
+    amount: float
+    customer_id: str
+    customer_phone: str
+    customer_email: str

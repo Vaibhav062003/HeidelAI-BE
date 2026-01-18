@@ -63,3 +63,8 @@ KOYEB2 = os.getenv("KOYEB2")
 # products service
 MEDIA_ROOT = os.getenv("MEDIA_ROOT", "./media")
 BASE_MEDIA_URL = os.getenv("BASE_MEDIA_URL", "http://localhost:8000/media")  
+
+#Cashfree Payment Gateway
+CASHFREE_URL = os.getenv("CASHFREE_URL")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
