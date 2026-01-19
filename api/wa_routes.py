@@ -37,6 +37,9 @@ from config.settings import (
     CLOUDINARY_API_SECRET
 )
 from core.logger import get_logger
+from services.wa_service import get_templates
+
+
 
 logger = get_logger(__name__)
 
@@ -988,3 +991,39 @@ async def get_whatsapp_profile(user: CurrentUser):
     except Exception as e:
         logger.error(f"Error fetching WhatsApp profile: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch WhatsApp profile: {str(e)}")
+
+
+@router.get("/template")
+async def fetch_templates(user: CurrentUser):
+    """
+    fetch prebuil templates:
+    """
+    try:
+        org_id = user.org_id
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        wa_id = org_document.get("wa_id")
+        logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
+
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0}
+        )
+        logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
+
+        access_token = connection.get("access_token") 
+    
+        if not access_token:
+            raise HTTPException(status_code=400, detail="WhatsApp access token not configured for this organization")
+
+        templates = await get_templates(org_id, wa_id, access_token)
+
+        return {
+            "status": "success",
+            "message": "templates fetched successfully",
+            "templates": templates
+        }
+
+    except Exception as e:
+        logger.error(f"Error fetching prebuilt templates: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch prebuilt templates: {str(e)}")
