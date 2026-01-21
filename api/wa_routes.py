@@ -20,7 +20,7 @@ from fastapi import (
 from core.services import services
 from services.utils import serialize_mongo
 from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
@@ -37,7 +37,6 @@ from config.settings import (
     CLOUDINARY_API_SECRET
 )
 from core.logger import get_logger
-from services.wa_service import get_templates
 
 
 
@@ -993,10 +992,10 @@ async def get_whatsapp_profile(user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to fetch WhatsApp profile: {str(e)}")
 
 
-@router.get("/template")
+@router.get("/templates")
 async def fetch_templates(user: CurrentUser):
     """
-    fetch prebuil templates:
+    fetch prebuilt templates:
     """
     try:
         org_id = user.org_id
@@ -1007,14 +1006,19 @@ async def fetch_templates(user: CurrentUser):
 
         connection = db.whatsapp_connections.find_one(
             {"wa_id": wa_id, "org_id": org_id},
-            {"_id": 0}
+            {"_id": 0, "access_token": 1}
         )
+
+        access_token = connection["access_token"] if connection else None
+
+        if not connection or "access_token" not in connection:
+            raise HTTPException(
+                status_code=404,
+                detail="WhatsApp connection not found or access token missing"
+            )
+
         logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
 
-        access_token = connection.get("access_token") 
-    
-        if not access_token:
-            raise HTTPException(status_code=400, detail="WhatsApp access token not configured for this organization")
 
         templates = await get_templates(org_id, wa_id, access_token)
 

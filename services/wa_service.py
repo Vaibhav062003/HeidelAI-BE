@@ -1018,10 +1018,20 @@ async def send_message_reaction(message_id: str, phone_id: str, access_token: st
         logger.error(f"Error sending message reaction: {str(e)}")
         return "error"
 
-async def  get_templates(org_id: str, wa_id: str | None , access_token: str):
+async def get_templates(org_id: str, wa_id: str, access_token: str):
     """
-    Get all templates pre-built and whatsapp templates
+    Fetch WhatsApp message templates associated with an organization.
+
+    This function retrieves:
+    1. Pre-built (Meta-provided) WhatsApp message templates.
+    2. User-created WhatsApp templates linked to the given WhatsApp Business Account (wa_id).
+
+    Behavior:
+    - If `wa_id` is provided, the function fetches templates created under that WhatsApp account.
+    - If `wa_id` is None or no user-created templates exist, only pre-built templates are returned.
+    - Uses the provided `access_token` to authenticate requests to the WhatsApp (Meta) Graph API.
     """
+
     
     headers = {
             "Authorization" : "Bearer " + access_token,
@@ -1039,7 +1049,7 @@ async def  get_templates(org_id: str, wa_id: str | None , access_token: str):
             if response.status_code == 200:
                 user_created = response.json().get("data", [])
                 logger.info(
-                    f"User-created templates | org_id={org_id} | count={len(user_created)}"
+                     f"User-created templates = {len(user_created)}"
                 )
 
         global_url = "https://graph.facebook.com/v24.0/message_template_library"
@@ -1048,7 +1058,7 @@ async def  get_templates(org_id: str, wa_id: str | None , access_token: str):
         if response.status_code == 200:
             prebuilt = response.json().get("data", [])
             logger.info(
-                f"Pre-built templates | org_id={org_id} | count={len(prebuilt)}"
+                 f"Pre-built templates = {len(prebuilt)}"
             )
 
         return {
