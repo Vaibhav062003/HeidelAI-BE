@@ -10,6 +10,7 @@ from . import integrations
 from . import security_routes
 from . import clerk_routes
 from . import canned_responses_routes
+from . import signup_routes
 
 router = APIRouter()
 
@@ -23,3 +24,4 @@ router.include_router(integrations.router)
 router.include_router(security_routes.router)
 router.include_router(clerk_routes.router)
 router.include_router(canned_responses_routes.router)
+router.include_router(signup_routes.router)

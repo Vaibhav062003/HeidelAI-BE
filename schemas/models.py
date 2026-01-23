@@ -1,5 +1,5 @@
 # Pydantic
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional, List, Literal, Dict, Any
 from enum import Enum
 from datetime import datetime, timezone
@@ -133,3 +133,30 @@ class SubscriptionRequest(BaseModel):
     customer_id: str
     customer_phone: str
     customer_email: str
+    customer_full_name: str
+
+class InitSignupRequest(BaseModel):
+    first_name: str
+    last_name: str
+    email: EmailStr
+    provider: str = "email"
+    clerk_signup_id: str
+
+class PasswordRequest(BaseModel):
+    session_id: str
+
+class OTPRequest(BaseModel):
+    session_id: str
+
+class SelectPlanRequest(BaseModel):
+    session_id: str
+    plan_id: Literal["free", "growth_monthly", "growth_yearly", "enterprise", "custom"]
+
+class AddPhoneNumberRequest(BaseModel):
+    phone_number: str
+    session_id: str
+
+class InviteTeamMembersRequest(BaseModel):
+    session_id: str
+    org_name: str
+    member_emails: List[EmailStr]

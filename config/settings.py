@@ -66,5 +66,8 @@ BASE_MEDIA_URL = os.getenv("BASE_MEDIA_URL", "http://localhost:8000/media")
 
 #Cashfree Payment Gateway
 CASHFREE_URL = os.getenv("CASHFREE_URL")
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+CASHFREE_APP_ID = os.getenv("CASHFREE_APP_ID")
+CASHFREE_SECRET_KEY = os.getenv("CASHFREE_SECRET_KEY")
+
+#Clerk
+CLERK_TOKEN = os.getenv("CLERK_TOKEN_KEY")

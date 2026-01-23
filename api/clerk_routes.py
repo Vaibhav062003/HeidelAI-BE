@@ -1,19 +1,16 @@
 import os, requests
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, EmailStr
-from dotenv import load_dotenv
 
 from auth.dependencies import CurrentUser
-
+from config.settings import CLERK_TOKEN
 from core.logger import get_logger
 
 logger = get_logger(__name__)
 
-load_dotenv()
 
 router = APIRouter(prefix="/api/clerk", tags=["clerk"])
 
-CLERK_TOKEN = os.getenv("CLERK_TOKEN_KEY")
 if not CLERK_TOKEN:
     raise RuntimeError("CLERK_TOKEN_KEY environment variable not set")
 base_url = "https://api.clerk.com/v1"

@@ -968,3 +968,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     # })
 
     return {"status": "ok"}
+
+@router.post("/cashfree")
+async def cashfree_webhook(payload: dict):
+    logger.info(f"Cashfree Webhook Received: {payload}")
