@@ -68,6 +68,7 @@ BASE_MEDIA_URL = os.getenv("BASE_MEDIA_URL", "http://localhost:8000/media")
 CASHFREE_URL = os.getenv("CASHFREE_URL")
 CASHFREE_APP_ID = os.getenv("CASHFREE_APP_ID")
 CASHFREE_SECRET_KEY = os.getenv("CASHFREE_SECRET_KEY")
+CASHFREE_VERSION = os.getenv("CASHFREE_VERSION")
 
 #Clerk
 CLERK_TOKEN = os.getenv("CLERK_TOKEN_KEY")

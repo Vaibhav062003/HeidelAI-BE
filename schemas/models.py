@@ -142,21 +142,12 @@ class InitSignupRequest(BaseModel):
     provider: str = "email"
     clerk_signup_id: str
 
-class PasswordRequest(BaseModel):
-    session_id: str
-
-class OTPRequest(BaseModel):
-    session_id: str
-
 class SelectPlanRequest(BaseModel):
-    session_id: str
     plan_id: Literal["free", "growth_monthly", "growth_yearly", "enterprise", "custom"]
 
-class AddPhoneNumberRequest(BaseModel):
+class InitPaymentRequest(BaseModel):
     phone_number: str
-    session_id: str
-
+    
 class InviteTeamMembersRequest(BaseModel):
-    session_id: str
     org_name: str
     member_emails: List[EmailStr]

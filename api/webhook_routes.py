@@ -5,11 +5,13 @@ from datetime import datetime
 from fastapi import Request, Header, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 # Internal Modules
 from core.managers import manager
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
+from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
 from services.wa_service import *
 from services.ig_service import *
 from schemas.models import MessageRole
@@ -970,5 +972,45 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     return {"status": "ok"}
 
 @router.post("/cashfree")
-async def cashfree_webhook(payload: dict):
-    logger.info(f"Cashfree Webhook Received: {payload}")
+async def cashfree_webhook(request: Request):
+
+    await verify_cashfree_signature(request)
+
+    raw_body = await request.body()
+    payload = json.loads(raw_body)
+    logger.info("Cashfree Webhook Received:", json.dumps(payload, indent=2))
+
+
+    event_type = payload["type"]
+    data = payload["data"]
+
+    idempotency_key = await build_idempotency_key(event_type, data)
+
+    try:
+        db.cashfree_webhook_events.insert_one({
+            "idempotency_key": idempotency_key,
+            "gateway": "CASHFREE",
+            "event_type": event_type,
+            "reference_id": data.get("cf_payment_id")
+                or data.get("cf_subscription_id"),
+            "processed": False,
+            "payload": payload,
+            "created_at": datetime.utcnow()
+        })
+    except DuplicateKeyError:
+        # webhook retry or duplicate
+        return {"status": "duplicate_ignored"}
+
+    try:
+        await process_cashfree_event(event_type, payload)
+
+        db.webhook_events.update_one(
+            {"idempotency_key": idempotency_key},
+            {"$set": {"processed": True}}
+        )
+
+    except Exception as e:
+        # DO NOT fail the webhook
+        logger.error(f"Webhook processing failed : {e}")
+
+    return {"status": "processed"}
