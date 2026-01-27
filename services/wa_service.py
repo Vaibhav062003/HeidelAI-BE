@@ -1017,3 +1017,56 @@ async def send_message_reaction(message_id: str, phone_id: str, access_token: st
     except Exception as e:
         logger.error(f"Error sending message reaction: {str(e)}")
         return "error"
+
+async def get_templates(org_id: str, wa_id: str, access_token: str):
+    """
+    Fetch WhatsApp message templates associated with an organization.
+
+    This function retrieves:
+    1. Pre-built (Meta-provided) WhatsApp message templates.
+    2. User-created WhatsApp templates linked to the given WhatsApp Business Account (wa_id).
+
+    Behavior:
+    - If `wa_id` is provided, the function fetches templates created under that WhatsApp account.
+    - If `wa_id` is None or no user-created templates exist, only pre-built templates are returned.
+    - Uses the provided `access_token` to authenticate requests to the WhatsApp (Meta) Graph API.
+    """
+
+    
+    headers = {
+            "Authorization" : "Bearer " + access_token,
+            "Content-Type": "application/json"
+        }
+        
+    user_created = []
+    prebuilt =[]
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        if wa_id:
+            org_url = f"https://graph.facebook.com/v24.0/{wa_id}/message_templates"
+            response = await client.get(org_url, headers=headers)
+
+            if response.status_code == 200:
+                user_created = response.json().get("data", [])
+                logger.info(
+                     f"User-created templates = {len(user_created)}"
+                )
+
+        global_url = "https://graph.facebook.com/v24.0/message_template_library"
+        response = await client.get(global_url, headers=headers)
+
+        if response.status_code == 200:
+            prebuilt = response.json().get("data", [])
+            logger.info(
+                 f"Pre-built templates = {len(prebuilt)}"
+            )
+
+        return {
+            "user_created": user_created,
+            "prebuilt": prebuilt,
+            "meta": {
+                "has_user_created": len(user_created) > 0,
+                "has_prebuilt": len(prebuilt) > 0,
+            }
+        }
+        
