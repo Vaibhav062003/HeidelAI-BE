@@ -8,12 +8,15 @@ import uuid
 from fastapi import HTTPException, Request
 import requests
 from dateutil import parser
+from pymongo import ReturnDocument
 
 # internal modules
 from database import get_mongo_db
 from core.logger import get_logger
 from config.settings import CASHFREE_URL, CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_VERSION
 from typing import Literal
+
+from services.clerk_service import create_organization
 
 logger = get_logger(__name__)
 db = get_mongo_db()
@@ -219,7 +222,11 @@ async def update_subscription_state(data: dict, event_time: datetime):
     # Update Payment Method if available in auth details
     auth_details = data.get("authorization_details", {})
     if auth_details.get("payment_group"):
-         update_fields["payment_method_type"] = auth_details.get("payment_group")
+        update_fields["payment_method_type"] = auth_details.get("payment_group")
+    if auth_details.get("payment_method"):
+        update_fields["payment_method"] = auth_details.get("payment_method")
+    if auth_details.get("payment_id"):
+        update_fields["payment_id"] = auth_details.get("payment_id")
 
     db.subscriptions.update_one(
         {"subscription_id": subscription_id},
@@ -319,16 +326,43 @@ async def mark_payment_success(data: dict, event_time: datetime):
     )
 
     # 2. Update Subscription Last Payment State
-    db.subscriptions.update_one(
+    subscription = db.subscriptions.find_one_and_update(
         {"subscription_id": subscription_id},
         {
             "$set": {
                 "last_payment_date": event_time,
                 "last_payment_status": "SUCCESS",
+                "last_payment_cf_id": cf_payment_id,
                 # Note: We rely on SUBSCRIPTION_STATUS_CHANGED for updating billing dates
             }
-        }
+        },
+        return_document=ReturnDocument.AFTER
     )
+
+    plan_id = subscription.get("plan_id")
+    session_id = subscription.get("session_id")
+    clerk_user_id = subscription.get("clerk_user_id")
+    
+    session = db.sessions.find_one({"session_id": session_id})
+    
+    org_name = f"{session.get('first_name')}'s Organization"
+    max_allowed_members = session.get("max_allowed_members", 4)
+    owner = {
+        "clerk_user_id": clerk_user_id,
+        "owner_email": session.get("owner_email"),
+        "owner_first_name": session.get("owner_first_name"),
+        "owner_last_name": session.get("owner_last_name"),
+        "owner_phone_number": session.get("owner_phone_number")
+    }
+    
+    # 3. Create Organization for paid plan subscribers
+    organization = await create_organization(
+        org_name=org_name,
+        max_allowed_members=max_allowed_members,
+        session_id=session_id,
+        owner=owner,
+        plan=plan_id
+    )    
 
 async def mark_payment_failed(data: dict, event_time: datetime):
     """

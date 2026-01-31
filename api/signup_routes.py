@@ -114,13 +114,33 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         # Update session with free plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
-            {"$set": {"status": "PLAN_SELECTED", "plan": "free", "next_step": "TEAM_INVITE", "updated_at": datetime.utcnow(), "max_allowed_members": 2}}, 
+            {"$set": {"status": "PLAN_SELECTED", "plan": "free", "next_step": "SUCCESS", "updated_at": datetime.utcnow(), "max_allowed_members": 2}}, 
             return_document=ReturnDocument.AFTER
         )
         if not session:
             raise HTTPException(status_code=400, detail="Invalid Session")
+
+        org_name = f"{session.get('first_name')}'s Organization"
+        max_allowed_members = 2
+        owner = {
+            "clerk_user_id": session.get("clerk_id"),
+            "owner_email": session.get("email"),
+            "owner_first_name": session.get("first_name"),
+            "owner_last_name": session.get("last_name"),
+            "owner_phone_number": session.get("phone_number"),
+        }
+
+        organization = await create_organization(
+            org_name=org_name,
+            max_allowed_members=max_allowed_members,
+            session_id=session_id,
+            owner=owner,
+            plan="free"
+        )
+
         
-        return {"success": True, "next_step": "TEAM_INVITE"}
+        
+        return {"success": True, "next_step": "SUCCESS"}
     
     elif plan_id in ["growth_monthly", "growth_yearly"]:
         # Update session with paid plan
@@ -212,21 +232,18 @@ async def invite_team_members(data: InviteTeamMembersRequest, session_id: str = 
     session = db.onboarding_sessions.find_one({"session_id": session_id})
     if not session:
         raise HTTPException(status_code=400, detail="Invalid Session")
+
+    organization = db.organizations.find_one(
+        {"session_id": session_id}, 
+        {"org_id": 1, "_id": 0}
+    )
     
     clerk_user_id = session.get("clerk_user_id")
     max_allowed_members = session.get("max_allowed_members", 2)
+    org_id = organization.get("org_id")
 
     if team_emails and len(team_emails) > max_allowed_members - 1:
         team_emails = team_emails[:max_allowed_members - 1]  # Limit to max allowed members minus the owner
-
-    # 1. Create organization
-    organization = await create_organization(
-        clerk_user_id=clerk_user_id,
-        org_name=org_name,
-        max_allowed_members=max_allowed_members
-    )
-
-    org_id = organization.get("id")
 
     # 2. Invite team members
     invitations = await invite_users_to_organization(
@@ -243,24 +260,14 @@ async def invite_team_members(data: InviteTeamMembersRequest, session_id: str = 
         return_document=ReturnDocument.AFTER
     )
 
-    db.organizations.insert_one({
-        "org_id": org_id,
-        "org_name": org_name,
-        "owner" : {
-            "clerk_user_id": clerk_user_id,
-            "email": session.get("email"),
-            "first_name": session.get("first_name"),
-            "last_name": session.get("last_name"),
-            "phone_number": session.get("phone_number")
-        },
-        "member_emails": team_emails,
-        "wa_id" : None,
-        "ig_id" : None,
-        "status": "active",
-        "plan": session.get("plan"),
-        "max_allowed_members": max_allowed_members,
-        "next_billing_date": session.get("payment_data", {}).get("next_scheduled_date"),
-        "created_at": datetime.utcnow()
+    db.organizations.update_one(
+        {"org_id": org_id},
+        {"$set": {
+            "org_name": org_name,
+            "member_emails": team_emails,
+            "next_billing_date": session.get("payment_data", {}).get("next_scheduled_date"),
+            "updated_at": datetime.utcnow()
+        }
     })
     
     return {"success": True, "next_step": "SUCCESS"}

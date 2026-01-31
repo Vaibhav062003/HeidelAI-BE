@@ -1,10 +1,21 @@
-from fastapi import HTTPException
+from datetime import datetime
+from typing import TypedDict, Literal
 import httpx
 
 from config.settings import CLERK_TOKEN
 from core.logger import get_logger
+from database import get_mongo_db
 
 logger = get_logger(__name__)
+db = get_mongo_db()
+
+class OwnerPayload(TypedDict):
+    clerk_user_id: str
+    owner_email: str
+    owner_first_name: str
+    owner_last_name: str
+    owner_phone_number: str | None
+
 base_url = "https://api.clerk.com/v1"
 
 def clerk_headers():
@@ -74,9 +85,10 @@ async def verify_clerk_otp(sign_up_id: str, code: str):
         # 'created_user_id' is the final Clerk User ID you should save to your DB
         return data.get("created_user_id")
     
-async def create_organization(clerk_user_id: str, org_name: str, max_allowed_members: int = 2):
+    
+async def create_organization(org_name: str, session_id: str, owner: OwnerPayload, plan: Literal["free", "growth_monthly", "growth_yearly", "enterprise"], max_allowed_members: int = 2):
     """
-    Create an organization in Clerk for the given user.
+    Create an organization in Clerk for the given user and also add the organization details in MongoDB.
     """
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -84,13 +96,35 @@ async def create_organization(clerk_user_id: str, org_name: str, max_allowed_mem
             headers=clerk_headers(),
             json={
                 "name": org_name,
-                "created_by": clerk_user_id,
+                "created_by": owner["clerk_user_id"],
                 "max_allowed_members": max_allowed_members
                 
             }
         )
         if response.status_code != 200:
             raise Exception(f"Failed to create organization: {response.text}")
+
+        response_data = response.json()
+        org_id = response_data.get("id")
+
+        db.organizations.insert_one({
+            "org_id": org_id,
+            "org_name": org_name,
+            "session_id": session_id,
+            "owner" : {
+                "clerk_user_id": owner["clerk_user_id"],
+                "email": owner["owner_email"],
+                "first_name": owner["owner_first_name"],
+                "last_name": owner["owner_last_name"],
+                "phone_number": owner.get("owner_phone_number")
+            },
+            "wa_id" : None,
+            "ig_id" : None,
+            "status": "active",
+            "plan": plan,
+            "max_allowed_members": max_allowed_members,
+            "created_at": datetime.utcnow()
+        })
         return response.json()  # Returns organization object
     
 async def invite_users_to_organization(clerk_user_id: str, org_id: str, emails: list[str], role: str = "member"):
