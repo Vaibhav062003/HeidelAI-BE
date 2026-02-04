@@ -1,16 +1,50 @@
-.pyc
-__pycache__/
-.log
-.md
-.env
-.venv/
-**/__pycache__/
+# Git history (likely the 900MB culprit)
+.git
+.gitignore
+
+# Python Environments
+.venv
+venv
+env
+
+# Cache and Bytecode
+__pycache__
 *.pyc
-node_modules/
-dist/
-build/
+.pytest_cache
+.mypy_cache
+
+# Environment variables (Safety risk!)
 .env
-.ipynb_checkpoints/
-test_env
-venv/
-test.py
+.env.local
+
+# IDE settings
+.vscode
+.idea
+
+# Large build artifacts or logs
+build
+dist
+*.log
+*.sqlite3
+
+# If you have a frontend folder inside, ignore its dependencies
+node_modules
+
+# Ignore .git recursively (Critical for your size issue)
+**/.git
+**/.gitignore
+
+# Ignore pycache recursively
+**/__pycache__
+**/*.pyc
+
+# Ignore envs recursively
+**/.env
+**/.venv
+**/venv
+**/env
+
+# Ignore logs/caches
+**/*.log
+**/.pytest_cache
+**/.mypy_cache

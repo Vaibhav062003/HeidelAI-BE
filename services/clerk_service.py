@@ -90,6 +90,7 @@ async def create_organization(org_name: str, session_id: str, owner: OwnerPayloa
     """
     Create an organization in Clerk for the given user and also add the organization details in MongoDB.
     """
+    logger.info(f"Creating organization '{org_name}' for user {owner['clerk_user_id']}")
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{base_url}/organizations",
@@ -101,6 +102,7 @@ async def create_organization(org_name: str, session_id: str, owner: OwnerPayloa
                 
             }
         )
+        logger.info(f"Clerk create organization response: {response.json()}")
         if response.status_code != 200:
             raise Exception(f"Failed to create organization: {response.text}")
 
@@ -121,6 +123,8 @@ async def create_organization(org_name: str, session_id: str, owner: OwnerPayloa
             "wa_id" : None,
             "ig_id" : None,
             "status": "active",
+            "onboarding_flow_completed" : False,
+            "sign_up_flow_completed" : True,
             "plan": plan,
             "max_allowed_members": max_allowed_members,
             "created_at": datetime.utcnow()

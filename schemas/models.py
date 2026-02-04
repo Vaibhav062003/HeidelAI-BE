@@ -1,5 +1,5 @@
 # Pydantic
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from typing import Optional, List, Literal, Dict, Any
 from enum import Enum
 from datetime import datetime, timezone
@@ -137,11 +137,24 @@ class SubscriptionRequest(BaseModel):
 
 class InitSignupRequest(BaseModel):
     first_name: str
-    last_name: str
+    last_name: Optional[str] = None
     email: EmailStr
     provider: str = "email"
     clerk_signup_id: str
+    clerk_user_id: Optional[str] = None
 
+    @model_validator(mode='after')
+    def require_last_name_for_email(self):
+        # Enforce last_name if provider is email
+        if self.provider == "email" and not self.last_name:
+            raise ValueError("Last name is required when signing up with email")
+        return self
+    
+class SetPasswordRequest(BaseModel):
+    clerk_user_id: Optional[str] = None
+
+class VerifyOtpRequest(BaseModel):
+    clerk_user_id: str
 class SelectPlanRequest(BaseModel):
     plan_id: Literal["free", "growth_monthly", "growth_yearly", "enterprise", "custom"]
 

@@ -343,7 +343,16 @@ async def mark_payment_success(data: dict, event_time: datetime):
     session_id = subscription.get("session_id")
     clerk_user_id = subscription.get("clerk_user_id")
     
-    session = db.sessions.find_one({"session_id": session_id})
+    session = db.sessions.find_one_and_update(
+        {"session_id": session_id},
+        {"$set": 
+            {
+                "status": "PAYMENT_SUCCESS",
+                "next_step" : "FLOW_COMPLETED"
+            }
+        },
+        return_document=ReturnDocument.AFTER
+        )
     
     org_name = f"{session.get('first_name')}'s Organization"
     max_allowed_members = session.get("max_allowed_members", 4)

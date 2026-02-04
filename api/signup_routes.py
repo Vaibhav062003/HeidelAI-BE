@@ -8,7 +8,7 @@ from pymongo import ReturnDocument
 # internal modules
 from database import get_mongo_db
 from core.logger import get_logger
-from schemas.models import InitPaymentRequest, InitSignupRequest, InviteTeamMembersRequest, SelectPlanRequest
+from schemas.models import InitPaymentRequest, InitSignupRequest, InviteTeamMembersRequest, SelectPlanRequest, SetPasswordRequest, VerifyOtpRequest
 from services.clerk_service import create_clerk_signup, create_organization, invite_users_to_organization, update_password_and_send_otp, verify_clerk_otp
 from services.payment_service import create_subscription
 
@@ -35,29 +35,33 @@ async def init_signup(data: InitSignupRequest, response: Response):
     Initialize signup process. Returns session_id.
     """
     first_name = data.first_name.strip()
-    last_name = data.last_name.strip()
+    last_name = data.last_name.strip() if data.last_name else ""
     email = data.email
     clerk_sign_up_id = data.clerk_signup_id
+    clerk_user_id = data.clerk_user_id
     provider = data.provider
 
 
-    existing_session = db.onboarding_sessions.find_one({"email": email, "status": {"$ne": "COMPLETED"}})
+    existing_session = db.onboarding_sessions.find_one({"email": email})
     if existing_session:
         session_id = existing_session.get("session_id")
         next_step = existing_session.get("next_step")
     else:
         session_id = str(uuid.uuid4())
-        next_step = "PASSWORD"
+        next_step = "PASSWORD" if provider == "email" else "PLAN"
+
         # Store session 
         db.onboarding_sessions.insert_one({
             "session_id": session_id,
             "clerk_id": clerk_sign_up_id,
+            "clerk_user_id": clerk_user_id,
             "first_name": first_name,
             "last_name": last_name,
             "email": email,
-            "email_verified": False,
+            "provider" : provider,
+            "email_verified": False if provider == "email" else True,
             "status": "SESSION_CREATED",
-            "next_step": "PASSWORD",
+            "next_step": next_step,
             "created_at": datetime.utcnow()
         })
 
@@ -73,7 +77,7 @@ async def init_signup(data: InitSignupRequest, response: Response):
     return {"next_step": next_step}
 
 @router.post("/set-password")
-async def set_password(session_id: str = Depends(get_onboarding_session)):
+async def set_password(data: SetPasswordRequest, session_id: str = Depends(get_onboarding_session)):
     """
     Check if the Signup session exists, set password for the signup session & trigger email OTP to the registered email by Clerk.
     """
@@ -81,7 +85,7 @@ async def set_password(session_id: str = Depends(get_onboarding_session)):
     # Fetch session from DB
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"status": "PASSWORD_SET_AND_OTP_SENT", "next_step": "OTP", "updated_at": datetime.utcnow()}}, 
+        {"$set": {"clerk_user_id": data.clerk_user_id, "status": "PASSWORD_SET_AND_OTP_SENT", "next_step": "OTP", "updated_at": datetime.utcnow()}}, 
         return_document=ReturnDocument.AFTER
     )
     if not session or not session.get("clerk_id"):
@@ -91,14 +95,14 @@ async def set_password(session_id: str = Depends(get_onboarding_session)):
     return {"success": True, "next_step": "OTP"}
 
 @router.post("/verify-otp")
-async def verify_otp(session_id: str = Depends(get_onboarding_session)):
+async def verify_otp(data: VerifyOtpRequest, session_id: str = Depends(get_onboarding_session)):
     """
     Verify the OTP code sent to the user's email. If correct, finalize signup.
     """
     # Update session as complete
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"status": "EMAIL_VERIFIED", "email_verified": True, "next_step": "PLAN", "updated_at": datetime.utcnow()}}, 
+        {"$set": {"clerk_user_id": data.clerk_user_id, "status": "EMAIL_VERIFIED", "email_verified": True, "next_step": "PLAN", "updated_at": datetime.utcnow()}}, 
         return_document=ReturnDocument.AFTER
     )
     if not session or not session.get("clerk_id"):
@@ -123,7 +127,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         org_name = f"{session.get('first_name')}'s Organization"
         max_allowed_members = 2
         owner = {
-            "clerk_user_id": session.get("clerk_id"),
+            "clerk_user_id": session.get("clerk_user_id"),
             "owner_email": session.get("email"),
             "owner_first_name": session.get("first_name"),
             "owner_last_name": session.get("last_name"),
@@ -187,7 +191,7 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
     customer_full_name = f"{session.get('first_name')} {session.get('last_name')}"
     customer_email = session.get("email")
     customer_phone = session.get("phone_number")
-    clerk_user_id = session.get("clerk_id")
+    clerk_user_id = session.get("clerk_user_id")
 
     subscription_data = await create_subscription(
         plan_id=plan_id,

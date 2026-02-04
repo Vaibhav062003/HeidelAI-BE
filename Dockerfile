@@ -20,9 +20,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# CHANGE: Install runtime libraries only, not dev tools
+# libpq5 = runtime for Postgres
+# default-libmysqlclient-dev = unfortunately often needed for MySQL on Debian, 
+# but we can try to rely on the shared libs if possible. 
+# For safety, we keep the MySQL dev lib if the runtime link is tricky, 
+# but definitely swap libpq-dev for libpq5.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    pkg-config \
     default-libmysqlclient-dev \
-    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed Python packages from builder
@@ -33,6 +40,4 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . .
 
 EXPOSE 8000
-
-# Run FastAPI with uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
