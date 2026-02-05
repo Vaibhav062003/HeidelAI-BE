@@ -5,8 +5,10 @@ from jose import JWTError
 
 from .service import decode_jwt
 from .models import CurrentUserModel
+from core.logger import get_logger
 
 security = HTTPBearer()
+logger = get_logger(__name__)
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -14,6 +16,7 @@ async def get_current_user(
     token = credentials.credentials
     try:
         payload = await decode_jwt(token)
+        logger.info(f"Decoded JWT payload: {payload}") 
         return CurrentUserModel(
             user_id=payload["sub"],
             org_id=payload["o"]["id"],

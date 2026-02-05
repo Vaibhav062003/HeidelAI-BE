@@ -92,44 +92,49 @@ async def create_organization(org_name: str, session_id: str, owner: OwnerPayloa
     """
     logger.info(f"Creating organization '{org_name}' for user {owner['clerk_user_id']}")
     async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{base_url}/organizations",
-            headers=clerk_headers(),
-            json={
-                "name": org_name,
-                "created_by": owner["clerk_user_id"],
-                "max_allowed_members": max_allowed_members
-                
-            }
-        )
-        logger.info(f"Clerk create organization response: {response.json()}")
-        if response.status_code != 200:
-            raise Exception(f"Failed to create organization: {response.text}")
+        try:
+            response = await client.post(
+                f"{base_url}/organizations",
+                headers=clerk_headers(),
+                json={
+                    "name": org_name,
+                    "created_by": owner["clerk_user_id"],
+                    "max_allowed_memberships": max_allowed_members
+                    
+                }
+            )
+            logger.info(f"Clerk create organization response: {response.json()}")
+            if response.status_code != 200:
+                raise Exception(f"Failed to create organization: {response.text}")
 
-        response_data = response.json()
-        org_id = response_data.get("id")
+            response_data = response.json()
+            org_id = response_data.get("id")
 
-        db.organizations.insert_one({
-            "org_id": org_id,
-            "org_name": org_name,
-            "session_id": session_id,
-            "owner" : {
-                "clerk_user_id": owner["clerk_user_id"],
-                "email": owner["owner_email"],
-                "first_name": owner["owner_first_name"],
-                "last_name": owner["owner_last_name"],
-                "phone_number": owner.get("owner_phone_number")
-            },
-            "wa_id" : None,
-            "ig_id" : None,
-            "status": "active",
-            "onboarding_flow_completed" : False,
-            "sign_up_flow_completed" : True,
-            "plan": plan,
-            "max_allowed_members": max_allowed_members,
-            "created_at": datetime.utcnow()
-        })
-        return response.json()  # Returns organization object
+            db.organizations.insert_one({
+                "org_id": org_id,
+                "org_name": org_name,
+                "session_id": session_id,
+                "owner" : {
+                    "clerk_user_id": owner["clerk_user_id"],
+                    "email": owner["owner_email"],
+                    "first_name": owner["owner_first_name"],
+                    "last_name": owner["owner_last_name"],
+                    "phone_number": owner.get("owner_phone_number")
+                },
+                "wa_id" : None,
+                "ig_id" : None,
+                "status": "active",
+                "onboarding_flow_completed" : False,
+                "sign_up_flow_completed" : True,
+                "plan": plan,
+                "max_allowed_members": max_allowed_members,
+                "created_at": datetime.utcnow()
+            })
+
+            return response.json()  # Returns organization object
+        except Exception as e:
+            logger.error(f"Error creating organization: {str(e)}")
+            return None
     
 async def invite_users_to_organization(clerk_user_id: str, org_id: str, emails: list[str], role: str = "member"):
     """

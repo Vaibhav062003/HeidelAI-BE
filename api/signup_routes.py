@@ -142,9 +142,10 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
             plan="free"
         )
 
+        if not organization:
+            raise HTTPException(status_code=500, detail="Failed to create organization")
         
-        
-        return {"success": True, "next_step": "SUCCESS"}
+        return {"success": True, "next_step": "SUCCESS", "org_id" : organization.get("id")}
     
     elif plan_id in ["growth_monthly", "growth_yearly"]:
         # Update session with paid plan
