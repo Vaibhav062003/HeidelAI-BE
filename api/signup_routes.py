@@ -1,6 +1,6 @@
 from datetime import datetime
 import uuid
-from fastapi import APIRouter, HTTPException, Depends, Response, Cookie
+from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request
 import requests
 from pymongo import ReturnDocument
 
@@ -30,10 +30,12 @@ async def get_onboarding_session(signup_session: str | None = Cookie(default=Non
     return signup_session
 
 @router.post("/init")
-async def init_signup(data: InitSignupRequest, response: Response):
+async def init_signup(data: InitSignupRequest, response: Response, request: Request):
     """
     Initialize signup process. Returns session_id.
     """
+    logger.info(f"Incoming Request: {request.cookies}")
+
     first_name = data.first_name.strip()
     last_name = data.last_name.strip() if data.last_name else ""
     email = data.email
@@ -71,16 +73,18 @@ async def init_signup(data: InitSignupRequest, response: Response):
         httponly=True,   # JavaScript cannot access this
         max_age=3600,    # 1 hour expiration
         secure=True,    # Set to True in Production (HTTPS)
-        samesite="none"   # Needed for cross-origin if frontend/backend ports differ
+        samesite="lax",   
+        domain=".heidelai.com"
     )
 
     return {"next_step": next_step}
 
 @router.post("/set-password")
-async def set_password(data: SetPasswordRequest, session_id: str = Depends(get_onboarding_session)):
+async def set_password(data: SetPasswordRequest, request: Request, session_id: str = Depends(get_onboarding_session)):
     """
     Check if the Signup session exists, set password for the signup session & trigger email OTP to the registered email by Clerk.
     """
+    logger.info(f"Incoming Request: {request.cookies}")
 
     # Fetch session from DB
     session = db.onboarding_sessions.find_one_and_update(
