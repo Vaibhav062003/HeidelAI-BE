@@ -2,8 +2,9 @@ import asyncio
 from fastapi.encoders import jsonable_encoder
 from core.services import services
 from fastapi import WebSocket, WebSocketDisconnect
-from database import get_mongo_db
+from database import get_mongo_db, get_async_mongo_db
 from core.logger import get_logger
+from services.common_service import fetch_conversation_stats
 
 logger = get_logger(__name__)
 db = get_mongo_db()
@@ -220,14 +221,14 @@ async def broadcast_conversation_stats(org_id: str):
     """
     Fetches the latest status counts and broadcasts them to all clients in the organization.
     """
-    from services.common_service import fetch_conversation_stats
+    async_db = get_async_mongo_db()
     
     logger.info(f"📊 Broadcasting conversation stats for org: {org_id}")
     
     stats = await fetch_conversation_stats(org_id)
     
     # Get organization metadata to find platform IDs
-    org_data = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
+    org_data = await async_db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
     if not org_data:
         logger.warning(f"No organization found for {org_id}, skipping stats broadcast")
         return
@@ -252,11 +253,6 @@ async def broadcast_conversation_stats(org_id: str):
         )
 
 
-async def fetch_conversation_status(org_id:str):
-    """
-    Fetches the status of all conversations for a given organization.
-    """
-    try:
-        async_db=get_async_mongo_db()
+
         
         

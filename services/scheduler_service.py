@@ -92,13 +92,14 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
                 {"conversation_id": conversation_id},
                 {"$set": {"status": "follow-up"}}
             )
-            
-
-            await broadcast_conversation_stats(org_id)
-
         except PyMongoError as e:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+        # Broadcast stats update (non-critical, don't fail the operation)
+        try:
+            await broadcast_conversation_stats(org_id)
+        except Exception as e:
+            logger.warning(f"Failed to broadcast conversation stats: {str(e)}")
         return {"message": "Follow-up message scheduled successfully."}
 
     except HTTPException:

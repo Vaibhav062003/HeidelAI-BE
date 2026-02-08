@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from pymongo.errors import PyMongoError
 from pymongo import ReturnDocument
 from services.utils import serialize_mongo
+from services.websocket_service import broadcast_conversation_stats
 
 db = get_mongo_db()
 
@@ -42,10 +43,12 @@ async def reopen_conversation(org_id: str, conversation_id: str):
         result = serialize_mongo(result)
 
         # Broadcast stats update
-        from services.websocket_service import broadcast_conversation_stats
-        await broadcast_conversation_stats(org_id)
+        try:
+            await broadcast_conversation_stats(org_id)
+        except Exception:
+            pass
 
-        return {"conversation": result} 
+        return {"conversation": result}        return {"conversation": result} 
     
     except HTTPException:
         raise
