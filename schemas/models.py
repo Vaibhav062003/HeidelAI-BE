@@ -151,3 +151,9 @@ class InitPaymentRequest(BaseModel):
 class InviteTeamMembersRequest(BaseModel):
     org_name: str
     member_emails: List[EmailStr]
+
+class Template(BaseModel):
+    name: str
+    language: str
+    category: str
+    components: List[Dict[str, Any]]
