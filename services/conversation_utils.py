@@ -41,6 +41,10 @@ async def reopen_conversation(org_id: str, conversation_id: str):
         
         result = serialize_mongo(result)
 
+        # Broadcast stats update
+        from services.websocket_service import broadcast_conversation_stats
+        await broadcast_conversation_stats(org_id)
+
         return {"conversation": result} 
     
     except HTTPException:

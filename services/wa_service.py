@@ -158,6 +158,11 @@ async def create_or_update_whatsapp_conversation(
         await broadcast_whatsapp_message(recipient_id, "conversation_updated", {
             "conversation": broadcast_conversation
         })
+    
+    # If it's a new conversation, broadcast stats (existing ones are handled by reopen_conversation)
+    if not existing_conversation:
+        from services.websocket_service import broadcast_conversation_stats
+        await broadcast_conversation_stats(org_id)
         
     return conversation_id
 

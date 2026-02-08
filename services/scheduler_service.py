@@ -8,6 +8,7 @@ from pymongo.errors import PyMongoError
 from database import get_mongo_db
 from .followup_agent_service import get_followup_message
 from core.logger import get_logger
+from services.websocket_service import broadcast_conversation_stats
 
 logger = get_logger(__name__)
 
@@ -91,6 +92,10 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
                 {"conversation_id": conversation_id},
                 {"$set": {"status": "follow-up"}}
             )
+            
+
+            await broadcast_conversation_stats(org_id)
+
         except PyMongoError as e:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 

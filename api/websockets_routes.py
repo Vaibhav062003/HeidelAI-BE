@@ -189,9 +189,13 @@ async def main_ws(websocket: WebSocket, client_id: str):
     logger.success(f"Connected client: {client_id}")
     logger.success(f"IG: {ig_id}, WA: {wa_id}")
 
+    # Step 4: Send initial stats
+    from services.websocket_service import broadcast_conversation_stats
+    asyncio.create_task(broadcast_conversation_stats(user.org_id))
+
     heartbeat_task = asyncio.create_task(start_heartbeat(client_id, websocket))
 
-   # Step 4: Keep listening for incoming messages
+   # Step 5: Keep listening for incoming messages
     try:
         while True:
             # 1. Use receive_text first to see raw data (debugs JSON errors)
@@ -210,6 +214,9 @@ async def main_ws(websocket: WebSocket, client_id: str):
 
                 if event_type == "typing_indicator":
                     await handle_typing_event(client_id, data)
+                
+                if event_type == "get_stats":
+                    await broadcast_conversation_stats(user.org_id)
                 
             except WebSocketDisconnect:
                 # 🛑 STOP the loop if the client disconnects

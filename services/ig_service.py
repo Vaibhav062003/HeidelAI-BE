@@ -6,10 +6,11 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from services.cloudinary_service import upload_media_to_cloudinary
-from services.websocket_service import broadcast_main_ws
+from services.websocket_service import broadcast_main_ws, broadcast_conversation_stats
 from supabase import create_client, Client
 from pymongo import UpdateOne, ReturnDocument
 from fastapi import HTTPException
+
 
 # Internal modules
 from core.managers import manager
@@ -562,6 +563,10 @@ async def create_or_update_instagram_conversation(org_id: str,
         await broadcast_instagram_message(recipient_id, "conversation_updated", {
             "conversation": broadcast_conversation
         })
+        
+    # If it's a new conversation, broadcast stats (existing ones are handled by reopen_conversation)
+    if not existing_conversation:
+        await broadcast_conversation_stats(org_id)
         
     return conversation_id
 

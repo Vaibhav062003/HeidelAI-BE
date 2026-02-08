@@ -4,14 +4,14 @@ from bson import ObjectId
 from typing import Optional, List, Dict
 from fastapi import HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorCollection
-from datetime import datetime, timezone
-from pymongo.errors import PyMongoError
 from pymongo.collection import Collection
 from pymongo import ReturnDocument
+from datetime import datetime, timezone, timedelta
 from core.services import services
 from services.wa_service import send_whatsapp_message, upload_and_send_wa_media_message
 from services.ig_service import send_ig_message, upload_and_send_ig_media_message
 from services.utils import serialize_mongo
+from services.websocket_service import broadcast_conversation_stats
 
 from database import get_mongo_db, get_async_mongo_db
 
@@ -89,6 +89,77 @@ async def fetch_conversations_new(org_id: str) -> List[Dict]:
     logger.info(f"[TIMING] Total: {end_time - start_time:.4f}s")
 
     return result
+
+async def fetch_conversation_stats(org_id: str) -> Dict:
+    """
+    Fetch conversation counts by status (open, closed, follow-up) for an organization, 
+    and also include WhatsApp conversations whose reply window is expiring within 2 hours.
+    """
+    try:
+        async_db = get_async_mongo_db()
+        collection = async_db[f"conversations_{org_id}"]
+        now = datetime.now(timezone.utc)
+        two_hours_from_now = now + timedelta(hours=2)
+
+        # Use facet to run multiple aggregations in one go
+        pipeline = [
+            {
+                "$facet": {
+                    "status_counts": [
+                        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
+                    ],
+                    "expiring_whatsapp": [
+                        {
+                            "$match": {
+                                "platform": "whatsapp",
+                                "status": "open",
+                                "reply_window_ends_at": {
+                                    "$gte": now, 
+                                    "$lte": two_hours_from_now 
+                                }
+                            }
+                        },
+                        {"$count": "count"}
+                    ]
+                }
+            }
+        ]
+
+        cursor = collection.aggregate(pipeline)
+        result_list = await cursor.to_list(length=1)
+
+        if not result_list:
+            return {"open": 0, "closed": 0, "follow-up": 0, "expiring_whatsapp": 0}
+
+        facet_result = result_list[0]
+        
+        # Initialize with 0
+        stats = {
+            "open": 0,
+            "closed": 0,
+            "follow-up": 0,
+            "expiring_whatsapp": 0
+        }
+
+        # Process status counts
+        for item in facet_result.get("status_counts", []):
+            status_val = item.get("_id")
+            if status_val in stats:
+                stats[status_val] = item.get("count", 0)
+            else:
+                # In case there are other statuses not in our default map
+                stats[status_val] = item.get("count", 0)
+
+        # Process expiring WhatsApp count
+        expiring_list = facet_result.get("expiring_whatsapp", [])
+        if expiring_list:
+            stats["expiring_whatsapp"] = expiring_list[0].get("count", 0)
+
+        return stats
+
+    except Exception as e:
+        logger.error(f"Error fetching conversation stats for {org_id}: {e}")
+        return {"open": 0, "closed": 0, "follow-up": 0, "expiring_whatsapp": 0}
 
 async def fetch_conversation(org_id: str, conversation_id: str):
     """
@@ -275,6 +346,9 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
             )
 
         convo = serialize_mongo(result)
+
+        await broadcast_conversation_stats(org_id)
+
         return {"conversation": convo}
 
     except PyMongoError as e:

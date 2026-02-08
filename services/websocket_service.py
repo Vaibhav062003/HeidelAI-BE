@@ -2,9 +2,11 @@ import asyncio
 from fastapi.encoders import jsonable_encoder
 from core.services import services
 from fastapi import WebSocket, WebSocketDisconnect
+from database import get_mongo_db
 from core.logger import get_logger
 
 logger = get_logger(__name__)
+db = get_mongo_db()
 
 async def cleanup_client(client_id: str):
     """
@@ -213,3 +215,48 @@ def leave_conversation_presence(org_id: str, conversation_id: str, client_id: st
     services.client_convo_map.pop(client_id, None)
     
     logger.info(f"Client {client_id} LEFT conversation {convo_key}")
+
+async def broadcast_conversation_stats(org_id: str):
+    """
+    Fetches the latest status counts and broadcasts them to all clients in the organization.
+    """
+    from services.common_service import fetch_conversation_stats
+    
+    logger.info(f"📊 Broadcasting conversation stats for org: {org_id}")
+    
+    stats = await fetch_conversation_stats(org_id)
+    
+    # Get organization metadata to find platform IDs
+    org_data = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
+    if not org_data:
+        logger.warning(f"No organization found for {org_id}, skipping stats broadcast")
+        return
+        
+    ig_id = org_data.get("ig_id")
+    wa_id = org_data.get("wa_id")
+    
+    if ig_id:
+        await broadcast_main_ws(
+            platform_id=ig_id,
+            platform_type="instagram",
+            event_type="stats_update",
+            payload={"stats": stats}
+        )
+        
+    if wa_id:
+        await broadcast_main_ws(
+            platform_id=wa_id,
+            platform_type="whatsapp",
+            event_type="stats_update",
+            payload={"stats": stats}
+        )
+
+
+async def fetch_conversation_status(org_id:str):
+    """
+    Fetches the status of all conversations for a given organization.
+    """
+    try:
+        async_db=get_async_mongo_db()
+        
+        
