@@ -4,6 +4,7 @@ from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
 from auth.dependencies import get_current_user
+from services.websocket_service import broadcast_on_stats_update
 
 from fastapi.security import HTTPAuthorizationCredentials
 import json
@@ -190,8 +191,7 @@ async def main_ws(websocket: WebSocket, client_id: str):
     logger.success(f"IG: {ig_id}, WA: {wa_id}")
 
     # Step 4: Send initial stats
-    from services.websocket_service import broadcast_conversation_stats
-    asyncio.create_task(broadcast_conversation_stats(user.org_id))
+    asyncio.create_task(broadcast_on_stats_update(user.org_id))
 
     heartbeat_task = asyncio.create_task(start_heartbeat(client_id, websocket))
 
@@ -215,8 +215,16 @@ async def main_ws(websocket: WebSocket, client_id: str):
                 if event_type == "typing_indicator":
                     await handle_typing_event(client_id, data)
                 
-                if event_type == "get_stats":
-                    await broadcast_conversation_stats(user.org_id)
+                if event_type == "get_stats" or event_type == "get_followup_stats":
+                    target_date = data.get("date") # Optional date from frontend
+                    start_date = data.get("start_date") # Optional start date range
+                    end_date = data.get("end_date") # Optional end date range
+                    await broadcast_on_stats_update(
+                        user.org_id, 
+                        target_date=target_date, 
+                        start_date=start_date, 
+                        end_date=end_date
+                    )
                 
             except WebSocketDisconnect:
                 # 🛑 STOP the loop if the client disconnects

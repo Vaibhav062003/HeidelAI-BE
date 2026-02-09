@@ -4,7 +4,7 @@ from core.services import services
 from fastapi import WebSocket, WebSocketDisconnect
 from database import get_mongo_db, get_async_mongo_db
 from core.logger import get_logger
-from services.common_service import fetch_conversation_stats
+
 
 logger = get_logger(__name__)
 db = get_mongo_db()
@@ -217,20 +217,34 @@ def leave_conversation_presence(org_id: str, conversation_id: str, client_id: st
     
     logger.info(f"Client {client_id} LEFT conversation {convo_key}")
 
-async def broadcast_conversation_stats(org_id: str):
+async def broadcast_on_stats_update(
+    org_id: str, 
+    target_date: str = None, 
+    start_date: str = None, 
+    end_date: str = None
+):
     """
-    Fetches the latest status counts and broadcasts them to all clients in the organization.
+    Unified broadcast function for the HeidelAI Dashboard.
+    Fetches full dashboard stats and broadcasts to connected clients.
     """
+    from services.dashboard_service import aggregate_dashboard_stats
     async_db = get_async_mongo_db()
     
-    logger.info(f"📊 Broadcasting conversation stats for org: {org_id}")
+    logger.info(f"🚀 Broadcasting dashboard stats for org: {org_id} (Range: {start_date} to {end_date} or Date: {target_date or 'today'})")
     
-    stats = await fetch_conversation_stats(org_id)
-    
+    payload = await aggregate_dashboard_stats(
+        org_id, 
+        target_date_str=target_date, 
+        start_date_str=start_date, 
+        end_date_str=end_date
+    )
+    if not payload:
+        logger.warning(f"Empty payload for org {org_id}, skipping broadcast")
+        return
+
     # Get organization metadata to find platform IDs
     org_data = await async_db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
     if not org_data:
-        logger.warning(f"No organization found for {org_id}, skipping stats broadcast")
         return
         
     ig_id = org_data.get("ig_id")
@@ -240,19 +254,15 @@ async def broadcast_conversation_stats(org_id: str):
         await broadcast_main_ws(
             platform_id=ig_id,
             platform_type="instagram",
-            event_type="stats_update",
-            payload={"stats": stats}
+            event_type="onStatsUpdate",
+            payload=payload
         )
         
     if wa_id:
         await broadcast_main_ws(
             platform_id=wa_id,
             platform_type="whatsapp",
-            event_type="stats_update",
-            payload={"stats": stats}
+            event_type="onStatsUpdate",
+            payload=payload
         )
 
-
-
-        
-        
