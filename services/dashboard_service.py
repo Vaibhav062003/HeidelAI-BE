@@ -54,7 +54,7 @@ async def aggregate_dashboard_stats(
             end_of_prev_day = None
         
         now = datetime.now(timezone.utc)
-        expiring_limit = now + timedelta(hours=2)
+        expiring_limit = now + timedelta(hours=5)
 
         async def get_stats_for_range(start, end):
             pipeline = [
@@ -102,6 +102,19 @@ async def aggregate_dashboard_stats(
                                 }
                             },
                             {
+                                "$lookup": {
+                                    "from": f"messages_{org_id}",
+                                    "localField": "conversation_id",
+                                    "foreignField": "conversation_id",
+                                    "as": "messages",
+                                    "pipeline": [
+                                        {"$sort": {"timestamp": -1}},
+                                        {"$limit": 3},
+                                        {"$project": {"_id": 0, "content": 1, "sender_type": 1, "timestamp": 1}}
+                                    ]
+                                }
+                            },
+                            {
                                 "$project": {
                                     "_id": 0,
                                     "conversation_id": 1,
@@ -110,7 +123,8 @@ async def aggregate_dashboard_stats(
                                     "platform": 1,
                                     "customer_username": 1,
                                     "last_message": 1,
-                                    "last_message_timestamp": 1
+                                    "last_message_timestamp": 1,
+                                    "messages": 1
                                 }
                             },
                             {"$limit": 10}
@@ -190,7 +204,7 @@ async def aggregate_dashboard_stats(
             "expiringWhatsApp": expiring_res[0].get("count", 0) if expiring_res else 0,
             "expiringWhatsAppDetails": await conv_col.find(
                 {
-                    "status": "open",
+                    "status": {"$in": ["open", "follow-up"]},
                     "reply_window_ends_at": {"$gte": now, "$lte": expiring_limit}
                 },
                 {
@@ -227,7 +241,7 @@ async def aggregate_dashboard_stats(
         flow = [
             {"name": "AI - Human Transfers", "value": 0}, 
             {"name": "Fully AI - converted", "value": sum(i["count"] for i in flow_data if i["_id"].get("is_ai") and i["_id"].get("status") == "closed")},
-            {"name": "Human converted", "value": sum(i["count"] for i in flow_data if not i["_id"].get("is_ai") and i["_id"].get("status") == "closed")},
+            {"name": "Human converted", "value": sum(i["count"] for i in flow_data if not i["_id"].get("is_ai") and i["_id"])},
             {"name": "Dropped / Ghosted", "value": 0},
             {"name": "Window Shoppers", "value": sum(i["count"] for i in flow_data if i["_id"].get("is_ai") and i["_id"].get("status") == "open")}
         ]
@@ -290,7 +304,11 @@ async def aggregate_dashboard_stats(
             for f in fr.get("upcomingList", []):
                 conv = await conv_col.find_one({"conversation_id": f["conversation_id"]}, {"customer_name": 1})
                 name = conv.get("customer_name") if conv else "Customer"
-                diff = f["scheduled_time"] - now
+                scheduled_time = f["scheduled_time"]
+                if scheduled_time.tzinfo is None:
+                    scheduled_time = scheduled_time.replace(tzinfo=timezone.utc)
+                
+                diff = scheduled_time - now
                 due_in = f"In {int(diff.total_seconds() // 60)}m" if diff.total_seconds() < 3600 else f"In {int(diff.total_seconds() // 3600)}h"
                 
                 followup_tracker["upcomingList"].append({
