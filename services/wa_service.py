@@ -116,6 +116,7 @@ async def create_or_update_whatsapp_conversation(
             "status": "open",
             "last_sender": last_sender,
             "started_at": now,
+            "created_at": now,
             "reminder_stage": 0,
             "next_action_at": now + timedelta(hours=6),
             "closed_at": None
@@ -159,9 +160,8 @@ async def create_or_update_whatsapp_conversation(
             "conversation": broadcast_conversation
         })
     
-    # If it's a new conversation, broadcast stats (existing ones are handled by reopen_conversation)
-    if not existing_conversation:
-        await broadcast_on_stats_update(org_id)
+    # Broadcast stats update for every message to ensure live dashboard refresh
+    await broadcast_on_stats_update(org_id)
         
     return conversation_id
 

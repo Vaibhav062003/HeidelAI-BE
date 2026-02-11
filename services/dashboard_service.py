@@ -1,5 +1,6 @@
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
+from bson import ObjectId
 from database import get_async_mongo_db
 from core.logger import get_logger
 
@@ -25,8 +26,12 @@ async def aggregate_dashboard_stats(
         
         if is_custom_range:
             try:
-                start_of_day = datetime.fromisoformat(start_date_str.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
-                end_of_day = datetime.fromisoformat(end_date_str.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
+                # Use astimezone(timezone.utc) to correctly map aware datetimes to UTC
+                start_dt = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+                start_of_day = start_dt.astimezone(timezone.utc)
+                
+                end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                end_of_day = end_dt.astimezone(timezone.utc)
             except ValueError:
                 # Fallback to defaults if parsing fails
                 target_date = datetime.now(timezone.utc)
@@ -36,13 +41,15 @@ async def aggregate_dashboard_stats(
         else:
             if target_date_str:
                 try:
-                    target_date = datetime.fromisoformat(target_date_str.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
+                    target_dt = datetime.fromisoformat(target_date_str.replace("Z", "+00:00"))
+                    # Floor to local midnight BEFORE converting to UTC
+                    local_midnight = target_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                    start_of_day = local_midnight.astimezone(timezone.utc)
                 except ValueError:
-                    target_date = datetime.now(timezone.utc)
+                    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             else:
-                target_date = datetime.now(timezone.utc)
-
-            start_of_day = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            
             end_of_day = start_of_day + timedelta(days=1)
         
         # Only calculate previous day if not a custom range
@@ -60,7 +67,7 @@ async def aggregate_dashboard_stats(
             pipeline = [
                 {
                     "$match": {
-                        "started_at": {"$gte": start, "$lt": end}
+                        "last_message_timestamp": {"$gte": start, "$lt": end}
                     }
                 },
                 {
@@ -70,6 +77,46 @@ async def aggregate_dashboard_stats(
                                 "$group": {
                                     "_id": None,
                                     "total": {"$sum": 1},
+                                    "new_leads": {
+                                        "$sum": {
+                                            "$cond": [
+                                                {
+                                                    "$cond": [
+                                                        {"$ifNull": ["$created_at", False]},
+                                                        {"$and": [{"$gte": ["$created_at", start]}, {"$lt": ["$created_at", end]}]},
+                                                        {"$and": [{"$gte": [{"$toDate": "$_id"}, start]}, {"$lt": [{"$toDate": "$_id"}, end]}]}
+                                                    ]
+                                                },
+                                                1,
+                                                0
+                                            ]
+                                        }
+                                    },
+                                    "engaged_new_leads": {
+                                        "$sum": {
+                                            "$cond": [
+                                                {
+                                                    "$and": [
+                                                        {
+                                                            "$cond": [
+                                                                {"$ifNull": ["$created_at", False]},
+                                                                {"$and": [{"$gte": ["$created_at", start]}, {"$lt": ["$created_at", end]}]},
+                                                                {"$and": [{"$gte": [{"$toDate": "$_id"}, start]}, {"$lt": [{"$toDate": "$_id"}, end]}]}
+                                                            ]
+                                                        },
+                                                        {
+                                                            "$or": [
+                                                                {"$in": ["$priority", ["low", "medium", "high"]]},
+                                                                {"$in": ["$last_sender", ["agent", "ai"]]}
+                                                            ]
+                                                        }
+                                                    ]
+                                                },
+                                                1,
+                                                0
+                                            ]
+                                        }
+                                    },
                                     "conversions": {"$sum": {"$cond": [{"$eq": ["$status", "closed"]}, 1, 0]}},
                                     "ai_handled": {"$sum": {"$cond": ["$is_ai_enabled", 1, 0]}},
                                     "human_handled": {"$sum": {"$cond": [{"$not": "$is_ai_enabled"}, 1, 0]}},
@@ -93,6 +140,37 @@ async def aggregate_dashboard_stats(
                         ],
                         "leadFunnel": [
                             {"$group": {"_id": "$priority", "count": {"$sum": 1}}}
+                        ],
+                        "newLeadDetails": [
+                            {
+                                "$match": {
+                                    "$or": [
+                                        {"created_at": {"$gte": start, "$lt": end}},
+                                        {
+                                            "$and": [
+                                                {"created_at": {"$exists": False}},
+                                                {"_id": {"$gte": ObjectId.from_datetime(start), "$lt": ObjectId.from_datetime(end)}}
+                                            ]
+                                        }
+                                    ]
+                                }
+                            },
+                            {"$sort": {"_id": -1}},
+                            {"$limit": 20},
+                            {
+                                "$project": {
+                                    "_id": 0,
+                                    "conversation_id": 1,
+                                    "customer_name": 1,
+                                    "customer_id": 1,
+                                    "platform": 1,
+                                    "customer_username": 1,
+                                    "last_message": 1,
+                                    "last_message_timestamp": 1,
+                                    "status": 1,
+                                    "priority": 1
+                                }
+                            }
                         ],
                         "hotLeadDetails": [
                             {
@@ -154,10 +232,14 @@ async def aggregate_dashboard_stats(
         prev_hl = prev_data.get("highLevel", [{}])[0] if prev_data.get("highLevel") else {}
         
         total_curr = curr_hl.get("total", 0)
+        new_leads_curr = curr_hl.get("new_leads", 0)
+        engaged_new_leads_curr = curr_hl.get("engaged_new_leads", 0)
         conv_curr = curr_hl.get("conversions", 0)
         rate_curr = round((conv_curr / total_curr * 100), 1) if total_curr > 0 else 0
         
         total_prev = prev_hl.get("total", 0)
+        new_leads_prev = prev_hl.get("new_leads", 0)
+        engaged_new_leads_prev = prev_hl.get("engaged_new_leads", 0)
         conv_prev = prev_hl.get("conversions", 0)
         rate_prev = round((conv_prev / total_prev * 100), 1) if total_prev > 0 else 0
 
@@ -224,8 +306,8 @@ async def aggregate_dashboard_stats(
         engaged_count = priority_map.get("low", 0) + priority_map.get("medium", 0) + priority_map.get("high", 0)
         
         funnel = [
-            {"label": "New Leads", "value": total_curr, "total": total_curr, "change": 100, "color": "#10b981"},
-            {"label": "Engaged Leads", "value": engaged_count, "total": total_curr, "change": round((engaged_count/total_curr*100), 1) if total_curr > 0 else 0, "color": "#3b82f6"},
+            {"label": "New Leads", "value": new_leads_curr, "total": total_curr, "change": calc_change(new_leads_curr, new_leads_prev), "color": "#10b981"},
+            {"label": "Engaged Leads", "value": engaged_new_leads_curr, "total": total_curr, "change": calc_change(engaged_new_leads_curr, engaged_new_leads_prev), "color": "#3b82f6"},
             {"label": "High Intent", "value": priority_map.get("high", 0), "total": total_curr, "change": round((priority_map.get('high', 0)/total_curr*100), 1) if total_curr > 0 else 0, "color": "#f59e0b"},
             {"label": "Converted", "value": conv_curr, "total": total_curr, "change": round((conv_curr/total_curr*100), 1) if total_curr > 0 else 0, "color": "#8b5cf6"}
         ]
@@ -249,7 +331,7 @@ async def aggregate_dashboard_stats(
         # 5. Performance Tracking (Current Day / Range)
         human_performance = []
         human_res = await conv_col.aggregate([
-            {"$match": {"started_at": {"$gte": start_of_day, "$lt": end_of_day}, "assigned_agent": {"$ne": None}}},
+            {"$match": {"last_message_timestamp": {"$gte": start_of_day, "$lt": end_of_day}, "assigned_agent": {"$ne": None}}},
             {"$group": {"_id": "$assigned_agent.username", "count": {"$sum": 1}}}
         ]).to_list(length=10)
         
@@ -355,7 +437,8 @@ async def aggregate_dashboard_stats(
             },
             "humanPerformance": human_performance,
             "followupTracker": followup_tracker,
-            "alerts": alerts
+            "alerts": alerts,
+            "newLeads": current_data.get("newLeadDetails", [])
         }
 
     except Exception as e:

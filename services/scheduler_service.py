@@ -90,7 +90,10 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
             scheduled_messages_collection.insert_one(followup_doc)
             conversation_collection.update_one(
                 {"conversation_id": conversation_id},
-                {"$set": {"status": "follow-up"}}
+                {"$set": {
+                    "status": "follow-up",
+                    "last_message_timestamp": datetime.now(timezone.utc)
+                }}
             )
         except PyMongoError as e:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")

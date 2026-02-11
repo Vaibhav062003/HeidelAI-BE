@@ -104,14 +104,15 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
     else:
         target_map = services.whatsapp_clients
 
-    if platform_id not in target_map:
+    client_ids = target_map.get(platform_id, [])
+    if not client_ids:
         return
 
     safe_payload = jsonable_encoder(payload)
 
     disconnected_clients = []
 
-    for client_id in target_map[platform_id]:
+    for client_id in client_ids:
 
         if exclude_client_id and client_id == exclude_client_id:
             continue
@@ -122,7 +123,6 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
             continue
 
         try:
-            logger.info(f"Sending {event_type} to client {client_id}")
             await ws.send_json({
                 "type": event_type,
                 "data":{
@@ -130,7 +130,6 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
                     **safe_payload
                 }
             })
-            logger.success(f"Sent {event_type} to {client_id}")
         except Exception as e:
             logger.error(f"Failed to send to {client_id}: {e}, marking as disconnected")
         except WebSocketDisconnect:
@@ -245,6 +244,7 @@ async def broadcast_on_stats_update(
     # Get organization metadata to find platform IDs
     org_data = await async_db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
     if not org_data:
+        logger.error(f"❌ Could not find organization data for broadcast: {org_id}")
         return
         
     ig_id = org_data.get("ig_id")
@@ -257,6 +257,8 @@ async def broadcast_on_stats_update(
             event_type="onStatsUpdate",
             payload=payload
         )
+    else:
+        logger.warning(f"⚠️ No ig_id found for org {org_id}")
         
     if wa_id:
         await broadcast_main_ws(
@@ -265,4 +267,6 @@ async def broadcast_on_stats_update(
             event_type="onStatsUpdate",
             payload=payload
         )
+    else:
+        logger.warning(f"⚠️ No wa_id found for org {org_id}")
 
