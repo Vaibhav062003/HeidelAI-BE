@@ -408,12 +408,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         sender_name='ai',
                                         recipient_id=whatsapp_business_id,
                                         role=MessageRole.AI,
-                                        message_id=message_id,
+                                        message_id=generate_message_id(),
                                         raw_data=None,
                                         mode="reply",
                                         context_type=context_type,
                                         context=context
                                     )
+
+                                    res = await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": chatbot_response,
+                                        "sender_id": HEIDELAI_ORG_WA_ID,
+                                    }, org_id, "reply")
 
                                     return {"status": "ok"}
 
