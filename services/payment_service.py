@@ -73,7 +73,8 @@ async def create_subscription(
         # IMMEDIATE PAYMENT CONFIGURATION
         "authorization_details": {
             "authorization_amount": plan_amount, # User pays this IMMEDIATELY
-            "authorization_amount_refund": False # Do not refund it
+            "authorization_amount_refund": False, # Do not refund it
+            "payment_methods": ["enach", "upi", "card"] # Let user choose between card and netbanking for the first payment
         },
         "subscription_expiry_time": expiry_date,
         "subscription_first_charge_time": subscription_first_charge_time, # Set to next month/year
