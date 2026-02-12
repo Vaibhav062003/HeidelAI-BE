@@ -307,7 +307,7 @@ async def unarchive_data(org_id: str, platform: str, user_id: str):
 
         archive_messages = f"archived_messages_{org_id}_{archive_id}"
         archive_conversations = f"archived_conversations_{org_id}_{archive_id}"
-        archive_private_notes = f"archived_private_notes_{org_id}_{archive_id}"
+        archive_private_notes = f"archived_private_notes_{org_id}_-{archive_id}"
 
         main_messages = f"messages_{org_id}"
         main_conversations = f"conversations_{org_id}"

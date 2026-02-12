@@ -1211,7 +1211,7 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             response = await client.post(url, headers=headers, json=data)
 
-        if response.status_code == 200:
+        if response.status_code != 200:
             error_payload = response.json() if response.content else {}
             logger.error(
                 f"WhatsApp API error | org_id={org_id} wa_id={wa_id} template={template_name} "
