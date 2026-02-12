@@ -7,6 +7,7 @@ from database import get_mongo_db
 from auth.dependencies import CurrentUser
 from services.automation_service import (
     create_automation_flow,
+    list_automation_flows,
     validate_flow_structure
 )
 from core.logger import get_logger
@@ -73,3 +74,43 @@ async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
     except Exception as e:
         logger.error(f"Error creating automation flow: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create automation flow: {str(e)}")
+    
+@router.get("")
+async def list_flows(user: CurrentUser, status: Optional[str] = None):
+    """
+    List all automation flows for the organization
+    
+    Query parameters:
+    - status: Filter by status ("draft" or "published")
+    
+    """
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        flows = await list_automation_flows(org_id=org_id, status=status)
+
+        return {"flows": flows}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing automation flows: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to list automation flows: {str(e)}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

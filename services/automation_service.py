@@ -1,5 +1,5 @@
 import uuid
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from datetime import datetime, timezone
 
 # Internal Modules
@@ -80,7 +80,42 @@ async def create_automation_flow(
         raise
 
 
-# === FLOW VALIDATION ===
+# List all flows 
+async def list_automation_flows(
+    org_id: str,
+    status: Optional[str] = None
+) -> List[Dict]:
+    """
+    List all automation flows for an organization
+    
+    Args:
+        org_id: Organization ID
+        status: Optional status filter ("draft" or "published")
+    
+    Returns:
+        List of flow documents (sorted by created_at, newest first)
+    """
+    try:
+        collection = _automation_flows_collection(org_id)
+        
+        # Build query
+        query = {"org_id": org_id}
+        if status:
+            query["status"] = status
+        
+        # Get flows, sorted by creation date (newest first)
+        flows = list(collection.find(query).sort("created_at", -1))
+        
+        logger.info(f"Listed {len(flows)} automation flows for org: {org_id}, status: {status}")
+        
+        # Serialize each flow (remove _id)
+        return [serialize_mongo(flow) for flow in flows]
+        
+    except Exception as e:
+        logger.error(f"Error listing automation flows: {str(e)}")
+        raise
+
+#  FLOW VALIDATION
 def validate_flow_structure(flow_data: Dict) -> tuple:
     """
     Validate the structure of a flow
