@@ -23,16 +23,18 @@ db = get_mongo_db()
 
 
 async def create_subscription(
-    plan_id: Literal["growth_monthly", "growth_yearly"],
+    plan_id: Literal["growth_monthly", "growth_yearly", "growth_monthly_inr_test"],
     customer_full_name: str,
     customer_email: str,
     customer_phone: str,
+    session_id: str
 ):
     # 1. Define Plan Configurations (Amount & Interval)
     # You might want to fetch this from a DB or config file
     PLAN_CONFIG = {
         "growth_monthly": {"amount": 2199.00, "days": 30}, 
-        "growth_yearly":  {"amount": 23748.00, "days": 365}
+        "growth_yearly":  {"amount": 23748.00, "days": 365},
+        "growth_monthly_inr_test": {"amount": 2.00, "days": 1}
     }
     
     if plan_id not in PLAN_CONFIG:
@@ -81,7 +83,7 @@ async def create_subscription(
             "session_id_expiry": session_expiry
         },
         "subscription_tags" : {
-            "psp_note": f"Subscription for {plan_id}"
+            "psp_note": f"{session_id}"
         }
     }
 

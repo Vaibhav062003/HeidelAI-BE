@@ -151,7 +151,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         
         return {"success": True, "next_step": "SUCCESS", "org_id" : organization.get("id")}
     
-    elif plan_id in ["growth_monthly", "growth_yearly"]:
+    elif plan_id in ["growth_monthly", "growth_yearly", "growth_monthly_inr_test"]:
         # Update session with paid plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
@@ -202,7 +202,8 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
         plan_id=plan_id,
         customer_full_name=customer_full_name,
         customer_email=customer_email,
-        customer_phone=customer_phone
+        customer_phone=customer_phone,
+        session_id=session_id
     )
 
     subscription_session_id = subscription_data.get("subscription_session_id") # ID for frontend to initialise payment
