@@ -61,7 +61,8 @@ async def get_conversations(
             raise HTTPException(status_code=400, detail="Invalid organization ID")
 
         return await fetch_conversations_new(
-            org_id=org_id
+            org_id=org_id,
+            current_user_id=user.user_id
         )
 
     except HTTPException:
