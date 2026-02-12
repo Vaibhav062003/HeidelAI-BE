@@ -1,9 +1,8 @@
-# === Third-party Modules ===
 import uuid
 from typing import Optional, Dict
 from datetime import datetime, timezone
 
-# === Internal Modules ===
+# Internal Modules
 from database import get_mongo_db
 from services.utils import serialize_mongo
 from core.logger import get_logger
@@ -12,13 +11,13 @@ logger = get_logger(__name__)
 db = get_mongo_db()
 
 
-# === Helper Functions for Collection Access ===
+# Helper Functions for Collection Access
 def _automation_flows_collection(org_id: str):
     """Get the automation flows collection for an organization"""
     return db[f"automation_flows_{org_id}"]
 
 
-# === STEP 1: CREATE AUTOMATION FLOW ===
+# CREATE AUTOMATION FLOW
 async def create_automation_flow(
     org_id: str,
     name: str,

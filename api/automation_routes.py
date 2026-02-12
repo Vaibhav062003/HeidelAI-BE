@@ -1,9 +1,8 @@
-# === Third-party Modules ===
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
-# === Internal Modules ===
+# Internal Modules
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
 from services.automation_service import (
@@ -18,7 +17,7 @@ db = get_mongo_db()
 router = APIRouter(prefix="/api/automation_flows", tags=["Automation Flows"])
 
 
-# === Request/Response Models ===
+# Request/Response Models
 class FlowNodePayload(BaseModel):
     """Represents a node's configuration in the flow"""
     type: str
@@ -41,21 +40,12 @@ class CreateFlowRequest(BaseModel):
     status: str = Field(default="draft")
 
 
-# === STEP 1: CREATE FLOW ENDPOINT ===
+# CREATE FLOW ENDPOINT
 @router.post("")
 async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
     """
     Create a new automation flow
     
-    Test with:
-    curl -X POST http://localhost:8000/api/automation_flows \
-      -H "Content-Type: application/json" \
-      -H "Authorization: Bearer YOUR_TOKEN" \
-      -d '{
-        "name": "Test Flow",
-        "description": "My first automation",
-        "status": "draft"
-      }'
     """
     try:
         org_id = user.org_id
