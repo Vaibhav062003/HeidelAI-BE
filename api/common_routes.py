@@ -422,7 +422,7 @@ async def bulk_upload_whatsapp_contacts(user: CurrentUser, file: UploadFile = Fi
         logger.error(f"Bulk upload failed: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error during processing.")
 
-@router.post("/api/temples/upload-media")
+@router.post("/api/templates/upload-media")
 async def upload_media(user: CurrentUser, file: UploadFile = File(...)):
     """
     Creates upload session and uploads file to Meta.
