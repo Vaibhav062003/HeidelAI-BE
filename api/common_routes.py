@@ -1,3 +1,4 @@
+import requests
 from database import get_mongo_db
 from config.settings import ACCESS_TOKEN
 from config.settings import APP_ID
@@ -521,7 +522,17 @@ async def upload_whatsapp_media( user: CurrentUser, file: UploadFile = File(...)
     Upload media to WhatsApp Cloud API.
     Returns media_id.
     """
+    return await upload_media_to_cloudinary(
+        file=file,
+        platform="whatsapp",
+        org_id=user.org_id
+    )
 
+@router.delete("/api/whatsapp/delete-template")
+async def delete_whatsapp_template(user: CurrentUser, template_name: str):
+    """
+    Delete a WhatsApp template.
+    """
     org_id = user.org_id
     org_document = db.organizations.find_one({"org_id": org_id})
 
@@ -530,64 +541,27 @@ async def upload_whatsapp_media( user: CurrentUser, file: UploadFile = File(...)
 
     connection = db.whatsapp_connections.find_one(
             {"wa_id": wa_id, "org_id": org_id},
-            {"_id": 0, "access_token": 1, "phone_id": 1}
+            {"_id": 0, "access_token": 1}
 
         )
-
-    phone_id = connection["phone_id"] if connection else None
     access_token = connection["access_token"] if connection else None
 
-    if not connection or "access_token" not in connection:
-        raise HTTPException(
-            status_code=404,
-            detail="WhatsApp connection not found or access token missing"
-        )
-
-    logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
-
-    url = f"https://graph.facebook.com/v24.0/{phone_id}/media"
+    teamplte_names = template_name.split(",")
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        for template_name in teamplte_names:
+            url = f"https://graph.facebook.com/v23.0/{wa_id}/message_templates?name={template_name}"
+            response = requests.delete(url, params={"access_token": access_token}) 
 
-            # Read file content
-            file_bytes = await file.read()
-
-            files = {
-                "file": (
-                    file.filename,
-                    file_bytes,
-                    file.content_type
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=response.text
                 )
-            }
-
-            data = {
-                "messaging_product": "whatsapp"
-            }
-
-            headers = {
-                "Authorization": f"Bearer {access_token}"
-            }
-
-            response = await client.post(
-                url,
-                headers=headers,
-                data=data,
-                files=files
-            )
-
-            response.raise_for_status()
-
-            return response.json()
-
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=e.response.text
-        )
-
+        return {"message": "Templates deleted successfully"}
     except Exception as e:
+        logger.error(f"Delete template failed: {e}")
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail="Internal Server Error during deletion."
         )
