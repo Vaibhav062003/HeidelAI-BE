@@ -151,7 +151,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         
         return {"success": True, "next_step": "SUCCESS", "org_id" : organization.get("id")}
     
-    elif plan_id in ["growth_monthly", "growth_yearly", "growth_monthly_test"]:
+    elif plan_id in ["growth_monthly", "growth_yearly", "growth_monthly_test", "growth_monthly_inr_test"]:
         # Update session with paid plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
@@ -160,6 +160,27 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         )
         if not session:
             raise HTTPException(status_code=400, detail="Invalid Session")
+        
+        org_name = f"{session.get('first_name')}'s Organization"
+        max_allowed_members = 2
+        owner = {
+            "clerk_user_id": session.get("clerk_user_id"),
+            "owner_email": session.get("email"),
+            "owner_first_name": session.get("first_name"),
+            "owner_last_name": session.get("last_name"),
+            "owner_phone_number": session.get("phone_number"),
+        }
+
+        organization = await create_organization(
+            org_name=org_name,
+            max_allowed_members=max_allowed_members,
+            session_id=session_id,
+            owner=owner,
+            plan="free"
+        )
+
+        if not organization:
+            raise HTTPException(status_code=500, detail="Failed to create organization")
         
         return {"success": True, "next_step": "PHONE_NUMBER"}
     elif plan_id in ["enterprise"]:
@@ -191,6 +212,14 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
 
     if not session:
         raise HTTPException(status_code=400, detail="Invalid Session")
+    
+    db.organizations.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "owner.phone_number": phone_number,
+            "updated_at": datetime.utcnow()
+        }}
+    )
     
     plan_id = session.get("plan")
     customer_full_name = f"{session.get('first_name')} {session.get('last_name')}"
@@ -226,10 +255,16 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
     # Update session with payment session ID
     db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"subscription_session_id": subscription_session_id, "status": "PAYMENT_INITIATED", "next_step": "PAYMENT", "updated_at": datetime.utcnow(), "payment_data": subscription_data}},
+        {"$set": {
+            "subscription_session_id": subscription_session_id, 
+            "status": "PAYMENT_INITIATED", 
+            "next_step": "PAYMENT", 
+            "updated_at": datetime.utcnow(), 
+            "payment_data": subscription_data
+        }},
     )
 
-    return {"subscription_session_id": subscription_session_id, "next_step": "TEAM_INVITE"}
+    return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
 
 @router.post("/invite-team-members")
 async def invite_team_members(data: InviteTeamMembersRequest, session_id: str = Depends(get_onboarding_session)):

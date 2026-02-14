@@ -16,14 +16,12 @@ from core.logger import get_logger
 from config.settings import CASHFREE_URL, CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_VERSION
 from typing import Literal
 
-from services.clerk_service import create_organization
-
 logger = get_logger(__name__)
 db = get_mongo_db()
 
 
 async def create_subscription(
-    plan_id: Literal["growth_monthly", "growth_yearly", "growth_monthly_test"],
+    plan_id: Literal["growth_monthly", "growth_yearly", "growth_monthly_test", "growth_monthly_inr_test"],
     customer_full_name: str,
     customer_email: str,
     customer_phone: str,
@@ -34,7 +32,8 @@ async def create_subscription(
     PLAN_CONFIG = {
         "growth_monthly": {"amount": 2199.00, "days": 30}, 
         "growth_yearly":  {"amount": 23748.00, "days": 365},
-        "growth_monthly_test": {"amount": 2.00, "days": 1}
+        "growth_monthly_test": {"amount": 2.00, "days": 30},
+        "growth_monthly_inr_test": {"amount": 2.00, "days": 1}
     }
     
     if plan_id not in PLAN_CONFIG:
@@ -346,7 +345,7 @@ async def mark_payment_success(data: dict, event_time: datetime):
     session_id = subscription.get("session_id")
     clerk_user_id = subscription.get("clerk_user_id")
     
-    session = db.sessions.find_one_and_update(
+    session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id},
         {"$set": 
             {
@@ -357,24 +356,7 @@ async def mark_payment_success(data: dict, event_time: datetime):
         return_document=ReturnDocument.AFTER
         )
     
-    org_name = f"{session.get('first_name')}'s Organization"
-    max_allowed_members = session.get("max_allowed_members", 4)
-    owner = {
-        "clerk_user_id": clerk_user_id,
-        "owner_email": session.get("owner_email"),
-        "owner_first_name": session.get("owner_first_name"),
-        "owner_last_name": session.get("owner_last_name"),
-        "owner_phone_number": session.get("owner_phone_number")
-    }
     
-    # 3. Create Organization for paid plan subscribers
-    organization = await create_organization(
-        org_name=org_name,
-        max_allowed_members=max_allowed_members,
-        session_id=session_id,
-        owner=owner,
-        plan=plan_id
-    )    
 
 async def mark_payment_failed(data: dict, event_time: datetime):
     """
