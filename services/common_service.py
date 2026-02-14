@@ -580,21 +580,15 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         convo = convo_collection.find_one({"conversation_id": conversation_id})
         
         if not convo:
-            # If we don't have participants yet (e.g. from existing conversation_id), parse from ID
             if not participants:
                 # Reconstruct participants correctly from team_userA_userB
-                # Since User IDs can contain underscores, we look for the "user_" tokens
-                parts = conversation_id.split("_")
-                temp_participants = []
-                for i in range(len(parts)):
-                    if parts[i] == "user" and i + 1 < len(parts):
-                        temp_participants.append(f"user_{parts[i+1]}")
+                import re
+                # Find all occurrences of 'user_' followed by alphanumeric characters
+                participants = re.findall(r"user_[A-Za-z0-9]+", conversation_id)
                 
-                if temp_participants:
-                    participants = temp_participants
-                elif len(parts) >= 3:
-                    # Fallback
-                    participants = parts[1:]
+                if not participants and len(conversation_id.split("_")) >= 3:
+                    # Fallback for IDs that might not follow the 'user_' prefix pattern
+                    participants = conversation_id.split("_")[1:]
             
             convo_doc = {
                 "conversation_id": conversation_id,
@@ -605,7 +599,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 "last_message": content,
                 "last_message_timestamp": now,
                 "last_sender": context.get("sender_id") if context else None,
-                "unread": {p: 0 for p in participants}
+                "unread": {p: 0 for p in participants if p}
             }
             convo_collection.insert_one(convo_doc)
             convo = convo_doc
@@ -614,14 +608,11 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         if not participants:
             participants = convo.get("participants", [])
         
-        # Self-healing: if participants list is broken (e.g. ['user', 'id']), repair it
-        if participants and ("user" in participants or len(participants) > 2):
+        # Self-healing: if participants list is broken (e.g. contains 'user' as a separate element)
+        if participants and ("user" in participants):
             logger.info(f"Repairing broken participants list for {conversation_id}")
-            parts = conversation_id.split("_")
-            reconstructed = []
-            for i in range(len(parts)):
-                if parts[i] == "user" and i + 1 < len(parts):
-                    reconstructed.append(f"user_{parts[i+1]}")
+            import re
+            reconstructed = re.findall(r"user_[A-Za-z0-9]+", conversation_id)
             
             if reconstructed:
                 participants = reconstructed
