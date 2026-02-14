@@ -89,7 +89,12 @@ async def set_password(data: SetPasswordRequest, request: Request, session_id: s
     # Fetch session from DB
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"clerk_user_id": data.clerk_user_id, "status": "PASSWORD_SET_AND_OTP_SENT", "next_step": "OTP", "updated_at": datetime.utcnow()}}, 
+        {"$set": {
+            "clerk_user_id": data.clerk_user_id, 
+            "status": "PASSWORD_SET_AND_OTP_SENT", 
+            "next_step": "OTP", 
+            "updated_at": datetime.utcnow()
+        }}, 
         return_document=ReturnDocument.AFTER
     )
     if not session or not session.get("clerk_id"):
@@ -106,7 +111,13 @@ async def verify_otp(data: VerifyOtpRequest, session_id: str = Depends(get_onboa
     # Update session as complete
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"clerk_user_id": data.clerk_user_id, "status": "EMAIL_VERIFIED", "email_verified": True, "next_step": "PLAN", "updated_at": datetime.utcnow()}}, 
+        {"$set": {
+            "clerk_user_id": data.clerk_user_id, 
+            "status": "EMAIL_VERIFIED", 
+            "email_verified": True, 
+            "next_step": "PLAN", 
+            "updated_at": datetime.utcnow()
+        }}, 
         return_document=ReturnDocument.AFTER
     )
     if not session or not session.get("clerk_id"):
@@ -122,7 +133,13 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         # Update session with free plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
-            {"$set": {"status": "PLAN_SELECTED", "plan": "free", "next_step": "SUCCESS", "updated_at": datetime.utcnow(), "max_allowed_members": 2}}, 
+            {"$set": {
+                "status": "PLAN_SELECTED", 
+                "plan": "free", 
+                "next_step": "SUCCESS", 
+                "updated_at": datetime.utcnow(), 
+                "max_allowed_members": 2
+            }}, 
             return_document=ReturnDocument.AFTER
         )
         if not session:
@@ -155,7 +172,13 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         # Update session with paid plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
-            {"$set": {"status": "PLAN_SELECTED", "plan": plan_id, "next_step": "PHONE_NUMBER", "updated_at": datetime.utcnow(), "max_allowed_members": 4}}, 
+            {"$set": {
+                "status": "PLAN_SELECTED", 
+                "plan": plan_id, 
+                "next_step": "PHONE_NUMBER", 
+                "updated_at": datetime.utcnow(), 
+                "max_allowed_members": 4
+            }}, 
             return_document=ReturnDocument.AFTER
         )
         if not session:
@@ -206,7 +229,12 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
     # Update session with phone number
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"phone_number": phone_number, "status": "PHONE_NUMBER_ADDED", "next_step": "PAYMENT", "updated_at": datetime.utcnow()}}, 
+        {"$set": {
+            "phone_number": phone_number, 
+            "status": "PHONE_NUMBER_ADDED", 
+            "next_step": "PAYMENT", 
+            "updated_at": datetime.utcnow()
+        }}, 
         return_document=ReturnDocument.AFTER
     )
 

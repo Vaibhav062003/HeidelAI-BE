@@ -251,7 +251,11 @@ async def mark_mandate_status(data: dict, event_time: datetime):
     if auth_status == "FAILED":
         db.subscriptions.update_one(
             {"subscription_id": subscription_id},
-            {"$set": {"mandate_active": False, "mandate_status": "FAILED", "updated_at": datetime.utcnow()}}
+            {"$set": {
+                "mandate_active": False, 
+                "mandate_status": "FAILED", 
+                "updated_at": datetime.utcnow()
+            }}
         )
     else:
         db.subscriptions.update_one(
@@ -345,7 +349,7 @@ async def mark_payment_success(data: dict, event_time: datetime):
     session_id = subscription.get("session_id")
     clerk_user_id = subscription.get("clerk_user_id")
     
-    session = db.onboarding_sessions.find_one_and_update(
+    db.onboarding_sessions.update_one(
         {"session_id": session_id},
         {"$set": 
             {
@@ -353,8 +357,7 @@ async def mark_payment_success(data: dict, event_time: datetime):
                 "next_step" : "FLOW_COMPLETED"
             }
         },
-        return_document=ReturnDocument.AFTER
-        )
+    )
     
     
 
@@ -467,8 +470,7 @@ async def handle_card_expiry(data: dict, event_time: datetime):
         }
     )
 
-
-
+# Consumed by SSE
 async def subscription_status_generator(sub_id: str):
     """
     Yields the subscription status.

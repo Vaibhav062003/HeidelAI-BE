@@ -1092,9 +1092,10 @@ async def cashfree_webhook(request: Request):
         return {"status": "duplicate_ignored"}
 
     try:
+        logger.info(f"Processing Cashfree event: {event_type}")
         await process_cashfree_event(event_type, payload)
 
-        db.webhook_events.update_one(
+        db.cashfree_webhook_events.update_one(
             {"idempotency_key": idempotency_key},
             {"$set": {"processed": True}}
         )
