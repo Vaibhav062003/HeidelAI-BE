@@ -205,7 +205,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         if not organization:
             raise HTTPException(status_code=500, detail="Failed to create organization")
         
-        return {"success": True, "next_step": "PHONE_NUMBER"}
+        return {"success": True, "next_step": "PHONE_NUMBER", "org_id" : organization.get("id")}
     elif plan_id in ["enterprise"]:
         # Update session with enterprise plan
         session = db.onboarding_sessions.find_one_and_update(
