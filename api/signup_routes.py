@@ -2,7 +2,7 @@ from datetime import datetime
 import uuid
 from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request
 import requests
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, DESCENDING
 
 
 # internal modules
@@ -298,7 +298,11 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
 async def init_payment(session_id: str = Depends(get_onboarding_session)):
     logger.info(f"Retrying payment for session ID: {session_id}")
 
-    subscription_status = db.subscriptions.find_one({"session_id": session_id}, {"status": 1, "_id": 0})
+    subscription_status = db.subscriptions.find_one(
+        {"session_id": session_id}, 
+        {'$sort': {'created_at': -1}},
+        {"status": 1, "_id": 0}
+    )
 
     if subscription_status and subscription_status.get("status") == "ACTIVE":
         raise HTTPException(status_code=400, detail="Payment already completed for this session")
@@ -338,7 +342,7 @@ async def init_payment(session_id: str = Depends(get_onboarding_session)):
     if not subscription_session_id:
         raise HTTPException(status_code=500, detail="Failed to initiate payment session")
 
-    db.subscriptions.update_one(
+    db.subscriptions.find_one_and_update(
         { "session_id": session_id },
         {
             "$set": {
@@ -346,13 +350,14 @@ async def init_payment(session_id: str = Depends(get_onboarding_session)):
                 "subscription_id": subscription_id, 
                 "clerk_user_id": clerk_user_id,
                 "plan_id": plan_id,
-                "status": "INITIALIZED", # Reset status to INITIALIZED for the retry
-                "updated_at": datetime.utcnow() # Track when the last attempt happened
+                "status": "INITIALIZED",
+                "updated_at": datetime.utcnow()
             },
             "$setOnInsert": {
                 "created_at": datetime.utcnow()
             }
         },
+        sort=[("created_at", DESCENDING)], 
         upsert=True
     )
 
@@ -372,7 +377,11 @@ async def init_payment(session_id: str = Depends(get_onboarding_session)):
 
 @router.get("/subscription/status")
 async def check_subscription_status(session_id: str = Depends(get_onboarding_session)):
-    subscription = db.subscriptions.find_one({"session_id": session_id}, {"status": 1, "_id": 0})
+    subscription = db.subscriptions.find_one(
+        {"session_id": session_id}, 
+        {'$sort': {'created_at': -1}},
+        {"status": 1, "_id": 0}
+    )
     if not subscription:
         raise HTTPException(status_code=404, detail="Subscription not found for this session")
     
