@@ -300,8 +300,8 @@ async def init_payment(session_id: str = Depends(get_onboarding_session)):
 
     subscription_status = db.subscriptions.find_one(
         {"session_id": session_id}, 
-        {'$sort': {'created_at': -1}},
-        {"status": 1, "_id": 0}
+        {"status": 1, "_id": 0},
+        sort=[("created_at", -1)],
     )
 
     if subscription_status and subscription_status.get("status") == "ACTIVE":
@@ -379,8 +379,8 @@ async def init_payment(session_id: str = Depends(get_onboarding_session)):
 async def check_subscription_status(session_id: str = Depends(get_onboarding_session)):
     subscription = db.subscriptions.find_one(
         {"session_id": session_id}, 
-        {'$sort': {'created_at': -1}},
-        {"status": 1, "_id": 0}
+        {"status": 1, "_id": 0},
+        sort=[("created_at", -1)],
     )
     if not subscription:
         raise HTTPException(status_code=404, detail="Subscription not found for this session")
