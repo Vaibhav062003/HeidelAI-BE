@@ -294,6 +294,82 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
 
     return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
 
+@router.post("/init-payment/retry")
+async def init_payment(session_id: str = Depends(get_onboarding_session)):
+    logger.info(f"Retrying payment for session ID: {session_id}")
+
+    subscription_status = db.subscriptions.find_one({"session_id": session_id}, {"status": 1, "_id": 0})
+
+    if subscription_status and subscription_status.get("status") == "ACTIVE":
+        raise HTTPException(status_code=400, detail="Payment already completed for this session")
+
+    session = db.onboarding_sessions.find_one(
+        {"session_id": session_id}
+    )
+
+    if not session:
+        raise HTTPException(status_code=400, detail="Invalid Session")
+
+    if subscription_status and subscription_status.get("status") == "INITIALIZED":
+        logger.info(f"Previous payment attempt found with status INITIALIZED for session ID: {session_id}. Allowing retry.")
+        return {"subscription_session_id": session.get("subscription_session_id"), "next_step": "PAYMENT"}
+
+    # Update session with phone number
+
+    
+    plan_id = session.get("plan")
+    customer_full_name = f"{session.get('first_name')} {session.get('last_name')}"
+    customer_email = session.get("email")
+    customer_phone = session.get("phone_number")
+    clerk_user_id = session.get("clerk_user_id")
+
+    subscription_data = await create_subscription(
+        plan_id=plan_id,
+        customer_full_name=customer_full_name,
+        customer_email=customer_email,
+        customer_phone=customer_phone,
+        session_id=session_id
+    )
+
+    subscription_session_id = subscription_data.get("subscription_session_id") # ID for frontend to initialise payment
+    cf_subscription_id = subscription_data.get("cf_subscription_id") # ID from Cashfree
+    subscription_id = subscription_data.get("subscription_id") # Our internal ID, matched on frontend payment status page
+
+    if not subscription_session_id:
+        raise HTTPException(status_code=500, detail="Failed to initiate payment session")
+
+    db.subscriptions.update_one(
+        { "session_id": session_id },
+        {
+            "$set": {
+                "cf_subscription_id": cf_subscription_id, 
+                "subscription_id": subscription_id, 
+                "clerk_user_id": clerk_user_id,
+                "plan_id": plan_id,
+                "status": "INITIALIZED", # Reset status to INITIALIZED for the retry
+                "updated_at": datetime.utcnow() # Track when the last attempt happened
+            },
+            "$setOnInsert": {
+                "created_at": datetime.utcnow()
+            }
+        },
+        upsert=True
+    )
+
+    # Update session with payment session ID
+    db.onboarding_sessions.find_one_and_update(
+        {"session_id": session_id}, 
+        {"$set": {
+            "subscription_session_id": subscription_session_id, 
+            "status": "PAYMENT_INITIATED", 
+            "next_step": "PAYMENT", 
+            "updated_at": datetime.utcnow(), 
+            "payment_data": subscription_data
+        }},
+    )
+
+    return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
+
 @router.post("/invite-team-members")
 async def invite_team_members(data: InviteTeamMembersRequest, session_id: str = Depends(get_onboarding_session)):
     """
