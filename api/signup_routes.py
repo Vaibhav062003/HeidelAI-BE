@@ -370,6 +370,14 @@ async def init_payment(session_id: str = Depends(get_onboarding_session)):
 
     return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
 
+@router.get("/subscription/status")
+async def check_subscription_status(session_id: str = Depends(get_onboarding_session)):
+    subscription = db.subscriptions.find_one({"session_id": session_id}, {"status": 1, "_id": 0})
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found for this session")
+    
+    return {"status": subscription.get("status")}
+
 @router.post("/invite-team-members")
 async def invite_team_members(data: InviteTeamMembersRequest, session_id: str = Depends(get_onboarding_session)):
     """
