@@ -555,7 +555,7 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
         # Store message in WhatsApp-specific collection
         mid = await store_whatsapp_message(
             org_id=org_id,
-            content=f"[Template] {template_name}",
+            content=f"Shared a template",
             conversation_id=f"whatsapp_{recipient_id}",
             customer_phone_no=recipient_id,
             type="template",
