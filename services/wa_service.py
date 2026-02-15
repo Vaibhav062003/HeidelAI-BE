@@ -528,7 +528,7 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
         template_name = template.get("name", "Unknown Template")
         
         wa_conversation = {
-            "last_message": f"Private Note: [Template] {template_name}" if mode == "private" else f"You: [Template] {template_name}",
+            "last_message": f"Private Note: Shared a template: {template_name}" if mode == "private" else f"You: Shared a template: {template_name}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
@@ -555,7 +555,7 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
         # Store message in WhatsApp-specific collection
         mid = await store_whatsapp_message(
             org_id=org_id,
-            content=f"Shared a template",
+            content=f"Shared a template {template_name}",
             conversation_id=f"whatsapp_{recipient_id}",
             customer_phone_no=recipient_id,
             type="template",
