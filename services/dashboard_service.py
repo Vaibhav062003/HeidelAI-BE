@@ -1,8 +1,8 @@
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 from bson import ObjectId
-from database import get_async_mongo_db
 from core.logger import get_logger
+from database import get_async_mongo_db
 
 logger = get_logger(__name__)
 
@@ -64,10 +64,33 @@ async def aggregate_dashboard_stats(
         expiring_limit = now + timedelta(hours=5)
 
         async def get_stats_for_range(start, end):
+            # Define labels of interest with flexible matching
+            LEAD_REGEX = r"^(label:)?(Lead|New customer)$"
+            CONVERSION_REGEX = r"^(label:)?(Order complete|Paid)$"
+            INTENT_REGEX = r"^(label:)?(New order|Pending payment)$"
+            ALL_REGEX = r"^(label:)?(Lead|New customer|Order complete|Paid|New order|Pending payment)$"
+
             pipeline = [
                 {
+                    "$lookup": {
+                        "from": f"contacts_{org_id}",
+                        "localField": "conversation_id",
+                        "foreignField": "conversation_id",
+                        "as": "contact_info"
+                    }
+                },
+                {
+                    "$set": {
+                        "categories": {"$ifNull": [{"$arrayElemAt": ["$contact_info.categories", 0]}, []]}
+                    }
+                },
+                {
                     "$match": {
-                        "last_message_timestamp": {"$gte": start, "$lt": end}
+                        "$or": [
+                            {"last_message_timestamp": {"$gte": start, "$lt": end}},
+                            {"created_at": {"$gte": start, "$lt": end}},
+                            {"categories": {"$elemMatch": {"$regex": ALL_REGEX, "$options": "i"}}}
+                        ]
                     }
                 },
                 {
@@ -81,10 +104,18 @@ async def aggregate_dashboard_stats(
                                         "$sum": {
                                             "$cond": [
                                                 {
-                                                    "$cond": [
-                                                        {"$ifNull": ["$created_at", False]},
+                                                    "$or": [
                                                         {"$and": [{"$gte": ["$created_at", start]}, {"$lt": ["$created_at", end]}]},
-                                                        {"$and": [{"$gte": [{"$toDate": "$_id"}, start]}, {"$lt": [{"$toDate": "$_id"}, end]}]}
+                                                        {"$gt": [
+                                                            {"$size": {
+                                                                "$filter": {
+                                                                    "input": "$categories",
+                                                                    "as": "cat",
+                                                                    "cond": {"$regexMatch": {"input": "$$cat", "regex": LEAD_REGEX, "options": "i"}}
+                                                                }
+                                                            }},
+                                                            0
+                                                        ]}
                                                     ]
                                                 },
                                                 1,
@@ -92,24 +123,22 @@ async def aggregate_dashboard_stats(
                                             ]
                                         }
                                     },
-                                    "engaged_new_leads": {
+                                    "high_intent": {
                                         "$sum": {
                                             "$cond": [
                                                 {
-                                                    "$and": [
-                                                        {
-                                                            "$cond": [
-                                                                {"$ifNull": ["$created_at", False]},
-                                                                {"$and": [{"$gte": ["$created_at", start]}, {"$lt": ["$created_at", end]}]},
-                                                                {"$and": [{"$gte": [{"$toDate": "$_id"}, start]}, {"$lt": [{"$toDate": "$_id"}, end]}]}
-                                                            ]
-                                                        },
-                                                        {
-                                                            "$or": [
-                                                                {"$in": ["$priority", ["low", "medium", "high"]]},
-                                                                {"$in": ["$last_sender", ["agent", "ai"]]}
-                                                            ]
-                                                        }
+                                                    "$or": [
+                                                        {"$eq": ["$priority", "high"]},
+                                                        {"$gt": [
+                                                            {"$size": {
+                                                                "$filter": {
+                                                                    "input": "$categories",
+                                                                    "as": "cat",
+                                                                    "cond": {"$regexMatch": {"input": "$$cat", "regex": INTENT_REGEX, "options": "i"}}
+                                                                }
+                                                            }},
+                                                            0
+                                                        ]}
                                                     ]
                                                 },
                                                 1,
@@ -117,7 +146,24 @@ async def aggregate_dashboard_stats(
                                             ]
                                         }
                                     },
-                                    "conversions": {"$sum": {"$cond": [{"$eq": ["$status", "closed"]}, 1, 0]}},
+                                    "conversions": {
+                                        "$sum": {
+                                            "$cond": [
+                                                {"$gt": [
+                                                    {"$size": {
+                                                        "$filter": {
+                                                            "input": "$categories",
+                                                            "as": "cat",
+                                                            "cond": {"$regexMatch": {"input": "$$cat", "regex": CONVERSION_REGEX, "options": "i"}}
+                                                        }
+                                                    }},
+                                                    0
+                                                ]},
+                                                1,
+                                                0
+                                            ]
+                                        }
+                                    },
                                     "ai_handled": {"$sum": {"$cond": ["$is_ai_enabled", 1, 0]}},
                                     "human_handled": {"$sum": {"$cond": [{"$not": "$is_ai_enabled"}, 1, 0]}},
                                     "hot_leads": {"$sum": {"$cond": [{"$and": [{"$eq": ["$priority", "high"]}, {"$eq": ["$status", "open"]}]}, 1, 0]}}
@@ -151,7 +197,8 @@ async def aggregate_dashboard_stats(
                                                 {"created_at": {"$exists": False}},
                                                 {"_id": {"$gte": ObjectId.from_datetime(start), "$lt": ObjectId.from_datetime(end)}}
                                             ]
-                                        }
+                                        },
+                                        {"$expr": {"$gt": [{"$size": {"$filter": {"input": "$categories", "as": "cat", "cond": {"$regexMatch": {"input": "$$cat", "regex": LEAD_REGEX, "options": "i"}}}}}, 0]}}
                                     ]
                                 }
                             },
@@ -168,7 +215,8 @@ async def aggregate_dashboard_stats(
                                     "last_message": 1,
                                     "last_message_timestamp": 1,
                                     "status": 1,
-                                    "priority": 1
+                                    "priority": 1,
+                                    "categories": 1
                                 }
                             }
                         ],
@@ -233,13 +281,13 @@ async def aggregate_dashboard_stats(
         
         total_curr = curr_hl.get("total", 0)
         new_leads_curr = curr_hl.get("new_leads", 0)
-        engaged_new_leads_curr = curr_hl.get("engaged_new_leads", 0)
+        high_intent_curr = curr_hl.get("high_intent", 0)
         conv_curr = curr_hl.get("conversions", 0)
         rate_curr = round((conv_curr / total_curr * 100), 1) if total_curr > 0 else 0
         
         total_prev = prev_hl.get("total", 0)
         new_leads_prev = prev_hl.get("new_leads", 0)
-        engaged_new_leads_prev = prev_hl.get("engaged_new_leads", 0)
+        high_intent_prev = prev_hl.get("high_intent", 0)
         conv_prev = prev_hl.get("conversions", 0)
         rate_prev = round((conv_prev / total_prev * 100), 1) if total_prev > 0 else 0
 
@@ -307,8 +355,8 @@ async def aggregate_dashboard_stats(
         
         funnel = [
             {"label": "New Leads", "value": new_leads_curr, "total": total_curr, "change": calc_change(new_leads_curr, new_leads_prev), "color": "#10b981"},
-            {"label": "Engaged Leads", "value": engaged_new_leads_curr, "total": total_curr, "change": calc_change(engaged_new_leads_curr, engaged_new_leads_prev), "color": "#3b82f6"},
-            {"label": "High Intent", "value": priority_map.get("high", 0), "total": total_curr, "change": round((priority_map.get('high', 0)/total_curr*100), 1) if total_curr > 0 else 0, "color": "#f59e0b"},
+            {"label": "Engaged Leads", "value": engaged_count, "total": total_curr, "change": calc_change(engaged_count, total_prev), "color": "#3b82f6"},
+            {"label": "High Intent", "value": high_intent_curr, "total": total_curr, "change": calc_change(high_intent_curr, high_intent_prev), "color": "#f59e0b"},
             {"label": "Converted", "value": conv_curr, "total": total_curr, "change": round((conv_curr/total_curr*100), 1) if total_curr > 0 else 0, "color": "#8b5cf6"}
         ]
         
@@ -422,6 +470,64 @@ async def aggregate_dashboard_stats(
                 "subtitle": "Reply within the 24h window",
                 "time": "Soon",
                 "details": lead_patrol_stats["expiringWhatsAppDetails"]
+            })
+
+        # 8. Reminders Alert
+        reminders_col = async_db["reminders"]
+        logger.info(f"Checking reminders for {org_id} range: {start_of_day} to {end_of_day}")
+        reminder_pipeline = [
+            {
+                "$match": {
+                    "status": {"$in": ["PENDING", "OVERDUE"]},
+                    "dateTime": {"$gte": start_of_day, "$lt": end_of_day},
+                    "$or": [
+                        {"org_id": org_id},
+                        {"org_id": {"$exists": False}} # Support legacy or untagged reminders
+                    ]
+                }
+            },
+            {
+                "$lookup": {
+                    "from": f"conversations_{org_id}",
+                    "localField": "conversationId",
+                    "foreignField": "conversation_id",
+                    "as": "conversation"
+                }
+            },
+            {
+                "$unwind": {
+                    "path": "$conversation",
+                    "preserveNullAndEmptyArrays": True
+                }
+            },
+            {
+                "$project": {
+                    "_id": 0,
+                    "title": 1,
+                    "notes": 1,
+                    "dateTime": 1,
+                    "created_at": 1,
+                    "status": 1,
+                    "conversation_id": "$conversationId",
+                    "customer_name": {"$ifNull": ["$conversation.customer_name", "Unknown"]},
+                    "customer_id": "$conversation.customer_id",
+                    "platform": {"$ifNull": ["$conversation.platform", "whatsapp"]}
+                }
+            },
+            {"$sort": {"dateTime": 1}},
+            {"$limit": 10}
+        ]
+        
+        active_reminders = await reminders_col.aggregate(reminder_pipeline).to_list(length=10)
+        logger.info(f"Found {len(active_reminders)} active reminders for {org_id} in range")
+        if active_reminders:
+            alerts.append({
+                "id": "reminders",
+                "type": "info",
+                "title": f"{len(active_reminders)} Reminders due soon",
+                "subtitle": "Follow up with these customers",
+                "time": "Today",
+                "details": active_reminders
             })
 
         return {
