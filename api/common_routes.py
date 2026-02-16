@@ -1,5 +1,5 @@
 import json
-from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form
+from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form, status
 from fastapi.responses import JSONResponse
 from typing import Optional
 
@@ -43,6 +43,16 @@ router = APIRouter(tags=["Common Routes"])
 @router.get("/")
 async def health_check():
     return {"status": "ok"}
+
+@router.head("/health", status_code=status.HTTP_200_OK)
+async def health_check_head(response: Response):
+    """
+    Lightweight uptime check.
+    Returns 200 OK with custom headers, but NO body content.
+    """
+    response.headers["X-App-Status"] = "Online"
+    
+    return None
 
 @router.get("/favicon.ico", include_in_schema=False)
 def favicon():
