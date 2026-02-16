@@ -498,9 +498,14 @@ async def aggregate_dashboard_stats(
                 }
             },
             {
+                "$addFields": {
+                    "normalized_conv_id": {"$ifNull": ["$conversation_id", "$conversationId"]}
+                }
+            },
+            {
                 "$lookup": {
                     "from": f"conversations_{org_id}",
-                    "localField": "conversationId",
+                    "localField": "normalized_conv_id",
                     "foreignField": "conversation_id",
                     "as": "conversation"
                 }
@@ -519,17 +524,20 @@ async def aggregate_dashboard_stats(
                     "dateTime": {"$ifNull": ["$dateTime", "$trigger_time"]},
                     "created_at": 1,
                     "status": 1,
-                    "conversation_id": "$conversationId",
+                    "conversation_id": "$normalized_conv_id",
+                    "conversationId": "$normalized_conv_id", # Include both for frontend compatibility
+                    "agent_id": {"$ifNull": ["$agent_id", None]},
+                    "org_id": {"$ifNull": ["$org_id", org_id]},
                     "customer_name": {"$ifNull": ["$conversation.customer_name", "Unknown"]},
                     "customer_id": "$conversation.customer_id",
                     "platform": {"$ifNull": ["$conversation.platform", "whatsapp"]}
                 }
             },
             {"$sort": {"dateTime": 1}},
-            {"$limit": 10}
+            {"$limit": 20}
         ]
         
-        reminders = await reminders_col.aggregate(reminder_pipeline).to_list(length=10)
+        reminders = await reminders_col.aggregate(reminder_pipeline).to_list(length=20)
         logger.info(f"Found {len(reminders)} active reminders for {org_id} in selected date range")
         
         if reminders:
@@ -556,6 +564,7 @@ async def aggregate_dashboard_stats(
             "humanPerformance": human_performance,
             "followupTracker": followup_tracker,
             "alerts": alerts,
+            "reminders": reminders, # Adding top-level key for direct access
             "newLeads": current_data.get("newLeadDetails", [])
         }
 
