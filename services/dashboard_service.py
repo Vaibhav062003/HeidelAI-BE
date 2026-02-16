@@ -474,15 +474,26 @@ async def aggregate_dashboard_stats(
 
         # 8. Reminders Alert
         reminders_col = async_db["reminders"]
-        logger.info(f"Checking reminders for {org_id} range: {start_of_day} to {end_of_day}")
+        logger.info(f"Checking reminders for {org_id} using filter: status in [PENDING, OVERDUE] AND (dateTime, trigger_time, or created_at) in range {start_of_day} to {end_of_day}")
+        
         reminder_pipeline = [
             {
                 "$match": {
                     "status": {"$in": ["PENDING", "OVERDUE"]},
-                    "dateTime": {"$gte": start_of_day, "$lt": end_of_day},
-                    "$or": [
-                        {"org_id": org_id},
-                        {"org_id": {"$exists": False}} # Support legacy or untagged reminders
+                    "$and": [
+                        {
+                            "$or": [
+                                {"dateTime": {"$gte": start_of_day, "$lt": end_of_day}},
+                                {"trigger_time": {"$gte": start_of_day, "$lt": end_of_day}},
+                                {"created_at": {"$gte": start_of_day, "$lt": end_of_day}}
+                            ]
+                        },
+                        {
+                            "$or": [
+                                {"org_id": org_id},
+                                {"org_id": {"$exists": False}} # Support legacy or untagged reminders
+                            ]
+                        }
                     ]
                 }
             },
@@ -505,7 +516,7 @@ async def aggregate_dashboard_stats(
                     "_id": 0,
                     "title": 1,
                     "notes": 1,
-                    "dateTime": 1,
+                    "dateTime": {"$ifNull": ["$dateTime", "$trigger_time"]},
                     "created_at": 1,
                     "status": 1,
                     "conversation_id": "$conversationId",
@@ -518,16 +529,17 @@ async def aggregate_dashboard_stats(
             {"$limit": 10}
         ]
         
-        active_reminders = await reminders_col.aggregate(reminder_pipeline).to_list(length=10)
-        logger.info(f"Found {len(active_reminders)} active reminders for {org_id} in range")
-        if active_reminders:
+        reminders = await reminders_col.aggregate(reminder_pipeline).to_list(length=10)
+        logger.info(f"Found {len(reminders)} active reminders for {org_id} in selected date range")
+        
+        if reminders:
             alerts.append({
                 "id": "reminders",
                 "type": "info",
-                "title": f"{len(active_reminders)} Reminders due soon",
+                "title": f"{len(reminders)} Reminders due soon",
                 "subtitle": "Follow up with these customers",
                 "time": "Today",
-                "details": active_reminders
+                "details": reminders
             })
 
         return {
