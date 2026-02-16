@@ -157,7 +157,7 @@ class VerifyOtpRequest(BaseModel):
     clerk_user_id: str
     
 class SelectPlanRequest(BaseModel):
-    plan_id: Literal["free", "growth_monthly", "growth_yearly", "growth_monthly_test", "growth_monthly_inr_test", "enterprise", "custom"]
+    plan_id: Literal["free", "growth_monthly_inr", "growth_yearly_inr", "growth_monthly_test", "growth_monthly_inr_test", "enterprise", "custom"]
 
 class InitPaymentRequest(BaseModel):
     phone_number: str
