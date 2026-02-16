@@ -78,7 +78,7 @@ async def create_subscription(
         "subscription_expiry_time": expiry_date,
         "subscription_first_charge_time": subscription_first_charge_time, # Set to next month/year
         "subscription_meta": {
-            "return_url": f"https://development.heidelai.com/api/payment/callback?sub_id={subscription_id}",
+            "return_url": f"https://heidelai.com/api/payment/callback?sub_id={subscription_id}",
             "notification_channel": ["SMS", "EMAIL"],
             "session_id_expiry": session_expiry
         },
