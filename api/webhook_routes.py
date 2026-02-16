@@ -421,6 +421,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "sender_id": HEIDELAI_ORG_WA_ID,
                                     }, org_id, "reply")
 
+                                    contact_data = {
+                                        "whatsapp_id": whatsapp_business_id,
+                                        "full_name": sender_name2,
+                                        "phone_number": customer_phone_no,
+                                        "country": None,
+                                        "profile_url": None,
+                                        "conversation_id": f"whatsapp_{customer_phone_no}",
+                                        "email": None,
+                                        "categories": []
+                                        }
+
+                                    store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
+
                                     return {"status": "ok"}
 
 
