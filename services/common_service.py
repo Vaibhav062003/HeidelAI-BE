@@ -9,7 +9,7 @@ from pymongo.errors import PyMongoError
 from pymongo.collection import Collection
 from pymongo import ReturnDocument
 from core.services import services
-from services.wa_service import send_whatsapp_message, upload_and_send_wa_media_message
+from services.wa_service import send_whatsapp_message, upload_and_send_wa_media_message, send_whatsapp_template_message
 from services.ig_service import send_ig_message, upload_and_send_ig_media_message
 from services.utils import serialize_mongo
 from services.websocket_service import broadcast_team_message
@@ -532,11 +532,30 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 )
 
         if content and not file:
-            res = await send_whatsapp_message({
-                "conversation_id": conversation_id,
-                "content": content,
-                "sender_id": wa_id,
-            }, org_id, mode, temp_id, context_type, context)
+            # Check if content is a JSON template
+            try:
+                import json
+                content_data = json.loads(content)
+                if isinstance(content_data, dict) and "name" in content_data and "language" in content_data:
+                    recipient_id = conversation_id.replace("whatsapp_", "")
+                    res = await send_whatsapp_template_message(
+                        recipient_id=recipient_id,
+                        template=content_data,
+                        wa_id=wa_id,
+                        org_id=org_id,
+                        temp_id=temp_id,
+                        mode=mode,
+                        context_type=context_type,
+                        context=context
+                    )
+                else:
+                    raise ValueError("Not a template")
+            except (json.JSONDecodeError, ValueError, TypeError):
+                res = await send_whatsapp_message({
+                    "conversation_id": conversation_id,
+                    "content": content,
+                    "sender_id": wa_id,
+                }, org_id, mode, temp_id, context_type, context)
         return res
     
     elif platform == "instagram":

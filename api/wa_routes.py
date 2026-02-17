@@ -19,8 +19,8 @@ from fastapi import (
 # Internal modules
 from core.services import services
 from services.utils import serialize_mongo
-from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates
+from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
@@ -1031,3 +1031,43 @@ async def fetch_templates(user: CurrentUser):
     except Exception as e:
         logger.error(f"Error fetching prebuilt templates: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch prebuilt templates: {str(e)}")
+
+@router.post("/templates")
+async def whatsapp_create_template(user: CurrentUser, template: Template):
+    """
+        Create templates
+    """
+    try:
+        org_id = user.org_id
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        wa_id = org_document.get("wa_id")
+        logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
+
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0, "access_token": 1}
+        )
+
+        access_token = connection["access_token"] if connection else None
+
+        if not connection or "access_token" not in connection:
+            raise HTTPException(
+                status_code=404,
+                detail="WhatsApp connection not found or access token missing"
+            )
+
+        logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
+
+
+        templates = await create_templates(org_id, wa_id, access_token, template.name, template.language, template.category, template.components)
+
+        return {
+            "status": "success",
+            "message": "templates sent for review",
+            "templates": templates
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating templates: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create templates: {str(e)}")
