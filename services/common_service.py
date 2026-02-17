@@ -93,7 +93,7 @@ async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = 
                 "id": doc.get("conversation_id"),
                 "customer_name": doc.get("customer_name") or doc.get("conversation_id"),
                 "last_message": doc.get("last_message", ""),
-                "last_message_timestamp": (
+                "timestamp": (
                     doc["last_message_timestamp"].isoformat()
                     if isinstance(doc.get("last_message_timestamp"), datetime)
                     else None
@@ -228,7 +228,7 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
                     }
                 }
             },
-            projection={"assigned_agent": 1, "assignment_history": 1, "_id": 0},
+            projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0},
             return_document=ReturnDocument.AFTER
         )
 

@@ -234,7 +234,7 @@ async def broadcast_team_message(org_id: str, conversation_id: str, participants
     
     for user_id in participants:
         if user_id in services.agent_clients:
-            for client_id in services.agent_clients[user_id]:
+            for client_id in list(services.agent_clients[user_id]):
                 ws = services.active_clients.get(client_id)
                 if ws:
                     try:
