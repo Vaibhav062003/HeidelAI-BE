@@ -126,7 +126,6 @@ async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = 
                 "assigned_agent": doc.get("assigned_agent", {}),
                 "is_ai_enabled": doc.get("is_ai_enabled"),
                 "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
-                "assigned_agent": doc.get("assigned_agent", {}),
                 "assignment_history": doc.get("assignment_history", []),
                 "suggestions": doc.get("suggestions", []),
                 "summary": doc.get("summary", []),
