@@ -546,11 +546,11 @@ async def delete_whatsapp_template(user: CurrentUser, template_name: str):
         )
     access_token = connection["access_token"] if connection else None
 
-    teamplte_names = template_name.split(",")
+    template_names = [name.strip() for name in template_name.split(",") if name.strip()]
 
     try:
-        for template_name in teamplte_names:
-            url = f"https://graph.facebook.com/v23.0/{wa_id}/message_templates?name={template_name}"
+        for name in template_names:
+            url = f"https://graph.facebook.com/v23.0/{wa_id}/message_templates?name={name}"
             response = requests.delete(url, params={"access_token": access_token}) 
 
             if response.status_code != 200:
