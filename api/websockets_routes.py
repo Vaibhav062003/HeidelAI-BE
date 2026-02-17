@@ -146,6 +146,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager2.disconnect(client_id)
 
+#TODO: Implement a ping-pong mechanism to kill dead connections
 @router.websocket("/main-ws/{client_id}")
 async def main_ws(websocket: WebSocket, client_id: str):
     token = websocket.headers.get("sec-websocket-protocol")
