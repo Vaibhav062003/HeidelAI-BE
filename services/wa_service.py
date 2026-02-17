@@ -509,7 +509,8 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
                 "Content-Type": "application/json",
             }
             
-            response = requests.post(url, headers=headers, json=data)
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, headers=headers, json=data)
             
             if response.status_code != 200:
                 logger.error(f"WhatsApp API error: {response.text}")
