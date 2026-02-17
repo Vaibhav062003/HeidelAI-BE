@@ -235,17 +235,41 @@ async def broadcast_on_stats_update(
     from services.dashboard_service import aggregate_dashboard_stats
     async_db = get_async_mongo_db()
     
-    logger.info(f"🚀 Broadcasting dashboard stats for org: {org_id} (Range: {start_date} to {end_date} or Date: {target_date or 'today'})")
+    import time
+    start_time = time.time()
+    logger.info(f"🚀 Starting dashboard stats broadcast for org: {org_id} (Range: {start_date} to {end_date} or Date: {target_date or 'today'})")
     
-    payload = await aggregate_dashboard_stats(
+    full_payload = await aggregate_dashboard_stats(
         org_id, 
         target_date_str=target_date, 
         start_date_str=start_date, 
         end_date_str=end_date
     )
-    if not payload:
+    if not full_payload:
         logger.warning(f"Empty payload for org {org_id}, skipping broadcast")
         return
+
+    # Create a reduced payload for WebSocket to minimize traffic
+    # Only includes summary metrics and alert headers
+    stats_summary = full_payload.get("stats", {})
+    status_counters = full_payload.get("statusCounters", {})
+    # Remove heavy details from status counters if present
+    status_counters.pop("expiringWhatsAppDetails", None)
+
+    payload = {
+        "stats": stats_summary,
+        "leadPatrol": full_payload.get("leadPatrol", []),
+        "overallMetrics": full_payload.get("overallMetrics", {}),
+        "statusCounters": status_counters,
+        "conversationFlow": full_payload.get("conversationFlow", []),
+        "aiMetrics": full_payload.get("aiMetrics", {}),
+        "alerts": full_payload.get("alerts", []), # Include full alert details (like hot leads)
+        "newLeads": full_payload.get("newLeads", []) # Include the list of new leads
+    }
+
+    import json
+    payload_size = len(json.dumps(payload))
+    logger.info(f"📊 Dashboard broadcast payload prepared for {org_id}. Size: {payload_size} bytes. Leads: {len(payload['newLeads'])}, Alerts: {len(payload['alerts'])}")
 
     # Get organization metadata to find platform IDs
     org_data = await async_db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
@@ -275,6 +299,9 @@ async def broadcast_on_stats_update(
         )
     else:
         logger.warning(f"⚠️ No wa_id found for org {org_id}")
+
+    end_time = time.time()
+    logger.success(f"✅ Dashboard stats broadcast completed for {org_id} in {end_time - start_time:.2f}s")
 
 async def broadcast_team_message(org_id: str, conversation_id: str, participants: list, payload: dict):
     """
