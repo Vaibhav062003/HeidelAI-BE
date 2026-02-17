@@ -8,6 +8,7 @@ from pymongo.errors import PyMongoError
 from database import get_mongo_db
 from .followup_agent_service import get_followup_message
 from core.logger import get_logger
+from services.websocket_service import broadcast_on_stats_update
 
 logger = get_logger(__name__)
 
@@ -89,11 +90,18 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
             scheduled_messages_collection.insert_one(followup_doc)
             conversation_collection.update_one(
                 {"conversation_id": conversation_id},
-                {"$set": {"status": "follow-up"}}
+                {"$set": {
+                    "status": "follow-up",
+                    "last_message_timestamp": datetime.now(timezone.utc)
+                }}
             )
         except PyMongoError as e:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+        try:
+            await broadcast_on_stats_update(org_id)
+        except Exception as e:
+            logger.warning(f"Failed to broadcast dashboard stats: {str(e)}")
         return {"message": "Follow-up message scheduled successfully."}
 
     except HTTPException:
@@ -129,6 +137,11 @@ async def abort_scheduled_message(org_id: str, conversation_id: str):
         if result.matched_count == 0:
             return {"message": "No pending scheduled message found to abort."}
         
+        try:
+            await broadcast_on_stats_update(org_id)
+        except Exception as e:
+            logger.warning(f"Failed to broadcast stats after abort: {str(e)}")
+
         return {"message": "Scheduled message marked as 'aborted' successfully."}
 
     except Exception as e:

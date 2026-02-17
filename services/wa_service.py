@@ -19,7 +19,7 @@ from schemas.models import MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
-from services.websocket_service import broadcast_main_ws
+from services.websocket_service import broadcast_main_ws, broadcast_on_stats_update
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from core.logger import get_logger
 
@@ -116,6 +116,7 @@ async def create_or_update_whatsapp_conversation(
             "status": "open",
             "last_sender": last_sender,
             "started_at": now,
+            "created_at": now,
             "reminder_stage": 0,
             "next_action_at": now + timedelta(hours=6),
             "closed_at": None
@@ -158,6 +159,9 @@ async def create_or_update_whatsapp_conversation(
         await broadcast_whatsapp_message(recipient_id, "conversation_updated", {
             "conversation": broadcast_conversation
         })
+    
+    # Broadcast stats update for every message to ensure live dashboard refresh
+    await broadcast_on_stats_update(org_id)
         
     return conversation_id
 

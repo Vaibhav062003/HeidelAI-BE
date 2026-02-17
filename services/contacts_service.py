@@ -99,6 +99,11 @@ async def update_contact_tag_categories(org_id: str, conversation_id: str, categ
 
         if not result:
             raise HTTPException(status_code=404, detail="Contact not found")
+
+        # Live Update: Trigger dashboard refresh
+        from services.websocket_service import broadcast_on_stats_update
+        import asyncio
+        asyncio.create_task(broadcast_on_stats_update(org_id))
         
         if "_id" in result:
             del result["_id"]

@@ -702,10 +702,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "message_id": deleted_message_id,
                                             "conversation_id": conversation_id
                                         })
+
+                                    # Update dashboard stats live after deletion
+                                    await broadcast_on_stats_update(org_id)
                                         
-                                        await broadcast_instagram_message(recipient_id, "conversation_updated", {
-                                            "conversation": conversation
-                                        })
+                                    await broadcast_instagram_message(recipient_id, "conversation_updated", {
+                                        "conversation": conversation
+                                    })
                         
                         # Return success early since we've handled the deletion event
                         return {"status": "ok"}

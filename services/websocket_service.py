@@ -2,9 +2,12 @@ import asyncio
 from fastapi.encoders import jsonable_encoder
 from core.services import services
 from fastapi import WebSocket, WebSocketDisconnect
+from database import get_mongo_db, get_async_mongo_db
 from core.logger import get_logger
 
+
 logger = get_logger(__name__)
+db = get_mongo_db()
 
 async def cleanup_client(client_id: str):
     """
@@ -107,14 +110,15 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
     else:
         target_map = services.whatsapp_clients
 
-    if platform_id not in target_map:
+    client_ids = target_map.get(platform_id, [])
+    if not client_ids:
         return
 
     safe_payload = jsonable_encoder(payload)
 
     disconnected_clients = []
 
-    for client_id in target_map[platform_id]:
+    for client_id in client_ids:
 
         if exclude_client_id and client_id == exclude_client_id:
             continue
@@ -125,7 +129,6 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
             continue
 
         try:
-            logger.info(f"Sending {event_type} to client {client_id}")
             await ws.send_json({
                 "type": event_type,
                 "data":{
@@ -133,7 +136,6 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
                     **safe_payload
                 }
             })
-            logger.success(f"Sent {event_type} to {client_id}")
         except Exception as e:
             logger.error(f"Failed to send to {client_id}: {e}, marking as disconnected")
         except WebSocketDisconnect:
@@ -219,6 +221,60 @@ def leave_conversation_presence(org_id: str, conversation_id: str, client_id: st
     services.client_convo_map.pop(client_id, None)
     
     logger.info(f"Client {client_id} LEFT conversation {convo_key}")
+
+async def broadcast_on_stats_update(
+    org_id: str, 
+    target_date: str = None, 
+    start_date: str = None, 
+    end_date: str = None
+):
+    """
+    Unified broadcast function for the HeidelAI Dashboard.
+    Fetches full dashboard stats and broadcasts to connected clients.
+    """
+    from services.dashboard_service import aggregate_dashboard_stats
+    async_db = get_async_mongo_db()
+    
+    logger.info(f"🚀 Broadcasting dashboard stats for org: {org_id} (Range: {start_date} to {end_date} or Date: {target_date or 'today'})")
+    
+    payload = await aggregate_dashboard_stats(
+        org_id, 
+        target_date_str=target_date, 
+        start_date_str=start_date, 
+        end_date_str=end_date
+    )
+    if not payload:
+        logger.warning(f"Empty payload for org {org_id}, skipping broadcast")
+        return
+
+    # Get organization metadata to find platform IDs
+    org_data = await async_db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
+    if not org_data:
+        logger.error(f"❌ Could not find organization data for broadcast: {org_id}")
+        return
+        
+    ig_id = org_data.get("ig_id")
+    wa_id = org_data.get("wa_id")
+    
+    if ig_id:
+        await broadcast_main_ws(
+            platform_id=ig_id,
+            platform_type="instagram",
+            event_type="onStatsUpdate",
+            payload=payload
+        )
+    else:
+        logger.warning(f"⚠️ No ig_id found for org {org_id}")
+        
+    if wa_id:
+        await broadcast_main_ws(
+            platform_id=wa_id,
+            platform_type="whatsapp",
+            event_type="onStatsUpdate",
+            payload=payload
+        )
+    else:
+        logger.warning(f"⚠️ No wa_id found for org {org_id}")
 
 async def broadcast_team_message(org_id: str, conversation_id: str, participants: list, payload: dict):
     """

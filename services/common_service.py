@@ -4,14 +4,14 @@ from bson import ObjectId
 from typing import Optional, List, Dict
 from fastapi import HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorCollection
-from datetime import datetime, timezone
-from pymongo.errors import PyMongoError
 from pymongo.collection import Collection
 from pymongo import ReturnDocument
+from datetime import datetime, timezone, timedelta
 from core.services import services
 from services.wa_service import send_whatsapp_message, upload_and_send_wa_media_message, send_whatsapp_template_message
 from services.ig_service import send_ig_message, upload_and_send_ig_media_message
 from services.utils import serialize_mongo
+from services.websocket_service import broadcast_on_stats_update
 from services.websocket_service import broadcast_team_message
 
 from database import get_mongo_db, get_async_mongo_db
@@ -140,6 +140,7 @@ async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = 
     logger.info(f"[TIMING] Total: {end_time - start_time:.4f}s")
 
     return result
+
 
 async def fetch_conversation(org_id: str, conversation_id: str):
     """
@@ -319,6 +320,7 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
                 "$set": {
                     "status": "closed",
                     "closed_at": now,
+                    "last_message_timestamp": now,
                     "assigned_agent": None,
                     "closure_reason": reason
                 }
@@ -337,6 +339,9 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
             )
 
         convo = serialize_mongo(result)
+
+        await broadcast_on_stats_update(org_id)
+
         return {"conversation": convo}
 
     except PyMongoError as e:
