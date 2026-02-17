@@ -474,7 +474,7 @@ async def upload_media(user: CurrentUser, file: UploadFile = File(...)):
                 "access_token": access_token
             }
 
-            session_res = await client.post(create_url, params=params)
+            session_res = await client.post(create_url, params=params, headers=headers, data=data)
 
             if session_res.status_code != 200:
                 raise HTTPException(
