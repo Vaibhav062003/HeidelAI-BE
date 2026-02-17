@@ -155,8 +155,9 @@ class SetPasswordRequest(BaseModel):
 
 class VerifyOtpRequest(BaseModel):
     clerk_user_id: str
+    
 class SelectPlanRequest(BaseModel):
-    plan_id: Literal["free", "growth_monthly", "growth_yearly", "enterprise", "custom"]
+    plan_id: Literal["free", "growth_monthly_inr", "growth_yearly_inr", "growth_monthly_test", "growth_monthly_inr_test", "enterprise", "custom"]
 
 class InitPaymentRequest(BaseModel):
     phone_number: str
@@ -164,3 +165,9 @@ class InitPaymentRequest(BaseModel):
 class InviteTeamMembersRequest(BaseModel):
     org_name: str
     member_emails: List[EmailStr]
+
+class Template(BaseModel):
+    name: str
+    language: str
+    category: str
+    components: List[Dict[str, Any]]

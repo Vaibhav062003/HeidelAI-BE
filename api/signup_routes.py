@@ -2,7 +2,7 @@ from datetime import datetime
 import uuid
 from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request
 import requests
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, DESCENDING
 
 
 # internal modules
@@ -89,7 +89,12 @@ async def set_password(data: SetPasswordRequest, request: Request, session_id: s
     # Fetch session from DB
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"clerk_user_id": data.clerk_user_id, "status": "PASSWORD_SET_AND_OTP_SENT", "next_step": "OTP", "updated_at": datetime.utcnow()}}, 
+        {"$set": {
+            "clerk_user_id": data.clerk_user_id, 
+            "status": "PASSWORD_SET_AND_OTP_SENT", 
+            "next_step": "OTP", 
+            "updated_at": datetime.utcnow()
+        }}, 
         return_document=ReturnDocument.AFTER
     )
     if not session or not session.get("clerk_id"):
@@ -106,7 +111,13 @@ async def verify_otp(data: VerifyOtpRequest, session_id: str = Depends(get_onboa
     # Update session as complete
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"clerk_user_id": data.clerk_user_id, "status": "EMAIL_VERIFIED", "email_verified": True, "next_step": "PLAN", "updated_at": datetime.utcnow()}}, 
+        {"$set": {
+            "clerk_user_id": data.clerk_user_id, 
+            "status": "EMAIL_VERIFIED", 
+            "email_verified": True, 
+            "next_step": "PLAN", 
+            "updated_at": datetime.utcnow()
+        }}, 
         return_document=ReturnDocument.AFTER
     )
     if not session or not session.get("clerk_id"):
@@ -122,7 +133,13 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         # Update session with free plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
-            {"$set": {"status": "PLAN_SELECTED", "plan": "free", "next_step": "SUCCESS", "updated_at": datetime.utcnow(), "max_allowed_members": 2}}, 
+            {"$set": {
+                "status": "PLAN_SELECTED", 
+                "plan": "free", 
+                "next_step": "SUCCESS", 
+                "updated_at": datetime.utcnow(), 
+                "max_allowed_members": 2
+            }}, 
             return_document=ReturnDocument.AFTER
         )
         if not session:
@@ -151,17 +168,44 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         
         return {"success": True, "next_step": "SUCCESS", "org_id" : organization.get("id")}
     
-    elif plan_id in ["growth_monthly", "growth_yearly"]:
+    elif plan_id in ["growth_monthly_inr", "growth_yearly_inr", "growth_monthly_test", "growth_monthly_inr_test"]:
         # Update session with paid plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
-            {"$set": {"status": "PLAN_SELECTED", "plan": plan_id, "next_step": "PHONE_NUMBER", "updated_at": datetime.utcnow(), "max_allowed_members": 4}}, 
+            {"$set": {
+                "status": "PLAN_SELECTED", 
+                "plan": plan_id, 
+                "next_step": "PHONE_NUMBER", 
+                "updated_at": datetime.utcnow(), 
+                "max_allowed_members": 4
+            }}, 
             return_document=ReturnDocument.AFTER
         )
         if not session:
             raise HTTPException(status_code=400, detail="Invalid Session")
         
-        return {"success": True, "next_step": "PHONE_NUMBER"}
+        org_name = f"{session.get('first_name')}'s Organization"
+        max_allowed_members = 2
+        owner = {
+            "clerk_user_id": session.get("clerk_user_id"),
+            "owner_email": session.get("email"),
+            "owner_first_name": session.get("first_name"),
+            "owner_last_name": session.get("last_name"),
+            "owner_phone_number": session.get("phone_number"),
+        }
+
+        organization = await create_organization(
+            org_name=org_name,
+            max_allowed_members=max_allowed_members,
+            session_id=session_id,
+            owner=owner,
+            plan="free"
+        )
+
+        if not organization:
+            raise HTTPException(status_code=500, detail="Failed to create organization")
+        
+        return {"success": True, "next_step": "PHONE_NUMBER", "org_id" : organization.get("id")}
     elif plan_id in ["enterprise"]:
         # Update session with enterprise plan
         session = db.onboarding_sessions.find_one_and_update(
@@ -185,12 +229,25 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
     # Update session with phone number
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"phone_number": phone_number, "status": "PHONE_NUMBER_ADDED", "next_step": "PAYMENT", "updated_at": datetime.utcnow()}}, 
+        {"$set": {
+            "phone_number": phone_number, 
+            "status": "PHONE_NUMBER_ADDED", 
+            "next_step": "PAYMENT", 
+            "updated_at": datetime.utcnow()
+        }}, 
         return_document=ReturnDocument.AFTER
     )
 
     if not session:
         raise HTTPException(status_code=400, detail="Invalid Session")
+    
+    db.organizations.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "owner.phone_number": phone_number,
+            "updated_at": datetime.utcnow()
+        }}
+    )
     
     plan_id = session.get("plan")
     customer_full_name = f"{session.get('first_name')} {session.get('last_name')}"
@@ -202,7 +259,8 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
         plan_id=plan_id,
         customer_full_name=customer_full_name,
         customer_email=customer_email,
-        customer_phone=customer_phone
+        customer_phone=customer_phone,
+        session_id=session_id
     )
 
     subscription_session_id = subscription_data.get("subscription_session_id") # ID for frontend to initialise payment
@@ -225,10 +283,109 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
     # Update session with payment session ID
     db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
-        {"$set": {"subscription_session_id": subscription_session_id, "status": "PAYMENT_INITIATED", "next_step": "PAYMENT", "updated_at": datetime.utcnow(), "payment_data": subscription_data}},
+        {"$set": {
+            "subscription_session_id": subscription_session_id, 
+            "status": "PAYMENT_INITIATED", 
+            "next_step": "PAYMENT", 
+            "updated_at": datetime.utcnow(), 
+            "payment_data": subscription_data
+        }},
     )
 
-    return {"subscription_session_id": subscription_session_id, "next_step": "TEAM_INVITE"}
+    return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
+
+@router.post("/init-payment/retry")
+async def init_payment(session_id: str = Depends(get_onboarding_session)):
+    logger.info(f"Retrying payment for session ID: {session_id}")
+
+    subscription_status = db.subscriptions.find_one(
+        {"session_id": session_id}, 
+        {"status": 1, "_id": 0},
+        sort=[("created_at", -1)],
+    )
+
+    if subscription_status and subscription_status.get("status") == "ACTIVE":
+        raise HTTPException(status_code=400, detail="Payment already completed for this session")
+
+    session = db.onboarding_sessions.find_one(
+        {"session_id": session_id}
+    )
+
+    if not session:
+        raise HTTPException(status_code=400, detail="Invalid Session")
+
+    if subscription_status and subscription_status.get("status") == "INITIALIZED":
+        logger.info(f"Previous payment attempt found with status INITIALIZED for session ID: {session_id}. Allowing retry.")
+        return {"subscription_session_id": session.get("subscription_session_id"), "next_step": "PAYMENT"}
+
+    # Update session with phone number
+
+    
+    plan_id = session.get("plan")
+    customer_full_name = f"{session.get('first_name')} {session.get('last_name')}"
+    customer_email = session.get("email")
+    customer_phone = session.get("phone_number")
+    clerk_user_id = session.get("clerk_user_id")
+
+    subscription_data = await create_subscription(
+        plan_id=plan_id,
+        customer_full_name=customer_full_name,
+        customer_email=customer_email,
+        customer_phone=customer_phone,
+        session_id=session_id
+    )
+
+    subscription_session_id = subscription_data.get("subscription_session_id") # ID for frontend to initialise payment
+    cf_subscription_id = subscription_data.get("cf_subscription_id") # ID from Cashfree
+    subscription_id = subscription_data.get("subscription_id") # Our internal ID, matched on frontend payment status page
+
+    if not subscription_session_id:
+        raise HTTPException(status_code=500, detail="Failed to initiate payment session")
+
+    db.subscriptions.find_one_and_update(
+        { "session_id": session_id },
+        {
+            "$set": {
+                "cf_subscription_id": cf_subscription_id, 
+                "subscription_id": subscription_id, 
+                "clerk_user_id": clerk_user_id,
+                "plan_id": plan_id,
+                "status": "INITIALIZED",
+                "updated_at": datetime.utcnow()
+            },
+            "$setOnInsert": {
+                "created_at": datetime.utcnow()
+            }
+        },
+        sort=[("created_at", DESCENDING)], 
+        upsert=True
+    )
+
+    # Update session with payment session ID
+    db.onboarding_sessions.find_one_and_update(
+        {"session_id": session_id}, 
+        {"$set": {
+            "subscription_session_id": subscription_session_id, 
+            "status": "PAYMENT_INITIATED", 
+            "next_step": "PAYMENT", 
+            "updated_at": datetime.utcnow(), 
+            "payment_data": subscription_data
+        }},
+    )
+
+    return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
+
+@router.get("/subscription/status")
+async def check_subscription_status(session_id: str = Depends(get_onboarding_session)):
+    subscription = db.subscriptions.find_one(
+        {"session_id": session_id}, 
+        {"status": 1, "_id": 0},
+        sort=[("created_at", -1)],
+    )
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found for this session")
+    
+    return {"status": subscription.get("status")}
 
 @router.post("/invite-team-members")
 async def invite_team_members(data: InviteTeamMembersRequest, session_id: str = Depends(get_onboarding_session)):

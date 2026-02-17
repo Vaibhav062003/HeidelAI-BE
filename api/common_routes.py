@@ -1,7 +1,13 @@
+import requests
+from database import get_mongo_db
+from config.settings import ACCESS_TOKEN
+from config.settings import APP_ID
+from services.cloudinary_service import upload_media_to_cloudinary
 import json
-from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form
+from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form, status
 from fastapi.responses import JSONResponse
 from typing import Optional
+import httpx
 
 from auth.dependencies import CurrentUser
 from core.services import services
@@ -34,15 +40,26 @@ from services.products_service import (
 )
 
 from core.logger import get_logger
-from services.wa_service import send_whatsapp_reaction
+
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["Common Routes"])
+db = get_mongo_db()
 
 @router.get("/")
 async def health_check():
     return {"status": "ok"}
+
+@router.head("/health", status_code=status.HTTP_200_OK)
+async def health_check_head(response: Response):
+    """
+    Lightweight uptime check.
+    Returns 200 OK with custom headers, but NO body content.
+    """
+    response.headers["X-App-Status"] = "Online"
+    
+    return None
 
 @router.get("/favicon.ico", include_in_schema=False)
 def favicon():
@@ -61,7 +78,8 @@ async def get_conversations(
             raise HTTPException(status_code=400, detail="Invalid organization ID")
 
         return await fetch_conversations_new(
-            org_id=org_id
+            org_id=org_id,
+            current_user_id=user.user_id
         )
 
     except HTTPException:
@@ -414,3 +432,147 @@ async def bulk_upload_whatsapp_contacts(user: CurrentUser, file: UploadFile = Fi
     except Exception as e:
         logger.error(f"Bulk upload failed: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error during processing.")
+
+@router.post("/api/templates/upload-media")
+async def upload_media(user: CurrentUser, file: UploadFile = File(...)):
+    """
+    Creates upload session and uploads file to Meta.
+    Returns uploaded file handle.
+    """
+    org_id = user.org_id
+    org_document = db.organizations.find_one({"org_id": org_id})
+
+    wa_id = org_document.get("wa_id")
+    logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
+
+    connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0, "access_token": 1}
+
+        )
+    access_token = connection["access_token"] if connection else None
+
+    if not connection or "access_token" not in connection:
+        raise HTTPException(
+            status_code=404,
+            detail="WhatsApp connection not found or access token missing"
+        )
+
+    logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
+
+    try:
+        file_content = await file.read()
+        file_length = len(file_content)
+
+        async with httpx.AsyncClient() as client:
+
+            # ---------------- STEP 1: Create Upload Session ----------------
+            create_url = f"https://graph.facebook.com/v24.0/{APP_ID}/uploads"
+
+            headers= {
+                "Authorization": f"Bearer {access_token}"
+            }
+
+            data= {
+                "messaging_product": "whatsapp",
+            }
+
+            
+            params = {  
+                "file_name": file.filename,
+                "file_length": file_length,
+                "file_type": file.content_type,
+                "access_token": access_token
+            }
+
+            session_res = await client.post(create_url, params=params, headers=headers, data=data)
+
+            if session_res.status_code != 200:
+                raise HTTPException(
+                    status_code=session_res.status_code,
+                    detail=session_res.text
+                )
+
+            upload_session_id = session_res.json()["id"]  # upload:<ID>
+
+            # ---------------- STEP 2: Upload File ----------------
+            upload_url = f"https://graph.facebook.com/v24.0/{upload_session_id}"
+
+            headers = {
+                "Authorization": f"OAuth {access_token}",
+                "file_offset": "0"
+            }
+
+            upload_res = await client.post(
+                upload_url,
+                headers=headers,
+                content=file_content  # binary upload
+            )
+
+            if upload_res.status_code != 200:
+                raise HTTPException(
+                    status_code=upload_res.status_code,
+                    detail=upload_res.text
+                )
+
+            return upload_res.json() 
+
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal Server Error during upload."
+        )
+
+        
+    
+@router.post("/api/whatsapp/upload-media")
+async def upload_whatsapp_media( user: CurrentUser, file: UploadFile = File(...)
+):
+    """
+    Upload media to WhatsApp Cloud API.
+    Returns media_id.
+    """
+    return await upload_media_to_cloudinary(
+        file=file,
+        platform="whatsapp",
+        org_id=user.org_id
+    )
+
+@router.delete("/api/whatsapp/delete-template")
+async def delete_whatsapp_template(user: CurrentUser, template_name: str):
+    """
+    Delete a WhatsApp template.
+    """
+    org_id = user.org_id
+    org_document = db.organizations.find_one({"org_id": org_id})
+
+    wa_id = org_document.get("wa_id")
+    logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
+
+    connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0, "access_token": 1}
+
+        )
+    access_token = connection["access_token"] if connection else None
+
+    template_names = [name.strip() for name in template_name.split(",") if name.strip()]
+
+    try:
+        for name in template_names:
+            url = f"https://graph.facebook.com/v23.0/{wa_id}/message_templates?name={name}"
+            response = requests.delete(url, params={"access_token": access_token}) 
+
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=response.text
+                )
+        return {"message": "Templates deleted successfully"}
+    except Exception as e:
+        logger.error(f"Delete template failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal Server Error during deletion."
+        )

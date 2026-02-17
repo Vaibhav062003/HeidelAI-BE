@@ -14,7 +14,7 @@ from pymongo import ReturnDocument, UpdateOne
 from core.managers import manager
 from database import get_mongo_db, get_mongo_client
 from core.services import services
-from config.settings import IG_VERSION, VERSION
+from config.settings import IG_VERSION, VERSION, APP_ID
 from schemas.models import MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
@@ -475,6 +475,117 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
         raise HTTPException(
             status_code=500, 
             detail=f"Failed to send message: {str(e)}"
+        )
+
+async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
+    """
+    Send a template message via WhatsApp Cloud API
+    """
+    try:
+        # Find the WhatsApp connection to get the access token
+        connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
+
+        if not connection:
+            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+
+        # Normalize template language format if it's a string
+        if "language" in template and isinstance(template["language"], str):
+            template["language"] = {"code": template["language"]}
+
+        data = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient_id,
+            "type": "template",
+            "template": template
+        }
+        
+        if context_type and context:
+            data["context"] = {
+                "message_id": context.get("mid")
+            }
+        
+        if mode == "reply":
+            # Send message via WhatsApp Cloud API
+            url = f"https://graph.facebook.com/{IG_VERSION}/{connection.get('phone_id')}/messages"
+            headers = {
+                "Authorization": f"Bearer {connection.get('access_token')}",
+                "Content-Type": "application/json",
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, headers=headers, json=data)
+            
+            if response.status_code != 200:
+                logger.error(f"WhatsApp API error: {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Failed to send WhatsApp template message"
+                )
+            
+            response_data = response.json()
+            message_id = response_data.get("messages", [{}])[0].get("id")
+        else:
+            message_id = f"privatenote_{uuid.uuid4()}"
+            response_data = {"status": "Private note created, no API call made"}
+
+        now = datetime.now(timezone.utc)
+        template_name = template.get("name", "Unknown Template")
+        
+        wa_conversation = {
+            "last_message": f"Private Note: Shared a template: {template_name}" if mode == "private" else f"You: Shared a template: {template_name}",
+            "last_message_timestamp": now,
+            "last_sender": "agent",
+            "reminder_stage": 0,
+            "next_action_at": now + timedelta(hours=6),
+            "last_message_is_private_note": mode == "private"
+        }
+
+        conversation = db[f"conversations_{org_id}"].find_one_and_update(
+            {"conversation_id": f"whatsapp_{recipient_id}"},
+            {"$set": wa_conversation},
+            return_document=ReturnDocument.AFTER  
+        )
+
+        if conversation and "_id" in conversation:
+            conversation["_id"] = str(conversation["_id"])
+
+        await broadcast_main_ws(
+            platform_id=connection.get("wa_id"),
+            platform_type="whatsapp",
+            event_type="conversation_updated",
+            payload={"conversation": conversation}
+        )
+
+        # Store message in WhatsApp-specific collection
+        mid = await store_whatsapp_message(
+            org_id=org_id,
+            content=f"Shared a template {template_name}",
+            conversation_id=f"whatsapp_{recipient_id}",
+            customer_phone_no=recipient_id,
+            type="template",
+            payload=template,
+            sender_name="Agent",
+            recipient_id=wa_id,
+            role=MessageRole.AGENT,
+            mode=mode,
+            message_id=message_id,
+            raw_data=response_data,
+            status="delivered" if mode == "private" else "sending",
+            temp_id=temp_id,
+            context=context,
+            context_type=context_type
+        )
+        
+        return {"message": "Message sent", "message_id": mid}
+    
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error sending WhatsApp template message: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to send template message: {str(e)}"
         )
 
 async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
@@ -1074,3 +1185,73 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
             }
         }
         
+
+async def create_templates(org_id:str, wa_id:str, access_token:str, template_name:str, language:str,category:str, components:list):
+    """
+    Create a WhatsApp message template for an organization.
+
+    Args:
+        org_id: The organization ID
+        wa_id: The WhatsApp Business Account ID
+        access_token: The access token for the WhatsApp Business Account
+        template_name: The name of the template
+        language: The language of the template
+        components: The components of the template
+    """
+
+    url = f"https://graph.facebook.com/v24.0/{wa_id}/message_templates"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    data = {
+        "name": template_name,
+        "language": language,
+        "category": category,
+        "components": components,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            response = await client.post(url, headers=headers, json=data)
+
+        logger.info(
+            f"WhatsApp API response | org_id={org_id} wa_id={wa_id} template={template_name} "
+            f"status={response.status_code} response={response.json()}"
+        )
+        if response.status_code != 200:
+            error_payload = response.json() if response.content else {}
+            logger.error(
+                f"WhatsApp API error | org_id={org_id} wa_id={wa_id} template={template_name} "
+                f"status={response.status_code} response={error_payload}"
+            )
+
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=error_payload or "Failed to create WhatsApp message template"
+            )
+        logger.info(
+            f"WhatsApp template created | org_id={org_id} wa_id={wa_id} "
+            f"template={template_name}"
+        )
+
+        return response.json()
+
+    except httpx.RequestError as e:
+        logger.error(
+            f"WhatsApp API request failed | org_id={org_id} wa_id={wa_id} error={str(e)}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to reach WhatsApp API"
+        )
+
+    except Exception as e:
+        logger.exception(
+            f"Unexpected error creating WhatsApp template | org_id={org_id}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error while creating WhatsApp template"
+        )

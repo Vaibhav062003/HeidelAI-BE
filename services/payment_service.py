@@ -16,23 +16,24 @@ from core.logger import get_logger
 from config.settings import CASHFREE_URL, CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_VERSION
 from typing import Literal
 
-from services.clerk_service import create_organization
-
 logger = get_logger(__name__)
 db = get_mongo_db()
 
 
 async def create_subscription(
-    plan_id: Literal["growth_monthly", "growth_yearly"],
+    plan_id: Literal["growth_monthly_inr", "growth_yearly_inr", "growth_monthly_test", "growth_monthly_inr_test"],
     customer_full_name: str,
     customer_email: str,
     customer_phone: str,
+    session_id: str
 ):
     # 1. Define Plan Configurations (Amount & Interval)
     # You might want to fetch this from a DB or config file
     PLAN_CONFIG = {
-        "growth_monthly": {"amount": 2199.00, "days": 30}, 
-        "growth_yearly":  {"amount": 23748.00, "days": 365}
+        "growth_monthly_inr": {"amount": 2199.00, "days": 30}, 
+        "growth_yearly_inr":  {"amount": 23748.00, "days": 365},
+        "growth_monthly_test": {"amount": 2.00, "days": 30},
+        "growth_monthly_inr_test": {"amount": 2.00, "days": 1}
     }
     
     if plan_id not in PLAN_CONFIG:
@@ -71,17 +72,18 @@ async def create_subscription(
         # IMMEDIATE PAYMENT CONFIGURATION
         "authorization_details": {
             "authorization_amount": plan_amount, # User pays this IMMEDIATELY
-            "authorization_amount_refund": False # Do not refund it
+            "authorization_amount_refund": False, # Do not refund it
+            "payment_methods": ["enach", "upi", "card"] # Let user choose between card and netbanking for the first payment
         },
         "subscription_expiry_time": expiry_date,
         "subscription_first_charge_time": subscription_first_charge_time, # Set to next month/year
         "subscription_meta": {
-            "return_url": f"https://development.heidelai.com/payment/status?sub_id={subscription_id}",
+            "return_url": f"https://heidelai.com/api/payment/callback?sub_id={subscription_id}",
             "notification_channel": ["SMS", "EMAIL"],
             "session_id_expiry": session_expiry
         },
         "subscription_tags" : {
-            "psp_note": f"Subscription for {plan_id}"
+            "psp_note": f"{session_id}"
         }
     }
 
@@ -249,7 +251,11 @@ async def mark_mandate_status(data: dict, event_time: datetime):
     if auth_status == "FAILED":
         db.subscriptions.update_one(
             {"subscription_id": subscription_id},
-            {"$set": {"mandate_active": False, "mandate_status": "FAILED", "updated_at": datetime.utcnow()}}
+            {"$set": {
+                "mandate_active": False, 
+                "mandate_status": "FAILED", 
+                "updated_at": datetime.utcnow()
+            }}
         )
     else:
         db.subscriptions.update_one(
@@ -343,7 +349,7 @@ async def mark_payment_success(data: dict, event_time: datetime):
     session_id = subscription.get("session_id")
     clerk_user_id = subscription.get("clerk_user_id")
     
-    session = db.sessions.find_one_and_update(
+    db.onboarding_sessions.update_one(
         {"session_id": session_id},
         {"$set": 
             {
@@ -351,27 +357,9 @@ async def mark_payment_success(data: dict, event_time: datetime):
                 "next_step" : "FLOW_COMPLETED"
             }
         },
-        return_document=ReturnDocument.AFTER
-        )
+    )
     
-    org_name = f"{session.get('first_name')}'s Organization"
-    max_allowed_members = session.get("max_allowed_members", 4)
-    owner = {
-        "clerk_user_id": clerk_user_id,
-        "owner_email": session.get("owner_email"),
-        "owner_first_name": session.get("owner_first_name"),
-        "owner_last_name": session.get("owner_last_name"),
-        "owner_phone_number": session.get("owner_phone_number")
-    }
     
-    # 3. Create Organization for paid plan subscribers
-    organization = await create_organization(
-        org_name=org_name,
-        max_allowed_members=max_allowed_members,
-        session_id=session_id,
-        owner=owner,
-        plan=plan_id
-    )    
 
 async def mark_payment_failed(data: dict, event_time: datetime):
     """
@@ -482,8 +470,7 @@ async def handle_card_expiry(data: dict, event_time: datetime):
         }
     )
 
-
-
+# Consumed by SSE
 async def subscription_status_generator(sub_id: str):
     """
     Yields the subscription status.

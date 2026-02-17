@@ -34,6 +34,12 @@ async def cleanup_client(client_id: str):
 
     ig_id = meta.get("ig_id")
     wa_id = meta.get("wa_id")
+    user_id = meta.get("user_id")
+
+    if user_id and client_id in services.agent_clients.get(user_id, set()):
+        services.agent_clients[user_id].remove(client_id)
+        if not services.agent_clients[user_id]:
+            del services.agent_clients[user_id]
 
     if ig_id and client_id in services.instagram_clients[ig_id]:
         services.instagram_clients[ig_id].remove(client_id)
@@ -270,3 +276,36 @@ async def broadcast_on_stats_update(
     else:
         logger.warning(f"⚠️ No wa_id found for org {org_id}")
 
+async def broadcast_team_message(org_id: str, conversation_id: str, participants: list, payload: dict):
+    """
+    Broadcast an internal message to all online participants in a team chat.
+    """
+    logger.info(f"📡 Broadcasting team message to participants: {participants}")
+    
+    if not participants:
+        logger.warning(f"⚠️ No participants found for broadcasting in conversation {conversation_id}")
+        return
+
+    safe_payload = jsonable_encoder(payload)
+    
+    for user_id in participants:
+        if user_id in services.agent_clients:
+            for client_id in list(services.agent_clients[user_id]):
+                ws = services.active_clients.get(client_id)
+                if ws:
+                    try:
+                        await ws.send_json({
+                            "type": "new_team_message",
+                            "data": {
+                                "org_id": org_id,
+                                "conversation_id": conversation_id,
+                                **safe_payload
+                            }
+                        })
+                        logger.success(f"Sent team message to agent {user_id} (client {client_id})")
+                    except Exception as e:
+                        logger.error(f"Failed to send team message to {client_id}: {e}")
+                else:
+                    logger.warning(f"WebSocket not found for active client {client_id}")
+        else:
+            pass

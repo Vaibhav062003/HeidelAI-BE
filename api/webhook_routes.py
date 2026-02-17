@@ -9,14 +9,16 @@ from pymongo.errors import DuplicateKeyError
 
 # Internal Modules
 from core.managers import manager
+from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
+from services.heidelai_bot import send_to_chatbot
 from services.wa_service import *
 from services.ig_service import *
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID
 from core.services import services
 from core.logger import get_logger
 
@@ -345,6 +347,96 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
+                                
+                                # Handling messages received on HeidelAI's whatsapp number
+                                if whatsapp_business_id == HEIDELAI_ORG_WA_ID:
+                                    chatbot_response = await send_to_chatbot(
+                                        customer_phone_no=customer_phone_no,
+                                        message_content=content
+                                    )
+                                    
+                                    # Storing messages from customers in the DB
+                                    # Create or update conversation
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=content,
+                                        last_sender="customer",
+                                        mode="reply"
+                                    )
+                                    
+                                    # Store in WhatsApp-specific collections
+                                    message_id = await store_whatsapp_message(
+                                        org_id=org_id,
+                                        content=content,
+                                        conversation_id=conversation_id,
+                                        customer_phone_no=customer_phone_no,
+                                        type=message_type,
+                                        payload=message.get("payload"),
+                                        sender_name=sender_name2,
+                                        recipient_id=whatsapp_business_id,
+                                        role=MessageRole.CUSTOMER,
+                                        message_id=message_id,  # Use the ID from the webhook for deduplication
+                                        raw_data=message,
+                                        mode="reply",
+                                        context_type=context_type,
+                                        context=context
+                                    )
+
+                                    # Storing chatbot response in the DB
+                                    # Create or update conversation
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=chatbot_response,
+                                        last_sender="ai",
+                                        mode="reply"
+                                    )
+                                    
+                                    # Store in WhatsApp-specific collections
+                                    message_id = await store_whatsapp_message(
+                                        org_id=org_id,
+                                        content=chatbot_response,
+                                        conversation_id=conversation_id,
+                                        customer_phone_no=customer_phone_no,
+                                        type=message_type,
+                                        payload=None,
+                                        sender_name='ai',
+                                        recipient_id=whatsapp_business_id,
+                                        role=MessageRole.AI,
+                                        message_id=generate_message_id(),
+                                        raw_data=None,
+                                        mode="reply",
+                                        context_type=context_type,
+                                        context=context
+                                    )
+
+                                    res = await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": chatbot_response,
+                                        "sender_id": HEIDELAI_ORG_WA_ID,
+                                    }, org_id, "reply")
+
+                                    contact_data = {
+                                        "whatsapp_id": whatsapp_business_id,
+                                        "full_name": sender_name2,
+                                        "phone_number": customer_phone_no,
+                                        "country": None,
+                                        "profile_url": None,
+                                        "conversation_id": f"whatsapp_{customer_phone_no}",
+                                        "email": None,
+                                        "categories": []
+                                        }
+
+                                    store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
+
+                                    return {"status": "ok"}
+
+
                             elif message_type in ["image", "video", "document"]:
                                 media_data = message[message_type]
                                 media_url = media_data["url"]
@@ -462,7 +554,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     "conversation": conversation
                                 })
 
-                            
+                            contact_data = {
+                                "whatsapp_id": whatsapp_business_id,
+                                "full_name": sender_name2,
+                                "phone_number": customer_phone_no,
+                                "country": None,
+                                "profile_url": None,
+                                "conversation_id": f"whatsapp_{customer_phone_no}",
+                                "email": None,
+                                "categories": []
+                                }
+
+                            store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
                             return {"status": "ok"}
     
@@ -1005,9 +1108,10 @@ async def cashfree_webhook(request: Request):
         return {"status": "duplicate_ignored"}
 
     try:
+        logger.info(f"Processing Cashfree event: {event_type}")
         await process_cashfree_event(event_type, payload)
 
-        db.webhook_events.update_one(
+        db.cashfree_webhook_events.update_one(
             {"idempotency_key": idempotency_key},
             {"$set": {"processed": True}}
         )

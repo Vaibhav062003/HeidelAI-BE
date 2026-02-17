@@ -1,5 +1,8 @@
 from bson import ObjectId
 from datetime import datetime
+import os
+import base64
+import time
 
 def serialize_mongo(obj):
     if isinstance(obj, ObjectId):
@@ -23,3 +26,10 @@ def serialize_mongo(obj):
         return serialized
 
     return obj
+
+def generate_message_id():
+    timestamp = int(time.time() * 1000)          # milliseconds
+    random_bytes = os.urandom(32)                # 256-bit randomness
+    raw = f"{timestamp}:".encode() + random_bytes
+    message_id = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return message_id
