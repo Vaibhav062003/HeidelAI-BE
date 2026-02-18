@@ -4,6 +4,7 @@ from core.services import services
 from fastapi import WebSocket, WebSocketDisconnect
 from database import get_mongo_db, get_async_mongo_db
 from core.logger import get_logger
+import json
 
 
 logger = get_logger(__name__)
@@ -266,10 +267,6 @@ async def broadcast_on_stats_update(
         "alerts": full_payload.get("alerts", []), # Include full alert details (like hot leads)
         "newLeads": full_payload.get("newLeads", []) # Include the list of new leads
     }
-
-    import json
-    payload_size = len(json.dumps(payload))
-    logger.info(f"📊 Dashboard broadcast payload prepared for {org_id}. Size: {payload_size} bytes. Leads: {len(payload['newLeads'])}, Alerts: {len(payload['alerts'])}")
 
     # Get organization metadata to find platform IDs
     org_data = await async_db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
