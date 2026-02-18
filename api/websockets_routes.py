@@ -4,7 +4,7 @@ from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
 from auth.dependencies import get_current_user
-from services.websocket_service import broadcast_on_stats_update
+from services.websocket_service import broadcast_on_stats_update, handle_unread_event, handle_typing_event, start_heartbeat, cleanup_client
 
 from fastapi.security import HTTPAuthorizationCredentials
 import json

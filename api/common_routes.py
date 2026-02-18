@@ -39,7 +39,9 @@ from services.products_service import (
     delete_product_by_id
 )
 
+from services.wa_service import send_whatsapp_reaction
 from core.logger import get_logger
+
 
 
 logger = get_logger(__name__)

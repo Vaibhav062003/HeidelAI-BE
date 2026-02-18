@@ -5,6 +5,7 @@ from typing import Optional, List, Dict
 from fastapi import HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorCollection
 from pymongo.collection import Collection
+from pymongo.errors import PyMongoError
 from pymongo import ReturnDocument
 from datetime import datetime, timezone, timedelta
 from core.services import services
