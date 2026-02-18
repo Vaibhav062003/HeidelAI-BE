@@ -42,4 +42,4 @@ jobs:
 
       - name: Redeploy Koyeb Instance
         # Replace 'heidelai-backend-dev' with your actual DEV service name
-        run: koyeb service redeploy heidelai-dev
+        run: koyeb service redeploy heidelai-dev/heidelai-dev
