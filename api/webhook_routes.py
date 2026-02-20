@@ -556,7 +556,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             return {"status": "ok"}
     
-    if payload["object"] == "instagram": 
+    if payload["object"] == "instagram":
         if "entry" in payload and len(payload["entry"]) > 0:
             for entry in payload["entry"]:
                 ig_account_id = entry.get("id")
@@ -568,8 +568,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     value = changes.get('value')
 
                     if field == 'comments':
-                        await process_comments_events(value, ig_account_id)
-                    return {"status": "success"}
+                        await process_comments_events(value, ig_account_id, background_tasks)
                 
                 for message in entry.get("messaging", []):
                     # Check if this is a deletion event
@@ -990,6 +989,26 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         context=context,
                     )
                     
+                    if not message_echo:
+                        from services.automation_trigger_handler import check_and_trigger_automations
+
+                        await check_and_trigger_automations(
+                            org_id=org_id,
+                            platform="instagram",
+                            event_type="message_received",
+                            trigger_data={
+                                "platform": "instagram",    
+                                "platform_id": recipient_id,
+                                "conversation_id": conversation_id,
+                                "customer_id": sender_id,
+                                "customer_name": name,
+                                "customer_username": username,
+                                "message_text": message_text,
+                                "message_type": attachment_type,
+                                "message_id": ig_message_id
+                            }
+                        )
+
                     # Check if conversation exists
                     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
                     conversation = conversations_collection.find_one({"conversation_id": conversation_id})
@@ -1060,7 +1079,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     # })
 
     return {"status": "ok"}
-
+        
 @router.post("/cashfree")
 async def cashfree_webhook(request: Request):
 
@@ -1104,3 +1123,5 @@ async def cashfree_webhook(request: Request):
         logger.error(f"Webhook processing failed : {e}")
 
     return {"status": "processed"}
+
+
