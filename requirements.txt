@@ -14,6 +14,7 @@ cloudinary==1.44.1
 colorama==0.4.6
 dateparser==1.2.2
 deprecation==2.1.0
+distro==1.9.0
 dnspython==2.7.0
 docstring_parser==0.17.0
 ecdsa==0.19.1
@@ -41,6 +42,7 @@ httptools==0.6.4
 httpx==0.28.1
 hyperframe==6.1.0
 idna==3.10
+jiter==0.12.0
 jsonpatch==1.33
 jsonpointer==3.0.0
 langchain-core==0.3.72
@@ -52,9 +54,10 @@ langgraph-sdk==0.2.0
 langsmith==0.4.11
 markdown-it-py==3.0.0
 mdurl==0.1.2
-multidict==6.6.3
 motor==3.7.1
+multidict==6.6.3
 numpy==2.3.5
+openai==2.13.0
 openpyxl==3.1.5
 orjson==3.11.1
 ormsgpack==1.10.0
@@ -74,7 +77,7 @@ pydantic-settings==2.10.1
 pydantic_core==2.41.5
 Pygments==2.19.2
 PyJWT==2.10.1
-pymongo==4.15.4
+pymongo==4.15.5
 pyparsing==3.2.3
 python-dateutil==2.9.0.post0
 python-dotenv==1.1.1
@@ -99,6 +102,7 @@ supabase==2.17.0
 supafunc==0.10.1
 tenacity==8.5.0
 tomli==2.2.1
+tqdm==4.67.1
 typer==0.16.0
 typing-inspection==0.4.2
 typing_extensions==4.14.1
