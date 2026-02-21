@@ -687,11 +687,15 @@ async def get_whatsapp_ai_status(conversation_id: str, user: CurrentUser):
             detail=f"Failed to check AI status: {str(e)}"
         )
 
-@router.post("/{whatsapp_id}/conversations/{conversation_id}/toggle_ai")
-async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body: dict, user: CurrentUser):
+@router.post("/conversations/{conversation_id}/toggle_ai")
+async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: CurrentUser):
     """Toggle AI status for a specific WhatsApp conversation"""
     try:
         org_id = user.org_id 
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        wa_id = org_document.get("wa_id")
+        logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
         
@@ -722,8 +726,8 @@ async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body
                 broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
             
             # Broadcast to WhatsApp-specific connections
-            if whatsapp_id in services.whatsapp_connections_map:
-                await broadcast_whatsapp_message(whatsapp_id, "conversation_updated", {
+            if wa_id in services.whatsapp_connections_map:
+                await broadcast_whatsapp_message(wa_id, "conversation_updated", {
                     "conversation": broadcast_conversation
                 })
         
