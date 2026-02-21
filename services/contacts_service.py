@@ -143,10 +143,12 @@ async def update_contact_labels(org_id: str, conversation_id: str, labels: list)
         logger.error(f"MongoDB error while updating labels for {org_id}: {e}")
         raise HTTPException(status_code=500, detail="Database error occurred")
 
+    except HTTPException:
+        raise
+
     except Exception as e:
         logger.error(f"Unexpected error in update_contact_labels: {e}")
         raise HTTPException(status_code=500, detail="Unexpected error occurred")
-
     
 async def add_tag_to_org_metadata(org_id: str, tag: str):
     """Add a tag to the organization's metadata."""
@@ -170,8 +172,7 @@ async def add_label_to_org_metadata(org_id: str, label: str):
         upsert=True
     )
     
-    return result.modified_count > 0
-
+    return result.modified_count > 0 or result.upserted_id is not None
 async def remove_tag_from_org_metadata(org_id: str, tag: str):
     """Remove a tag from the organization's metadata."""
 
