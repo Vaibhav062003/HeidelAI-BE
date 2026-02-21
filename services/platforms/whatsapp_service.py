@@ -20,6 +20,6 @@ class WhatsAppService(BasePlatformService):
         return await send_whatsapp_message(payload, org_id)
 
     async def disconnect(self, org_id: str, connection_id: str) -> dict:
-        await archive_whatsapp_data(org_id, connection_id)
-        # await revoke_whatsapp_access(org_id, connection_id)
-        # return await remove_whatsapp_connection(org_id, connection_id)
+        # await archive_whatsapp_data(org_id, connection_id)
+        await revoke_whatsapp_access(org_id, connection_id)
+        return await remove_whatsapp_connection(org_id, connection_id)
