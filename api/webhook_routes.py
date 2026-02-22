@@ -360,7 +360,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 content = message.get("text", {}).get("body", "")
                                 
                                 # Handling messages received on HeidelAI's whatsapp number
-                                if whatsapp_business_id == HEIDELAI_ORG_WA_ID:
+                                if whatsapp_business_id == HEIDELAI_ORG_WA_ID and not DEV_WEBHOOK_URL:  # Only send to chatbot in production and for HeidelAI's WA number
                                     chatbot_response = await send_to_chatbot(
                                         customer_phone_no=customer_phone_no,
                                         message_content=content
