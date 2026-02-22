@@ -1,7 +1,8 @@
 import os
 from typing import List, Optional
 from dotenv import load_dotenv
-from agno.models.google import Gemini
+from agno.models.azure import AzureOpenAI
+from config.settings import AZURE_MODEL
 from pydantic import BaseModel, Field
 from agno.agent import Agent, RunResponse
 from pymongo import MongoClient
@@ -12,8 +13,9 @@ logger = get_logger(__name__)
 load_dotenv()
 
 MONGODB_URI = os.getenv("MONGODB_URI")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL")
+# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# LLM_MODEL = os.getenv("LLM_MODEL")
 
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client['Cluster0']
@@ -31,6 +33,14 @@ class ConversationSummary(BaseModel):
         ..., description="The sentiment of the conversation: 'positive', 'neutral', or 'negative'.",
         example="positive"
     )
+    tags: List[str] = Field(
+        ..., description="A list of 3-5 specific keywords or tags related to the conversation (e.g., 'product_inquiry', 'pricing', 'macbook').",
+        example=["product_inquiry", "macbook"]
+    )
+    labels: List[str] = Field(
+        ..., description="A list of 1-2 high-level labels or categories for the conversation (e.g., 'Leads', 'Support', 'Urgent').",
+        example=["Leads"]
+    )
     suggestions: List[str] = Field(
         ..., description=(
             "A list of exactly 3 actionable recommendations for the sales agent to improve this specific conversation. "
@@ -42,14 +52,16 @@ class ConversationSummary(BaseModel):
 
 # Agent that uses structured outputs for conversation analysis
 chat_analysis_agent = Agent(
-    model=Gemini(id=LLM_MODEL),  
-    description="You are a customer service assistant. Summarize conversations and assign a priority level.",
+    model=AzureOpenAI(id=AZURE_MODEL),  
+    description="You are a customer service assistant. Summarize conversations and assign a priority level and relevant tags/labels.",
     response_model=ConversationSummary,
     instructions=[
         "Summarize the chat in 2-5 bullet points, keeping it concise and relevant.",
         "Ensure the 'priority' field contains only one of the following values: 'low', 'medium', or 'high' - case sensitive.",
         "The priority should reflect the urgency to buy from the customer, or if they show intent to purchase soon.",
         "Analyze the overall sentiment of the conversation and set the 'sentiment' field to 'positive', 'neutral', or 'negative' - case sensitive.",
+        "Generate 3-5 concise, lowercase tags representing specific topics discussed.",
+        "Generate 1-2 high-level labels/categories (e.g., 'Leads', 'Support', 'Feedback', 'Urgent').",
         "Provide exactly 3 actionable suggestions in the 'suggestions' field, each as a concise bullet point."
     ],
 )

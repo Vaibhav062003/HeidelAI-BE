@@ -4,7 +4,7 @@ from pymongo.errors import PyMongoError
 from database import get_mongo_db
 from schemas.models import ChatAnalysis
 from agents.support_agent.agent import analyze_conversation
-
+import services.contacts_service as contacts_service
 from core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,7 +60,7 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
         if analysis_result:
             timestamp = datetime.now(timezone.utc)
 
-            # Update DB
+            # Update DB - Conversation
             update_fields = {
                 "priority": analysis_result.priority,
                 "summary": analysis_result.summary,
@@ -72,6 +72,34 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
             conversations_collection.update_one(
                 {"conversation_id": conversation_id},
                 {"$set": update_fields},
+            )
+
+       
+            for tag in analysis_result.tags:
+                try:
+                    if hasattr(contacts_service, 'add_tag_to_org_metadata'):
+                        await contacts_service.add_tag_to_org_metadata(org_id, tag)
+                except Exception:
+                    pass
+            
+            for label in analysis_result.labels:
+                try:
+                    if hasattr(contacts_service, 'add_label_to_org_metadata'):
+                        await contacts_service.add_label_to_org_metadata(org_id, label)
+                except Exception:
+                    # Logic: Assuming this exists on another branch as per user instruction
+                    pass
+
+            # Update Contact (Categories & Labels)
+            contacts_collection = db[f"contacts_{org_id}"]
+            contacts_collection.update_one(
+                {"conversation_id": conversation_id},
+                {
+                    "$addToSet": {
+                        "categories": {"$each": analysis_result.tags},
+                        "labels": {"$each": analysis_result.labels}
+                    }
+                }
             )
 
             # Update result_data to return

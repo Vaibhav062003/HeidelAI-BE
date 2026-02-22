@@ -26,6 +26,8 @@ def conversation_doc_to_analysis(doc: dict) -> ChatAnalysis:
         priority=doc.get("priority"),
         sentiment=doc.get("sentiment"),
         suggestions=doc.get("suggestions", []),
+        tags=doc.get("tags", []),
+        labels=doc.get("labels", []),
         last_analyzed=doc.get("last_analyzed"),
     )
 
