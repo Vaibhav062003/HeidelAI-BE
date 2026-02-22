@@ -75,3 +75,6 @@ CLERK_TOKEN = os.getenv("CLERK_TOKEN_KEY")
 
 #HeidelAI Org WA ID
 HEIDELAI_ORG_WA_ID = os.getenv("HEIDELAI_ORG_WA_ID")
+
+# Webhook for Dev
+DEV_WEBHOOK_URL = os.getenv("DEV_WEBHOOK_URL")
