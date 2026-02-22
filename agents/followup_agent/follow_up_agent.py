@@ -1,9 +1,9 @@
 from agno.agent import Agent, RunResponse
-from agno.models.google import Gemini
 from pydantic import BaseModel, Field
-
-from config.settings import LLM_MODEL
+from agno.models.azure import AzureOpenAI
 from database import get_mongo_db
+from config.settings import AZURE_MODEL
+from langsmith import traceable
 
 db = get_mongo_db()
 
@@ -31,7 +31,9 @@ class FollowUpAgentResponse(BaseModel):
 
 
 follow_up_agent = Agent(
-    model=Gemini(id=LLM_MODEL),
+    model=AzureOpenAI(
+        id=AZURE_MODEL
+    ),
     description=(
         "AI assistant that creates polite and professional follow-up messages for sales agents "
         "based on past conversations with customers who haven't replied."
@@ -51,7 +53,7 @@ follow_up_agent = Agent(
     ],
 )
 
-
+@traceable(run_type="llm", name="follow-up-agent", metadata={"model": AZURE_MODEL})
 def generate_followup_message(conversation: str) -> FollowUpAgentResponse:
     """
     Generates a follow-up message using the follow_up_agent.
@@ -67,3 +69,15 @@ def generate_followup_message(conversation: str) -> FollowUpAgentResponse:
         return response.content
     else:
         raise ValueError("AI response is not in the expected format")
+
+if __name__ == "__main__":
+    conversation = """
+    Customer: Hi, I'm interested in your product but I have some questions.
+    Agent: Hi! I'd be happy to help. What questions do you have about our product?
+    Customer: Can you tell me more about the features?
+    Agent: Sure! Our product offers a range of features including A, B, and C. Is there a specific feature you're interested in?
+    Customer: Yes, I'm particularly interested in feature B. I'll get back to you after I review the information.
+    """
+    followup_response = generate_followup_message(conversation)
+    print(f"Follow-up Message: {followup_response.followup}")
+    print(f"Delay: {followup_response.delay}")
