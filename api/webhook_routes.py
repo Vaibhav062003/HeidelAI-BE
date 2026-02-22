@@ -99,7 +99,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     # First, validate the signature
     body = await request.body()
 
-    if background_tasks:
+    if background_tasks and DEV_WEBHOOK_URL:
         # Cherry-pick only the necessary headers. 
         # Don't forward the 'Host' header, as that will confuse your dev server.
         forward_headers = {
