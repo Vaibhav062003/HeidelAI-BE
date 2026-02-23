@@ -6,6 +6,7 @@ from fastapi import Request, Header, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
+import httpx
 
 # Internal Modules 
 from core.managers import manager
@@ -18,13 +19,27 @@ from services.wa_service import *
 from services.ig_service import *
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL
 from core.services import services
 from core.logger import get_logger
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
 logger = get_logger(__name__)
+
+async def forward_webhook_to_dev(body: bytes, headers: dict):
+    """
+    Forwards the raw webhook body and necessary headers to the dev environment.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            # We use `content=body` to send the exact raw bytes, 
+            # preserving the integrity of the payload for signature validation.
+            response = await client.post(DEV_WEBHOOK_URL, content=body, headers=headers)
+            response.raise_for_status()
+            logger.info(f"Successfully replicated webhook to Dev. Status: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Failed to forward webhook to Dev: {e}")
 
 def validate_signature(payload, signature):
     # Hash the payload with the app secret
@@ -49,18 +64,7 @@ async def signature_required(request: Request, x_hub_signature_256: str = Header
     if not validate_signature(payload, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
-# def validate_signature(payload, signature):
-#     expected_signature = hmac.new(
-#         bytes(APP_SECRET, 'latin-1'),
-#         msg=payload.encode('utf-8'),
-#         digestmod=hashlib.sha256
-#     ).hexdigest()
-    
-#     computed_signature = f"sha256={expected_signature}"
-#     print(f"Computed Signature: {computed_signature}")
-#     print(f"Received Signature: {signature}")
-    
-#     return hmac.compare_digest(computed_signature, signature)
+    return True # Added this return so the check in handle_webhook evaluates correctly
 
 def remove_expired_message_ids():
     current_time = time.time()
@@ -88,15 +92,22 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     """
     This weebhook accepts POST requests from 
     """
+    await signature_required(request, x_hub_signature_256)
 
-    if not signature_required(request, x_hub_signature_256):
-        # print("APP SECRET:", APP_SECRET)
-        raise HTTPException(status_code=403, detail="Invalid signature")
-    else:
-        logger.success("Signature validated successfully.")
+    logger.success("Signature validated successfully.")
 
     # First, validate the signature
     body = await request.body()
+
+    if background_tasks and DEV_WEBHOOK_URL:
+        # Cherry-pick only the necessary headers. 
+        # Don't forward the 'Host' header, as that will confuse your dev server.
+        forward_headers = {
+            "x-hub-signature-256": x_hub_signature_256,
+            "Content-Type": request.headers.get("content-type", "application/json")
+        }
+        background_tasks.add_task(forward_webhook_to_dev, body, forward_headers)
+
     payload_str = body.decode('utf-8')
 
     # payload_str = request.state.payload_body.decode('utf-8')
@@ -349,7 +360,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 content = message.get("text", {}).get("body", "")
                                 
                                 # Handling messages received on HeidelAI's whatsapp number
-                                if whatsapp_business_id == HEIDELAI_ORG_WA_ID:
+                                if whatsapp_business_id == HEIDELAI_ORG_WA_ID and not DEV_WEBHOOK_URL:  # Only send to chatbot in production and for HeidelAI's WA number
                                     chatbot_response = await send_to_chatbot(
                                         customer_phone_no=customer_phone_no,
                                         message_content=content

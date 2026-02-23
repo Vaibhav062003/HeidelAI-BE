@@ -63,7 +63,7 @@ async def process_scheduled_messages():
             continue
 
         try:
-            await service.send_message(
+            send_msg_response = await service.send_message(
                 sender_id=sender_id, 
                 recipient_id=receiver_id, 
                 message=message,
@@ -71,6 +71,8 @@ async def process_scheduled_messages():
                 org_id=org_id,
                 conversation_id=conversation_id
             )
+
+            logger.info(f"send_message response for {receiver_id} on {platform}: {send_msg_response}")
 
             updates.append(
                 UpdateOne(

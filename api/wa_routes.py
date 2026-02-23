@@ -148,6 +148,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
                 detail="Failed to subscribe WhatsApp account to webhook"
             )
         
+        # TODO: test out if register step is needed or not
         # Check if phone number is verified
         if phone_verified != "VERIFIED":
             logger.warning(f"Phone number {phone} is currently {phone_verified}. Attempting registration to fix this...")
