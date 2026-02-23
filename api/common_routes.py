@@ -69,10 +69,12 @@ def favicon():
 
 @router.get("/api/conversations")
 async def get_conversations(
-    user: CurrentUser
+    user: CurrentUser,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100) # Limit max fetch to 100
 ):
     """
-    Get conversations for the current user's organization, 
+    Get conversations for the current user's organization
     """
     try:
         org_id = user.org_id
@@ -81,7 +83,9 @@ async def get_conversations(
 
         return await fetch_conversations_new(
             org_id=org_id,
-            current_user_id=user.user_id
+            current_user_id=user.user_id,
+            skip=skip,
+            limit=limit
         )
 
     except HTTPException:
