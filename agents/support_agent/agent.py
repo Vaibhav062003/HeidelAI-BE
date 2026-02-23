@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from agno.agent import Agent, RunResponse
 from pymongo import MongoClient
 from core.logger import get_logger
-
+import json
 logger = get_logger(__name__)
 
 load_dotenv()
@@ -34,11 +34,11 @@ class ConversationSummary(BaseModel):
         example="positive"
     )
     tags: List[str] = Field(
-        ..., description="A list of 3-5 specific keywords or tags related to the conversation (e.g., 'product_inquiry', 'pricing', 'macbook').",
+        default=[], description="A list of 1-2 tags selected from the provided available tags list. Only use tags from the provided list. Return empty list if no available tags are provided.",
         example=["product_inquiry", "macbook"]
     )
     labels: List[str] = Field(
-        ..., description="A list of 1-2 high-level labels or categories for the conversation (e.g., 'Leads', 'Support', 'Urgent').",
+        default=[], description="A list of 1-2 labels selected from the provided available labels list. Only use labels from the provided list. Return empty list if no available labels are provided.",
         example=["Leads"]
     )
     suggestions: List[str] = Field(
@@ -60,26 +60,33 @@ chat_analysis_agent = Agent(
         "Ensure the 'priority' field contains only one of the following values: 'low', 'medium', or 'high' - case sensitive.",
         "The priority should reflect the urgency to buy from the customer, or if they show intent to purchase soon.",
         "Analyze the overall sentiment of the conversation and set the 'sentiment' field to 'positive', 'neutral', or 'negative' - case sensitive.",
-        "Generate 3-5 concise, lowercase tags representing specific topics discussed.",
-        "Generate 1-2 high-level labels/categories (e.g., 'Leads', 'Support', 'Feedback', 'Urgent').",
-        "Provide exactly 3 actionable suggestions in the 'suggestions' field, each as a concise bullet point."
+        "Provide exactly 3 actionable suggestions in the 'suggestions' field, each as a concise bullet point.",
+        "For tags and labels: You MUST ONLY select from the available tags/labels list provided in the conversation input. Do NOT create or invent new tags or labels.",
+        "Pick 1-2 tags and 1-2 labels that best match the conversation from the provided lists. if there is no match found in the provided list,strictly return empty array for tags and labels.",
     ],
 )
 
 # Function to analyze a conversation
-async def analyze_conversation(conversation: str) -> Optional[ConversationSummary]:
+async def analyze_conversation(conversation: str, available_tags: list = None, available_labels: list = None) -> Optional[ConversationSummary]:
     """
     Analyzes the given conversation to generate a summary and priority level.
 
     Args:
         conversation (str): The entire conversation as a single string.
+        available_tags (list): Predefined tags from org metadata. LLM must pick only from these.
+        available_labels (list): Predefined labels from org metadata. LLM must pick only from these.
 
     Returns:
         ConversationSummary: The summary and priority level.
     """
 
-    response: RunResponse = await chat_analysis_agent.arun(conversation)
-    # print(type(response))
+    prompt = json.dumps({
+        "conversation": conversation,
+        "available_tags": available_tags or [],
+        "available_labels": available_labels or []
+    }, indent=2)
+
+    response: RunResponse = await chat_analysis_agent.arun(prompt)
     if isinstance(response.content, ConversationSummary):
         return response.content
 

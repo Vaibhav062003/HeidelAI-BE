@@ -62,6 +62,8 @@ class ChatAnalysis(BaseModel):
     priority: Optional[Literal["low", "medium", "high"]] = None
     sentiment: Optional[Literal["positive", "neutral", "negative"]] = None
     suggestions: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    labels: List[str] = Field(default_factory=list)
     last_analyzed: Optional[datetime] = None
 
 class UnarchiveRequest(BaseModel):
