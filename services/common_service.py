@@ -23,11 +23,9 @@ logger = get_logger(__name__)
 
 db = get_mongo_db()
 
-async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = None) -> List[Dict]:
+async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = None, skip: int = 0, limit: int = 50) -> List[Dict]:
     start_time = time.time()
-
     async_db = get_async_mongo_db()
-
     collection = async_db[f"conversations_{org_id}"]
 
     projection = {
@@ -59,7 +57,8 @@ async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = 
         collection
         .find(query, projection)
         .sort("last_message_timestamp", -1)
-        .batch_size(1000)
+        .skip(skip)   # <-- Added skip
+        .limit(limit) # <-- Added limit
     )
 
     # Fetch all docs
