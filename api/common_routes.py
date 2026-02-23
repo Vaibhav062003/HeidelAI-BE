@@ -74,7 +74,9 @@ async def get_conversations(
     limit: int = Query(50, ge=1, le=100), # Limit max fetch to 100
     search: Optional[str] = None,
     active_tab: str = Query("all"),
-    unread_only: bool = Query(False) 
+    unread_only: bool = Query(False),
+    platform: Optional[str] = None,
+    priority: Optional[str] = None
 ):
     """
     Get conversations for the current user's organization
@@ -91,7 +93,9 @@ async def get_conversations(
             limit=limit,
             search=search,
             active_tab=active_tab,
-            unread_only=unread_only
+            unread_only=unread_only,
+            platform=platform,
+            priority=priority
         )
 
     except HTTPException:

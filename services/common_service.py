@@ -30,7 +30,9 @@ async def fetch_conversations_new(
     limit: int = 50,
     search: Optional[str] = None,
     active_tab: str = "all",
-    unread_only: bool = False
+    unread_only: bool = False,
+    platform: Optional[str] = None,
+    priority: Optional[str] = None
 ) -> List[Dict]:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -73,6 +75,17 @@ async def fetch_conversations_new(
     # Unread filter
     if unread_only:
         base_conditions.append({"unread_count": {"$gt": 0}})
+
+    # Platform Filter
+    if platform:
+        # Split "whatsapp,instagram" into ["whatsapp", "instagram"]
+        platform_list = [p.strip() for p in platform.split(",")]
+        base_conditions.append({"platform": {"$in": platform_list}})
+
+    # Priority Filter
+    if priority:
+        priority_list = [p.strip() for p in priority.split(",")]
+        base_conditions.append({"priority": {"$in": priority_list}})
 
     # Search filter
     if search:
