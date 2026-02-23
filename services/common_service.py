@@ -23,7 +23,15 @@ logger = get_logger(__name__)
 
 db = get_mongo_db()
 
-async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = None, skip: int = 0, limit: int = 50) -> List[Dict]:
+async def fetch_conversations_new(
+    org_id: str, 
+    current_user_id: Optional[str] = None, 
+    skip: int = 0, 
+    limit: int = 50,
+    search: Optional[str] = None,
+    active_tab: str = "all",
+    unread_only: bool = False
+) -> List[Dict]:
     start_time = time.time()
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{org_id}"]
@@ -43,15 +51,43 @@ async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = 
     # Filtering logic for Team Chat
     # 1. Customer conversations: type != "team"
     # 2. Team conversations: type == "team" AND current_user_id in participants
-    query = {
-        "$or": [
-            {"type": {"$ne": "team"}},
-            {
-                "type": "team",
-                "participants": current_user_id
-            }
-        ]
-    }
+    # TODO: seperate out the team and non-team conversations filtering don't add both in one call
+    base_conditions = [
+        {
+            "$or": [
+                {"type": {"$ne": "team"}},
+                {
+                    "type": "team",
+                    "participants": current_user_id
+                }
+            ]
+        }
+    ]
+
+    # Tab filters
+    if active_tab == "open":
+        base_conditions.append({"status": {"$in": ["open", "follow-up"]}})
+    elif active_tab == "closed":
+        base_conditions.append({"status": "closed"})
+
+    # Unread filter
+    if unread_only:
+        base_conditions.append({"unread_count": {"$gt": 0}})
+
+    # Search filter
+    if search:
+        # $options: "i" makes the search case-insensitive
+        search_regex = {"$regex": search, "$options": "i"}
+        base_conditions.append({
+            "$or": [
+                {"customer_name": search_regex},
+                {"last_message": search_regex},
+                {"conversation_id": search_regex}
+            ]
+        })
+
+    # Final query
+    query = {"$and": base_conditions} if base_conditions else {}
 
     cursor = (
         collection
@@ -62,7 +98,7 @@ async def fetch_conversations_new(org_id: str, current_user_id: Optional[str] = 
     )
 
     # Fetch all docs
-    raw_docs = await cursor.to_list(length=None)
+    raw_docs = await cursor.to_list(length=limit)
 
     fetch_time = time.time()
     logger.info(f"[TIMING] Mongo fetch: {fetch_time - start_time:.4f}s")

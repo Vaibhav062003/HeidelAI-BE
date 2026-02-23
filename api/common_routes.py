@@ -71,7 +71,10 @@ def favicon():
 async def get_conversations(
     user: CurrentUser,
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100) # Limit max fetch to 100
+    limit: int = Query(50, ge=1, le=100), # Limit max fetch to 100
+    search: Optional[str] = None,
+    active_tab: str = Query("all"),
+    unread_only: bool = Query(False) 
 ):
     """
     Get conversations for the current user's organization
@@ -85,7 +88,10 @@ async def get_conversations(
             org_id=org_id,
             current_user_id=user.user_id,
             skip=skip,
-            limit=limit
+            limit=limit,
+            search=search,
+            active_tab=active_tab,
+            unread_only=unread_only
         )
 
     except HTTPException:
