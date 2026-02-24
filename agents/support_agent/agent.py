@@ -63,8 +63,7 @@ chat_analysis_agent = Agent(
         "Provide exactly 3 actionable suggestions in the 'suggestions' field, each as a concise bullet point.",
         "For tags and labels: You MUST ONLY select from the available tags/labels list provided in the conversation input. Do NOT create or invent new tags or labels.",
         "Pick 1-2 tags and 1-2 labels that best match the conversation from the provided lists. if there is no match found in the provided list,strictly return empty array for tags and labels.",
-        "for labels analyse the conversation and check if the conversation is about a new customer, new order, pending payment, paid, order complete, lead, quote shared, or any other category. and select the label that best matches the conversation from the provided lists. if there is no match found in the provided list,strictly return empty array for labels.",
-    ],
+        "For labels: analyze the conversation's context and intent, then select the single best-matching label from the provided available labels list. Do NOT use any label that is not in the provided list. If no label in the provided list fits, return an empty array.",    ],
 )
 
 # Function to analyze a conversation
