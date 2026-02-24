@@ -1,7 +1,7 @@
-# Third-party imports
+# Built-in modules
 import datetime
 
-# Built-in imports
+# Internal modules
 from database import get_mongo_db, get_async_mongo_db
 from core.logger import get_logger
 
