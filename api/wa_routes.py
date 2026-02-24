@@ -19,8 +19,8 @@ from fastapi import (
 # Internal modules
 from core.services import services
 from services.utils import serialize_mongo
-from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates
+from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template, BulkMessageRequest
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, send_bulk_whatsapp_template
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
@@ -1076,3 +1076,71 @@ async def whatsapp_create_template(user: CurrentUser, template: Template):
     except Exception as e:
         logger.error(f"Error creating templates: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create templates: {str(e)}")
+
+
+@router.post("/bulk/send")
+async def bulk_send_whatsapp_message(request: BulkMessageRequest, user: CurrentUser):
+    """
+    Send a WhatsApp approved template message to multiple recipients in a single request.
+
+    - template_name: Must be the name of an APPROVED template in your WhatsApp Business account.
+    - language_code: BCP-47 language code (e.g. 'en', 'en_US', 'hi').
+    - recipients: List of objects with `phone_number` (E.164 without '+') and optional `template_variables`.
+    - delay_seconds: Pause between sends in seconds (minimum 0.5, default 1.0).
+    """
+    try:
+        org_id = user.org_id
+
+        if not request.recipients:
+            raise HTTPException(status_code=400, detail="At least one recipient is required")
+
+        # Look up the org's WhatsApp connection
+        org_document = db.organizations.find_one({"org_id": org_id})
+        if not org_document:
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        wa_id = org_document.get("wa_id")
+        if not wa_id:
+            raise HTTPException(status_code=404, detail="No WhatsApp account connected to this organization")
+
+        logger.success(f"Bulk send | wa_id={wa_id} org_id={org_id}")
+
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0, "access_token": 1, "phone_id": 1}
+        )
+
+        if not connection or "access_token" not in connection:
+            raise HTTPException(
+                status_code=404,
+                detail="WhatsApp connection not found or access token missing"
+            )
+
+        access_token = connection["access_token"]
+        phone_id = connection.get("phone_id")
+
+        if not phone_id:
+            raise HTTPException(status_code=400, detail="Phone ID not found for this WhatsApp connection")
+
+        summary = await send_bulk_whatsapp_template(
+            org_id=org_id,
+            wa_id=wa_id,
+            phone_id=phone_id,
+            access_token=access_token,
+            template_name=request.template_name,
+            language_code=request.language_code,
+            recipients=request.recipients,
+            delay_seconds=request.delay_seconds,
+        )
+
+        return {
+            "status": "success",
+            "message": f"Bulk send complete: {summary['sent']} sent, {summary['failed']} failed",
+            "summary": summary,
+        }
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Error in bulk WhatsApp send: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Bulk send failed: {str(e)}")

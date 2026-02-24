@@ -22,10 +22,12 @@ from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws, broadcast_on_stats_update
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from core.logger import get_logger
+import asyncio
 
 logger = get_logger(__name__)
 db = get_mongo_db()
 mongo_client = get_mongo_client()
+
 
 async def create_or_update_whatsapp_conversation(
     org_id: str, 
@@ -1255,3 +1257,121 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
             status_code=500,
             detail="Internal server error while creating WhatsApp template"
         )
+
+
+async def send_bulk_whatsapp_template(
+    org_id: str,
+    wa_id: str,
+    phone_id: str,
+    access_token: str,
+    template_name: str,
+    language_code: str,
+    recipients: list,
+    delay_seconds: float = 8.0,
+) -> dict:
+    """
+    Send a WhatsApp approved template message to a list of recipients in bulk.
+
+    Args
+        org_id:          Organization ID
+        wa_id:           WhatsApp Business Account ID
+        phone_id:        WhatsApp Phone Number ID (used as sender)
+        access_token:    Meta access token for this connection
+        template_name:   Name of an APPROVED WhatsApp message template
+        language_code:   BCP-47 language code (e.g. "en", "en_US", "hi")
+        recipients:      List of BulkRecipient objects
+        delay_seconds:   Seconds to sleep between API calls (≥ 0.5 recommended)
+
+    Returns:
+        dict with keys: total, sent, failed, results (per-recipient detail)
+    """
+  
+
+    url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    results = []
+    sent = 0
+    failed = 0
+
+    for index, recipient in enumerate(recipients):
+        phone_number = recipient.phone_number
+        template_variables = recipient.template_variables or []
+
+        # Build template components for body parameters if variables provided
+        components = []
+        if template_variables:
+            body_params = [
+                {"type": "text", "text": var} for var in template_variables
+            ]
+            components.append({
+                "type": "body",
+                "parameters": body_params
+            })
+
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": phone_number,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language_code},
+                **({"components": components} if components else {})
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
+
+            if response.status_code == 200:
+                message_id = response.json().get("messages", [{}])[0].get("id")
+                logger.success(
+                    f"Bulk WA | sent to {phone_number} | msg_id={message_id} | org={org_id}"
+                )
+                results.append({
+                    "phone_number": phone_number,
+                    "status": "sent",
+                    "message_id": message_id,
+                })
+                sent += 1
+            else:
+                error_detail = response.json().get("error", {}).get("message", response.text)
+                logger.error(
+                    f"Bulk WA | failed for {phone_number} | error={error_detail} | org={org_id}"
+                )
+                results.append({
+                    "phone_number": phone_number,
+                    "status": "failed",
+                    "error": error_detail,
+                })
+                failed += 1
+
+        except Exception as e:
+            logger.error(f"Bulk WA | exception for {phone_number} | error={str(e)} | org={org_id}")
+            results.append({
+                "phone_number": phone_number,
+                "status": "failed",
+                "error": str(e),
+            })
+            failed += 1
+
+        # Rate-limit delay — skip after the last recipient
+        if index < len(recipients) - 1:
+            await asyncio.sleep(max(delay_seconds, 0.5))
+
+    logger.info(
+        f"Bulk WA broadcast complete | org={org_id} | total={len(recipients)} "
+        f"sent={sent} failed={failed}"
+    )
+
+    return {
+        "total": len(recipients),
+        "sent": sent,
+        "failed": failed,
+        "results": results,
+    }
