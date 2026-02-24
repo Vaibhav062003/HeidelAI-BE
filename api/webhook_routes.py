@@ -355,14 +355,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "mid": replied_message_id
                                     }
                             # Get conversation doc to check if AI is enabled
-                            convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
-                            is_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else False
+                            # convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                            # is_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else False
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
                                 
                                 # Handling messages received on HeidelAI's whatsapp number
-                                if (whatsapp_business_id == HEIDELAI_ORG_WA_ID) and (is_ai_enabled):  # Only send to chatbot in production and for HeidelAI's WA number
+                                # if (whatsapp_business_id == HEIDELAI_ORG_WA_ID) and (is_ai_enabled):  # Only send to chatbot in production and for HeidelAI's WA number
+                                if (whatsapp_business_id == HEIDELAI_ORG_WA_ID): # Only send to chatbot in production and for HeidelAI's WA number
                                     if ENVIRONMENT == "production":
                                         # Storing messages from customers in the DB
                                         # Create or update conversation
