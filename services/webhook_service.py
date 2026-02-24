@@ -2,11 +2,10 @@
 import datetime
 
 # Internal modules
-from database import get_mongo_db, get_async_mongo_db
+from database import get_mongo_db
 from core.logger import get_logger
 
 logger = get_logger(__name__)
-db = get_mongo_db()
 
 async def calculate_whatsapp_repy_window(message_payload):
     """
