@@ -592,3 +592,31 @@ async def delete_whatsapp_template(user: CurrentUser, template_name: str):
             status_code=500,
             detail="Internal Server Error during deletion."
         )
+
+@router.post("/api/organization/toggle_ai")
+async def toggle_whatsapp_ai_status(user: CurrentUser, body: dict):
+    """Toggle AI status for a specific organization"""
+    try:
+        org_id = user.org_id 
+        ai_enabled = body.get("enabled")
+        
+        if ai_enabled is None:
+            return {"status": "error", "message": "Incorrect request body"}
+        
+        # Update the organization
+        result = db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"is_ai_enabled": ai_enabled}}
+        )
+        
+        if result.matched_count == 0:
+            return {"status": "error", "message": "Organization not found"}
+        
+        return {"status": "success", "message": f"AI status updated to {ai_enabled}"}
+    
+    except Exception as e:
+        logger.error(f"Error updating WhatsApp AI status: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to update AI status: {str(e)}"
+        )
