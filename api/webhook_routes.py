@@ -22,6 +22,7 @@ from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT
 from core.services import services
 from core.logger import get_logger
+from services.webhook_service import calculate_whatsapp_repy_window
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -515,6 +516,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 content = f"[Unsupported message type: {message_type}]"
                            
                             logger.info(f"WhatsApp Message Received from {sender_name2}, Message: {content}")
+
+                            reply_window_expiry_time_utc = await calculate_whatsapp_repy_window(message)
                             
                             # Create or update conversation
                             conversation_id = await create_or_update_whatsapp_conversation(
@@ -524,7 +527,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 customer_name=sender_name2,
                                 last_message=content,
                                 last_sender="customer",
-                                mode="reply"
+                                reply_window_expiry=reply_window_expiry_time_utc,
+                                mode="reply",
                             )
                             
                             # Store in WhatsApp-specific collections
