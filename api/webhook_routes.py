@@ -357,6 +357,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Get conversation doc to check if AI is enabled
                             # convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
                             # is_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else False
+
+                            org_doc = db.organizations.find_one({"org_id": org_id},{"is_ai_enabled": 1})
+                            is_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
+
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
@@ -451,6 +455,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                         return {"status": "ok"}
                                     return {"status": "ok"}
+
+                                elif (whatsapp_business_id == "892752546585378") and (is_ai_enabled):  # Parijat academy wa_id
+                                    if ENVIRONMENT == "production":
+                                        pass
+
 
                             elif message_type in ["image", "video", "document"]:
                                 media_data = message[message_type]
