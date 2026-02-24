@@ -14,7 +14,22 @@ async def calculate_whatsapp_repy_window(message_payload):
     """
     # Extract the base timestamp provided by WhatsApp (Unix epoch)
     timestamp_str = message_payload.get("timestamp")
-    message_time_utc = datetime.datetime.fromtimestamp(int(timestamp_str), datetime.timezone.utc)
+    if timestamp_str is None:
+        logger.error("Missing 'timestamp' in WhatsApp message payload: %s", message_payload)
+        raise ValueError("Missing 'timestamp' in WhatsApp message payload")
+    try:
+        message_timestamp = int(timestamp_str)
+        message_time_utc = datetime.datetime.fromtimestamp(
+            message_timestamp,
+            datetime.timezone.utc,
+        )
+    except (TypeError, ValueError, OSError) as exc:
+        logger.error(
+            "Invalid 'timestamp' value in WhatsApp message payload: %s (error: %s)",
+            timestamp_str,
+            exc,
+        )
+        raise ValueError(f"Invalid 'timestamp' value in WhatsApp message payload: {timestamp_str}") from exc
     
     # Check if the message originated from a CTWA ad
     referral = message_payload.get("referral", {})
