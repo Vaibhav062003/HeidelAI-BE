@@ -174,10 +174,10 @@ class Template(BaseModel):
 
 class BulkRecipient(BaseModel):
     phone_number: str  # E.164 format without '+', e.g. "919876543210"
-    template_variables: Optional[List[str]] = None  # Positional body variables for this recipient
 
 class BulkMessageRequest(BaseModel):
-    template_name: str                 # Must be an APPROVED WhatsApp template
-    language_code: str                 # e.g. "en", "en_US", "hi"
-    recipients: List[BulkRecipient]    # At least one recipient required
-    delay_seconds: float = 1.0         # Seconds to wait between each send (min 0.5 recommended)
+    template_name: str                               # Must be an APPROVED WhatsApp template
+    language_code: str                               # e.g. "en", "en_US", "hi"
+    recipients: List[BulkRecipient]                  # At least one recipient required
+    components: Optional[List[Dict[str, Any]]] = None  # Same for all recipients (header, body, etc.)
+    delay_seconds: float = 4.0                       # Seconds to wait between each send

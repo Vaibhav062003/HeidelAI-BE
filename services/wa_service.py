@@ -1140,12 +1140,10 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
     Fetch WhatsApp message templates associated with an organization.
 
     This function retrieves:
-    1. Pre-built (Meta-provided) WhatsApp message templates.
-    2. User-created WhatsApp templates linked to the given WhatsApp Business Account (wa_id).
+    - User-created WhatsApp templates linked to the given WhatsApp Business Account (wa_id).
 
     Behavior:
     - If `wa_id` is provided, the function fetches templates created under that WhatsApp account.
-    - If `wa_id` is None or no user-created templates exist, only pre-built templates are returned.
     - Uses the provided `access_token` to authenticate requests to the WhatsApp (Meta) Graph API.
     """
 
@@ -1254,6 +1252,7 @@ async def send_bulk_whatsapp_template(
     template_name: str,
     language_code: str,
     recipients: list,
+    components: Optional[list] = None,
     delay_seconds: float = 8.0,
 ) -> dict:
     """
@@ -1286,29 +1285,22 @@ async def send_bulk_whatsapp_template(
 
     for index, recipient in enumerate(recipients):
         phone_number = recipient.phone_number
-        template_variables = recipient.template_variables or []
 
-        # Build template components for body parameters if variables provided
-        components = []
-        if template_variables:
-            body_params = [
-                {"type": "text", "text": var} for var in template_variables
-            ]
-            components.append({
-                "type": "body",
-                "parameters": body_params
-            })
+        template_payload = {
+            "name": template_name,
+            "language": {"code": language_code},
+        }
+        if components:
+            template_payload["components"] = components
+
+        logger.info(f"Bulk WA | sending to {phone_number} | template={template_name} | components={components}")
 
         payload = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": phone_number,
             "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": language_code},
-                **({"components": components} if components else {})
-            }
+            "template": template_payload
         }
 
         try:

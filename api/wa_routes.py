@@ -1090,6 +1090,7 @@ async def bulk_send_whatsapp_message(request: BulkMessageRequest, user: CurrentU
     """
     try:
         org_id = user.org_id
+        logger.info(f"Bulk WA send request received | org_id={org_id} | payload={request.model_dump()}")
 
         if not request.recipients:
             raise HTTPException(status_code=400, detail="At least one recipient is required")
@@ -1130,6 +1131,7 @@ async def bulk_send_whatsapp_message(request: BulkMessageRequest, user: CurrentU
             template_name=request.template_name,
             language_code=request.language_code,
             recipients=request.recipients,
+            components=request.components,
             delay_seconds=request.delay_seconds,
         )
 
