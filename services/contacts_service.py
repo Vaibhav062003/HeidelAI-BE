@@ -178,6 +178,7 @@ async def add_label_to_org_metadata(org_id: str, label: str):
     )
     
     return result.modified_count > 0 or result.upserted_id is not None
+    
 async def remove_tag_from_org_metadata(org_id: str, tag: str):
     """Remove a tag from the organization's metadata."""
 

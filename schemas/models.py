@@ -88,6 +88,14 @@ class UpdateCategoriesRequest(BaseModel):
     conversation_id: str = Field(..., description="Unique conversation ID of the contact")
     categories: List[str] = Field(..., description="List of categories to assign to this contact")
 
+class UpdateLabelsRequest(BaseModel):
+    conversation_id: str = Field(..., description="Unique conversation ID of the contact")
+    labels: List[str] = Field(..., description="List of labels to assign to this contact")
+
+class UpdateTagsRequest(BaseModel):
+    conversation_id: str = Field(..., description="Unique conversation ID of the contact")
+    tags: List[str] = Field(..., description="List of tags to assign to this contact")
+
 class SendReactionRequest(BaseModel):
     message_id: str = Field(..., description="Message ID of the message to react to")
     emoji: str = Field(..., description="Emoji to react with")

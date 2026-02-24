@@ -11,7 +11,7 @@ import httpx
 
 from auth.dependencies import CurrentUser
 from core.services import services
-from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, CannedResponse, SendReactionRequest
+from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, UpdateLabelsRequest, CannedResponse, SendReactionRequest
 from services.conversation_utils import reopen_conversation
 from services.common_service import (
     fetch_conversations_new, 
@@ -319,19 +319,16 @@ async def update_contact_categories(body: UpdateCategoriesRequest, user: Current
     return await update_contact_tag_categories(org_id, body.conversation_id, body.categories)
 
 @router.post("/api/contacts/update-labels")
-async def update_contact_labels_endpoint(body: UpdateCategoriesRequest, user: CurrentUser):
+async def update_contact_labels_endpoint(body: UpdateLabelsRequest, user: CurrentUser):
     """
     Replace the labels array for a specific contact.
     """
-    # Note: Using UpdateCategoriesRequest as a temporary solution since it has the same structure (conversation_id, categories/labels)
-    # The frontend should send {conversation_id: "...", categories: ["label1", "label2"]} 
-    # but we map 'categories' to 'labels' in the service call for consistency with how Pydantic handles the body.
     org_id = user.org_id
 
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
     
-    return await update_contact_labels(org_id, body.conversation_id, body.categories)
+    return await update_contact_labels(org_id, body.conversation_id, body.labels)
 
 
 @router.get("/api/products")
