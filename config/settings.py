@@ -78,8 +78,8 @@ DEV_WEBHOOK_URL = os.getenv("DEV_WEBHOOK_URL")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT")
 
-#HeidelAI Org WA ID
 HEIDELAI_ORG_WA_ID = os.getenv("HEIDELAI_ORG_WA_ID")
+PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
 
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"

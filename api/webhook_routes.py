@@ -19,7 +19,7 @@ from services.wa_service import *
 from services.ig_service import *
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID
 from core.services import services
 from core.logger import get_logger
 
@@ -357,9 +357,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Get conversation doc to check if AI is enabled
                             # convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
                             # is_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else False
+                            
 
                             org_doc = db.organizations.find_one({"org_id": org_id},{"is_ai_enabled": 1})
-                            is_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
+                            is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
 
                             # Extract message content based on message type
                             if message_type == "text":
@@ -456,8 +457,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         return {"status": "ok"}
                                     return {"status": "ok"}
 
-                                elif (whatsapp_business_id == "892752546585378") and (is_ai_enabled):  # Parijat academy wa_id
-                                    if ENVIRONMENT == "production":
+                                elif (whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID) and (is_org_ai_enabled): # Only send to chatbot for Parijat Academy's WA number if org has AI enabled
+                                    convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                                    is_conv_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else False
+                                    if (ENVIRONMENT == "production") and (is_conv_ai_enabled):
                                         pass
 
 
