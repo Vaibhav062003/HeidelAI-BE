@@ -1153,8 +1153,7 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
             "Content-Type": "application/json"
         }
         
-    user_created = []
-    prebuilt =[]
+    templates = []
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
         if wa_id:
@@ -1162,26 +1161,14 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
             response = await client.get(org_url, headers=headers)
 
             if response.status_code == 200:
-                user_created = response.json().get("data", [])
+                templates = response.json().get("data", [])
                 logger.info(
-                     f"User-created templates = {len(user_created)}"
+                     f"User-created templates = {len( templates)}"
                 )
-
-        global_url = "https://graph.facebook.com/v24.0/message_template_library"
-        response = await client.get(global_url, headers=headers)
-
-        if response.status_code == 200:
-            prebuilt = response.json().get("data", [])
-            logger.info(
-                 f"Pre-built templates = {len(prebuilt)}"
-            )
-
         return {
-            "user_created": user_created,
-            "prebuilt": prebuilt,
+            "templates": templates,
             "meta": {
-                "has_user_created": len(user_created) > 0,
-                "has_prebuilt": len(prebuilt) > 0,
+                "has_templates": len(templates) > 0,
             }
         }
         
