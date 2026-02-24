@@ -80,11 +80,14 @@ async def analyze_conversation(conversation: str, available_tags: list = None, a
         ConversationSummary: The summary and priority level.
     """
 
-    prompt = json.dumps({
-        "conversation": conversation,
-        "available_tags": available_tags or [],
-        "available_labels": available_labels or []
-    }, indent=2)
+    prompt = json.dumps(
+        {
+            "conversation": conversation,
+            "available_tags": available_tags or [],
+            "available_labels": available_labels or [],
+        },
+        separators=(",", ":"),
+    )
 
     response: RunResponse = await chat_analysis_agent.arun(prompt)
     if isinstance(response.content, ConversationSummary):
