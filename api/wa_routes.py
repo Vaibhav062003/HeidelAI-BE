@@ -8,7 +8,8 @@ from datetime import datetime
 # Third-party modules
 import cloudinary
 from fastapi import (
-    APIRouter, 
+    APIRouter,
+    BackgroundTasks,
     HTTPException,
     Form,
     File,
@@ -20,7 +21,7 @@ from fastapi import (
 from core.services import services
 from services.utils import serialize_mongo
 from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template, BulkMessageRequest
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, send_bulk_whatsapp_template
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, get_bulk_job, run_bulk_send_job
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
@@ -1079,18 +1080,24 @@ async def whatsapp_create_template(user: CurrentUser, template: Template):
 
 
 @router.post("/bulk/send")
-async def bulk_send_whatsapp_message(request: BulkMessageRequest, user: CurrentUser):
+async def bulk_send_whatsapp_message(
+    request: BulkMessageRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser,
+):
     """
-    Send a WhatsApp approved template message to multiple recipients in a single request.
+    Enqueue a bulk WhatsApp template send as a background job.
 
-    - template_name: Must be the name of an APPROVED template in your WhatsApp Business account.
-    - language_code: BCP-47 language code (e.g. 'en', 'en_US', 'hi').
-    - recipients: List of objects with `phone_number` (E.164 without '+') and optional `template_variables`.
-    - delay_seconds: Pause between sends in seconds (minimum 0.5, default 1.0).
+    Returns immediately with a `job_id`. Poll `/bulk/status/{job_id}` to track progress.
+    - template_name: Name of an APPROVED template in your WhatsApp Business account.
+    - language_code: BCP-47 code (e.g. 'en', 'en_US', 'hi').
+    - recipients: List of objects with `phone_number` (E.164 without '+').
+    - delay_seconds: Pause between sends in seconds (minimum 0.5, default 4.0).
     """
     try:
+        import uuid as _uuid
         org_id = user.org_id
-        logger.info(f"Bulk WA send request received | org_id={org_id} | payload={request.model_dump()}")
+        logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(request.recipients)}")
 
         if not request.recipients:
             raise HTTPException(status_code=400, detail="At least one recipient is required")
@@ -1103,8 +1110,6 @@ async def bulk_send_whatsapp_message(request: BulkMessageRequest, user: CurrentU
         wa_id = org_document.get("wa_id")
         if not wa_id:
             raise HTTPException(status_code=404, detail="No WhatsApp account connected to this organization")
-
-        logger.success(f"Bulk send | wa_id={wa_id} org_id={org_id}")
 
         connection = db.whatsapp_connections.find_one(
             {"wa_id": wa_id, "org_id": org_id},
@@ -1123,7 +1128,20 @@ async def bulk_send_whatsapp_message(request: BulkMessageRequest, user: CurrentU
         if not phone_id:
             raise HTTPException(status_code=400, detail="Phone ID not found for this WhatsApp connection")
 
-        summary = await send_bulk_whatsapp_template(
+        # Create the job record synchronously so the client gets the job_id immediately
+        job_id = _uuid.uuid4().hex
+        create_bulk_job(
+            org_id=org_id,
+            job_id=job_id,
+            template_name=request.template_name,
+            language_code=request.language_code,
+            total=len(request.recipients),
+        )
+
+        # Enqueue the heavy work as a background task
+        background_tasks.add_task(
+            run_bulk_send_job,
+            job_id=job_id,
             org_id=org_id,
             wa_id=wa_id,
             phone_id=phone_id,
@@ -1135,14 +1153,34 @@ async def bulk_send_whatsapp_message(request: BulkMessageRequest, user: CurrentU
             delay_seconds=request.delay_seconds,
         )
 
+        logger.success(f"Bulk WA | job={job_id} enqueued | org={org_id} | recipients={len(request.recipients)}")
+
         return {
-            "status": "success",
-            "message": f"Bulk send complete: {summary['sent']} sent, {summary['failed']} failed",
-            "summary": summary,
+            "status": "accepted",
+            "message": "Bulk send job enqueued. Poll /bulk/status/{job_id} for progress.",
+            "job_id": job_id,
+            "total": len(request.recipients),
         }
 
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        logger.error(f"Error in bulk WhatsApp send: {str(e)}")
+        logger.error(f"Error enqueueing bulk WhatsApp send: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Bulk send failed: {str(e)}")
+
+
+@router.get("/bulk/status/{job_id}")
+async def get_bulk_send_status(job_id: str, user: CurrentUser):
+    """
+    Poll the status of a bulk WhatsApp send job.
+
+    Returns job metadata including current progress (`sent`, `failed`, `total`),
+    overall `status` (pending | running | completed | failed), and per-recipient `results`.
+    """
+    org_id = user.org_id
+    job = get_bulk_job(job_id=job_id, org_id=org_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk send job not found")
+
+    return job
