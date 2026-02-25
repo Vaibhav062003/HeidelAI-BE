@@ -369,6 +369,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
                             
                             server_owns_message = False
+
+                            logger.info("is_heidelai: ", is_heidelai)
+                            logger.info("is_production: ", is_production)
+                            logger.info("is_dev: ", is_dev)
+                            logger.info("ai_enabled: ", ai_enabled)
                             
                             if is_heidelai:
                                 if ai_enabled:
@@ -377,6 +382,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     server_owns_message = is_dev
                             else:
                                 server_owns_message = is_production
+
+                            logger.info(f"Server owns message: {'Yes' if server_owns_message else 'No'}")
                             
                             if not server_owns_message:
                                 return {"status": "ok"}     
