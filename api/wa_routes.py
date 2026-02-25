@@ -1157,11 +1157,10 @@ async def bulk_send_whatsapp_message(
 
         return {
             "status": "accepted",
-            "message": "Bulk send job enqueued. Poll /bulk/status/{job_id} for progress.",
+            "message": f"Bulk send job enqueued. Poll /bulk/status/{job_id} for progress.",
             "job_id": job_id,
             "total": len(request.recipients),
         }
-
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
@@ -1178,9 +1177,15 @@ async def get_bulk_send_status(job_id: str, user: CurrentUser):
     overall `status` (pending | running | completed | failed), and per-recipient `results`.
     """
     org_id = user.org_id
-    job = get_bulk_job(job_id=job_id, org_id=org_id)
+    try:
+        job = get_bulk_job(job_id=job_id, org_id=org_id)
 
-    if not job:
-        raise HTTPException(status_code=404, detail="Bulk send job not found")
+        if not job:
+            raise HTTPException(status_code=404, detail="Bulk send job not found")
 
-    return job
+        return serialize_mongo(job)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching bulk job status | job_id={job_id} org_id={org_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch job status: {str(e)}")

@@ -1358,9 +1358,9 @@ async def run_bulk_send_job(
                     response = await client.post(url, headers=headers, json=payload)
 
                 if response.status_code == 200:
-                    message_id = response.json().get("messages", [{}])[0].get("id")
-                    logger.success(
-                        f"Bulk WA | job={job_id} | sent to {phone_number} | msg_id={message_id}"
+                    messages = response.json().get("messages") or [{}]
+                    message_id = messages[0].get("id")
+                    logger.success(                        f"Bulk WA | job={job_id} | sent to {phone_number} | msg_id={message_id}"
                     )
                     result_entry = {
                         "phone_number": phone_number,
