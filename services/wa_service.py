@@ -112,7 +112,7 @@ async def create_or_update_whatsapp_conversation(
             "last_message_is_private_note": mode == "private",
             "unread_count": 1,
             "message_counter": 1,
-            "is_ai_enabled": False,  
+            "is_ai_enabled": True,  
             "status": "open",
             "last_sender": last_sender,
             "started_at": now,
