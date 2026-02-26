@@ -10,6 +10,7 @@ from services.websocket_service import broadcast_main_ws
 from supabase import create_client, Client
 from pymongo import UpdateOne, ReturnDocument
 from fastapi import HTTPException
+from fastapi import BackgroundTasks
 
 # Internal modules
 from core.managers import manager
@@ -687,122 +688,179 @@ def fetch_media_data():
 
 media_data = fetch_media_data()
 
-async def reply_to_comment(comment_id, message, ig_account_id):
-    if ig_account_id:
-        # Query the specific Instagram connection to get its access token
-        connection = db.instagram_connections.find_one(
-            {"instagram_id": ig_account_id, "is_active": True},
-            {"page_access_token": 1},
-            sort=[("last_updated", -1)]
-        )
+# ============================================================================
+# INSTAGRAM COMMENT AUTOMATION FUNCTIONS
+# ============================================================================
 
-        logger.success(f"Retrieved IG Connection: {connection}")
-        
-        if connection and connection.get("page_access_token"):
-            # Use the connection-specific token
-            access_token = connection["page_access_token"]
-            logger.info(f"Using Instagram-specific token for {ig_account_id}")
-        else:
-            # Fallback to default token if connection not found
-            access_token = IG_ACCESS_TOKEN
-            logger.error(f"Instagram connection not found for {ig_account_id}, using default token")
-    url = f"https://graph.facebook.com/v21.0/{comment_id}/replies"
-    payload= {
-      "message": message,
-      "access_token": access_token
-    }
+import httpx
+from database import get_mongo_db
+from core.logger import get_logger
 
-    response = requests.post(url, data=payload)
-    logger.info(f"Comment reply response: {response.json()}")
+db = get_mongo_db()
+logger = get_logger(__name__)
 
-async def send_private_reply(comment_id,ig_account_id, message_text=None, link_url=None, button_title="View Offer"):
-    """Send private message to user who commented"""
-    if ig_account_id:
-        # Query the specific Instagram connection to get its access token
-        connection = db.instagram_connections.find_one(
-            {"instagram_id": ig_account_id, "is_active": True},
-            {"page_access_token": 1},
-            sort=[("last_updated", -1)]
-        )
 
-        logger.success(f"Retrieved IG Connection: {connection}")
-        
-        if connection and connection.get("page_access_token"):
-            # Use the connection-specific token
-            access_token = connection["page_access_token"]
-            logger.info(f"Using Instagram-specific token for {ig_account_id}")
-        else:
-            # Fallback to default token if connection not found
-            access_token = IG_ACCESS_TOKEN
-            logger.error(f"Instagram connection not found for {ig_account_id}, using default token")
+async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str) -> bool:
+    """
+    Reply to an Instagram comment
     
-    url = f"https://graph.instagram.com/v23.0/{ig_account_id}/messages"
-
-    # Validate and clean the link_url
-    has_valid_link = (
-        link_url is not None and 
-        isinstance(link_url, str) and 
-        link_url.strip() and 
-        (link_url.startswith('http://') or link_url.startswith('https://'))
-    )
-
-    if has_valid_link:
-        # Ensure button_title is valid
-        if not button_title or not isinstance(button_title, str):
-            button_title = "View Link"  # Default fallback
+    Args:
+        comment_id: Instagram comment ID
+        reply_text: Reply message text
+        ig_account_id: Instagram business account ID
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Get page access token
+        connection = db.instagram_connections.find_one(
+            {"instagram_id": ig_account_id, "is_active": True}
+        )
         
-        # Trim button title if too long (Instagram has limits)
-        button_title = button_title[:20] if len(button_title) > 20 else button_title
+        if not connection:
+            logger.error(f"No Instagram connection found for {ig_account_id}")
+            return False
         
-        payload = {
-            "recipient": {
-                "comment_id": comment_id
-            },
-            "message": {
-                "attachment": {
-                    "type": "template",
-                    "payload": {
-                        "template_type": "button",
-                        "text": message_text,
-                        "buttons": [
-                            {  
-                                "type": "web_url",
-                                "url": link_url.strip(),
-                                "title": button_title.strip()
-                            }
-                        ]
+        page_access_token = connection.get("page_access_token")
+        
+        if not page_access_token:
+            logger.error("No page access token found")
+            return False
+        
+        # Instagram Graph API v22.0 - Reply to comment
+        url = f"https://graph.instagram.com/v22.0/{comment_id}/replies"
+        
+        params = {
+            "message": reply_text,
+            "access_token": page_access_token
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, params=params)
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.success(f"✅ Comment reply sent: {result.get('id')}")
+                return True
+            else:
+                error_data = response.json()
+                logger.error(f"❌ Failed to reply to comment: {error_data}")
+                return False
+    
+    except Exception as e:
+        logger.error(f"❌ Error replying to comment: {str(e)}")
+        return False
+
+
+async def send_private_reply(
+    comment_id: str,
+    ig_account_id: str,
+    message_text: str,
+    link_url: str = None,
+    button_title: str = None
+) -> bool:
+    """
+    Send a private DM to the user who commented
+    
+    Args:
+        comment_id: Instagram comment ID
+        ig_account_id: Instagram business account ID
+        message_text: DM text
+        link_url: Optional link URL
+        button_title: Optional button title
+    
+    Returns:
+        True if successful
+    """
+    try:
+        # Get page access token
+        connection = db.instagram_connections.find_one(
+            {"instagram_id": ig_account_id, "is_active": True}
+        )
+        
+        if not connection:
+            logger.error(f"No Instagram connection found for {ig_account_id}")
+            return False
+        
+        page_access_token = connection.get("page_access_token")
+        
+        if not page_access_token:
+            logger.error("No page access token found")
+            return False
+        
+        # Step 1: Get commenter ID from comment
+        comment_url = f"https://graph.instagram.com/v22.0/{comment_id}"
+        comment_params = {
+            "fields": "from,text",
+            "access_token": page_access_token
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            comment_response = await client.get(comment_url, params=comment_params)
+            
+            if comment_response.status_code != 200:
+                logger.error(f"Failed to fetch comment: {comment_response.text}")
+                return False
+            
+            comment_data = comment_response.json()
+            commenter_id = comment_data.get("from", {}).get("id")
+            
+            if not commenter_id:
+                logger.error("Could not extract commenter ID")
+                return False
+            
+            logger.info(f"Sending DM to commenter: {commenter_id}")
+            
+            # Step 2: Send DM
+            message_url = f"https://graph.instagram.com/v22.0/me/messages"
+            
+            # Build message payload
+            message_payload = {
+                "recipient": {"id": commenter_id},
+                "message": {},
+                "access_token": page_access_token
+            }
+            
+            # Add message content
+            if link_url:
+                # Send with link button
+                message_payload["message"] = {
+                    "attachment": {
+                        "type": "template",
+                        "payload": {
+                            "template_type": "generic",
+                            "elements": [{
+                                "title": message_text[:80],
+                                "buttons": [{
+                                    "type": "web_url",
+                                    "url": link_url,
+                                    "title": button_title or "View Link"
+                                }]
+                            }]
+                        }
                     }
                 }
-            },
-            "access_token": access_token
-        }
-        logger.info(f"Sending button message with link: {link_url}")
-    else:
-        # Send simple text message when no valid link is provided
-        payload = {
-            "recipient": { 
-                "comment_id": comment_id
-            },
-            "message": { 
-                "text": message_text
-            },
-            "access_token": access_token
-        }
-        logger.info("Sending simple text message (no valid link provided)")
-
-    try:
-        response = requests.post(url, json=payload)
-        logger.info(f"Private message response: {response.status_code}")
-        
-        if response.status_code == 200:
-            logger.success("Message sent successfully!")
-            return True
-        else:
-            logger.error(f"Error sending message: {response.json()}")
-            return False
+            else:
+                # Send text-only message
+                message_payload["message"] = {
+                    "text": message_text
+                }
             
+            # Send DM
+            dm_response = await client.post(message_url, json=message_payload)
+            
+            if dm_response.status_code == 200:
+                result = dm_response.json()
+                logger.success(f"✅ DM sent: {result.get('message_id')}")
+                return True
+            else:
+                error_data = dm_response.json()
+                logger.error(f"❌ Failed to send DM: {error_data}")
+                return False
+    
     except Exception as e:
-        logger.error(f"Exception while sending message: {e}")
+        logger.error(f"❌ Error sending DM: {str(e)}")
         return False
 
 async def process_comments_events(value, ig_account_id): 
@@ -817,6 +875,30 @@ async def process_comments_events(value, ig_account_id):
     if not media_id or not user_id:
         logger.error("Missing media_id or user_id.")
         return
+
+    # ADD THIS: Get org_id and trigger automation
+    from services.automation_trigger_handler import check_and_trigger_automations
+    
+    org_data = db.organizations.find_one({"ig_id": ig_account_id})
+    if org_data:
+        org_id = org_data.get("org_id")
+        
+        # Trigger automation check BEFORE existing keyword logic
+        await check_and_trigger_automations(
+            org_id=org_id,
+            platform="instagram",
+            event_type="post_comment",
+            trigger_data={
+                "platform": "instagram",
+                "platform_id": ig_account_id,
+                "comment_id": comment_id,
+                "comment_text": text,
+                "commenter_username": from_user,
+                "commenter_id": user_id,
+                "post_id": media_id,
+                "message_text": text  # For keyword matching
+            }
+        )
 
     media_info = media_data.get(str(media_id))
 
@@ -1188,3 +1270,303 @@ async def send_message_reaction(message_id: str, instagram_id: str, page_access_
     except Exception as e:
         logger.error(f"Error sending message reaction: {str(e)}")
         return "error"
+    
+
+
+    
+# # ============================================================================
+# # INSTAGRAM COMMENT REPLY FUNCTIONS
+# # ============================================================================
+
+# async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str) -> bool:
+#     """
+#     Reply to an Instagram comment
+    
+#     Args:
+#         comment_id: Instagram comment ID
+#         reply_text: Reply message text
+#         ig_account_id: Instagram business account ID
+    
+#     Returns:
+#         True if successful, False otherwise
+#     """
+#     try:
+#         # Get page access token for this Instagram account
+#         connection = db.instagram_connections.find_one(
+#             {"instagram_id": ig_account_id, "is_active": True}
+#         )
+        
+#         if not connection:
+#             logger.error(f"No active Instagram connection found for {ig_account_id}")
+#             return False
+        
+#         page_access_token = connection.get("page_access_token")
+        
+#         if not page_access_token:
+#             logger.error("No page access token found")
+#             return False
+        
+#         # Instagram Graph API v22.0 - Reply to comment
+#         url = f"https://graph.instagram.com/v22.0/{comment_id}/replies"
+        
+#         payload = {
+#             "message": reply_text,
+#             "access_token": page_access_token
+#         }
+        
+#         async with httpx.AsyncClient(timeout=30.0) as client:
+#             response = await client.post(url, data=payload)
+            
+#             if response.status_code == 200:
+#                 result = response.json()
+#                 logger.success(f"✅ Comment reply sent: {result.get('id')}")
+#                 return True
+#             else:
+#                 error_data = response.json()
+#                 logger.error(f"❌ Failed to reply to comment: {error_data}")
+#                 return False
+    
+#     except Exception as e:
+#         logger.error(f"❌ Error replying to comment: {str(e)}")
+#         return False
+
+
+# async def send_private_reply(
+#     comment_id: str,
+#     ig_account_id: str,
+#     message_text: str,
+#     link_url: str = None,
+#     button_title: str = None
+# ) -> bool:
+#     """
+#     Send a private DM to the user who commented (via comment ID)
+    
+#     Args:
+#         comment_id: Instagram comment ID
+#         ig_account_id: Instagram business account ID
+#         message_text: DM text
+#         link_url: Optional link URL
+#         button_title: Optional button title
+    
+#     Returns:
+#         True if successful, False otherwise
+#     """
+#     try:
+#         # Get page access token
+#         connection = db.instagram_connections.find_one(
+#             {"instagram_id": ig_account_id, "is_active": True}
+#         )
+        
+#         if not connection:
+#             logger.error(f"No active Instagram connection found for {ig_account_id}")
+#             return False
+        
+#         page_access_token = connection.get("page_access_token")
+        
+#         if not page_access_token:
+#             logger.error("No page access token found")
+#             return False
+        
+#         # Step 1: Get comment details to extract commenter ID
+#         comment_url = f"https://graph.instagram.com/v22.0/{comment_id}"
+#         comment_params = {
+#             "fields": "from,text",
+#             "access_token": page_access_token
+#         }
+        
+#         async with httpx.AsyncClient(timeout=30.0) as client:
+#             comment_response = await client.get(comment_url, params=comment_params)
+            
+#             if comment_response.status_code != 200:
+#                 logger.error(f"Failed to fetch comment details: {comment_response.text}")
+#                 return False
+            
+#             comment_data = comment_response.json()
+#             commenter_id = comment_data.get("from", {}).get("id")
+            
+#             if not commenter_id:
+#                 logger.error("Could not extract commenter ID from comment")
+#                 return False
+            
+#             logger.info(f"Sending DM to commenter: {commenter_id}")
+            
+#             # Step 2: Send DM using Instagram Messaging API
+#             message_url = f"https://graph.instagram.com/v22.0/me/messages"
+            
+#             # Build message payload
+#             message_payload = {
+#                 "recipient": {"id": commenter_id},
+#                 "message": {},
+#                 "access_token": page_access_token
+#             }
+            
+#             # Add message content
+#             if link_url:
+#                 # Send with link button
+#                 message_payload["message"] = {
+#                     "attachment": {
+#                         "type": "template",
+#                         "payload": {
+#                             "template_type": "generic",
+#                             "elements": [{
+#                                 "title": message_text[:80],  # Max 80 chars
+#                                 "subtitle": message_text[80:] if len(message_text) > 80 else None,
+#                                 "buttons": [{
+#                                     "type": "web_url",
+#                                     "url": link_url,
+#                                     "title": button_title or "View Link"
+#                                 }]
+#                             }]
+#                         }
+#                     }
+#                 }
+#             else:
+#                 # Send text-only message
+#                 message_payload["message"] = {
+#                     "text": message_text
+#                 }
+            
+#             # Send DM
+#             dm_response = await client.post(
+#                 message_url,
+#                 json=message_payload
+#             )
+            
+#             if dm_response.status_code == 200:
+#                 result = dm_response.json()
+#                 logger.success(f"✅ DM sent successfully: {result.get('message_id')}")
+#                 return True
+#             else:
+#                 error_data = dm_response.json()
+#                 logger.error(f"❌ Failed to send DM: {error_data}")
+#                 return False
+    
+#     except Exception as e:
+#         logger.error(f"❌ Error sending private reply: {str(e)}")
+#         return False
+
+
+async def get_comment_details(comment_id: str, ig_account_id: str) -> dict:
+    """
+    Get details of an Instagram comment
+    
+    Args:
+        comment_id: Instagram comment ID
+        ig_account_id: Instagram business account ID
+    
+    Returns:
+        Comment data dictionary
+    """
+    try:
+        connection = db.instagram_connections.find_one(
+            {"instagram_id": ig_account_id, "is_active": True}
+        )
+        
+        if not connection:
+            return {}
+        
+        page_access_token = connection.get("page_access_token")
+        
+        url = f"https://graph.instagram.com/v22.0/{comment_id}"
+        params = {
+            "fields": "id,text,from,timestamp,media",
+            "access_token": page_access_token
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, params=params)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Failed to fetch comment: {response.text}")
+                return {}
+    
+    except Exception as e:
+        logger.error(f"Error fetching comment details: {str(e)}")
+        return {}
+
+
+
+async def process_comments_events(value: dict, ig_account_id: str, background_tasks: BackgroundTasks):
+    """
+    Process Instagram comment events from webhook
+    """
+    try:
+        comment_id = value.get("id")
+        comment_text = value.get("text", "")
+        media_info = value.get("media", {})
+        post_id = media_info.get("id")
+        commenter_info = value.get("from", {})
+        commenter_id = commenter_info.get("id")
+        commenter_username = commenter_info.get("username")
+
+        if str(commenter_id) == str(ig_account_id):
+            logger.info("Ignoring echo comment (comment made by the business account).")
+            return
+        
+        if not comment_id or not post_id:
+            logger.warning("Missing comment_id or post_id in webhook payload")
+            return
+        
+        if comment_id in services.processed_message_ids:
+            logger.info(f"Duplicate comment ID {comment_id}, skipping processing.")
+            return
+        
+        logger.info(f" Instagram Comment Received: @{commenter_username} on post {post_id}: '{comment_text}'")
+        
+        #  Get connection from instagram_connections 
+        instagram_connection = db.instagram_connections.find_one(
+            {"instagram_id": ig_account_id, "is_active": True},
+            sort=[("last_updated", -1)]
+        )
+        
+        if not instagram_connection:
+            logger.error(f"No active Instagram connection found for {ig_account_id}")
+            return
+        
+        #  Get org_id and page_access_token from connection
+        org_id = instagram_connection.get("org_id")
+        page_access_token = instagram_connection.get("page_access_token")
+        
+        if not org_id:
+            logger.error(f"No org_id found for Instagram connection {ig_account_id}")
+            return
+        
+        if not page_access_token:
+            logger.warning(f"No page_access_token found for Instagram connection {ig_account_id}")
+            # Continue anyway - automation might not need to reply
+        
+        # Prepare trigger data with ALL required fields
+        trigger_data = {
+            "platform": "instagram",
+            "platform_id": ig_account_id,  
+            "comment_id": comment_id,
+            "post_id": post_id,  
+            "commenter_id": commenter_id,
+            "commenter_username": commenter_username,
+            "customer_id": commenter_id,
+            "customer_name": commenter_username,
+            "customer_username": commenter_username,
+            "message_text": comment_text,  
+            "comment_text": comment_text,
+            "media_type": media_info.get("media_product_type"),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        # Trigger automation system with correct event_type
+        from services.automation_trigger_handler import check_and_trigger_automations
+        
+        background_tasks.add_task(
+            check_and_trigger_automations,
+            org_id=org_id,
+            platform="instagram",
+            event_type="post_comment",  # Maps to "instagram_comment" trigger
+            trigger_data=trigger_data
+        )
+        
+        logger.success(f" Processed Instagram comment automation for comment {comment_id}")
+        
+    except Exception as e:
+        logger.error(f"Error processing Instagram comment event: {str(e)}", exc_info=True)
+

@@ -53,19 +53,18 @@ class UpdateFlowRequest(BaseModel):
     status: Optional[str] = None
 
 
-# CREATE FLOW ENDPOINT
+# =============================================================================
+# FLOW CRUD
+# =============================================================================
+
 @router.post("")
 async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
-    """
-    Create a new automation flow
-    
-    """
+    """Create a new automation flow"""
     try:
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
-        # Validate flow structure if flow_data is provided
         if payload.flow_data:
             is_valid, error_message = validate_flow_structure(payload.flow_data.dict())
             if not is_valid:
@@ -86,23 +85,17 @@ async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
     except Exception as e:
         logger.error(f"Error creating automation flow: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create automation flow: {str(e)}")
-    
+
+
 @router.get("")
 async def list_flows(user: CurrentUser, status: Optional[str] = None):
-    """
-    List all automation flows for the organization
-    
-    Query parameters:
-    - status: Filter by status ("draft" or "published")
-
-    """
+    """List all automation flows for the organization"""
     try:
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         flows = await list_automation_flows(org_id=org_id, status=status)
-
         return {"flows": flows}
 
     except HTTPException:
@@ -110,9 +103,8 @@ async def list_flows(user: CurrentUser, status: Optional[str] = None):
     except Exception as e:
         logger.error(f"Error listing automation flows: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to list automation flows: {str(e)}")
-    
 
-# GET SINGLE 
+
 @router.get("/{flow_id}")
 async def get_flow(flow_id: str, user: CurrentUser):
     """Get a specific automation flow by ID"""
@@ -122,7 +114,6 @@ async def get_flow(flow_id: str, user: CurrentUser):
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         flow = await get_automation_flow(org_id=org_id, flow_id=flow_id)
-
         if not flow:
             raise HTTPException(status_code=404, detail="Automation flow not found")
 
@@ -135,7 +126,6 @@ async def get_flow(flow_id: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to get automation flow: {str(e)}")
 
 
-# UPDATE FLOW
 @router.patch("/{flow_id}")
 async def update_flow(flow_id: str, payload: UpdateFlowRequest, user: CurrentUser):
     """Update an existing automation flow"""
@@ -187,7 +177,6 @@ async def delete_flow(flow_id: str, user: CurrentUser):
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         success = await delete_automation_flow(org_id=org_id, flow_id=flow_id)
-
         if not success:
             raise HTTPException(status_code=404, detail="Automation flow not found")
 
@@ -200,7 +189,10 @@ async def delete_flow(flow_id: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to delete automation flow: {str(e)}")
 
 
-# PUBLISH FLOW
+# =============================================================================
+# PUBLISH / UNPUBLISH
+# =============================================================================
+
 @router.post("/{flow_id}/publish")
 async def publish_flow(flow_id: str, user: CurrentUser):
     """Publish (activate) an automation flow"""
@@ -210,7 +202,6 @@ async def publish_flow(flow_id: str, user: CurrentUser):
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         flow = await publish_automation_flow(org_id=org_id, flow_id=flow_id)
-
         if not flow:
             raise HTTPException(status_code=404, detail="Automation flow not found")
 
@@ -224,7 +215,7 @@ async def publish_flow(flow_id: str, user: CurrentUser):
         logger.error(f"Error publishing automation flow: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to publish automation flow: {str(e)}")
 
-# UNPUBLISH FLOW (around line 175)
+
 @router.post("/{flow_id}/unpublish")
 async def unpublish_flow(flow_id: str, user: CurrentUser):
     """Unpublish (deactivate) an automation flow"""
@@ -234,7 +225,6 @@ async def unpublish_flow(flow_id: str, user: CurrentUser):
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         flow = await unpublish_automation_flow(org_id=org_id, flow_id=flow_id)
-
         if not flow:
             raise HTTPException(status_code=404, detail="Automation flow not found")
 
@@ -249,10 +239,13 @@ async def unpublish_flow(flow_id: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to unpublish automation flow: {str(e)}")
 
 
-# GET EXECUTION HISTORY
+# =============================================================================
+# EXECUTION HISTORY
+# =============================================================================
+
 @router.get("/{flow_id}/executions")
 async def get_flow_executions(
-    flow_id: str, 
+    flow_id: str,
     user: CurrentUser,
     limit: int = 50,
     skip: int = 0
@@ -264,17 +257,14 @@ async def get_flow_executions(
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         executions_collection = db["automation_executions"]
-        
+
         executions = list(
-            executions_collection.find(
-                {"flow_id": flow_id, "org_id": org_id}
-            )
+            executions_collection.find({"flow_id": flow_id, "org_id": org_id})
             .sort("created_at", -1)
             .skip(skip)
             .limit(limit)
         )
-        
-        # Serialize for JSON
+
         for exec in executions:
             exec["_id"] = str(exec["_id"])
             if exec.get("created_at"):
@@ -283,7 +273,7 @@ async def get_flow_executions(
                 exec["completed_at"] = exec["completed_at"].isoformat()
             if exec.get("error") and exec["error"].get("timestamp"):
                 exec["error"]["timestamp"] = exec["error"]["timestamp"].isoformat()
-        
+
         return {"executions": executions, "total": len(executions)}
 
     except Exception as e:
@@ -291,7 +281,127 @@ async def get_flow_executions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# GET AVAILABLE TRIGGER TYPES
+# =============================================================================
+# FOLLOW-UP MANAGEMENT ENDPOINTS (WhatsApp Scheduler)
+# =============================================================================
+
+@router.get("/{flow_id}/followups")
+async def get_flow_followups(
+    flow_id: str,
+    user: CurrentUser,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    """
+    List scheduled follow-up jobs for a specific flow.
+    Optionally filter by status: pending | executing | completed | failed | cancelled
+    """
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        from services.automation_scheduler import list_followups_for_flow
+        followups = list_followups_for_flow(org_id, flow_id, status=status, limit=limit)
+
+        return {"followups": followups, "total": len(followups)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching followups for flow {flow_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{flow_id}/followups/{schedule_id}")
+async def cancel_flow_followup(flow_id: str, schedule_id: str, user: CurrentUser):
+    """Cancel a specific pending follow-up job."""
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        from services.automation_scheduler import cancel_followup
+        cancelled = cancel_followup(schedule_id=schedule_id, org_id=org_id)
+
+        if not cancelled:
+            raise HTTPException(
+                status_code=404,
+                detail="Follow-up not found or already in terminal state (completed/failed/cancelled)"
+            )
+
+        return {"message": f"Follow-up {schedule_id} cancelled successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling followup {schedule_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/followups/pending")
+async def get_pending_followups(user: CurrentUser):
+    """
+    List all pending and executing follow-up jobs for the organization.
+    Useful for a dashboard overview of active scheduled messages.
+    """
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        from services.automation_scheduler import list_followups_for_org
+        pending = list_followups_for_org(org_id, status="pending", limit=100)
+        executing = list_followups_for_org(org_id, status="executing", limit=100)
+
+        return {
+            "pending": pending,
+            "executing": executing,
+            "total_active": len(pending) + len(executing),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching pending followups: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{flow_id}/followups/stats")
+async def get_followup_stats(flow_id: str, user: CurrentUser):
+    """
+    Aggregated statistics for follow-up jobs of a specific flow.
+    Returns counts grouped by status.
+    """
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        pipeline = [
+            {"$match": {"org_id": org_id, "flow_id": flow_id}},
+            {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+        ]
+
+        raw = list(db["automation_scheduled_followups"].aggregate(pipeline))
+        stats = {item["_id"]: item["count"] for item in raw}
+
+        # Ensure all statuses are represented
+        for s in ["pending", "executing", "completed", "failed", "cancelled"]:
+            stats.setdefault(s, 0)
+
+        stats["total"] = sum(stats.values())
+        return {"flow_id": flow_id, "stats": stats}
+
+    except Exception as e:
+        logger.error(f"Error fetching followup stats for flow {flow_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# AVAILABLE TRIGGERS & ACTIONS (discovery endpoints)
+# =============================================================================
+
 @router.get("/triggers/available")
 async def get_available_triggers(user: CurrentUser):
     """Get list of available trigger types"""
@@ -329,6 +439,14 @@ async def get_available_triggers(user: CurrentUser):
             "optional": ["keyword"]
         },
         {
+            "type": "whatsapp_followup",
+            "name": "WhatsApp Follow-Up",
+            "description": "Schedule an automated follow-up message to a specific WhatsApp conversation",
+            "platform": "whatsapp",
+            "requires": ["conversation_id"],
+            "optional": []
+        },
+        {
             "type": "contact_tag_added",
             "name": "Tag Added",
             "description": "Triggers when a tag is added to a contact",
@@ -337,11 +455,10 @@ async def get_available_triggers(user: CurrentUser):
             "optional": []
         }
     ]
-    
+
     return {"triggers": triggers}
 
 
-# GET AVAILABLE ACTION TYPES
 @router.get("/actions/available")
 async def get_available_actions(user: CurrentUser):
     """Get list of available action types"""
@@ -397,6 +514,13 @@ async def get_available_actions(user: CurrentUser):
             "requires": ["amount", "unit"]
         },
         {
+            "type": "smart_delay",
+            "name": "Smart Delay",
+            "description": "Wait for a specified duration before the next action",
+            "platform": "both",
+            "requires": ["amount", "unit"]
+        },
+        {
             "type": "condition",
             "name": "Condition",
             "description": "Branch based on a condition",
@@ -404,15 +528,5 @@ async def get_available_actions(user: CurrentUser):
             "requires": ["variable", "operator", "value"]
         }
     ]
-    
+
     return {"actions": actions}
-
-
-
-
-
-
-
-
-
-

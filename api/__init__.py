@@ -13,6 +13,8 @@ from . import canned_responses_routes
 from . import signup_routes
 from . import sse_routes
 from . import automation_routes
+from . import google_routes    
+from . import google_sheets_routes 
 
 router = APIRouter()
 
@@ -29,3 +31,5 @@ router.include_router(canned_responses_routes.router)
 router.include_router(signup_routes.router)
 router.include_router(sse_routes.router)
 router.include_router(automation_routes.router)
+router.include_router(google_routes.router)
+router.include_router(google_sheets_routes.router)

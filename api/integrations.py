@@ -25,11 +25,17 @@ async def get_integrations_status(user: CurrentUser):
 
         if not org_data:
             raise HTTPException(status_code=404, detail="Organization not found")
+        
+        google_conn = db.google_connections.find_one(
+            {"org_id": org_id, "status": "active"},
+            {"_id": 1}
+        )
 
         # Fetch integration status
         integration_status = {
             "instagram": bool(org_data.get("ig_id")),
             "whatsapp": bool(org_data.get("wa_id")),
+            "google": bool(google_conn)
         }
 
         return integration_status
