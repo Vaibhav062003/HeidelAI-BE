@@ -154,7 +154,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     
                     if not connection:
                         logger.error(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
-                        continue
+                        return {"status": "ok"}
 
                     # ============================================================================
                     # Handle status updates (message delivery/read receipts)
@@ -368,25 +368,25 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
                             
-                            server_owns_message = False
+                            # server_owns_message = False
 
                             logger.info("is_heidelai: ", is_heidelai)
                             logger.info("is_production: ", is_production)
                             logger.info("is_dev: ", is_dev)
                             logger.info("ai_enabled: ", ai_enabled)
                             
-                            if is_heidelai:
-                                if ai_enabled:
-                                    server_owns_message = is_production
-                                else:
-                                    server_owns_message = is_dev
-                            else:
-                                server_owns_message = is_production
+                            # if is_heidelai:
+                            #     if ai_enabled:
+                            #         server_owns_message = is_production
+                            #     else:
+                            #         server_owns_message = is_dev
+                            # else:
+                            #     server_owns_message = is_production
 
-                            logger.info(f"Server owns message: {'Yes' if server_owns_message else 'No'}")
+                            # logger.info(f"Server owns message: {'Yes' if server_owns_message else 'No'}")
                             
-                            if not server_owns_message:
-                                return {"status": "ok"}     
+                            # if not server_owns_message:
+                            #     return {"status": "ok"}     
 
                             # Extract message content based on message type
                             if message_type == "text":
