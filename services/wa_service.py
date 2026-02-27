@@ -112,7 +112,7 @@ async def create_or_update_whatsapp_conversation(
             "last_message_is_private_note": mode == "private",
             "unread_count": 1,
             "message_counter": 1,
-            "is_ai_enabled": False,  
+            "is_ai_enabled": True,  
             "status": "open",
             "last_sender": last_sender,
             "started_at": now,
@@ -350,7 +350,15 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
                 if not services.whatsapp_connections_map[whatsapp_id]:
                     del services.whatsapp_connections_map[whatsapp_id]
 
-async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None) -> dict:
+async def send_whatsapp_message(
+        message: dict, 
+        org_id: str, 
+        mode:str, 
+        temp_id: Optional[str] = None, 
+        context_type: Optional[str] = None, 
+        context: Optional[dict] = None,
+        bot_context: Optional[dict] = None
+    ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
     
@@ -396,7 +404,7 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
                 "message_id": context.get("mid")
             }
         
-        if mode == "reply":
+        if mode == "reply" or mode == "ai":
             
             # Send message via WhatsApp Cloud API
             url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
@@ -423,10 +431,17 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
         
         now = datetime.now(timezone.utc)
 
+        if mode == "private":
+            last_message = f"Private Note: {content}"
+        elif mode == "ai":
+            last_message= f"AI: {content}"
+        else:
+            last_message = f"You: {content}"
+
         wa_conversation = {
-            "last_message": f"Private Note: {content}" if mode == "private" else f"You: {content}",
+            "last_message": last_message,
             "last_message_timestamp": now,
-            "last_sender": "agent",
+            "last_sender": "ai" if mode == "ai" else "agent" ,
             "reminder_stage": 0,
             "next_action_at": now + timedelta(hours=6),
             "last_message_is_private_note": mode == "private"
@@ -465,7 +480,8 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
             status="delivered" if mode == "private" else "sending",
             temp_id=temp_id,
             context=context,
-            context_type=context_type
+            context_type=context_type,
+            bot_context=bot_context
         )
         
         return {"message": "Message sent", "message_id": mid}
