@@ -35,7 +35,7 @@ async def create_or_update_whatsapp_conversation(
     last_message, 
     last_sender,
     is_auto_followup: bool = False,
-    mode: Optional[str] = None
+    mode: Optional[str] = None,
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -181,7 +181,8 @@ async def store_whatsapp_message(
     status: Optional[str] = "received",
     temp_id: Optional[str] = None,
     context_type: Optional[str] = None,
-    context: Optional[dict] = None
+    context: Optional[dict] = None,
+    bot_context: Optional[dict] = None
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -227,7 +228,8 @@ async def store_whatsapp_message(
         "status": status,
         "temp_id": temp_id,
         "raw_data": raw_data,
-        "mode": mode
+        "mode": mode,
+        "ai_metadata" : bot_context if bot_context else None
     }   
     
     # Store message in WhatsApp-specific collection

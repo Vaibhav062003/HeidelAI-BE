@@ -10,6 +10,7 @@ import httpx
 
 # Internal Modules 
 from core.managers import manager
+from services.pma_chatbot import send_to_pma_chatbot
 from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
@@ -363,6 +364,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
                             
                             is_heidelai = whatsapp_business_id == HEIDELAI_ORG_WA_ID
+                            is_pma_wa = whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
                             # fetch org + convo flags
@@ -481,11 +483,52 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif (whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID) and (is_org_ai_enabled): # Only send to chatbot for Parijat Academy's WA number if org has AI enabled
-                                    convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
-                                    is_conv_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else False
-                                    if (ENVIRONMENT == "production") and (is_conv_ai_enabled):
-                                        pass
+                                elif is_pma_wa and ai_enabled and is_dev: # Only send to chatbot for Parijat Academy's WA number if org as well as that specific conv has AI enabled
+                                    chatbot_response = await send_to_pma_chatbot(
+                                        customer_phone_no=customer_phone_no,
+                                        message_content=content
+                                    )
+
+                                    final_response = chatbot_response.get("final_response")
+                                    bot_context = chatbot_response.get("bot_context")
+                                
+                                    # Storing chatbot response in the DB
+                                    # Create or update conversation
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=final_response,
+                                        last_sender="ai",
+                                        mode="reply",
+                                    )
+                                    
+                                    # Store in WhatsApp-specific collections
+                                    message_id = await store_whatsapp_message(
+                                        org_id=org_id,
+                                        content=final_response,
+                                        conversation_id=conversation_id,
+                                        customer_phone_no=customer_phone_no,
+                                        type=message_type,
+                                        payload=None,
+                                        sender_name='ai',
+                                        recipient_id=whatsapp_business_id,
+                                        role=MessageRole.AI,
+                                        message_id=generate_message_id(),
+                                        raw_data=None,
+                                        mode="reply",
+                                        context_type=context_type,
+                                        context=context,
+                                        bot_context=bot_context
+                                    )
+
+                                    res = await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": final_response,
+                                        "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                    }, org_id, "reply")
+
                                 return {"status":"ok"}
 
                             elif message_type in ["image", "video", "document"]:
