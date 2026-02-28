@@ -11,8 +11,6 @@ db = get_async_mongo_db()
 
 ORG_ID = settings.PMA_ORG_ID
 
-from config.settings import X_INTERNAL_SECRET
-
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -26,11 +24,24 @@ async def send_to_pma_chatbot(
     persona: str,
     location: str,
     customer_name: str,
-    ORG_ID: str,
+    org_id: str,
     source: str = "webhook",
     timeout: int = 10
-) -> Optional[str]:
+) -> Dict:
     """
+    Send a message to the PMA chatbot service and return the chatbot's response.
+    Args:
+        conversation_id: Unique identifier for the current conversation/session.
+        user_input: The latest message or query from the user.
+        persona: The chatbot persona or configuration to use.
+        location: The user's location or relevant location context.
+        customer_name: Name of the customer interacting with the chatbot.
+        org_id: Organization identifier used for routing/authorization.
+        source: Source of the message (for example, "webhook").
+        timeout: Timeout in seconds for the HTTP request to the chatbot service.
+    Returns:
+        A dictionary containing the key ``"final_response"`` on success, or ``None`` if the chatbot response is missing
+        the expected data.
     """
     # Prepare the request payload
     payload = {
@@ -39,7 +50,7 @@ async def send_to_pma_chatbot(
             "persona": persona,
             "location": location,
             "customer_name": customer_name,
-            "ORG_ID": ORG_ID,
+            "ORG_ID": org_id,
             "source": source
         }
     
@@ -75,23 +86,22 @@ async def send_to_pma_chatbot(
             
             if final_response:
                 logger.info(f"Received response from chatbot for {conversation_id}")
-                # logger.debug(f"Response: {chatbot_response[:100]}...")
                 return { "final_response" : final_response }
             else:
-                logger.error(f"No 'final_response' field in chatbot response: {response_data}")
-                return None
-                
+                logger.warning(f"Chatbot response missing 'response' field for {conversation_id}: {response_data}")
+                return { "final_response" : "I apologize, but I'm having trouble generating a response right now. Please try again later."}
+
     except httpx.TimeoutException:
         logger.error(f"Timeout while calling chatbot for {conversation_id}")
-        return { "final_response" : "I apologize, but I'm taking longer than usual to respond. Please try again in a moment.", "bot_context" : {} } 
+        return { "final_response" : "I apologize, but I'm taking longer than usual to respond. Please try again in a moment."} 
         
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error from chatbot: {e.response.status_code} - {e.response.text}")
-        return { "final_response" : "I apologize, but I'm experiencing technical difficulties. Please try again later.", "bot_context" : {} }  
+        return { "final_response" : "I apologize, but I'm experiencing technical difficulties. Please try again later."}  
         
     except Exception as e:
         logger.error(f"Unexpected error calling chatbot: {str(e)}", exc_info=True)
-        return { "final_response" : "I apologize, but something went wrong. Please try again later.", "bot_context" : {} }  
+        return { "final_response" : "I apologize, but something went wrong. Please try again later."}  
 
 """
 Parijat Academy - Onboarding Flow
@@ -196,7 +206,7 @@ async def process_onboarding_if_needed(conversation_id: str, user_input: str, st
             {"conversation_id": conversation_id},
             {"$set": {
                 "onboarding_stage": "awaiting_persona",
-                "is_ai_enabled": False
+                "is_ai_enabled": True
             }}
         )
         # TODO: save message to messages collection
@@ -249,8 +259,13 @@ async def process_onboarding_if_needed(conversation_id: str, user_input: str, st
 
         if user_input in LOCATION_MAP:
             location = LOCATION_MAP[user_input]
+
             convo = await get_conversation(conversation_id)
-            persona = convo.get("persona", "fallback")
+            if convo is None:
+                persona = "fallback"
+            else:
+                persona = convo.get("persona", "fallback")
+
             agent = AGENT_MAP.get(persona, "agent_fallback")
             reply = _handoff_message(persona, location)
 

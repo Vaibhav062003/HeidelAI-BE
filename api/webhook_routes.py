@@ -453,26 +453,27 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_dev: # Only send to chatbot for Parijat Academy's WA number if org as well as that specific conv has AI enabled
-                                    stage = convo_doc.get("stage", "welcome")
-                                    chatbot_response = await process_onboarding_if_needed(conversation_id, 
+                                elif is_pma_wa and ai_enabled and is_dev:
+                                    convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                                    stage = convo_doc.get("onboarding_stage", "welcome")
+                                    flow_response = await process_onboarding_if_needed(conversation_id,
                                                                                content,
                                                                                stage
                                                                                )
-                                    if chatbot_response:
+                                    if flow_response:
                                         conversation_id = await create_or_update_whatsapp_conversation(
                                             org_id=org_id,
                                             recipient_id=whatsapp_business_id,
                                             customer_phone_no=customer_phone_no,
                                             customer_name=sender_name2,
-                                            last_message=chatbot_response,
+                                            last_message=flow_response,
                                             last_sender="ai",
                                             mode="reply"
                                         )
 
                                         res = await send_whatsapp_message({
                                                 "conversation_id": conversation_id,
-                                                "content": chatbot_response,
+                                                "content": flow_response,
                                                 "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
                                             }, org_id, "ai")
 
@@ -484,11 +485,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             persona=convo_doc.get("persona", "fallback"),
                                             location=convo_doc.get("location", "india"),
                                             customer_name=sender_name2,
-                                            ORG_ID=org_id,
+                                            org_id=org_id,
                                             source="webhook",
                                     )
 
-                                    final_response = chatbot_response
+                                    final_response = chatbot_response["final_response"]
 
                                     # Storing chatbot response in the DB
                                     # Create or update conversation
