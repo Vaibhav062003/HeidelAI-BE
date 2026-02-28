@@ -37,10 +37,11 @@ class InteractiveWhatsAppMessageSection(BaseModel):
     rows: List[InteractiveWhatsAppMessageRow]
 
 class InteractiveWhatsAppMessage(BaseModel):
-    header_text: str
+    header_text: Optional[str] = None
     body_text: str
     button_text: str
     sections: List[InteractiveWhatsAppMessageSection]
+
 class ChatMessage(BaseModel):
     user_id: str
     message: str

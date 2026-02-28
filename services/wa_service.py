@@ -1308,11 +1308,11 @@ async def send_interactive_whatsapp_message(
     whatsapp_business_id = wa_connection["wa_id"]
     
     try:
-        header_text = interactive_message["header_text"]
-        body_text = interactive_message["body_text"]
-        button_text = interactive_message["button_text"]
+        header_text = interactive_message.header_text
+        body_text = interactive_message.body_text
+        button_text = interactive_message.button_text
 
-        sections = interactive_message["sections"]
+        sections = interactive_message.sections
 
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
@@ -1382,7 +1382,7 @@ async def send_interactive_whatsapp_message(
         wa_conversation = {
             "last_message": last_message,
             "last_message_timestamp": now,
-            "last_sender": "agent" ,
+            "last_sender": "AI" ,
             "reminder_stage": 0,
             "next_action_at": now + timedelta(hours=6),
             "last_message_is_private_note": False
@@ -1417,9 +1417,9 @@ async def send_interactive_whatsapp_message(
                 "button": button_text,
                 "sections": sections
             },
-            sender_name="Agent",
+            sender_name="AI",
             recipient_id=whatsapp_business_id,
-            role=MessageRole.AGENT,
+            role=MessageRole.AI,
             mode="reply",
             message_id=message_id,
             status="sending",

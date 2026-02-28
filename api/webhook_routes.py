@@ -454,55 +454,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     return {"status": "ok"}
 
                                 elif is_pma_wa and ai_enabled and is_dev:
-                                    # If the message is Hi then trigger rule based flow
-                                    if content.strip().lower() == "hi":
-                                        # Options to send
-                                        sections = [
-                                            {
-                                            "rows": [
-                                                {
-                                                    "id": "company_information",
-                                                    "title": "Company Information",
-                                                },
-                                                {
-                                                    "id": "our_courses",
-                                                    "title": "Our Courses"
-                                                },
-                                                {
-                                                    "id": "testimonials",
-                                                    "title": "Testimonials",
-                                                },
-                                                {
-                                                    "id": "videos",
-                                                    "title": "Videos"
-                                                },
-                                                {
-                                                    "id": "admission_form",
-                                                    "title": "Admission Form",
-                                                },
-                                                {
-                                                    "id": "other",
-                                                    "title": "Other"
-                                                },
-                                            ]
-                                            }
-                                        ]
-
-                                        res = await send_interactive_whatsapp_message(
-                                            org_id=org_id,
-                                            conversation_id=conversation_id,
-                                            sender_id=whatsapp_business_id,
-                                            interactive_message=InteractiveWhatsAppMessage(
-                                                header_text="Welcome to Parijat Academy",
-                                                body_text=f"Hello {sender_name2}, \n\n Please select an option from below to continue.",
-                                                button_text="Options",
-                                                sections=sections
-                                            )
-                                        )
-
-                                        return {"status": "ok"}
-                                    
-
                                     convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
                                     stage = convo_doc.get("onboarding_stage", "welcome")
                                     flow_response = await process_onboarding_if_needed(conversation_id,
@@ -510,21 +461,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                                                stage
                                                                                )
                                     if flow_response:
-                                        conversation_id = await create_or_update_whatsapp_conversation(
+                                        res = await send_interactive_whatsapp_message(
                                             org_id=org_id,
-                                            recipient_id=whatsapp_business_id,
-                                            customer_phone_no=customer_phone_no,
-                                            customer_name=sender_name2,
-                                            last_message=flow_response,
-                                            last_sender="ai",
-                                            mode="reply"
+                                            conversation_id=conversation_id,
+                                            sender_id=whatsapp_business_id,
+                                            interactive_message=flow_response
                                         )
-
-                                        res = await send_whatsapp_message({
-                                                "conversation_id": conversation_id,
-                                                "content": flow_response,
-                                                "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
-                                            }, org_id, "ai")
 
                                         return {"status": "ok"}
 
