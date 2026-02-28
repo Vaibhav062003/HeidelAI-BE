@@ -370,25 +370,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
                             
-                            # server_owns_message = False
 
                             logger.info("is_heidelai: ", is_heidelai)
                             logger.info("is_production: ", is_production)
                             logger.info("is_dev: ", is_dev)
-                            logger.info("ai_enabled: ", ai_enabled)
-                            
-                            # if is_heidelai:
-                            #     if ai_enabled:
-                            #         server_owns_message = is_production
-                            #     else:
-                            #         server_owns_message = is_dev
-                            # else:
-                            #     server_owns_message = is_production
-
-                            # logger.info(f"Server owns message: {'Yes' if server_owns_message else 'No'}")
-                            
-                            # if not server_owns_message:
-                            #     return {"status": "ok"}     
+                            logger.info("ai_enabled: ", ai_enabled) 
 
                             # Extract message content based on message type
                             if message_type == "text":
@@ -457,24 +443,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         mode="reply"
                                     )
                                     
-                                    # # Store in WhatsApp-specific collections
-                                    # message_id = await store_whatsapp_message(
-                                    #     org_id=org_id,
-                                    #     content=chatbot_response,
-                                    #     conversation_id=conversation_id,
-                                    #     customer_phone_no=customer_phone_no,
-                                    #     type=message_type,
-                                    #     payload=None,
-                                    #     sender_name='ai',
-                                    #     recipient_id=whatsapp_business_id,
-                                    #     role=MessageRole.AI,
-                                    #     message_id=generate_message_id(),
-                                    #     raw_data=None,
-                                    #     mode="reply",
-                                    #     context_type=context_type,
-                                    #     context=context
-                                    # )
-
+                                    # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
                                     res = await send_whatsapp_message({
                                         "conversation_id": conversation_id,
                                         "content": chatbot_response,
