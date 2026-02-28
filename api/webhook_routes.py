@@ -453,6 +453,54 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     return {"status": "ok"}
 
                                 elif is_pma_wa and ai_enabled and is_dev: # Only send to chatbot for Parijat Academy's WA number if org as well as that specific conv has AI enabled
+                                    # If the message is Hi then trigger rule based flow
+                                    if content.strip().lower() == "hi":
+                                        # Options to send
+                                        sections = [
+                                            {
+                                            "rows": [
+                                                {
+                                                    "id": "company_information",
+                                                    "title": "Company Information",
+                                                },
+                                                {
+                                                    "id": "our_courses",
+                                                    "title": "Our Courses"
+                                                },
+                                                {
+                                                    "id": "testimonials",
+                                                    "title": "Testimonials",
+                                                },
+                                                {
+                                                    "id": "videos",
+                                                    "title": "Videos"
+                                                },
+                                                {
+                                                    "id": "admission_form",
+                                                    "title": "Admission Form",
+                                                },
+                                                {
+                                                    "id": "other",
+                                                    "title": "Other"
+                                                },
+                                            ]
+                                            }
+                                        ]
+
+                                        res = await send_interactive_whatsapp_message(
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            sender_id=whatsapp_business_id,
+                                            interactive_message=InteractiveWhatsAppMessage(
+                                                header_text="Welcome to Parijat Academy",
+                                                body_text=f"Hello {sender_name2}, \n\n Please select an option from below to continue.",
+                                                button_text="Options",
+                                                sections=sections
+                                            )
+                                        )
+
+                                        return {"status": "ok"}
+                                    
                                     chatbot_response = await send_to_pma_chatbot(
                                         customer_phone_no=customer_phone_no,
                                         message_content=content

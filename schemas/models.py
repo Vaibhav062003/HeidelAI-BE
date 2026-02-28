@@ -27,6 +27,20 @@ class Message(BaseModel):
     user_id: str
     message: str
 
+class InteractiveWhatsAppMessage(BaseModel):
+    header_text: str
+    body_text: str
+    button_text: str
+    sections: List['InteractiveWhatsAppMessageSection']
+
+class InteractiveWhatsAppMessageSection(BaseModel):
+    title: Optional[str] = None
+    rows: List['InteractiveWhatsAppMessageRow']
+
+class InteractiveWhatsAppMessageRow(BaseModel):
+    id: str
+    title: str
+    description: Optional[str] = None
 
 class ChatMessage(BaseModel):
     user_id: str
