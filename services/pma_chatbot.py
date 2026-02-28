@@ -143,13 +143,15 @@ WELCOME_MESSAGE = (
     "1. Teacher or Tutor\n"
     "2. Parent or Student\n"
     "3. School or Institution\n"
-    "4. Franchise Investor"
+    "4. Franchise Investor\n"
+    "Enter the number corresponding to your choice."
 )
 
 LOCATION_MESSAGE = (
     "Got it! Are you based in India or abroad?\n"
     "1. India\n"
-    "2. Abroad"
+    "2. Abroad\n"
+    "Enter the number corresponding to your choice."
 )
 
 FALLBACK_MESSAGE = (
@@ -195,7 +197,7 @@ def _handoff_message(persona: str, location: str) -> str:
 
 
 async def process_onboarding_if_needed(conversation_id: str, user_input: str, stage: str):
-    user_input = user_input.strip()
+    user_input = user_input.strip().strip('.').lower()
 
     # ───────────────────────────────────
     # STAGE 1: Welcome
