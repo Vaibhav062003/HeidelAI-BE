@@ -374,8 +374,8 @@ async def send_whatsapp_message(
     whatsapp_id = message.get("sender_id")
 
     if not whatsapp_id:
-        logger.error("Webhook payload is missing 'sender_id'")
-        raise HTTPException(status_code=404, detail="Error: Webhook payload is missing 'sender_id'")
+        logger.error("Missing 'sender_id' in outbound WhatsApp message payload")
+        raise HTTPException(status_code=422, detail="Missing 'sender_id'")
         
     # Query the database to validate the ID
     wa_connection = db.whatsapp_connections.find_one(
