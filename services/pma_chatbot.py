@@ -241,7 +241,7 @@ async def process_onboarding_if_needed(conversation_id: str, user_input: str, st
                 "is_ai_enabled": True
             }}
         )
-        # TODO: save message to messages collection
+        
         return reply
 
     # ───────────────────────────────────
