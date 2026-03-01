@@ -461,14 +461,27 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                                                stage
                                                                                )
                                     if flow_response:
-                                        res = await send_interactive_whatsapp_message(
-                                            org_id=org_id,
-                                            conversation_id=conversation_id,
-                                            sender_id=whatsapp_business_id,
-                                            interactive_message=flow_response
-                                        )
-
+                                        # Check if the response is a plain string
+                                        if isinstance(flow_response, str):
+                                            # TODO: Replace with your actual function for sending normal text messages
+                                            res = await send_normal_whatsapp_message( 
+                                                org_id=org_id,
+                                                conversation_id=conversation_id,
+                                                sender_id=whatsapp_business_id,
+                                                text_message=flow_response 
+                                            )
+                                        
+                                        # Otherwise, treat it as an InteractiveWhatsAppMessage
+                                        else: 
+                                            res = await send_interactive_whatsapp_message(
+                                                org_id=org_id,
+                                                conversation_id=conversation_id,
+                                                sender_id=whatsapp_business_id,
+                                                interactive_message=flow_response
+                                            )
+                                    
                                         return {"status": "ok"}
+
 
                                     chatbot_response = await send_to_pma_chatbot(
                                             conversation_id=conversation_id,
