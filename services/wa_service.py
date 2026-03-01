@@ -373,12 +373,23 @@ async def send_whatsapp_message(
     """
     whatsapp_id = message.get("sender_id")
 
+    if not whatsapp_id:
+        logger.error("Webhook payload is missing 'sender_id'")
+        raise HTTPException(status_code=404, detail="Error: Webhook payload is missing 'sender_id'")
+        
+    # Query the database to validate the ID
     wa_connection = db.whatsapp_connections.find_one(
         {"wa_id": whatsapp_id},
         {"wa_id": 1, "_id": 0}
     )
     
+    if not wa_connection:
+        logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
+        raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
+        
+    # safe to use wa_id
     whatsapp_business_id = wa_connection["wa_id"]
+        
     
     try:
         conversation_id = message["conversation_id"]
@@ -1300,11 +1311,21 @@ async def send_interactive_whatsapp_message(
     """
     whatsapp_id = sender_id
 
+    if not whatsapp_id:
+        logger.error("Webhook payload is missing 'sender_id'")
+        raise HTTPException(status_code=404, detail="Error: Webhook payload is missing 'sender_id'")
+        
+    # Query the database to validate the ID
     wa_connection = db.whatsapp_connections.find_one(
         {"wa_id": whatsapp_id},
         {"wa_id": 1, "_id": 0}
     )
     
+    if not wa_connection:
+        logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
+        raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
+    
+    # safe to use wa_id
     whatsapp_business_id = wa_connection["wa_id"]
     
     try:
