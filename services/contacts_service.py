@@ -9,6 +9,8 @@ from pymongo import UpdateOne
 from core.services import services
 from database import get_mongo_db
 from core.logger import get_logger
+from services.websocket_service import broadcast_on_stats_update
+
 
 logger = get_logger(__name__)
 
