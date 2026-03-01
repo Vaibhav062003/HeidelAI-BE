@@ -62,7 +62,7 @@ chat_analysis_agent = Agent(
         "Analyze the overall sentiment of the conversation and set the 'sentiment' field to 'positive', 'neutral', or 'negative' - case sensitive.",
         "Provide exactly 3 actionable suggestions in the 'suggestions' field, each as a concise bullet point.",
         "For tags and labels: You MUST ONLY select from the available tags/labels list provided in the conversation input. Do NOT create or invent new tags or labels.",
-        "Pick 1-2 tags and 1-2 labels that best match the conversation from the provided lists. if there is no match found in the provided list,strictly return empty array for tags and labels.",
+        "Pick 1-2 tags and 1-2 labels that best match the conversation from the provided lists. if there is no match found in the provided list, strictly return empty array for tags and labels.",
         "For labels: analyze the conversation's context and intent, then select the single best-matching label from the provided available labels list. Do NOT use any label that is not in the provided list. If no label in the provided list fits, return an empty array.",    ],
 )
 
