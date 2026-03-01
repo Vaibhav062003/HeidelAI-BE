@@ -490,7 +490,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     
                                         return {"status": "ok"}
 
-
                                     chatbot_response = await send_to_pma_chatbot(
                                             conversation_id=conversation_id,
                                             user_input=content,
@@ -503,15 +502,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     final_response = chatbot_response["final_response"]
 
-                                    
-                                    chatbot_response = await send_to_pma_chatbot(
-                                        customer_phone_no=customer_phone_no,
-                                        message_content=content
-                                    )
-
-                                    final_response = chatbot_response.get("final_response")
-                                    bot_context = chatbot_response.get("bot_context")
-                                
                                     # Storing chatbot response in the DB
                                     # Create or update conversation
                                     conversation_id = await create_or_update_whatsapp_conversation(
@@ -610,6 +600,36 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                 
                                 content = selection_title
                                 
+                                # Storing messages from customers in the DB
+                                # Create or update conversation
+                                conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=content,
+                                        last_sender="customer",
+                                        mode="reply"
+                                    )
+                                    
+                                # Store in WhatsApp-specific collections
+                                message_id = await store_whatsapp_message(
+                                        org_id=org_id,
+                                        content=content,
+                                        conversation_id=conversation_id,
+                                        customer_phone_no=customer_phone_no,
+                                        type=message_type,
+                                        payload=interactive_data,
+                                        sender_name=sender_name2,
+                                        recipient_id=whatsapp_business_id,
+                                        role=MessageRole.CUSTOMER,
+                                        message_id=message_id,  # Use the ID from the webhook for deduplication
+                                        raw_data=message,
+                                        mode="reply",
+                                        context_type=context_type,
+                                        context=context
+                                    )
+                                
                                 if is_pma_wa and ai_enabled and is_dev:
                                     convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
                                     stage = convo_doc.get("onboarding_stage", "welcome")
@@ -659,15 +679,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     final_response = chatbot_response["final_response"]
 
-                                    
-                                    chatbot_response = await send_to_pma_chatbot(
-                                        customer_phone_no=customer_phone_no,
-                                        message_content=content
-                                    )
-
-                                    final_response = chatbot_response.get("final_response")
-                                    bot_context = chatbot_response.get("bot_context")
-                                
                                     # Storing chatbot response in the DB
                                     # Create or update conversation
                                     conversation_id = await create_or_update_whatsapp_conversation(
@@ -687,7 +698,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
                                         }, org_id, "ai")
 
-                                    return {"status":"ok"}
+                                return {"status":"ok"}
                                 
                             elif message_type == "unsupported":
                                 continue  # Skip unsupported messages
