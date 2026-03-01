@@ -22,6 +22,7 @@ from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws, broadcast_on_stats_update
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from core.logger import get_logger
+from schemas.models import InteractiveWhatsAppMessage
 
 logger = get_logger(__name__)
 db = get_mongo_db()
@@ -372,12 +373,23 @@ async def send_whatsapp_message(
     """
     whatsapp_id = message.get("sender_id")
 
+    if not whatsapp_id:
+        logger.error("Missing 'sender_id' in outbound WhatsApp message payload")
+        raise HTTPException(status_code=422, detail="Missing 'sender_id'")
+        
+    # Query the database to validate the ID
     wa_connection = db.whatsapp_connections.find_one(
         {"wa_id": whatsapp_id},
         {"wa_id": 1, "_id": 0}
     )
     
+    if not wa_connection:
+        logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
+        raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
+        
+    # safe to use wa_id
     whatsapp_business_id = wa_connection["wa_id"]
+        
     
     try:
         conversation_id = message["conversation_id"]
@@ -1259,4 +1271,197 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
         raise HTTPException(
             status_code=500,
             detail="Internal server error while creating WhatsApp template"
+        )
+
+
+
+async def send_interactive_whatsapp_message(
+        org_id: str, 
+        conversation_id: str, 
+        sender_id: str, 
+        interactive_message: InteractiveWhatsAppMessage, 
+    ) -> dict:
+    """
+    Send an interactive WhatsApp message.
+
+    Args:
+    org_id:str                             --> Organization ID of the sender's HeidelAI org (to store sent message in appropriate messages/conversations collection)
+    conversation_id: str,                  --> conversation_id is in the format whatsapp_{recipient_phone_number} which is used to fetch recipient_id for sending message
+    sender_id: str,                        --> Our whatsapp business account id (wa_id) which is used to fetch access token and phone number for sending message
+    interactive_message: {
+        header_text: str,                  --> The text content of header of the interactive message.
+        body_text: str,                    --> The text content of the interactive message.
+        button_text: str,                  --> The text content of button of the interactive message.
+        sections: List[                    --> The list of sections in the interactive message.
+            {
+                title: str,                --> The text content of the section title which will be shown in interactive message.
+                rows: List[                --> The list of rows in the section.
+                    {
+                        id: str,           --> The id of the row in interactive message which will be sent back to us in webhook when user clicks on that row. This is important to identify which button was clicked by the user.
+                        title: str,        --> The text content of the row which will be shown in interactive message.
+                        description: str   --> The text content of the row description which will be shown in interactive message.
+                    },
+                    ...
+                ]
+            },
+            ...
+        ],       
+    }
+
+    """
+    whatsapp_id = sender_id
+
+    if not whatsapp_id:
+        logger.error("Webhook payload is missing 'sender_id'")
+        raise HTTPException(status_code=404, detail="Error: Webhook payload is missing 'sender_id'")
+        
+    # Query the database to validate the ID
+    wa_connection = db.whatsapp_connections.find_one(
+        {"wa_id": whatsapp_id},
+        {"wa_id": 1, "_id": 0}
+    )
+    
+    if not wa_connection:
+        logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
+        raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
+    
+    # safe to use wa_id
+    whatsapp_business_id = wa_connection["wa_id"]
+    
+    try:
+        header_text = interactive_message.header_text
+        body_text = interactive_message.body_text
+        button_text = interactive_message.button_text
+
+        # Convert Pydantic model to JSON-serializable
+        sections = [
+            section.model_dump(exclude_none=True)
+            for section in interactive_message.sections
+        ]
+
+        # Find the WhatsApp connection to get the access token
+        connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
+        
+        if not connection:
+            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+
+        access_token = connection["access_token"]
+        phone_id = connection["phone_id"]
+
+        if not access_token or not phone_id:
+            raise HTTPException(status_code=404, detail="WhatsApp connection not properly configured")
+
+        # Extract the recipient phone number from conversation ID
+        recipient_id = conversation_id.replace("whatsapp_", "")
+
+        interactive_content = {
+            "type": "list",
+            "body": {
+                "text": f"{body_text}"
+            },
+            "footer": {
+                "text": "Powered By HeidelAI"
+            },
+            "action": {
+                "button": f"{button_text}",
+                "sections": sections
+            }
+        }
+
+        # Only include header if header_text is provided
+        if header_text is not None:
+            interactive_content["header"] = {
+                "type": "text",
+                "text": f"{header_text}"
+            }
+
+        data = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient_id,
+            "type": "interactive",
+            "interactive": interactive_content
+        }
+
+        # Send message via WhatsApp Cloud API
+        url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        
+        
+        response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code != 200:
+            logger.error(f"WhatsApp API error: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Failed to send WhatsApp message"
+            )
+        
+        response_data = response.json()
+        message_id = response_data.get("messages", [{}])[0].get("id")
+        
+        
+        now = datetime.now(timezone.utc)
+
+        
+        last_message = f"AI: Sent a List Message"
+
+        wa_conversation = {
+            "last_message": last_message,
+            "last_message_timestamp": now,
+            "last_sender": "ai",
+            "reminder_stage": 0,
+            "next_action_at": now + timedelta(hours=6),
+            "last_message_is_private_note": False
+        }
+
+        conversation = db[f"conversations_{org_id}"].find_one_and_update(
+            {"conversation_id": conversation_id},
+            {"$set": wa_conversation},
+            return_document=ReturnDocument.AFTER  
+        )
+
+        if "_id" in conversation:
+            conversation["_id"] = str(conversation["_id"])
+
+        await broadcast_main_ws(
+            platform_id=connection.get("wa_id"),
+            platform_type="whatsapp",
+            event_type="conversation_updated",
+            payload={"conversation": conversation}
+        )
+
+        # Store message in WhatsApp-specific collection
+        mid = await store_whatsapp_message(
+            org_id=org_id,
+            content=body_text,
+            conversation_id=conversation_id,
+            customer_phone_no=recipient_id,
+            type="interactive",
+            payload={
+                "header": header_text,
+                "body": body_text,
+                "button": button_text,
+                "sections": sections
+            },
+            sender_name="AI",
+            recipient_id=whatsapp_business_id,
+            role=MessageRole.AI,
+            mode="reply",
+            message_id=message_id,
+            status="sending",
+        )
+        
+        return {"message": "Message sent", "message_id": mid}
+    
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error sending WhatsApp message: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to send message: {str(e)}"
         )

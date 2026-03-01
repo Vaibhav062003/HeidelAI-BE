@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from config import settings
 from database import get_async_mongo_db
+from schemas.models import InteractiveWhatsAppMessage, InteractiveWhatsAppMessageRow, InteractiveWhatsAppMessageSection
 
 db = get_async_mongo_db()
 
@@ -137,21 +138,50 @@ AGENT_MAP = {
     "fallback":            "agent_fallback",
 }
 
-WELCOME_MESSAGE = (
-    "Hi! Welcome to Parijat Academy.\n"
-    "What brings you here today? Please tell me who you are:\n"
-    "1. Teacher or Tutor\n"
-    "2. Parent or Student\n"
-    "3. School or Institution\n"
-    "4. Franchise Investor\n"
-    "Enter the number corresponding to your choice."
+# WELCOME_MESSAGE = (
+#     "Hi! Welcome to Parijat Academy.\n"
+#     "What brings you here today? Please tell me who you are:\n"
+#     "1. Teacher or Tutor\n"
+#     "2. Parent or Student\n"
+#     "3. School or Institution\n"
+#     "4. Franchise Investor\n"
+#     "Enter the number corresponding to your choice."
+# )
+
+WELCOME_MESSAGE = InteractiveWhatsAppMessage(
+    header_text="Welcome to Parijat Academy",
+    body_text="Hello 👋🏻, \n\n What brings you here today? Please select an option from below to continue.",
+    button_text="Options",
+    sections=[
+        InteractiveWhatsAppMessageSection(
+            rows=[
+                InteractiveWhatsAppMessageRow(id="1", title="Teacher or Tutor"),
+                InteractiveWhatsAppMessageRow(id="2", title="Parent or Student"),
+                InteractiveWhatsAppMessageRow(id="3", title="School or Institution"),
+                InteractiveWhatsAppMessageRow(id="4", title="Franchise Investor"),
+            ]
+        )
+    ]
 )
 
-LOCATION_MESSAGE = (
-    "Got it! Are you based in India or abroad?\n"
-    "1. India\n"
-    "2. Abroad\n"
-    "Enter the number corresponding to your choice."
+# LOCATION_MESSAGE = (
+#     "Got it! Are you based in India or abroad?\n"
+#     "1. India\n"
+#     "2. Abroad\n"
+#     "Enter the number corresponding to your choice."
+# )
+
+LOCATION_MESSAGE = InteractiveWhatsAppMessage(
+    body_text="Got it! Are you based in India or abroad?",
+    button_text="Options",
+    sections=[
+        InteractiveWhatsAppMessageSection(
+            rows=[
+                InteractiveWhatsAppMessageRow(id="1", title="India"),
+                InteractiveWhatsAppMessageRow(id="2", title="Abroad"),
+            ]
+        )
+    ]
 )
 
 FALLBACK_MESSAGE = (
@@ -211,7 +241,7 @@ async def process_onboarding_if_needed(conversation_id: str, user_input: str, st
                 "is_ai_enabled": True
             }}
         )
-        # TODO: save message to messages collection
+        
         return reply
 
     # ───────────────────────────────────
