@@ -10,6 +10,7 @@ import httpx
 
 # Internal Modules 
 from core.managers import manager
+from services.pma_chatbot import send_to_pma_chatbot, process_onboarding_if_needed
 from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
@@ -19,7 +20,7 @@ from services.wa_service import *
 from services.ig_service import *
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID
 from core.services import services
 from core.logger import get_logger
 
@@ -363,30 +364,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
                             
                             is_heidelai = whatsapp_business_id == HEIDELAI_ORG_WA_ID
+                            is_pma_wa = whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
                             
-                            # server_owns_message = False
 
                             logger.info("is_heidelai: ", is_heidelai)
+                            logger.info("is_pma_wa: ", is_pma_wa)
                             logger.info("is_production: ", is_production)
                             logger.info("is_dev: ", is_dev)
-                            logger.info("ai_enabled: ", ai_enabled)
-                            
-                            # if is_heidelai:
-                            #     if ai_enabled:
-                            #         server_owns_message = is_production
-                            #     else:
-                            #         server_owns_message = is_dev
-                            # else:
-                            #     server_owns_message = is_production
-
-                            # logger.info(f"Server owns message: {'Yes' if server_owns_message else 'No'}")
-                            
-                            # if not server_owns_message:
-                            #     return {"status": "ok"}     
+                            logger.info("ai_enabled: ", ai_enabled) 
 
                             # Extract message content based on message type
                             if message_type == "text":
@@ -442,7 +431,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_phone_no=customer_phone_no,
                                         message_content=content
                                     )
-                                
+
                                     # Storing chatbot response in the DB
                                     # Create or update conversation
                                     conversation_id = await create_or_update_whatsapp_conversation(
@@ -455,38 +444,81 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         mode="reply"
                                     )
                                     
-                                    # Store in WhatsApp-specific collections
-                                    message_id = await store_whatsapp_message(
-                                        org_id=org_id,
-                                        content=chatbot_response,
-                                        conversation_id=conversation_id,
-                                        customer_phone_no=customer_phone_no,
-                                        type=message_type,
-                                        payload=None,
-                                        sender_name='ai',
-                                        recipient_id=whatsapp_business_id,
-                                        role=MessageRole.AI,
-                                        message_id=generate_message_id(),
-                                        raw_data=None,
-                                        mode="reply",
-                                        context_type=context_type,
-                                        context=context
-                                    )
-
+                                    # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
                                     res = await send_whatsapp_message({
                                         "conversation_id": conversation_id,
                                         "content": chatbot_response,
                                         "sender_id": HEIDELAI_ORG_WA_ID,
-                                    }, org_id, "reply")
+                                    }, org_id, "ai")
 
                                     return {"status": "ok"}
 
-                                # elif (whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID) and (is_org_ai_enabled): # Only send to chatbot for Parijat Academy's WA number if org has AI enabled
-                                #     convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
-                                #     is_conv_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else False
-                                #     if (ENVIRONMENT == "production") and (is_conv_ai_enabled):
-                                #         pass
-                                # return {"status":"ok"}
+                                elif is_pma_wa and ai_enabled and is_production:    
+                                    convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                                    stage = convo_doc.get("onboarding_stage", "welcome")
+                                    flow_response = await process_onboarding_if_needed(conversation_id,
+                                                                               content,
+                                                                               stage
+                                                                               )
+                                    
+                                    logger.error(f"Flow response from onboarding: {flow_response}")
+                                    
+                                    if flow_response:
+                                        conversation_id = await create_or_update_whatsapp_conversation(
+                                            org_id=org_id,
+                                            recipient_id=whatsapp_business_id,
+                                            customer_phone_no=customer_phone_no,
+                                            customer_name=sender_name2,
+                                            last_message=flow_response,
+                                            last_sender="ai",
+                                            mode="reply"
+                                        )
+
+                                        logger.info(f"Sending message to {sender_name2} from PMA")
+                                        logger.info(f"ConverstionID: {conversation_id}")
+                                        logger.info(f"WAID: {PARIJAT_ACADEMY_ORG_WA_ID}")
+                                        logger.info(f"ORGID: {org_id}")
+
+                                        res = await send_whatsapp_message({
+                                                "conversation_id": conversation_id,
+                                                "content": flow_response,
+                                                "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                            }, org_id, "ai")
+
+                                        return {"status": "ok"}
+
+                                    chatbot_response = await send_to_pma_chatbot(
+                                            conversation_id=conversation_id,
+                                            user_input=content,
+                                            persona=convo_doc.get("persona", "fallback"),
+                                            location=convo_doc.get("location", "india"),
+                                            customer_name=sender_name2,
+                                            org_id=org_id,
+                                            source="webhook",
+                                    )
+
+                                    final_response = chatbot_response["final_response"]
+
+                                    # Storing chatbot response in the DB
+                                    # Create or update conversation
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=final_response,
+                                        last_sender="ai",
+                                        mode="ai",
+                                    )
+
+                                    # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
+                                    res = await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": final_response,
+                                        "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                        }, org_id, "ai")
+
+                                return {"status":"ok"}
 
                             elif message_type in ["image", "video", "document"]:
                                 media_data = message[message_type]
@@ -753,7 +785,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "message_id": deleted_message_id,
                                             "conversation_id": conversation_id
                                         })
-                                        
+
+
                                     await broadcast_instagram_message(recipient_id, "conversation_updated", {
                                         "conversation": conversation
                                     })
