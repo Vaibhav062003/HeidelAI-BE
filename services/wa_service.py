@@ -1333,7 +1333,11 @@ async def send_interactive_whatsapp_message(
         body_text = interactive_message.body_text
         button_text = interactive_message.button_text
 
-        sections = interactive_message.sections
+        # Convert Pydantic model to JSON-serializable
+        sections = [
+            section.model_dump(exclude_none=True)
+            for section in interactive_message.sections
+        ]
 
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
