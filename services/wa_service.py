@@ -1350,28 +1350,33 @@ async def send_interactive_whatsapp_message(
         # Extract the recipient phone number from conversation ID
         recipient_id = conversation_id.replace("whatsapp_", "")
 
+        interactive_content = {
+            "type": "list",
+            "body": {
+                "text": f"{body_text}"
+            },
+            "footer": {
+                "text": "Powered By HeidelAI"
+            },
+            "action": {
+                "button": f"{button_text}",
+                "sections": sections
+            }
+        }
+
+        # Only include header if header_text is provided
+        if header_text is not None:
+            interactive_content["header"] = {
+                "type": "text",
+                "text": f"{header_text}"
+            }
+
         data = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": recipient_id,
             "type": "interactive",
-            "interactive": {
-                "type": "list",
-                "header": {
-                    "type": "text",
-                    "text": f"{header_text}"
-                },
-                "body": {
-                    "text": f"{body_text}"
-                },
-                "footer": {
-                    "text": "Powered By HeidelAI"
-                },
-                "action": {
-                    "button": f"{button_text}",
-                    "sections": sections
-                }
-            }
+            "interactive": interactive_content
         }
 
         # Send message via WhatsApp Cloud API
