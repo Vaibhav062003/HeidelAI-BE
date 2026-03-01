@@ -1407,7 +1407,7 @@ async def send_interactive_whatsapp_message(
         now = datetime.now(timezone.utc)
 
         
-        last_message = f"You: Sent a List Message"
+        last_message = f"AI: Sent a List Message"
 
         wa_conversation = {
             "last_message": last_message,
