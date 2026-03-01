@@ -150,7 +150,7 @@ AGENT_MAP = {
 
 WELCOME_MESSAGE = InteractiveWhatsAppMessage(
     header_text="Welcome to Parijat Academy",
-    body_text="Hello 👋🏻, \n\n What brings you here today? Please select an option from below to continue.",
+    body_text="Hello 👋🏻 \n\nWhat brings you here today? \nPlease select an option from below to continue.",
     button_text="Options",
     sections=[
         InteractiveWhatsAppMessageSection(
@@ -221,8 +221,8 @@ def _handoff_message(persona: str, location: str) -> str:
     label = labels.get(persona, "")
     loc_label = "India" if location == "india" else "international partners"
     return (
-        f"Great! I've noted that you're from {loc_label} and are connecting as part of our {label} community. "
-        f"Let me connect you with the right specialist. How can I help you today?"
+        f"Great! I've noted that you're from *{loc_label}* and are connecting as part of our *{label}* community."
+        f"\n\nLet me connect you with the right specialist. \n\nHow can I help you today?"
     )
 
 
