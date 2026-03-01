@@ -1408,7 +1408,7 @@ async def send_interactive_whatsapp_message(
         wa_conversation = {
             "last_message": last_message,
             "last_message_timestamp": now,
-            "last_sender": "AI" ,
+            "last_sender": "ai",
             "reminder_stage": 0,
             "next_action_at": now + timedelta(hours=6),
             "last_message_is_private_note": False
