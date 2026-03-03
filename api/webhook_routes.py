@@ -393,7 +393,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         mode="reply"
                                     )
                                     
-                                    # Store in WhatsApp-specific collections
+                                # Store in WhatsApp-specific collections
                                 message_id = await store_whatsapp_message(
                                         org_id=org_id,
                                         content=content,
@@ -424,7 +424,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
                                 # Handling messages received on HeidelAI's whatsapp number
-                                # if (whatsapp_business_id == HEIDELAI_ORG_WA_ID) and (is_ai_enabled):  # Only send to chatbot in production and for HeidelAI's WA number
                                 if is_heidelai and ai_enabled and is_production:
 
                                     chatbot_response = await send_to_chatbot(

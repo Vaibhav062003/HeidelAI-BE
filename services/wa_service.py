@@ -15,14 +15,14 @@ from core.managers import manager
 from database import get_mongo_db, get_mongo_client
 from core.services import services
 from config.settings import IG_VERSION, VERSION, APP_ID
-from schemas.models import MessageRole
+from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, ListRow, ListSection, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws, broadcast_on_stats_update
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from core.logger import get_logger
-from schemas.models import InteractiveWhatsAppMessage
+from schemas.models import WhatsAppInteractiveMessage
 
 logger = get_logger(__name__)
 db = get_mongo_db()
@@ -1273,107 +1273,174 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
             detail="Internal server error while creating WhatsApp template"
         )
 
+# WhatsApp Interactive Messages (Free to send)
 
+def build_list_message_payload(message_data: InteractiveListMessage) -> dict:
+    """
+    Constructs the Meta WhatsApp API payload for a 'list' interactive message.
+    
+    Args:
+        message_data (InteractiveListMessage): A validated Pydantic model containing 
+            the list message details (body, footer, button text, and sections/rows).
+            
+    Returns:
+        dict: The dictionary representing the 'interactive' JSON object required 
+            by the Meta Cloud API.
+    """
+
+    interactive_content = {
+        "type": "list",
+        "body": {
+            "text": message_data.body_text
+        },
+        "footer": {
+            "text": message_data.footer_text
+        },
+        "action": {
+            "button": message_data.button_text,
+            "sections": [section.model_dump(exclude_none=True) for section in message_data.sections]
+        }
+    }
+
+    if message_data.header_text:
+        interactive_content["header"] = {
+            "type": "text",
+            "text": message_data.header_text
+        }
+
+    return interactive_content
+
+def build_url_button_message_payload(message_data: InteractiveUrlButtonMessage) -> dict:
+    """
+    Constructs the Meta WhatsApp API payload for a 'cta_url' (Call To Action URL) interactive message.
+    
+    Args:
+        message_data (InteractiveUrlButtonMessage): A validated Pydantic model containing 
+            the URL button details (optional media/text header, body, footer, button text, and URL).
+            
+    Returns:
+        dict: The dictionary representing the 'interactive' JSON object required 
+            by the Meta Cloud API.
+    """
+
+    interactive_content = {
+        "type": "cta_url",
+        "body": {
+            "text": message_data.body_text
+        },
+        "footer": {
+            "text": message_data.footer_text
+        },
+        "action": {
+            "name": "cta_url",
+            "parameters": {
+                "display_text": message_data.button_text,
+                "url": message_data.url
+            }
+        }
+    }
+
+    # Dump the polymorphic header directly if it exists
+    if message_data.header:
+        interactive_content["header"] = message_data.header.model_dump(exclude_none=True)
+
+    return interactive_content
+
+def build_reply_button_message_payload(message_data: InteractiveReplyButtonMessage) -> dict:
+    """
+    Constructs the Meta WhatsApp API payload for a 'button' (Quick Reply) interactive message.
+    
+    Args:
+        message_data (InteractiveReplyButtonMessage): A validated Pydantic model containing 
+            the reply button details (optional media/text header, body, footer, and up to 3 buttons).
+            
+    Returns:
+        dict: The dictionary representing the 'interactive' JSON object required 
+            by the Meta Cloud API.
+    """
+
+    interactive_content = {
+        "type": "button",
+        "body": {
+            "text": message_data.body_text
+        },
+        "footer": {
+            "text": message_data.footer_text
+        },
+        "action": {
+            "buttons": [button.model_dump(exclude_none=True) for button in message_data.buttons]
+        }
+    }
+
+    # Dump the polymorphic header directly if it exists
+    if message_data.header:
+        interactive_content["header"] = message_data.header.model_dump(exclude_none=True)
+
+    return interactive_content
+
+# For routing to different interactive message types
+ROUTER_MAP = {
+    "list": build_list_message_payload,
+    "cta_url": build_url_button_message_payload,
+    "button": build_reply_button_message_payload,
+}
 
 async def send_interactive_whatsapp_message(
         org_id: str, 
         conversation_id: str, 
         sender_id: str, 
-        interactive_message: InteractiveWhatsAppMessage, 
+        interactive_message: WhatsAppInteractiveMessage, 
     ) -> dict:
     """
-    Send an interactive WhatsApp message.
+    Routes and sends a polymorphic interactive WhatsApp message via the Meta Cloud API,
+    and logs the interaction in the database.
 
     Args:
-    org_id:str                             --> Organization ID of the sender's HeidelAI org (to store sent message in appropriate messages/conversations collection)
-    conversation_id: str,                  --> conversation_id is in the format whatsapp_{recipient_phone_number} which is used to fetch recipient_id for sending message
-    sender_id: str,                        --> Our whatsapp business account id (wa_id) which is used to fetch access token and phone number for sending message
-    interactive_message: {
-        header_text: str,                  --> The text content of header of the interactive message.
-        body_text: str,                    --> The text content of the interactive message.
-        button_text: str,                  --> The text content of button of the interactive message.
-        sections: List[                    --> The list of sections in the interactive message.
-            {
-                title: str,                --> The text content of the section title which will be shown in interactive message.
-                rows: List[                --> The list of rows in the section.
-                    {
-                        id: str,           --> The id of the row in interactive message which will be sent back to us in webhook when user clicks on that row. This is important to identify which button was clicked by the user.
-                        title: str,        --> The text content of the row which will be shown in interactive message.
-                        description: str   --> The text content of the row description which will be shown in interactive message.
-                    },
-                    ...
-                ]
-            },
-            ...
-        ],       
-    }
+        org_id (str): Organization ID of the sender's HeidelAI org (used to store the 
+            sent message in the appropriate org's collections).
+        conversation_id (str): Formatted as 'whatsapp_{recipient_phone_number}', used 
+            to extract the recipient ID and update the correct conversation thread.
+        sender_id (str): The WhatsApp Business Account ID (wa_id) used to fetch the 
+            sender's access token and phone number from the database.
+        interactive_message (WhatsAppInteractiveMessage): A discriminated union Pydantic 
+            model representing the message data. It routes based on the 'type' field 
+            (e.g., "list", "cta_url", "button").
 
+    Returns:
+        dict: A dictionary containing a success message and the internal database 'message_id'.
+
+    Raises:
+        HTTPException: If the sender_id is unregistered, the connection is misconfigured,
+            the message type is unsupported, or the Meta API rejects the request.
     """
-    whatsapp_id = sender_id
 
+    whatsapp_id = sender_id
     if not whatsapp_id:
         logger.error("Webhook payload is missing 'sender_id'")
         raise HTTPException(status_code=404, detail="Error: Webhook payload is missing 'sender_id'")
         
     # Query the database to validate the ID
-    wa_connection = db.whatsapp_connections.find_one(
-        {"wa_id": whatsapp_id},
-        {"wa_id": 1, "_id": 0}
-    )
-    
+    wa_connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_id})
     if not wa_connection:
         logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
         raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
     
-    # safe to use wa_id
-    whatsapp_business_id = wa_connection["wa_id"]
+    whatsapp_business_id = wa_connection.get("wa_id")
+    access_token = wa_connection.get("access_token")
+    phone_id = wa_connection.get("phone_id")
+    recipient_id = conversation_id.replace("whatsapp_", "")
+
+    if not access_token or not phone_id or not whatsapp_business_id:
+        raise HTTPException(status_code=404, detail="WhatsApp connection not properly configured")
     
-    try:
-        header_text = interactive_message.header_text
-        body_text = interactive_message.body_text
-        button_text = interactive_message.button_text
-
-        # Convert Pydantic model to JSON-serializable
-        sections = [
-            section.model_dump(exclude_none=True)
-            for section in interactive_message.sections
-        ]
-
-        # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
+    try:    
+        # Route to the appropriate handler function based on the interactive message type
+        handler_function = ROUTER_MAP.get(interactive_message.type)
         
-        if not connection:
-            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
-
-        access_token = connection["access_token"]
-        phone_id = connection["phone_id"]
-
-        if not access_token or not phone_id:
-            raise HTTPException(status_code=404, detail="WhatsApp connection not properly configured")
-
-        # Extract the recipient phone number from conversation ID
-        recipient_id = conversation_id.replace("whatsapp_", "")
-
-        interactive_content = {
-            "type": "list",
-            "body": {
-                "text": f"{body_text}"
-            },
-            "footer": {
-                "text": "Powered By HeidelAI"
-            },
-            "action": {
-                "button": f"{button_text}",
-                "sections": sections
-            }
-        }
-
-        # Only include header if header_text is provided
-        if header_text is not None:
-            interactive_content["header"] = {
-                "type": "text",
-                "text": f"{header_text}"
-            }
+        if handler_function:
+            interactive_content = handler_function(interactive_message)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported interactive message type")
 
         data = {
             "messaging_product": "whatsapp",
@@ -1388,8 +1455,7 @@ async def send_interactive_whatsapp_message(
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-        }
-        
+        } 
         
         response = requests.post(url, headers=headers, json=data)
         
@@ -1403,11 +1469,8 @@ async def send_interactive_whatsapp_message(
         response_data = response.json()
         message_id = response_data.get("messages", [{}])[0].get("id")
         
-        
         now = datetime.now(timezone.utc)
-
-        
-        last_message = f"AI: Sent a List Message"
+        last_message = f"AI: Sent an Interactive Message"
 
         wa_conversation = {
             "last_message": last_message,
@@ -1428,7 +1491,7 @@ async def send_interactive_whatsapp_message(
             conversation["_id"] = str(conversation["_id"])
 
         await broadcast_main_ws(
-            platform_id=connection.get("wa_id"),
+            platform_id=whatsapp_business_id,
             platform_type="whatsapp",
             event_type="conversation_updated",
             payload={"conversation": conversation}
@@ -1437,16 +1500,11 @@ async def send_interactive_whatsapp_message(
         # Store message in WhatsApp-specific collection
         mid = await store_whatsapp_message(
             org_id=org_id,
-            content=body_text,
+            content=interactive_message.body_text,
             conversation_id=conversation_id,
             customer_phone_no=recipient_id,
             type="interactive",
-            payload={
-                "header": header_text,
-                "body": body_text,
-                "button": button_text,
-                "sections": sections
-            },
+            payload=interactive_message.model_dump(exclude_none=True),
             sender_name="AI",
             recipient_id=whatsapp_business_id,
             role=MessageRole.AI,
