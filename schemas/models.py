@@ -176,7 +176,7 @@ class Template(BaseModel):
 
 class ListRow(BaseModel):
     id: str
-    title: str
+    title: str = Field(..., max_length=24)
     description: Optional[str] = None
 
 class ListSection(BaseModel):
@@ -221,17 +221,17 @@ WhatsAppInteractiveMessageHeader = Annotated[
 class InteractiveListMessage(BaseModel):
     type: Literal["list"]
     header_text: Optional[str] = None
-    body_text: str
+    body_text: str = Field(..., max_length=1024)
     button_text: str
     sections: List[ListSection]
-    footer_text: Optional[str] = "Powered by HeidelAI"
+    footer_text: Optional[str] = "Powered by heidelai.com"
 
 # 2. URL Button Message Model
 class InteractiveUrlButtonMessage(BaseModel):
     type: Literal["cta_url"]
     header: Optional[WhatsAppInteractiveMessageHeader] = None
-    body_text: str
-    footer_text: Optional[str] = "Powered by HeidelAI"
+    body_text: str = Field(..., max_length=1024)
+    footer_text: Optional[str] = "Powered by heidelai.com"
     url: str
     button_text: str
 
@@ -239,8 +239,8 @@ class InteractiveUrlButtonMessage(BaseModel):
 class InteractiveReplyButtonMessage(BaseModel):
     type: Literal["button"]
     header: Optional[WhatsAppInteractiveMessageHeader] = None
-    body_text: str
-    footer_text: Optional[str] = "Powered by HeidelAI"
+    body_text: str = Field(..., max_length=1024)
+    footer_text: Optional[str] = "Powered by heidelai.com"
     buttons: List[ActionButton] = Field(..., max_length=3)
 
 # TODO: More 2 are left such as Media Carousel and Product Carousel

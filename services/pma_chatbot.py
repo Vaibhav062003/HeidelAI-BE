@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from config import settings
 from database import get_async_mongo_db
-from schemas.models import InteractiveWhatsAppMessage, InteractiveWhatsAppMessageRow, InteractiveWhatsAppMessageSection
+from schemas.models import InteractiveListMessage, InteractiveWhatsAppMessage, InteractiveWhatsAppMessageRow, InteractiveWhatsAppMessageSection, ListRow, ListSection
 
 db = get_async_mongo_db()
 
@@ -148,17 +148,22 @@ AGENT_MAP = {
 #     "Enter the number corresponding to your choice."
 # )
 
-WELCOME_MESSAGE = InteractiveWhatsAppMessage(
+WELCOME_MESSAGE = InteractiveListMessage(
+    type="list",
     header_text="Welcome to Parijat Academy",
-    body_text="Hello 👋🏻, \n\n What brings you here today? Please select an option from below to continue.",
-    button_text="Options",
+    body_text=(
+        "We offer structured learning programs for Students and Teachers.\n\n"
+        "We also conduct a *FREE Vedic Maths Master Class* every 2nd and 4th Saturday (8:00 PM – 9:30 PM).\n\n"
+        "Please choose an option below."
+    ),
+    button_text="View Options",
     sections=[
-        InteractiveWhatsAppMessageSection(
+        ListSection(
             rows=[
-                InteractiveWhatsAppMessageRow(id="1", title="Teacher or Tutor"),
-                InteractiveWhatsAppMessageRow(id="2", title="Parent or Student"),
-                InteractiveWhatsAppMessageRow(id="3", title="School or Institution"),
-                InteractiveWhatsAppMessageRow(id="4", title="Franchise Investor"),
+                ListRow(id="free_master_class", title="🎓 Free Master Class"),
+                ListRow(id="vedic_maths_students", title="🧠 Vedic Maths for Students", description="Age 9+"),
+                ListRow(id="abacus_students", title="🔢 Abacus for Students", description="Age 5-9"),
+                ListRow(id="vedic_maths_teacher", title="👩🏻‍🏫 Vedic Maths Teacher Training"),
             ]
         )
     ]
