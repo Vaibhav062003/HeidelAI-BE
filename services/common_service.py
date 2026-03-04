@@ -1,5 +1,6 @@
 import uuid
 import time
+import re
 from bson import ObjectId
 from typing import Optional, List, Dict
 from fastapi import HTTPException, status
@@ -90,7 +91,8 @@ async def fetch_conversations_new(
     # Search filter
     if search:
         # $options: "i" makes the search case-insensitive
-        search_regex = {"$regex": search, "$options": "i"}
+        safe_search = re.escape(search)
+        search_regex = {"$regex": safe_search, "$options": "i"}
         base_conditions.append({
             "$or": [
                 {"customer_name": search_regex},
