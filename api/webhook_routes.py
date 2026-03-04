@@ -10,7 +10,7 @@ import httpx
 
 # Internal Modules 
 from core.managers import manager
-from services.pma_chatbot import send_to_pma_chatbot, process_onboarding_if_needed
+from services.pma_chatbot import send_to_pma_chatbot
 from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
