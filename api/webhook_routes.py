@@ -780,7 +780,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                         "Duration: *40 hours*\n"
                                                         "Schedule: *3 days per week*\n\n"
 
-                                                        "\n\n*Benefits*\n"
+                                                        "*Benefits*\n"
                                                         "✅ Become a Certified Vedic Maths Trainer\n"
                                                         "✅ Start your own classes\n"
                                                         "✅ Teach online or offline\n"
