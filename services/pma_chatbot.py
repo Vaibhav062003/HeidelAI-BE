@@ -203,6 +203,7 @@ def get_location_message(sender_name: str):
     )
 
 async def process_onboarding_if_needed(user_input: str, conversation_id: str, org_id: str, stage: str, whatsapp_business_id: str, sender_name: str):
+    logger.info("Processing onboarding for conversation_id=%s at stage=%s with user_input=%s", conversation_id, stage, user_input)
     user_input = user_input.strip().lower()
 
     # ───────────────────────────────────

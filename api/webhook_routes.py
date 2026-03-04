@@ -569,16 +569,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 # Extract the specific payload/ID and title into larger scope variables
                                 if interaction_type == "list_reply":
                                     reply = interactive_data.get("list_reply", {})
+                                    logger.info("Interaction type is list")
+
                                     selection_id = reply.get("id")      # Predefined Row ID
                                     selection_title = reply.get("title")
                                         
                                 elif interaction_type == "button_reply":
                                     reply = interactive_data.get("button_reply", {})
+                                    logger.info("Interaction type is button")
+
                                     selection_id = reply.get("id")      # Predefined Button ID
                                     selection_title = reply.get("title")
                 
                                 content = selection_title
-                                
+                                logger.info(f"Extracted content from interactive message: {content}, selection_id: {selection_id}")
                                 # Storing messages from customers in the DB
                                 # Create or update conversation
                                 conversation_id = await create_or_update_whatsapp_conversation(
