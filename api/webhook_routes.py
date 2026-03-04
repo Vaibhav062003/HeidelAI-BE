@@ -517,10 +517,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                 sections=[
                                                     ListSection(
                                                         rows=[
-                                                            ListRow(id="free_master_class", title="🎓 Free Master Class"),
-                                                            ListRow(id="vedic_maths_students", title="🧠 Vedic Maths for Students", description="Age 9+"),
-                                                            ListRow(id="abacus_students", title="🔢 Abacus for Students", description="Age 5-9"),
-                                                            ListRow(id="vedic_maths_teacher", title="👩🏻‍🏫 Vedic Maths Teacher Training"),
+                                                            ListRow(id="free_master_class", title="Free Master Class", description="Join our free Vedic Maths Master Class"),
+                                                            ListRow(id="vedic_maths_students", title="Vedic Maths for Students", description="Age 9+"),
+                                                            ListRow(id="abacus_students", title="Abacus for Students", description="Age 5-9"),
+                                                            ListRow(id="vedic_maths_teacher", title="Vedic Maths for Teachers", description="Comprehensive training program for educators"),
                                                         ]
                                                     )
                                                 ]
@@ -795,8 +795,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                 chatbot_response = await send_to_pma_chatbot(
                                                     conversation_id=conversation_id,
                                                     user_input=content,
-                                                    persona=convo_doc.get("persona", "fallback"),
-                                                    location=convo_doc.get("location", "india"),
+                                                    persona="fallback",
+                                                    location="india",
                                                     customer_name=sender_name2,
                                                     org_id=org_id,
                                                     source="webhook",

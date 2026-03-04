@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from config import settings
 from database import get_async_mongo_db
-from schemas.models import InteractiveListMessage, InteractiveWhatsAppMessage, InteractiveWhatsAppMessageRow, InteractiveWhatsAppMessageSection, ListRow, ListSection
+from schemas.models import InteractiveListMessage, ListRow, ListSection
 
 db = get_async_mongo_db()
 
@@ -160,10 +160,10 @@ WELCOME_MESSAGE = InteractiveListMessage(
     sections=[
         ListSection(
             rows=[
-                ListRow(id="free_master_class", title="🎓 Free Master Class"),
-                ListRow(id="vedic_maths_students", title="🧠 Vedic Maths for Students", description="Age 9+"),
-                ListRow(id="abacus_students", title="🔢 Abacus for Students", description="Age 5-9"),
-                ListRow(id="vedic_maths_teacher", title="👩🏻‍🏫 Vedic Maths Teacher Training"),
+                ListRow(id="free_master_class", title="Free Master Class", description="Join our free Vedic Maths Master Class"),
+                ListRow(id="vedic_maths_students", title="Vedic Maths for Students", description="Age 9+"),
+                ListRow(id="abacus_students", title="Abacus for Students", description="Age 5-9"),
+                ListRow(id="vedic_maths_teacher", title="Vedic Maths for Teachers", description="Comprehensive training program for educators"),
             ]
         )
     ]
@@ -176,18 +176,7 @@ WELCOME_MESSAGE = InteractiveListMessage(
 #     "Enter the number corresponding to your choice."
 # )
 
-LOCATION_MESSAGE = InteractiveWhatsAppMessage(
-    body_text="Got it! Are you based in India or abroad?",
-    button_text="Options",
-    sections=[
-        InteractiveWhatsAppMessageSection(
-            rows=[
-                InteractiveWhatsAppMessageRow(id="1", title="India"),
-                InteractiveWhatsAppMessageRow(id="2", title="Abroad"),
-            ]
-        )
-    ]
-)
+LOCATION_MESSAGE = "Got it! Are you based in India or abroad?\n1. India\n2. Abroad\nEnter the number corresponding to your choice."
 
 FALLBACK_MESSAGE = (
     "Sorry, I didn't quite catch that. Let me connect you with our team!"
