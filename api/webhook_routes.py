@@ -784,6 +784,34 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                     )
                                                 )
 
+                                                return {"status": "ok"}
+
+                                            case "vedic_maths_summer_camp":
+                                                await send_interactive_whatsapp_message(
+                                                    org_id=org_id,
+                                                    conversation_id=conversation_id,
+                                                    sender_id=whatsapp_business_id,
+                                                    interactive_message=InteractiveUrlButtonMessage(
+                                                        type="cta_url",
+                                                        header={
+                                                            "type": "image",
+                                                            "image": {
+                                                                "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1772623405/WhatsApp_Image_2026-03-04_at_4.32.48_PM_ej7mnt.jpg"
+                                                            }
+                                                        },
+                                                        body_text=(
+                                                            "☀️ *Vedic Maths Summer Program*\n\n"
+                                                            "⚠️ Seats are LIMITED because we believe every child deserves attention.\n\n"
+                                                            "Once full, admissions will close."
+                                                        ),
+                                                        button_text="Register Now",
+                                                        url="https://forms.gle/hPMw7inpe7H1E4gF9"
+
+                                                    )
+                                                )
+
+                                                return {"status": "ok"}
+                                            
                                             # --- Fallback for unknown IDs ---
                                             case _:
                                                 chatbot_response = await send_to_pma_chatbot(
