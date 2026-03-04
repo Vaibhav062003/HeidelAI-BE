@@ -156,7 +156,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     
                     if not connection:
                         logger.error(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
-                        continue
+                        return {"status": "ok"}
 
                     # ============================================================================
                     # Handle status updates (message delivery/read receipts)
