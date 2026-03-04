@@ -495,7 +495,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     # Trigger options flow on first message or on hi, hello, hey
                                     if content.strip().lower() in ["hi", "hello", "hey"] or stage == "welcome" or stage is None:
-                                        await db[f"conversations_{org_id}"].update_one(
+                                        db[f"conversations_{org_id}"].update_one(
                                             {"conversation_id": conversation_id},
                                             {"$set": {
                                                 "onboarding_stage": "awaiting_persona",
