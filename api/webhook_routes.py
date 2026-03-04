@@ -18,6 +18,7 @@ from services.payment_service import build_idempotency_key, process_cashfree_eve
 from services.heidelai_bot import send_to_chatbot
 from services.wa_service import *
 from services.ig_service import *
+from schemas.models import InteractiveListMessage, InteractiveUrlButtonMessage, ListSection, ListRow
 from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID
