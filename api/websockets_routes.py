@@ -196,7 +196,7 @@ async def main_ws(websocket: WebSocket, client_id: str):
     logger.success(f"IG: {ig_id}, WA: {wa_id}")
 
     # Step 4: Send initial stats
-    asyncio.create_task(broadcast_on_stats_update(user.org_id))
+    # asyncio.create_task(broadcast_on_stats_update(user.org_id))
 
     heartbeat_task = asyncio.create_task(start_heartbeat(client_id, websocket))
 
