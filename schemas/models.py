@@ -1,6 +1,6 @@
 # Pydantic
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
-from typing import Optional, List, Literal, Dict, Any
+from typing import Annotated, Optional, List, Literal, Dict, Any, Union
 from enum import Enum
 from datetime import datetime, timezone
 
@@ -26,21 +26,6 @@ class Conversation(BaseModel):
 class Message(BaseModel):
     user_id: str
     message: str
-
-class InteractiveWhatsAppMessageRow(BaseModel):
-    id: str
-    title: str
-    description: Optional[str] = None
-
-class InteractiveWhatsAppMessageSection(BaseModel):
-    title: Optional[str] = None
-    rows: List[InteractiveWhatsAppMessageRow]
-
-class InteractiveWhatsAppMessage(BaseModel):
-    header_text: Optional[str] = None
-    body_text: str
-    button_text: str
-    sections: List[InteractiveWhatsAppMessageSection]
 
 class ChatMessage(BaseModel):
     user_id: str
@@ -185,3 +170,87 @@ class Template(BaseModel):
     language: str
     category: str
     components: List[Dict[str, Any]]
+
+
+# Interactive WhatsApp Message Models
+
+class ListRow(BaseModel):
+    id: str
+    title: str = Field(..., max_length=24)
+    description: Optional[str] = None
+
+class ListSection(BaseModel):
+    title: Optional[str] = None
+    rows: List[ListRow]
+
+class ReplyButton(BaseModel):
+    id: str
+    title: str = Field(..., max_length=20)
+
+class ActionButton(BaseModel):
+    type: Literal["reply"] = "reply"
+    reply: ReplyButton
+
+# Header fields for text, image, document, video
+class MediaLink(BaseModel):
+    link: str
+
+class TextHeader(BaseModel):
+    type: Literal["text"]
+    text: str
+
+class ImageHeader(BaseModel):
+    type: Literal["image"]
+    image: MediaLink
+
+class DocumentHeader(BaseModel):
+    type: Literal["document"]
+    document: MediaLink
+
+class VideoHeader(BaseModel):
+    type: Literal["video"]
+    video: MediaLink
+
+# Pydantic checks the "type" field to validate the correct header format
+WhatsAppInteractiveMessageHeader = Annotated[
+    Union[TextHeader, ImageHeader, DocumentHeader, VideoHeader],
+    Field(discriminator="type")
+]
+
+# 1. List Message Model
+class InteractiveListMessage(BaseModel):
+    type: Literal["list"]
+    header_text: Optional[str] = None
+    body_text: str = Field(..., max_length=1024)
+    button_text: str
+    sections: List[ListSection]
+    footer_text: Optional[str] = "Powered by heidelai.com"
+
+# 2. URL Button Message Model
+class InteractiveUrlButtonMessage(BaseModel):
+    type: Literal["cta_url"]
+    header: Optional[WhatsAppInteractiveMessageHeader] = None
+    body_text: str = Field(..., max_length=1024)
+    footer_text: Optional[str] = "Powered by heidelai.com"
+    url: str
+    button_text: str
+
+# 3. Reply Button Message Model
+class InteractiveReplyButtonMessage(BaseModel):
+    type: Literal["button"]
+    header: Optional[WhatsAppInteractiveMessageHeader] = None
+    body_text: str = Field(..., max_length=1024)
+    footer_text: Optional[str] = "Powered by heidelai.com"
+    buttons: List[ActionButton] = Field(..., max_length=3)
+
+# TODO: More 2 are left such as Media Carousel and Product Carousel
+
+WhatsAppInteractiveMessage = Annotated[
+    Union[
+        InteractiveListMessage,
+        InteractiveUrlButtonMessage,
+        InteractiveReplyButtonMessage,
+        # other models will be added here
+    ],
+    Field(discriminator="type")
+]
