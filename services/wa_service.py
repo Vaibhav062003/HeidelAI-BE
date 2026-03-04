@@ -15,7 +15,7 @@ from core.managers import manager
 from database import get_mongo_db, get_mongo_client
 from core.services import services
 from config.settings import IG_VERSION, VERSION, APP_ID
-from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, ListRow, ListSection, MessageRole
+from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
