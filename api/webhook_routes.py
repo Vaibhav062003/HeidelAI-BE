@@ -498,7 +498,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         db[f"conversations_{org_id}"].update_one(
                                             {"conversation_id": conversation_id},
                                             {"$set": {
-                                                "onboarding_stage": "awaiting_persona",
+                                                "onboarding_stage": "completed",
                                                 "is_ai_enabled": True
                                             }}
                                         )
