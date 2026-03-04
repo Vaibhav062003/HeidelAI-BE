@@ -453,7 +453,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_production:
+                                elif is_pma_wa and ai_enabled and is_dev:
                                     convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
                                     stage = convo_doc.get("onboarding_stage", "welcome")
 
