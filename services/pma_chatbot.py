@@ -270,7 +270,7 @@ async def process_onboarding_if_needed(user_input: str, conversation_id: str, or
     # STAGE 2: Awaiting Location
     # ───────────────────────────────────
     if stage == "awaiting_location":
-        reply = get_menu_message(location)
+        reply = get_location_message(sender_name)
 
         if user_input in ["india", "abroad"]:
             location = user_input
