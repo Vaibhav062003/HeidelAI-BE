@@ -13,7 +13,7 @@ from core.services import services
 from services.wa_service import send_whatsapp_message, upload_and_send_wa_media_message, send_whatsapp_template_message
 from services.ig_service import send_ig_message, upload_and_send_ig_media_message
 from services.utils import serialize_mongo
-from services.websocket_service import broadcast_on_stats_update
+# from services.websocket_service import broadcast_on_stats_update
 from services.websocket_service import broadcast_team_message
 
 from database import get_mongo_db, get_async_mongo_db
@@ -391,7 +391,7 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
 
         convo = serialize_mongo(result)
 
-        await broadcast_on_stats_update(org_id)
+        # await broadcast_on_stats_update(org_id)
 
         return {"conversation": convo}
 

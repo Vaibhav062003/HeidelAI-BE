@@ -19,7 +19,7 @@ from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
-from services.websocket_service import broadcast_main_ws, broadcast_on_stats_update
+from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from core.logger import get_logger
 from schemas.models import WhatsAppInteractiveMessage
@@ -162,7 +162,7 @@ async def create_or_update_whatsapp_conversation(
         })
     
     # Broadcast stats update for every message to ensure live dashboard refresh
-    await broadcast_on_stats_update(org_id)
+    # await broadcast_on_stats_update(org_id)
         
     return conversation_id
 

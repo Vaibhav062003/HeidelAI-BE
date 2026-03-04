@@ -1039,7 +1039,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         })
 
                                     # Update dashboard stats live after deletion
-                                    await broadcast_on_stats_update(org_id)
+                                    # await broadcast_on_stats_update(org_id)
                                         
                                     await broadcast_instagram_message(recipient_id, "conversation_updated", {
                                         "conversation": conversation

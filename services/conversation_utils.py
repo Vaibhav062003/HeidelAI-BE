@@ -6,7 +6,7 @@ from pymongo.errors import PyMongoError
 from pymongo import ReturnDocument
 from services.utils import serialize_mongo
 from core.logger import get_logger
-from services.websocket_service import broadcast_on_stats_update
+# from services.websocket_service import broadcast_on_stats_update
 
 logger = get_logger(__name__)
 
@@ -47,10 +47,10 @@ async def reopen_conversation(org_id: str, conversation_id: str):
         result = serialize_mongo(result)
 
         # Broadcast stats update
-        try:
-            await broadcast_on_stats_update(org_id)
-        except Exception as e:
-            logger.error(f"Failed to broadcast stats update for org {org_id} after reopen: {e}")
+        # try:
+        #     await broadcast_on_stats_update(org_id)
+        # except Exception as e:
+        #     logger.error(f"Failed to broadcast stats update for org {org_id} after reopen: {e}")
 
         return {"conversation": result}
     
