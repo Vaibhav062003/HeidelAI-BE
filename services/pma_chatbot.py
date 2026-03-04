@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 
 from config import settings
 from database import get_async_mongo_db
-from schemas.models import InteractiveListMessage, ListRow, ListSection
+from schemas.models import ActionButton, InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, ListRow, ListSection, ReplyButton
+from services.wa_service import send_interactive_whatsapp_message
 
 db = get_async_mongo_db()
 
@@ -106,227 +107,186 @@ async def send_to_pma_chatbot(
 
 """
 Parijat Academy - Onboarding Flow
-Handles 2-stage onboarding, saves state to MongoDB, routes to persona agent.
+Handles 2-stage onboarding, saves state to MongoDB, routes to fallback agent by default.
 """
 
 def conversations_col():
     return db[f"conversations_{ORG_ID}"]
 
-
-def messages_col():
-    return db[f"messages_{ORG_ID}"]
-
-
-PERSONA_MAP = {
-    "1": "teacher_tutor",
-    "2": "parent_student",
-    "3": "school_institution",
-    "4": "franchise_investor",
-}
-
-LOCATION_MAP = {
-    "1": "india",
-    "2": "abroad",
-}
-
-# Maps persona → which bot/agent handles next messages
-AGENT_MAP = {
-    "teacher_tutor":       "agent_teacher",
-    "parent_student":      "agent_parent",
-    "school_institution":  "agent_school",
-    "franchise_investor":  "agent_franchise",
-    "fallback":            "agent_fallback",
-}
-
-# WELCOME_MESSAGE = (
-#     "Hi! Welcome to Parijat Academy.\n"
-#     "What brings you here today? Please tell me who you are:\n"
-#     "1. Teacher or Tutor\n"
-#     "2. Parent or Student\n"
-#     "3. School or Institution\n"
-#     "4. Franchise Investor\n"
-#     "Enter the number corresponding to your choice."
-# )
-
-WELCOME_MESSAGE = InteractiveListMessage(
-    type="list",
-    header_text="Welcome to Parijat Academy",
-    body_text=(
-        "We offer structured learning programs for Students and Teachers.\n\n"
-        "We also conduct a *FREE Vedic Maths Master Class* every 2nd and 4th Saturday (8:00 PM – 9:30 PM).\n\n"
-        "Please choose an option below."
+MENU_MESSAGE_SECTIONS = [
+    ListSection(
+        title="Free Events",
+        rows=[
+            ListRow(id="free_master_class", title="Free Master Class", description="Join our free Vedic Maths Master Class"),
+        ]
     ),
-    button_text="View Options",
-    sections=[
-        ListSection(
-            rows=[
-                ListRow(id="free_master_class", title="Free Master Class", description="Join our free Vedic Maths Master Class"),
-                ListRow(id="vedic_maths_students", title="Vedic Maths for Students", description="Age 9+"),
-                ListRow(id="abacus_students", title="Abacus for Students", description="Age 5-9"),
-                ListRow(id="vedic_maths_teacher", title="Vedic Maths for Teachers", description="Comprehensive training program for educators"),
-            ]
-        )
-    ]
-)
+    ListSection(
+        title="Student Programs",
+        rows=[
+            ListRow(id="abacus_students_5_to_9", title="Abacus for Students", description="For ages 5 to 9"),
+            ListRow(id="vedic_maths_regular_9_plus", title="Regular Vedic Maths", description="For ages 9+"),
+            ListRow(id="vedic_maths_summer_camp", title="Vedic Maths Summer Camp", description="Special vedic maths summer program for ages 9+"),
+        ]
+    ),
+    ListSection(
+        title="Educator Programs",
+        rows=[
+            ListRow(id="vedic_maths_teacher", title="Vedic Maths for Teachers", description="Comprehensive training for educators"),
+        ]
+    )
+]
 
-# LOCATION_MESSAGE = (
-#     "Got it! Are you based in India or abroad?\n"
-#     "1. India\n"
-#     "2. Abroad\n"
-#     "Enter the number corresponding to your choice."
-# )
-
-LOCATION_MESSAGE = "Got it! Are you based in India or abroad?\n1. India\n2. Abroad\nEnter the number corresponding to your choice."
-
-FALLBACK_MESSAGE = (
-    "Sorry, I didn't quite catch that. Let me connect you with our team!"
-)
-
-async def get_conversation(conversation_id: str) -> dict | None:
-    return await conversations_col().find_one({"conversation_id": conversation_id})
-
-
-async def save_onboarding_attrs(conversation_id: str, org_id: str, update: dict):
-    await conversations_col().update_one(
-        {"conversation_id": conversation_id},
-        {"$set": {
-            **update,
-            "last_message_timestamp": datetime.now(timezone.utc)
-        }},
-        upsert=True,
+def get_menu_message(location: str):
+    return InteractiveListMessage(
+        type="list",
+        header_text="Welcome to Parijat Academy",
+        body_text=(
+            "Great!\n"
+            f"I've noted that you are from {location}.\n\n"
+            "We offer structured learning programs for Students and Teachers.\n\n"
+            "We also conduct a *FREE Vedic Maths Master Class* every 2nd and 4th Saturday (8:00 PM – 9:30 PM).\n\n"
+            "Please choose an option below."
+        ),
+        button_text="View Options",
+        sections=MENU_MESSAGE_SECTIONS
     )
 
-
-# def save_message(conversation_id: str, role: str, text: str):
-#     messages_col().insert_one({
-#         "conversation_id": conversation_id,
-#         "role": role,     
-#         "content": text,
-#         "timestamp": datetime.now(timezone.utc),
-#     })
-
-def _handoff_message(persona: str, location: str) -> str:
-    labels = {
-        "teacher_tutor":      "Teachers & Tutors",
-        "parent_student":     "Parents & Students",
-        "school_institution": "Schools & Institutions",
-        "franchise_investor": "Franchise Investors",
-    }
-    label = labels.get(persona, "")
-    loc_label = "India" if location == "india" else "international partners"
-    return (
-        f"Great! I've noted that you're from *{loc_label}* and are connecting as part of our *{label}* community."
-        f"\n\nLet me connect you with the right specialist. \n\nHow can I help you today?"
+def get_welcome_message(sender_name: str):
+    # Safely get the first name, default to "there" if sender_name is empty/None
+    first_name = sender_name.split(' ')[0] if sender_name else "there"
+    
+    return InteractiveListMessage(
+        type="list",
+        header_text="Welcome to Parijat Academy",
+        body_text=(
+            f"Hello {first_name}👋🏻\n"
+            "My name is Vedica and I am your virtual assistant.\n\n"
+            "We offer structured learning programs for Students and Teachers.\n\n"
+            "We also conduct a *FREE Vedic Maths Master Class* every 2nd and 4th Saturday (8:00 PM – 9:30 PM).\n\n"
+            "Please choose an option below."
+        ),
+        button_text="View Options",
+        sections=MENU_MESSAGE_SECTIONS
     )
 
+def get_location_message(sender_name: str):
+    # Safely get the first name, default to "there" if sender_name is empty/None
+    first_name = sender_name.split(' ')[0] if sender_name else "there"
 
-async def process_onboarding_if_needed(conversation_id: str, user_input: str, stage: str):
-    user_input = user_input.strip().strip('.').lower()
+    return InteractiveReplyButtonMessage(
+        type="button",
+        header={
+            "type": "text",
+            "text": "Welcome to Parijat Academy"
+        },
+        body_text=(
+            f"Hello {first_name}👋🏻\n"
+            "My name is Vedica and I am your virtual assistant.\n\n"
+            "To proceed, please let me know where you are based:\n\n"
+        ),
+        buttons=[
+            ActionButton(
+                type="reply",
+                reply=ReplyButton(
+                    id="india", 
+                    title="India"
+                )
+            ),
+            ActionButton(
+                type="reply",
+                reply=ReplyButton(
+                    id="abroad", 
+                    title="Abroad"
+                )
+            ),
+        ],
+    )
+
+async def process_onboarding_if_needed(user_input: str, conversation_id: str, org_id: str, stage: str, whatsapp_business_id: str, sender_name: str):
+    user_input = user_input.strip().lower()
 
     # ───────────────────────────────────
     # STAGE 1: Welcome
     # ───────────────────────────────────
     if stage == "welcome" or stage is None:
-        reply = WELCOME_MESSAGE
+        # First message to be sent would always be current campaign text
+        await send_interactive_whatsapp_message(
+            org_id=org_id,
+            conversation_id=conversation_id,
+            sender_id=whatsapp_business_id,
+            interactive_message=InteractiveUrlButtonMessage(
+                type="cta_url",
+                header={
+                    "type": "image",
+                    "image": {
+                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1772559110/intro_image_pma_p0tae1.jpg"
+                    }
+                },
+                body_text=(
+                    "🌟 FREE VEDIC MATHS MASTERCLASS 🌟\n\n"
+                    "Does your child feel Exam Stress in Maths? 😟\n"
+                    "✨ Now let the Exam Stress Just Go Away! ✨\n"
+                    "Give your child the power of Vedic Maths and watch confidence grow! 🚀\n\n"
+                    "🎯 In This FREE Masterclass Students Will Learn:\n"
+                    "✅ Faster Calculations\n"
+                    "✅ Better Accuracy\n"
+                    "✅ Improved Concentration\n"
+                    "✅ More Confidence in Exams\n"
+                    "✅ Fear of Maths will disappear\n\n"
+                    "🎓 100% FREE Session\n"
+                    "🚀 Limited Seats, Register Now!\n\n" 
+                    "🌐 www.paarijatacademy.in\n"
+                    "📞 Call / WhatsApp:\n"
+                    "8055579965 / 9503498556"
+                ),
+                button_text="Register Now",
+                url="https://forms.gle/xWnKQCt8CVepAbYb9"
+            )
+        )
+
+        reply = get_location_message(sender_name)
+
         await conversations_col().update_one(
             {"conversation_id": conversation_id},
             {"$set": {
-                "onboarding_stage": "awaiting_persona",
+                "onboarding_stage": "awaiting_location",
                 "is_ai_enabled": True
             }}
         )
         
         return reply
-
+    
     # ───────────────────────────────────
-    # STAGE 2: Awaiting Persona
+    # Edge Case: Menu always shown on hi hello hey
     # ───────────────────────────────────
-    if stage == "awaiting_persona":
-        if user_input in PERSONA_MAP:
-            persona = PERSONA_MAP[user_input]
-            reply = LOCATION_MESSAGE
+    
+    if user_input in ["hi", "hello", "hey"]:
+        reply = get_welcome_message(sender_name)
 
-            await conversations_col().update_one(
-                {"conversation_id": conversation_id},
-                {"$set": {
-                    "onboarding_stage": "awaiting_location",
-                    "persona": persona,
-                }}
-            )
-        else:
-            # Invalid - fallback persona
-            await conversations_col().update_one(
-                {"conversation_id": conversation_id},
-                {"$set": {
-                    "onboarding_stage": "completed",
-                    "persona": "fallback",
-                    "assigned_bot": AGENT_MAP["fallback"],
-                    "is_ai_enabled": True,
-                }}
-            )
-            reply = FALLBACK_MESSAGE
-
-        # await messages_col(org_id).insert_one({
-        #     "conversation_id": conversation_id,
-        #     "role": "bot",
-        #     "content": reply,
-        #     "timestamp": datetime.now(timezone.utc)
-        # })
-        
-        if reply == FALLBACK_MESSAGE:
-            return None
-        
         return reply
 
     # ───────────────────────────────────
-    # STAGE 3: Awaiting Location
+    # STAGE 2: Awaiting Location
     # ───────────────────────────────────
     if stage == "awaiting_location":
+        if user_input in ["india", "abroad"]:
+            location = user_input
+            persona = "fallback"
 
-        if user_input in LOCATION_MAP:
-            location = LOCATION_MAP[user_input]
-
-            convo = await get_conversation(conversation_id)
-            if convo is None:
-                persona = "fallback"
-            else:
-                persona = convo.get("persona", "fallback")
-
-            agent = AGENT_MAP.get(persona, "agent_fallback")
-            reply = _handoff_message(persona, location)
+            agent = "agent_fallback"
+            reply = get_menu_message(location)
 
             await conversations_col().update_one(
                 {"conversation_id": conversation_id},
                 {"$set": {
                     "onboarding_stage": "completed",
                     "location": location,
+                    "persona": persona,
                     "assigned_bot": agent,
                     "is_ai_enabled": True,
                 }}
             )
-        else:
-            reply = FALLBACK_MESSAGE
-            await conversations_col().update_one(
-                {"conversation_id": conversation_id},
-                {"$set": {
-                    "onboarding_stage": "completed",
-                    "persona": "fallback",
-                    "location": "unknown",
-                    "assigned_bot": AGENT_MAP["fallback"],
-                    "is_ai_enabled": True,
-                }}
-            )
-
-       # await messages_col(org_id).insert_one({
-        #     "conversation_id": conversation_id,
-        #     "role": "bot",
-        #     "content": reply,
-        #     "timestamp": datetime.now(timezone.utc)
-        # })
-        
-        if reply == FALLBACK_MESSAGE:
-            return None
-        
+            
         return reply
 
 
