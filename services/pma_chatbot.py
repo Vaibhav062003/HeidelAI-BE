@@ -139,7 +139,6 @@ MENU_MESSAGE_SECTIONS = [
 def get_menu_message(location: str):
     return InteractiveListMessage(
         type="list",
-        header_text="Welcome to Parijat Academy",
         body_text=(
             "Great!\n"
             f"I've noted that you are from {location}.\n\n"
