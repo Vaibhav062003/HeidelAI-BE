@@ -613,7 +613,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context=context
                                     )
                                 
-                                if is_pma_wa and ai_enabled and is_production:
+                                if is_pma_wa and ai_enabled and is_dev:
                                     if selection_id:
                                         match selection_id:
                                             case "india":
