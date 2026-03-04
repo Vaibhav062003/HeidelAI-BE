@@ -168,7 +168,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         
         return {"success": True, "next_step": "SUCCESS", "org_id" : organization.get("id")}
     
-    elif plan_id in ["growth_monthly_inr", "growth_yearly_inr", "growth_monthly_test", "growth_monthly_inr_test"]:
+    elif plan_id in ["growth_monthly_inr_3499", "growth_yearly_inr_37789"]:
         # Update session with paid plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 

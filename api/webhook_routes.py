@@ -10,7 +10,7 @@ import httpx
 
 # Internal Modules 
 from core.managers import manager
-from services.pma_chatbot import send_to_pma_chatbot, process_onboarding_if_needed
+from services.pma_chatbot import send_to_pma_chatbot
 from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
@@ -18,6 +18,7 @@ from services.payment_service import build_idempotency_key, process_cashfree_eve
 from services.heidelai_bot import send_to_chatbot
 from services.wa_service import *
 from services.ig_service import *
+from schemas.models import InteractiveListMessage, InteractiveUrlButtonMessage, ListSection, ListRow
 from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID
@@ -393,7 +394,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         mode="reply"
                                     )
                                     
-                                    # Store in WhatsApp-specific collections
+                                # Store in WhatsApp-specific collections
                                 message_id = await store_whatsapp_message(
                                         org_id=org_id,
                                         content=content,
@@ -424,14 +425,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
                                 # Handling messages received on HeidelAI's whatsapp number
-                                # if (whatsapp_business_id == HEIDELAI_ORG_WA_ID) and (is_ai_enabled):  # Only send to chatbot in production and for HeidelAI's WA number
                                 if is_heidelai and ai_enabled and is_production:
 
                                     chatbot_response = await send_to_chatbot(
                                         customer_phone_no=customer_phone_no,
                                         message_content=content
                                     )
-
+                                
                                     # Storing chatbot response in the DB
                                     # Create or update conversation
                                     conversation_id = await create_or_update_whatsapp_conversation(
@@ -453,38 +453,81 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_production:    
+                                elif is_pma_wa and ai_enabled and is_production:
                                     convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
                                     stage = convo_doc.get("onboarding_stage", "welcome")
-                                    flow_response = await process_onboarding_if_needed(conversation_id,
-                                                                               content,
-                                                                               stage
-                                                                               )
-                                    
-                                    logger.error(f"Flow response from onboarding: {flow_response}")
-                                    
-                                    if flow_response:
-                                        conversation_id = await create_or_update_whatsapp_conversation(
+
+                                    # Before any message first display their current free class message
+                                    if stage == "welcome" or stage is None:
+                                        await send_interactive_whatsapp_message(
                                             org_id=org_id,
-                                            recipient_id=whatsapp_business_id,
-                                            customer_phone_no=customer_phone_no,
-                                            customer_name=sender_name2,
-                                            last_message=flow_response,
-                                            last_sender="ai",
-                                            mode="reply"
+                                            conversation_id=conversation_id,
+                                            sender_id=whatsapp_business_id,
+                                            interactive_message=InteractiveUrlButtonMessage(
+                                                type="cta_url",
+                                                header={
+                                                    "type": "image",
+                                                    "image": {
+                                                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1772559110/intro_image_pma_p0tae1.jpg"
+                                                    }
+                                                },
+                                                body_text=(
+                                                    "🌟 FREE VEDIC MATHS MASTERCLASS 🌟\n\n"
+                                                    "Does your child feel Exam Stress in Maths? 😟\n"
+                                                    "✨ Now let the Exam Stress Just Go Away! ✨\n"
+                                                    "Give your child the power of Vedic Maths and watch confidence grow! 🚀\n\n"
+                                                    "🎯 In This FREE Masterclass Students Will Learn:\n"
+                                                    "✅ Faster Calculations\n"
+                                                    "✅ Better Accuracy\n"
+                                                    "✅ Improved Concentration\n"
+                                                    "✅ More Confidence in Exams\n"
+                                                    "✅ Fear of Maths will disappear\n\n"
+                                                    "🎓 100% FREE Session\n"
+                                                    "🚀 Limited Seats, Register Now!\n\n" 
+                                                    "🌐 www.paarijatacademy.in\n"
+                                                    "📞 Call / WhatsApp:\n"
+                                                    "8055579965 / 9503498556"
+                                                ),
+                                                button_text="Register Now",
+                                                url="https://forms.gle/xWnKQCt8CVepAbYb9"
+                                            )
                                         )
 
-                                        logger.info(f"Sending message to {sender_name2} from PMA")
-                                        logger.info(f"ConverstionID: {conversation_id}")
-                                        logger.info(f"WAID: {PARIJAT_ACADEMY_ORG_WA_ID}")
-                                        logger.info(f"ORGID: {org_id}")
-
-                                        res = await send_whatsapp_message({
-                                                "conversation_id": conversation_id,
-                                                "content": flow_response,
-                                                "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
-                                            }, org_id, "ai")
-
+                                    # Trigger options flow on first message or on hi, hello, hey
+                                    if content.strip().lower() in ["hi", "hello", "hey"] or stage == "welcome" or stage is None:
+                                        db[f"conversations_{org_id}"].update_one(
+                                            {"conversation_id": conversation_id},
+                                            {"$set": {
+                                                "onboarding_stage": "completed",
+                                                "is_ai_enabled": True
+                                            }}
+                                        )
+                                        await send_interactive_whatsapp_message(
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            sender_id=whatsapp_business_id,
+                                            interactive_message=InteractiveListMessage(
+                                                type="list",
+                                                header_text="Welcome to Parijat Academy",
+                                                body_text=(
+                                                    "We offer structured learning programs for Students and Teachers.\n\n"
+                                                    "We also conduct a *FREE Vedic Maths Master Class* every 2nd and 4th Saturday (8:00 PM – 9:30 PM).\n\n"
+                                                    "Please choose an option below."
+                                                ),
+                                                button_text="View Options",
+                                                sections=[
+                                                    ListSection(
+                                                        rows=[
+                                                            ListRow(id="free_master_class", title="Free Master Class", description="Join our free Vedic Maths Master Class"),
+                                                            ListRow(id="vedic_maths_students", title="Vedic Maths for Students", description="Age 9+"),
+                                                            ListRow(id="abacus_students", title="Abacus for Students", description="Age 5-9"),
+                                                            ListRow(id="vedic_maths_teacher", title="Vedic Maths for Teachers", description="Comprehensive training program for educators"),
+                                                        ]
+                                                    )
+                                                ]
+                                            )
+                                        )
+                                    
                                         return {"status": "ok"}
 
                                     chatbot_response = await send_to_pma_chatbot(
@@ -575,7 +618,216 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             elif message_type == "order":
                                 content = "Shared an order"
                             elif message_type == "interactive":
-                                content = "[Interactive Message]"
+                                interactive_data = message.get("interactive", {})
+                                
+                                # Determine if it's a list or button reply
+                                interaction_type = interactive_data.get("type")
+                    
+                                # Larger scope variables to access later below in the block
+                                selection_id = None
+                                selection_title = None
+                    
+                                # Extract the specific payload/ID and title into larger scope variables
+                                if interaction_type == "list_reply":
+                                    reply = interactive_data.get("list_reply", {})
+                                    selection_id = reply.get("id")      # Predefined Row ID
+                                    selection_title = reply.get("title")
+                                        
+                                elif interaction_type == "button_reply":
+                                    reply = interactive_data.get("button_reply", {})
+                                    selection_id = reply.get("id")      # Predefined Button ID
+                                    selection_title = reply.get("title")
+                
+                                content = selection_title
+                                
+                                # Storing messages from customers in the DB
+                                # Create or update conversation
+                                conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=content,
+                                        last_sender="customer",
+                                        mode="reply"
+                                    )
+                                    
+                                # Store in WhatsApp-specific collections
+                                message_id = await store_whatsapp_message(
+                                        org_id=org_id,
+                                        content=content,
+                                        conversation_id=conversation_id,
+                                        customer_phone_no=customer_phone_no,
+                                        type=message_type,
+                                        payload=interactive_data,
+                                        sender_name=sender_name2,
+                                        recipient_id=whatsapp_business_id,
+                                        role=MessageRole.CUSTOMER,
+                                        message_id=message_id,  # Use the ID from the webhook for deduplication
+                                        raw_data=message,
+                                        mode="reply",
+                                        context_type=context_type,
+                                        context=context
+                                    )
+                                
+                                if is_pma_wa and ai_enabled and is_production:
+                                    if selection_id:
+                                        match selection_id:
+                                            case "free_master_class":
+                                                await send_interactive_whatsapp_message(
+                                                    org_id=org_id,
+                                                    conversation_id=conversation_id,
+                                                    sender_id=whatsapp_business_id,
+                                                    interactive_message=InteractiveUrlButtonMessage(
+                                                        type="cta_url",
+                                                        header={
+                                                            "type": "image",
+                                                            "image": {
+                                                                "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1772559110/intro_image_pma_p0tae1.jpg"
+                                                            }
+                                                        },
+                                                        body_text=(
+                                                            "🌟 FREE VEDIC MATHS MASTERCLASS 🌟\n\n"
+                                                            "Does your child feel Exam Stress in Maths? 😟\n"
+                                                            "✨ Now let the Exam Stress Just Go Away! ✨\n"
+                                                            "Give your child the power of Vedic Maths and watch confidence grow! 🚀\n\n"
+                                                            "🎯 In This FREE Masterclass Students Will Learn:\n"
+                                                            "✅ Faster Calculations\n"
+                                                            "✅ Better Accuracy\n"
+                                                            "✅ Improved Concentration\n"
+                                                            "✅ More Confidence in Exams\n"
+                                                            "✅ Fear of Maths will disappear\n\n"
+                                                            "🎓 100% FREE Session\n"
+                                                            "🚀 Limited Seats, Register Now!\n\n" 
+                                                            "🌐 www.paarijatacademy.in\n"
+                                                            "📞 Call / WhatsApp:\n"
+                                                            "8055579965 / 9503498556"
+                                                        ),
+                                                        button_text="Register Now",
+                                                        url="https://forms.gle/xWnKQCt8CVepAbYb9"
+                                                    )
+                                                )
+
+                                                return {"status": "ok"}
+
+                                            case "vedic_maths_students":
+                                                # Send info about Vedic Maths for Students
+                                                await send_whatsapp_message(
+                                                    org_id=org_id,
+                                                    mode="reply",
+                                                    message={
+                                                        "sender_id" : whatsapp_business_id,
+                                                        "conversation_id" : conversation_id,
+                                                        "content": (
+                                                        "🧠 *Vedic Maths Program*\n\n"
+                                                        
+                                                        "Age: *9 years and above*\n\n"
+                                                        
+                                                        "Course Structure:\n"
+                                                        "- *Five Structured Volumes*\n"
+                                                        "- Classes: *2 days per week*"
+
+                                                        "\n\n*Benefits*\n"
+                                                        "✅ Faster calculations\n"
+                                                        "✅ Improves concentration\n"
+                                                        "✅ Boosts confidence in Maths\n"
+                                                        "✅ Helpful for school & competitive exams\n\n"
+                                                    )
+                                                    }
+                                                )
+
+                                                return {"status": "ok"}                                
+
+                                            case "abacus_students":
+                                                # Send info about the Abacus course
+                                                await send_whatsapp_message(
+                                                    org_id=org_id,
+                                                    mode="reply",
+                                                    message={
+                                                        "sender_id" : whatsapp_business_id,
+                                                        "conversation_id" : conversation_id,
+                                                        "content": (
+                                                        "🔢 *Abacus Program*\n\n"
+                                                        
+                                                        "Age: *5-9 years*\n\n"
+                                                        
+                                                        "Course Structure:\n"
+                                                        "- *8 levels*\n"
+                                                        "- Classes: *2 days per week*"
+
+                                                        "\n\n*Benefits*\n"
+                                                        "✅ Improves memory\n"
+                                                        "✅ Strong number sense\n"
+                                                        "✅ Faster mental calculations\n"
+                                                        "✅ Better concentration\n\n"
+                                                    )
+                                                    }
+                                                )
+
+                                                return {"status": "ok"}   
+
+                                            case "vedic_maths_teacher":
+                                                # Send info about Teacher Training
+                                                await send_whatsapp_message(
+                                                    org_id=org_id,
+                                                    mode="reply",
+                                                    message={
+                                                        "sender_id" : whatsapp_business_id,
+                                                        "conversation_id" : conversation_id,
+                                                        "content": (
+                                                        "🔢 *Vedic Maths Teacher Certification*\n\n"
+                                                        
+                                                        "Duration: *40 hours*\n"
+                                                        "Schedule: *3 days per week*\n\n"
+
+                                                        "*Benefits*\n"
+                                                        "✅ Become a Certified Vedic Maths Trainer\n"
+                                                        "✅ Start your own classes\n"
+                                                        "✅ Teach online or offline\n"
+                                                        "✅ Earn additional income\n\n"
+                                                    )
+                                                    }
+                                                )
+
+                                                return {"status": "ok"}
+
+                                            # --- Fallback for unknown IDs ---
+                                            case _:
+                                                chatbot_response = await send_to_pma_chatbot(
+                                                    conversation_id=conversation_id,
+                                                    user_input=content,
+                                                    persona="fallback",
+                                                    location="india",
+                                                    customer_name=sender_name2,
+                                                    org_id=org_id,
+                                                    source="webhook",
+                                                )
+
+                                                final_response = chatbot_response["final_response"]
+
+                                                # Storing chatbot response in the DB
+                                                # Create or update conversation
+                                                conversation_id = await create_or_update_whatsapp_conversation(
+                                                    org_id=org_id,
+                                                    recipient_id=whatsapp_business_id,
+                                                    customer_phone_no=customer_phone_no,
+                                                    customer_name=sender_name2,
+                                                    last_message=final_response,
+                                                    last_sender="ai",
+                                                    mode="ai",
+                                                )
+
+                                                # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
+                                                res = await send_whatsapp_message({
+                                                    "conversation_id": conversation_id,
+                                                    "content": final_response,
+                                                    "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                                    }, org_id, "ai")
+
+                                    
+
+                                return {"status":"ok"}
+                                
                             elif message_type == "unsupported":
                                 continue  # Skip unsupported messages
                             elif message_type == "reaction":
@@ -786,7 +1038,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "conversation_id": conversation_id
                                         })
 
-
+                                    # Update dashboard stats live after deletion
+                                    # await broadcast_on_stats_update(org_id)
+                                        
                                     await broadcast_instagram_message(recipient_id, "conversation_updated", {
                                         "conversation": conversation
                                     })

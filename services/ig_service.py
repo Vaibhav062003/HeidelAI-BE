@@ -11,6 +11,7 @@ from supabase import create_client, Client
 from pymongo import UpdateOne, ReturnDocument
 from fastapi import HTTPException
 
+
 # Internal modules
 from core.managers import manager
 from schemas.models import MessageRole
@@ -514,6 +515,7 @@ async def create_or_update_instagram_conversation(org_id: str,
             "status": "open",
             "last_sender": last_sender,
             "started_at": now,
+            "created_at": now,
             "reminder_stage": 0,
             "next_action_at": now + timedelta(hours=6),
             "closed_at": None,
@@ -562,6 +564,9 @@ async def create_or_update_instagram_conversation(org_id: str,
         await broadcast_instagram_message(recipient_id, "conversation_updated", {
             "conversation": broadcast_conversation
         })
+        
+    # Broadcast stats update for every message to ensure live dashboard refresh
+    # await broadcast_on_stats_update(org_id)
         
     return conversation_id
 

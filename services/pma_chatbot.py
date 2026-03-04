@@ -6,9 +6,7 @@ from datetime import datetime, timezone
 
 from config import settings
 from database import get_async_mongo_db
-from services.wa_service import send_whatsapp_message
-
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID
+from schemas.models import InteractiveListMessage, ListRow, ListSection
 
 db = get_async_mongo_db()
 
@@ -140,22 +138,45 @@ AGENT_MAP = {
     "fallback":            "agent_fallback",
 }
 
-WELCOME_MESSAGE = (
-    "Hi! Welcome to Parijat Academy.\n"
-    "What brings you here today? Please tell me who you are:\n"
-    "1. Teacher or Tutor\n"
-    "2. Parent or Student\n"
-    "3. School or Institution\n"
-    "4. Franchise Investor\n"
-    "Enter the number corresponding to your choice."
+# WELCOME_MESSAGE = (
+#     "Hi! Welcome to Parijat Academy.\n"
+#     "What brings you here today? Please tell me who you are:\n"
+#     "1. Teacher or Tutor\n"
+#     "2. Parent or Student\n"
+#     "3. School or Institution\n"
+#     "4. Franchise Investor\n"
+#     "Enter the number corresponding to your choice."
+# )
+
+WELCOME_MESSAGE = InteractiveListMessage(
+    type="list",
+    header_text="Welcome to Parijat Academy",
+    body_text=(
+        "We offer structured learning programs for Students and Teachers.\n\n"
+        "We also conduct a *FREE Vedic Maths Master Class* every 2nd and 4th Saturday (8:00 PM – 9:30 PM).\n\n"
+        "Please choose an option below."
+    ),
+    button_text="View Options",
+    sections=[
+        ListSection(
+            rows=[
+                ListRow(id="free_master_class", title="Free Master Class", description="Join our free Vedic Maths Master Class"),
+                ListRow(id="vedic_maths_students", title="Vedic Maths for Students", description="Age 9+"),
+                ListRow(id="abacus_students", title="Abacus for Students", description="Age 5-9"),
+                ListRow(id="vedic_maths_teacher", title="Vedic Maths for Teachers", description="Comprehensive training program for educators"),
+            ]
+        )
+    ]
 )
 
-LOCATION_MESSAGE = (
-    "Got it! Are you based in India or abroad?\n"
-    "1. India\n"
-    "2. Abroad\n"
-    "Enter the number corresponding to your choice."
-)
+# LOCATION_MESSAGE = (
+#     "Got it! Are you based in India or abroad?\n"
+#     "1. India\n"
+#     "2. Abroad\n"
+#     "Enter the number corresponding to your choice."
+# )
+
+LOCATION_MESSAGE = "Got it! Are you based in India or abroad?\n1. India\n2. Abroad\nEnter the number corresponding to your choice."
 
 FALLBACK_MESSAGE = (
     "Sorry, I didn't quite catch that. Let me connect you with our team!"
@@ -194,8 +215,8 @@ def _handoff_message(persona: str, location: str) -> str:
     label = labels.get(persona, "")
     loc_label = "India" if location == "india" else "international partners"
     return (
-        f"Great! I've noted that you're from {loc_label} and are connecting as part of our {label} community. "
-        f"Let me connect you with the right specialist. How can I help you today?"
+        f"Great! I've noted that you're from *{loc_label}* and are connecting as part of our *{label}* community."
+        f"\n\nLet me connect you with the right specialist. \n\nHow can I help you today?"
     )
 
 
@@ -214,7 +235,7 @@ async def process_onboarding_if_needed(conversation_id: str, user_input: str, st
                 "is_ai_enabled": True
             }}
         )
-        # TODO: save message to messages collection
+        
         return reply
 
     # ───────────────────────────────────
@@ -317,17 +338,7 @@ if __name__ == "__main__":
     import asyncio
     
     async def test_chatbot():
-        # response = await send_to_pma_chatbot("whatsapp_919511907785", "Hi", "parent_student", "india", "John Doe", ORG_ID, "webhook")
-        # print("Chatbot response:", response)
-
-        response = await process_onboarding_if_needed("whatsapp_919511907785", "2", "awaiting_persona")
-        print("Onboarding response:", response)
-
-        res = await send_whatsapp_message({"conversation_id": "whatsapp_919511907785",
-                                                "content": response,
-                                                "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
-                                        }, ORG_ID, "ai")
-
-        print("Message send response:", res)
+        response = await send_to_pma_chatbot("whatsapp_919511907785", "Hi", "parent_student", "india", "John Doe", ORG_ID, "webhook")
+        print("Chatbot response:", response)
     
     asyncio.run(test_chatbot())

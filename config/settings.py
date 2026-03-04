@@ -78,8 +78,9 @@ DEV_WEBHOOK_URL = os.getenv("DEV_WEBHOOK_URL")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT")
 
-#HeidelAI Org WA ID
 HEIDELAI_ORG_WA_ID = os.getenv("HEIDELAI_ORG_WA_ID")
+PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
+X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making & validating API calls between different koyeb instances
 
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
@@ -98,4 +99,3 @@ os.environ["AZURE_OPENAI_ENDPOINT"] =os.getenv("AZURE_OPENAI_ENDPOINT")
 os.environ["AZURE_OPENAI_DEPLOYMENT"] =os.getenv("AZURE_DEPLOYMENT")
 
 PMA_ORG_ID=os.getenv("PMA_ORG_ID")
-PARIJAT_ACADEMY_ORG_WA_ID=os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")

@@ -4,6 +4,7 @@ from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
 from auth.dependencies import get_current_user
+from services.websocket_service import broadcast_on_stats_update, handle_unread_event, handle_typing_event, start_heartbeat, cleanup_client
 
 from fastapi.security import HTTPAuthorizationCredentials
 import json
@@ -146,11 +147,12 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager2.disconnect(client_id)
 
+#TODO: Implement a ping-pong mechanism to kill dead connections
 @router.websocket("/main-ws/{client_id}")
 async def main_ws(websocket: WebSocket, client_id: str):
     token = websocket.headers.get("sec-websocket-protocol")
 
-    # Step 1: Authenticate using the token
+    # Authenticate using the token
     try:
         credentials = HTTPAuthorizationCredentials(
             scheme="Bearer", 
@@ -178,7 +180,11 @@ async def main_ws(websocket: WebSocket, client_id: str):
     services.client_metadata[client_id] = {
         "ig_id": ig_id,
         "wa_id": wa_id,
+        "user_id": user.user_id
     }
+
+    if user.user_id:
+        services.agent_clients[user.user_id].add(client_id)
 
     if ig_id:
         services.instagram_clients[ig_id].add(client_id)
@@ -189,9 +195,12 @@ async def main_ws(websocket: WebSocket, client_id: str):
     logger.success(f"Connected client: {client_id}")
     logger.success(f"IG: {ig_id}, WA: {wa_id}")
 
+    # Step 4: Send initial stats
+    # asyncio.create_task(broadcast_on_stats_update(user.org_id))
+
     heartbeat_task = asyncio.create_task(start_heartbeat(client_id, websocket))
 
-   # Step 4: Keep listening for incoming messages
+   # Step 5: Keep listening for incoming messages
     try:
         while True:
             # 1. Use receive_text first to see raw data (debugs JSON errors)
@@ -210,6 +219,17 @@ async def main_ws(websocket: WebSocket, client_id: str):
 
                 if event_type == "typing_indicator":
                     await handle_typing_event(client_id, data)
+                
+                if event_type == "get_stats" or event_type == "get_followup_stats":
+                    target_date = data.get("date") # Optional date from frontend
+                    start_date = data.get("start_date") # Optional start date range
+                    end_date = data.get("end_date") # Optional end date range
+                    await broadcast_on_stats_update(
+                        user.org_id, 
+                        target_date=target_date, 
+                        start_date=start_date, 
+                        end_date=end_date
+                    )
                 
             except WebSocketDisconnect:
                 # 🛑 STOP the loop if the client disconnects
