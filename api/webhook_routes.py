@@ -90,6 +90,7 @@ async def verify_webhook(request: Request):
         return PlainTextResponse(content=str(args.get("hub.challenge")))
     return {"status": "Verification failed"}
 
+# TODO: add caching at relevant spots in webhook
 @router.post("")
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None), background_tasks: BackgroundTasks = None):
     """
