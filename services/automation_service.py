@@ -1,15 +1,19 @@
 import uuid
 from typing import Optional, Dict, List
 from datetime import datetime, timezone
+from pydantic import TypeAdapter
 
 # Internal Modules
 from database import get_mongo_db
-from services.utils import serialize_mongo
+from schemas.models import WhatsAppInteractiveMessage
+from services.utils import get_first_name, inject_variables, serialize_mongo
 from core.logger import get_logger
+from services.wa_service import send_interactive_whatsapp_message, send_whatsapp_message
 
 logger = get_logger(__name__)
 db = get_mongo_db()
 
+InteractiveMessageAdapter = TypeAdapter(WhatsAppInteractiveMessage)
 
 # Helper Functions for Collection Access
 def _automation_flows_collection(org_id: str):
@@ -178,3 +182,129 @@ def validate_flow_structure(flow_data: Dict) -> tuple:
         
     except Exception as e:
         return False, f"Validation error: {str(e)}"
+
+
+# TODO: flow doc must have an index on status, trigger_event, trigger_from
+async def execute_whatsapp_flow(
+        flow: dict,
+        org_id: str,
+        conversation_id: str,
+        stage: str,
+        customer_name:str,
+        trigger_event: str,
+        trigger_messages: str,
+        message_content: str,  # For interactive message_type, this is the selection_id
+        whatsapp_business_id: str,
+        message_type: str,
+    ):
+
+    welcome_message = flow.get("welcome_message")
+    flow_nodes = flow.get("nodes", {})
+    
+    # Safely parse trigger keywords
+    trigger_keywords = [msg.strip().lower() for msg in trigger_messages.split(",")] if trigger_messages else []
+
+    first_name = get_first_name(customer_name)
+    template_variables = {
+        "customer_name": first_name,
+    }
+
+    # User clicked a button or list item
+    if message_type == "interactive":
+        selection_id = message_content  # The ID of the button/list item clicked
+        
+        if selection_id in flow_nodes:
+            node_data = flow_nodes[selection_id]
+            node_type = node_data.get("type")
+
+            if node_type == "text":
+                raw_content = node_data.get("content", "")
+                personalized_content = inject_variables(raw_content, template_variables)
+
+                await send_whatsapp_message(
+                    org_id=org_id,
+                    mode="reply",
+                    message={
+                        "sender_id": whatsapp_business_id,
+                        "conversation_id": conversation_id,
+                        "content": personalized_content
+                    }
+                )
+            
+            # Note: Currently we only support button, list, and cta_url 
+            # TODO: Add support for more interactive types
+            elif node_type in ["button", "list", "cta_url"]:
+                try:
+                    # Inject variables into the raw dictionary
+                    personalized_dict = inject_variables(node_data, template_variables)
+                    
+                    # Validate the personalized dictionary with Pydantic
+                    validated_interactive_msg = InteractiveMessageAdapter.validate_python(personalized_dict)
+                    
+                    await send_interactive_whatsapp_message(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        sender_id=whatsapp_business_id,
+                        interactive_message=validated_interactive_msg
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to validate interactive node data: {e}")
+                    
+        else:
+            # The button ID isn't in the flow JSON. 
+            # TODO: Route to AI chatbot or send a fallback message.
+            logger.info(f"Node {selection_id} not found in flow, routing to AI...")
+            # await send_to_pma_chatbot(...)
+
+    # Triggering the Welcome Message
+    elif welcome_message:
+        is_new_session = (stage == "welcome")
+        is_keyword_match = (
+            message_type == "text" 
+            and trigger_event == "message_received" 
+            and message_content.strip().lower() in trigger_keywords
+        )
+
+        if is_new_session or is_keyword_match:
+            welcome_type = welcome_message.get("type")
+
+            if welcome_type == "text":
+                raw_content = welcome_message.get("content", "")
+                personalized_content = inject_variables(raw_content, template_variables)
+
+                await send_whatsapp_message(
+                    org_id=org_id,
+                    mode="reply",
+                    message={
+                        "sender_id": whatsapp_business_id,
+                        "conversation_id": conversation_id,
+                        "content": personalized_content
+                    }
+                )
+
+            elif welcome_type == "interactive":
+                try:
+                    raw_interactive_data = welcome_message.get("interactive", {})
+                    personalized_welcome_dict = inject_variables(raw_interactive_data, template_variables)
+                    
+                    validated_welcome_msg = InteractiveMessageAdapter.validate_python(personalized_welcome_dict)
+                    
+                    await send_interactive_whatsapp_message(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        sender_id=whatsapp_business_id,
+                        interactive_message=validated_welcome_msg
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to validate welcome interactive data: {e}")
+
+
+            db[f"conversations_{org_id}"].update_one(
+                {"conversation_id": conversation_id},
+                {"$set": {"onboarding_stage": "completed"}},
+            )
+        else:
+            # Message doesn't match trigger keywords - is a normal text message
+            # TODO: Route to AI chatbot or send a fallback message.
+            logger.info(f"Node {selection_id} not found in flow, routing to AI...")
+            # await send_to_pma_chatbot(...)
