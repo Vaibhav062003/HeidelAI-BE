@@ -54,4 +54,8 @@ def inject_variables(data, variables: dict):
     return data
 
 def get_first_name(full_name: str):
-    return full_name.split(' ')[0] if full_name else "there"
+    if not full_name:
+        return "there"
+
+    parts = full_name.strip().split()
+    return parts[0] if parts else "there"
