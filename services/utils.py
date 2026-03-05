@@ -47,7 +47,7 @@ def inject_variables(data, variables: dict):
         # Replace all matching placeholders in the string
         for key, val in variables.items():
             # Using .replace() handles multiple occurrences in the same string
-            data = data.replace(f"{{{key}}}", str(val) if val else "")
+            data = data.replace(f"{{{key}}}", "" if val is None else str(val))
         return data
     
     # Return ints, bools, etc., as is

@@ -217,6 +217,12 @@ async def execute_whatsapp_flow(
             node_data = flow_nodes[selection_id]
             node_type = node_data.get("type")
 
+            # The user successfully clicked a button, so we graduate them from the onboarding stage
+            db[f"conversations_{org_id}"].update_one(
+                {"conversation_id": conversation_id},
+                {"$set": {"onboarding_stage": "completed"}},
+            )
+
             if node_type == "text":
                 raw_content = node_data.get("content", "")
                 personalized_content = inject_variables(raw_content, template_variables)
@@ -230,6 +236,8 @@ async def execute_whatsapp_flow(
                         "content": personalized_content
                     }
                 )
+
+                return True
             
             # Note: Currently we only support button, list, and cta_url 
             # TODO: Add support for more interactive types
@@ -247,14 +255,19 @@ async def execute_whatsapp_flow(
                         sender_id=whatsapp_business_id,
                         interactive_message=validated_interactive_msg
                     )
+
+                    return True
                 except Exception as e:
                     logger.error(f"Failed to validate interactive node data: {e}")
-                    
+
+                    return False
+
         else:
             # The button ID isn't in the flow JSON. 
             # TODO: Route to AI chatbot or send a fallback message.
             logger.info(f"Node {selection_id} not found in flow, routing to AI...")
             # await send_to_pma_chatbot(...)
+        return False
 
     # Triggering the Welcome Message
     elif welcome_message:
@@ -282,6 +295,13 @@ async def execute_whatsapp_flow(
                     }
                 )
 
+                # It's a plain text welcome, mark as complete immediately
+                db[f"conversations_{org_id}"].update_one(
+                    {"conversation_id": conversation_id},
+                    {"$set": {"onboarding_stage": "completed"}},
+                )
+                return True
+
             elif welcome_type == "interactive":
                 try:
                     raw_interactive_data = welcome_message.get("interactive", {})
@@ -295,16 +315,17 @@ async def execute_whatsapp_flow(
                         sender_id=whatsapp_business_id,
                         interactive_message=validated_welcome_msg
                     )
+
+                    # DO NOT update DB stage here. Keep it as "welcome" until they click a button.
+                    return True
+                    
                 except Exception as e:
                     logger.error(f"Failed to validate welcome interactive data: {e}")
 
+                    return False
 
-            db[f"conversations_{org_id}"].update_one(
-                {"conversation_id": conversation_id},
-                {"$set": {"onboarding_stage": "completed"}},
-            )
         else:
-            # Message doesn't match trigger keywords - is a normal text message
-            # TODO: Route to AI chatbot or send a fallback message.
-            logger.info(f"Node {selection_id} not found in flow, routing to AI...")
-            # await send_to_pma_chatbot(...)
+            logger.info("Message not found in flow, routing to AI...")
+            return False
+
+    return False
