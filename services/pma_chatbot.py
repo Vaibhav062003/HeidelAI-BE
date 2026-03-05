@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from config import settings
 from database import get_async_mongo_db
 from schemas.models import ActionButton, InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, ListRow, ListSection, ReplyButton
+from services.utils import get_first_name
 from services.wa_service import send_interactive_whatsapp_message
 
 db = get_async_mongo_db()
@@ -152,7 +153,7 @@ def get_menu_message(location: str):
 
 def get_welcome_message(sender_name: str):
     # Safely get the first name, default to "there" if sender_name is empty/None
-    first_name = sender_name.split(' ')[0] if sender_name else "there"
+    first_name = get_first_name(sender_name)
     
     return InteractiveListMessage(
         type="list",
@@ -170,7 +171,7 @@ def get_welcome_message(sender_name: str):
 
 def get_location_message(sender_name: str):
     # Safely get the first name, default to "there" if sender_name is empty/None
-    first_name = sender_name.split(' ')[0] if sender_name else "there"
+    first_name = get_first_name(sender_name)
 
     return InteractiveReplyButtonMessage(
         type="button",
