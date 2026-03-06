@@ -618,7 +618,18 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
             detail=f"Failed to send template message: {str(e)}"
         )
 
-async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
+async def send_wa_media_message(
+        recipient_id: str, 
+        media_url: str, 
+        media_type: str, 
+        wa_id: str, 
+        content: Optional[str], 
+        org_id: str, 
+        temp_id: Optional[str], 
+        mode: str, 
+        context_type: Optional[str], 
+        context: Optional[dict]
+    ) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """

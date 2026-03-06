@@ -10,6 +10,7 @@ import httpx
 
 # Internal Modules 
 from core.managers import manager
+from services.automation_service import execute_whatsapp_flow
 from services.pma_chatbot import process_onboarding_if_needed, send_to_pma_chatbot
 from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
@@ -89,6 +90,7 @@ async def verify_webhook(request: Request):
         return PlainTextResponse(content=str(args.get("hub.challenge")))
     return {"status": "Verification failed"}
 
+# TODO: add caching at relevant spots in webhook
 @router.post("")
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None), background_tasks: BackgroundTasks = None):
     """
@@ -199,6 +201,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     
                     org_id = connection.get("org_id") 
                     access_token = connection.get("access_token")
+
+                    # Get organization's automation flow collection
+                    flow_collection_name = f"automation_flows_{org_id}"
+                    flow_collection = db[flow_collection_name]
 
                     # Get sender name from contacts if available
                     sender_name2 = "Unknown Sender"
@@ -360,6 +366,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Get conversation doc to check if AI is enabled
                             convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
                             is_conv_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else True
+                            stage = convo_doc.get("onboarding_stage", "welcome") if convo_doc else "welcome"
                             
                             org_doc = db.organizations.find_one({"org_id": org_id},{"is_ai_enabled": 1})
                             is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
@@ -370,13 +377,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_dev = ENVIRONMENT == "development"
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
-                            
 
                             logger.info("is_heidelai: ", is_heidelai)
                             logger.info("is_pma_wa: ", is_pma_wa)
                             logger.info("is_production: ", is_production)
                             logger.info("is_dev: ", is_dev)
                             logger.info("ai_enabled: ", ai_enabled) 
+
+                            whatsapp_flow = flow_collection.find_one({"trigger_from": "webhook", "trigger_event": "message_received", "status": "active"})
+                            logger.info(
+                                f"[{org_id}] WhatsApp automation flow: "
+                                f"{'found' if whatsapp_flow else 'no active flow found'}"
+                            )
 
                             # Extract message content based on message type
                             if message_type == "text":
@@ -424,6 +436,23 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 }
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
+                                if whatsapp_flow and ai_enabled and is_production:
+                                    automation_response = await execute_whatsapp_flow(
+                                        flow=whatsapp_flow,
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        stage=stage,
+                                        trigger_event="message_received",
+                                        trigger_messages=whatsapp_flow.get("trigger_messages"),
+                                        message_content=content,
+                                        customer_name=sender_name2,
+                                        whatsapp_business_id=whatsapp_business_id,
+                                        message_type=message_type,
+                                    )
+
+                                    if automation_response:
+                                        return {"status": "ok"}
+
                                 # Handling messages received on HeidelAI's whatsapp number
                                 if is_heidelai and ai_enabled and is_production:
 
@@ -454,8 +483,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     return {"status": "ok"}
 
                                 elif is_pma_wa and ai_enabled and is_production:
-                                    convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
-                                    stage = convo_doc.get("onboarding_stage", "welcome")
 
                                     flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                         
@@ -612,6 +639,23 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context_type=context_type,
                                         context=context
                                     )
+
+                                if whatsapp_flow and ai_enabled and is_production:
+                                    automation_response = await execute_whatsapp_flow(
+                                        flow=whatsapp_flow,
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        stage=stage,
+                                        trigger_event="message_received",
+                                        trigger_messages=whatsapp_flow.get("trigger_messages") if isinstance(whatsapp_flow, dict) else None,
+                                        message_content=selection_id if selection_id else None,
+                                        customer_name=sender_name2,
+                                        whatsapp_business_id=whatsapp_business_id,
+                                        message_type=message_type,
+                                    )
+
+                                    if automation_response:
+                                        return {"status": "ok"}
                                 
                                 if is_pma_wa and ai_enabled and is_production:
                                     if selection_id:
