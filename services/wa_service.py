@@ -1276,14 +1276,18 @@ def create_bulk_job(
     }
 
 
-def get_bulk_job(job_id: str, org_id: str) -> Optional[dict]:
+def get_bulk_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
     """
-    Fetch a bulk-send job record from memory, scoped to an org.
-    Returns None if the job doesn't exist or belongs to a different org.
+    Fetch a bulk-send job record from memory, scoped to an org if org_id is provided.
+    Returns None if the job doesn't exist.
     """
     job = _bulk_jobs.get(job_id)
-    if job is None or job.get("org_id") != org_id:
+    if job is None:
         return None
+    
+    if org_id and job.get("org_id") != org_id:
+        return None
+        
     return dict(job)  # return a copy so callers can't mutate state
 
 
@@ -1424,3 +1428,21 @@ async def run_bulk_send_job(
             "error": str(e),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
+
+
+async def bulk_job_status_generator(job_id: str):
+    """
+    Yields the status of a bulk WhatsApp send job over SSE.
+    """
+    while True:
+        job = get_bulk_job(job_id)
+        if not job:
+            yield f"data: {json.dumps({'status': 'ERROR', 'message': 'Job not found'})}\n\n"
+            return
+
+        yield f"data: {json.dumps(job)}\n\n"
+
+        if job.get("status") in ["completed", "failed"]:
+            break
+
+        await asyncio.sleep(2)
