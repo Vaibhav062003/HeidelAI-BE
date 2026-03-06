@@ -385,7 +385,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info("ai_enabled: ", ai_enabled) 
 
                             whatsapp_flow = flow_collection.find_one({"trigger_from": "webhook", "trigger_event": "message_received", "status": "active"})
-                            logger.info(f"Fetched WhatsApp automation flow for org id : {org_id if whatsapp_flow else 'No active flow found'}")
+                            logger.info(
+                                f"[{org_id}] WhatsApp automation flow: "
+                                f"{'found' if whatsapp_flow else 'no active flow found'}"
+                            )
 
                             # Extract message content based on message type
                             if message_type == "text":
