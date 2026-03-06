@@ -8,7 +8,7 @@ from database import get_mongo_db
 from schemas.models import WhatsAppInteractiveMessage
 from services.utils import get_first_name, inject_variables, serialize_mongo
 from core.logger import get_logger
-from services.wa_service import send_interactive_whatsapp_message, send_whatsapp_message
+from services.wa_service import send_interactive_whatsapp_message, send_wa_media_message, send_whatsapp_message
 
 logger = get_logger(__name__)
 db = get_mongo_db()
@@ -288,6 +288,15 @@ async def execute_whatsapp_flow(
         if is_new_session or is_keyword_match:
             welcome_type = welcome_message.get("type")
             logger.info(f"[{org_id}] Trigger conditions met. Sending welcome message (Type: {welcome_type})")
+
+            await send_wa_media_message(
+                recipient_id=conversation_id.split("_")[1],  # Extract the phone number from conversation_id format "whatsapp_{phone_number}"
+                media_url="https://res.cloudinary.com/djpc5zfgz/video/upload/v1772718015/cognisive_intro_video_e9d7cc.mp4",
+                media_type="video",
+                wa_id=whatsapp_business_id,
+                org_id=org_id,
+                mode="reply",
+            )
 
             if welcome_type == "text":
                 raw_content = welcome_message.get("content", "")
