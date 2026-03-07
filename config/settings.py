@@ -74,7 +74,7 @@ CASHFREE_VERSION = os.getenv("CASHFREE_VERSION")
 CLERK_TOKEN = os.getenv("CLERK_TOKEN_KEY")
 
 # Webhook for Dev
-DEV_WEBHOOK_URL = os.getenv("DEV_WEBHOOK_URL")
+DEV_WEBHOOK_URL = os.getenv("DEV_WEBHOOK_URL", "").strip().strip("'\"")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT")
 
