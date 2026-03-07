@@ -2,10 +2,6 @@ import httpx
 from typing import Dict
 import logging
 
-from database import get_async_mongo_db
-
-db = get_async_mongo_db()
-
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -35,8 +31,7 @@ async def send_to_agent(
         source: Source of the message (for example, "webhook").
         timeout: Timeout in seconds for the HTTP request to the chatbot service.
     Returns:
-        A dictionary containing the key ``"final_response"`` on success, or ``None`` if the chatbot response is missing
-        the expected data.
+        A dictionary containing the key ``"final_response"`` on success.
     """
     # Prepare the request payload
     payload = {
@@ -98,18 +93,3 @@ async def send_to_agent(
         logger.error(f"Unexpected error calling chatbot: {str(e)}", exc_info=True)
         return { "final_response" : "I apologize, but something went wrong. Please try again later."}  
     
-if __name__ == "__main__":
-    import asyncio
-    
-    async def test_send_to_chatbot():
-        response = await send_to_agent(
-            conversation_id="whatsapp_919511907785",
-            user_input="Hello, how are you?",
-            persona="fallback",
-            location="NA",
-            customer_name="Sahil",
-            org_id="org_3AA6u6o9qyEvIFVx8jTbgGwe8Np"
-        )
-        print(response)
-    
-    asyncio.run(test_send_to_chatbot())
