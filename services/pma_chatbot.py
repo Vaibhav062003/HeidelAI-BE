@@ -100,7 +100,7 @@ async def send_to_pma_chatbot(
         return { "final_response" : "I apologize, but I'm experiencing technical difficulties. Please try again later."}  
         
     except Exception as e:
-        logger.error(f"Unexpected error calling chatbot: {str(e)}", exc_info=True)
+        logger.opt(exception=True).error(f"Unexpected error calling chatbot: {str(e)}")
         return { "final_response" : "I apologize, but something went wrong. Please try again later."}  
 
 """
@@ -200,7 +200,7 @@ def get_location_message(sender_name: str):
     )
 
 async def process_onboarding_if_needed(user_input: str, conversation_id: str, org_id: str, stage: str, whatsapp_business_id: str, sender_name: str):
-    logger.info("Processing onboarding for conversation_id=%s at stage=%s with user_input=%s", conversation_id, stage, user_input)
+    logger.info(f"Processing onboarding for conversation_id={conversation_id} at stage={stage} with user_input={user_input}")
     user_input = user_input.strip().lower()
 
     # ───────────────────────────────────

@@ -72,7 +72,7 @@ async def send_to_chatbot(
         return "I apologize, but I'm experiencing technical difficulties. Please try again later."
         
     except Exception as e:
-        logger.error(f"Unexpected error calling chatbot: {str(e)}", exc_info=True)
+        logger.opt(exception=True).error(f"Unexpected error calling chatbot: {str(e)}")
         return "I apologize, but something went wrong. Please try again later."
 
 
@@ -144,9 +144,9 @@ def send_to_chatbot_sync(
         return "I apologize, but I'm experiencing technical difficulties. Please try again later."
         
     except Exception as e:
-        logger.error(f"Unexpected error calling chatbot: {str(e)}", exc_info=True)
+        logger.opt(exception=True).error(f"Unexpected error calling chatbot: {str(e)}")
         return "I apologize, but something went wrong. Please try again later."
-    
+
 if __name__ == "__main__":
     # Example usage
     import asyncio

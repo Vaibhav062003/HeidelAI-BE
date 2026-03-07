@@ -2,6 +2,7 @@
 import os, traceback, sys
 
 # === Third-party Modules ===
+from fastapi.exception_handlers import http_exception_handler
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -35,22 +36,18 @@ app = FastAPI(
     )
 
 @app.exception_handler(StarletteHTTPException)
-async def http_exception_traceback_handler(request: Request, exc: StarletteHTTPException):
-    # Hunt down the 403 errors only
+async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    # We only care about hunting down the 403 right now
     if exc.status_code == 403:
-        # Format the traceback into a readable string
         tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         
-        logger.error(f"🚨 403 FORBIDDEN INTERCEPTED!")
+        logger.error("🚨 403 FORBIDDEN INTERCEPTED!")
         logger.error(f"Endpoint: {request.method} {request.url}")
         logger.error(f"Detail: {exc.detail}")
         logger.error(f"Traceback:\n{tb_str}")
         
-    # Return the standard response so the app behaves normally
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-    )
+    # Delegate back to FastAPI's default handler to safely preserve all headers and exact behavior
+    return await http_exception_handler(request, exc)
 
 app.include_router(router)
 
