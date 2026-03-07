@@ -44,11 +44,11 @@ async def forward_webhook_to_dev(body: bytes, headers: dict):
         except Exception as e:
             logger.error(f"Failed to forward webhook to Dev: {e}")
 
-def validate_signature(payload, signature):
-    # Hash the payload with the app secret
+def validate_signature(raw_body: bytes, signature: str) -> bool:
+    # Encode the secret using 'utf-8'
     expected_signature = hmac.new(
-        bytes(APP_SECRET, 'latin-1'),
-        msg=payload.encode('utf-8'),
+        key=APP_SECRET.encode('utf-8'), 
+        msg=raw_body,
         digestmod=hashlib.sha256
     ).hexdigest()
     
@@ -57,17 +57,17 @@ def validate_signature(payload, signature):
 
 # Middleware or decorator to validate signature for POST requests
 async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
-    # Get the request payload
-    body = await request.body()
-    payload = body.decode('utf-8')
+    # Get the raw request payload bytes.
+    body = await request.body() 
 
     if not x_hub_signature_256:
         raise HTTPException(status_code=403, detail="Signature missing")
 
-    if not validate_signature(payload, x_hub_signature_256):
+    # Pass the raw `body` directly into the validator
+    if not validate_signature(body, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
-    return True # Added this return so the check in handle_webhook evaluates correctly
+    return True
 
 def remove_expired_message_ids():
     current_time = time.time()
