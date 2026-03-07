@@ -28,9 +28,8 @@ from config.settings import (
     SUPABASE_INSTA_DM_TABLE,  
     IG_ACCESS_TOKEN
 )
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 

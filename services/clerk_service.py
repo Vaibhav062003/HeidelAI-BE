@@ -3,10 +3,9 @@ from typing import TypedDict, Literal
 import httpx
 
 from config.settings import CLERK_TOKEN
-from core.logger import get_logger
+from loguru import logger
 from database import get_mongo_db
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 class OwnerPayload(TypedDict):

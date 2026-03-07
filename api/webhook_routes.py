@@ -24,11 +24,11 @@ from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID
 from core.services import services
-from core.logger import get_logger
+from loguru import logger
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
-logger = get_logger(__name__)
+
 
 async def forward_webhook_to_dev(body: bytes, headers: dict):
     """
@@ -136,7 +136,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     # Remove expired message IDs
     remove_expired_message_ids()
 
-    logger.info("Incoming webhook payload:", json.dumps(payload, indent=2))
+    logger.info(f"Incoming webhook payload:\n{json.dumps(payload, indent=2)}")
 
     if payload["object"] == "whatsapp_business_account":
         if "entry" in payload and len(payload["entry"]) > 0:
@@ -378,11 +378,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
 
-                            logger.info("is_heidelai: ", is_heidelai)
-                            logger.info("is_pma_wa: ", is_pma_wa)
-                            logger.info("is_production: ", is_production)
-                            logger.info("is_dev: ", is_dev)
-                            logger.info("ai_enabled: ", ai_enabled) 
+                            logger.info(f"is_heidelai: {is_heidelai}")
+                            logger.info(f"is_pma_wa: {is_pma_wa}")
+                            logger.info(f"is_production: {is_production}")
+                            logger.info(f"is_dev: {is_dev}")
+                            logger.info(f"ai_enabled: {ai_enabled}") 
 
                             whatsapp_flow = flow_collection.find_one({"trigger_from": "webhook", "trigger_event": "message_received", "status": "active"})
                             logger.info(
@@ -1471,7 +1471,7 @@ async def cashfree_webhook(request: Request):
 
     raw_body = await request.body()
     payload = json.loads(raw_body)
-    logger.info("Cashfree Webhook Received:", json.dumps(payload, indent=2))
+    logger.info(f"Cashfree Webhook Received:\n{json.dumps(payload, indent=2)}")
 
 
     event_type = payload["type"]

@@ -5,10 +5,8 @@ from fastapi import HTTPException
 from pymongo.errors import PyMongoError
 from pymongo import ReturnDocument
 from services.utils import serialize_mongo
-from core.logger import get_logger
-# from services.websocket_service import broadcast_on_stats_update
+from loguru import logger
 
-logger = get_logger(__name__)
 
 db = get_mongo_db()
 

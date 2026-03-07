@@ -36,11 +36,8 @@ from config.settings import (
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET
 )
-from core.logger import get_logger
+from loguru import logger
 
-
-
-logger = get_logger(__name__)
 
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD_NAME,

@@ -3,9 +3,8 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 from auth.dependencies import CurrentUser
 from services.dashboard_service import aggregate_dashboard_stats
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 router = APIRouter(tags=["Dashboard Routes"])
 

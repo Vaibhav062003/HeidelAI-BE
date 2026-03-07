@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 from bson import ObjectId
 from datetime import datetime
 import os
@@ -59,3 +61,13 @@ def get_first_name(full_name: str):
 
     parts = full_name.strip().split()
     return parts[0] if parts else "there"
+
+def format_in_ist(record):
+    # Convert Loguru's default aware datetime to IST
+    ist_time = record["time"].astimezone(ZoneInfo("Asia/Kolkata"))
+    
+    # Format the time: %I is 12-hour clock, %M is minute, %S is second, %p is AM/PM
+    record["extra"]["formatted_time"] = ist_time.strftime("%d-%m-%y %I:%M:%S %p")
+    
+    # Return the log string format (matching Loguru's default color style)
+    return "<green>{extra[formatted_time]}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>\n"

@@ -7,10 +7,9 @@ from pydantic import TypeAdapter
 from database import get_mongo_db
 from schemas.models import WhatsAppInteractiveMessage
 from services.utils import get_first_name, inject_variables, serialize_mongo
-from core.logger import get_logger
 from services.wa_service import send_interactive_whatsapp_message, send_whatsapp_message
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 InteractiveMessageAdapter = TypeAdapter(WhatsAppInteractiveMessage)

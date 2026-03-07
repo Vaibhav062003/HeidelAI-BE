@@ -8,9 +8,8 @@ from pymongo import UpdateOne
 # Internal Modules
 from core.services import services
 from database import get_mongo_db
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 db = get_mongo_db()
 

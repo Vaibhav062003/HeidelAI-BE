@@ -45,11 +45,8 @@ from services.products_service import (
 )
 
 from services.wa_service import send_whatsapp_reaction
-from core.logger import get_logger
+from loguru import logger
 
-
-
-logger = get_logger(__name__)
 
 router = APIRouter(tags=["Common Routes"])
 db = get_mongo_db()

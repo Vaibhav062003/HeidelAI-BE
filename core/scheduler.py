@@ -8,9 +8,8 @@ from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
 # from services.websocket_service import broadcast_on_stats_update
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 db = get_mongo_db()
 scheduled_collection = db["scheduled_messages"]

@@ -1,10 +1,9 @@
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 from bson import ObjectId
-from core.logger import get_logger
+from loguru import logger
 from database import get_async_mongo_db
 
-logger = get_logger(__name__)
 
 async def aggregate_dashboard_stats(
     org_id: str, 

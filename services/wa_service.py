@@ -21,10 +21,10 @@ from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
-from core.logger import get_logger
+from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
 
-logger = get_logger(__name__)
+
 db = get_mongo_db()
 mongo_client = get_mongo_client()
 

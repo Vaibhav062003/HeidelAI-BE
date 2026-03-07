@@ -15,9 +15,8 @@ from config.settings import (
     CLOUDINARY_API_SECRET,
 )
 from schemas.models import MessageRole
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 # Cloudinary configuration
 cloudinary.config(
