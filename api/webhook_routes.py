@@ -45,15 +45,26 @@ async def forward_webhook_to_dev(body: bytes, headers: dict):
             logger.error(f"Failed to forward webhook to Dev: {e}")
 
 def validate_signature(raw_body: bytes, signature: str) -> bool:
-    # Encode the secret using 'utf-8'
+    # Calculate the hash
     expected_signature = hmac.new(
         key=APP_SECRET.encode('utf-8'), 
-        msg=raw_body,
+        msg=raw_body, 
         digestmod=hashlib.sha256
     ).hexdigest()
     
-    # Compare signatures to ensure they match
-    return hmac.compare_digest(f"sha256={expected_signature}", signature)
+    our_sig = f"sha256={expected_signature}"
+    
+    # If they don't match, log EVERYTHING before failing
+    if not hmac.compare_digest(our_sig, signature):
+        logger.error("🚨 SIGNATURE MISMATCH DETECTED 🚨")
+        # Mask the secret so you don't leak the whole thing in logs, but check the length!
+        logger.error(f"1. App Secret Prefix: {APP_SECRET[:4]}*** (Total Length: {len(APP_SECRET)})")
+        logger.error(f"2. Meta's Signature:  {signature}")
+        logger.error(f"3. Our Signature:     {our_sig}")
+        logger.error(f"4. Raw Bytes Length:  {len(raw_body)}")
+        logger.error(f"5. Raw Payload:       {raw_body.decode('utf-8', errors='replace')}")
+        
+    return hmac.compare_digest(our_sig, signature)
 
 # Middleware or decorator to validate signature for POST requests
 async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
