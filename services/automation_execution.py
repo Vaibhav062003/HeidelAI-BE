@@ -40,7 +40,7 @@ class FlowExecutionContext:
             # Keep full nested structure for advanced users
             "trigger_data": trigger_data,
             
-            # Flatten common fields for convenience (extract from trigger_data)
+            # Flatten common fields for convenience
             "customer_name": trigger_data.get("customer_name") or trigger_data.get("commenter_username"),
             "customer_username": trigger_data.get("customer_username") or trigger_data.get("commenter_username"),
             "customer_id": trigger_data.get("customer_id") or trigger_data.get("commenter_id"),
@@ -49,8 +49,11 @@ class FlowExecutionContext:
             "post_id": trigger_data.get("post_id"),
             "platform": trigger_data.get("platform"),
             "platform_id": trigger_data.get("platform_id"),
+            # Google Sheet specific
+            "phone_number": trigger_data.get("phone_number"),
+            "row": trigger_data.get("row", {}),
             
-            # Dynamic variables that can be set during execution
+            # Dynamic variables
             "execution_id": self.execution_id,
             "org_id": org_id,
             "flow_id": flow_id,
@@ -87,7 +90,6 @@ class FlowExecutionContext:
     
     def get_variable(self, key: str) -> Any:
         """Get a variable from the execution context"""
-        # Support nested access like "trigger_data.customer_name"
         parts = key.split(".")
         value = self.variables
         
@@ -104,7 +106,6 @@ class FlowExecutionContext:
         if not text or not isinstance(text, str):
             return text
         
-        # Find all {{variable}} patterns
         pattern = r'\{\{([^}]+)\}\}'
         
         def replace_match(match):
@@ -151,6 +152,21 @@ class FlowExecutionContext:
         }
 
 
+# Trigger node types that are just pass-throughs (log and continue)
+TRIGGER_NODE_TYPES = {
+    "instagram_dm_received",
+    "instagram_comment",
+    "instagram_story_reply",
+    "instagram_story_mention",
+    "whatsapp_message_received",
+    "contact_tag_added",
+    "contact_tag_removed",
+    # Google Sheet trigger node
+    "google_sheet",
+    "trigger_google_sheet",
+}
+
+
 # === Main Execution Function ===
 async def execute_automation_flow(
     org_id: str,
@@ -159,22 +175,11 @@ async def execute_automation_flow(
     trigger_data: Dict
 ) -> Dict:
     """
-    Execute an automation flow
-    
-    Args:
-        org_id: Organization ID
-        flow_id: Flow ID to execute
-        trigger_type: Type of trigger that initiated this execution
-        trigger_data: Data from the trigger event
-    
-    Returns:
-        Execution record
+    Execute an automation flow.
     """
-    # Create execution context
     context = FlowExecutionContext(org_id, flow_id, trigger_type, trigger_data)
     
     try:
-        # Get the flow
         flows_collection = _automation_flows_collection(org_id)
         flow = flows_collection.find_one({"flow_id": flow_id, "org_id": org_id})
         
@@ -192,7 +197,6 @@ async def execute_automation_flow(
             success=True
         )
         
-        # Get flow data
         flow_data = flow.get("flow_data", {})
         nodes = flow_data.get("nodes", {})
         connections = flow_data.get("connections", [])
@@ -200,17 +204,19 @@ async def execute_automation_flow(
         
         # Map event type to expected trigger type
         event_to_trigger_map = {
-    "post_comment": "instagram_comment",
-    "story_reply": "instagram_story_reply", 
-    "message_received": "instagram_dm_received",
-}
+            "post_comment": "instagram_comment",
+            "story_reply": "instagram_story_reply",
+            "message_received": "instagram_dm_received",
+            "google_sheet_row": "google_sheet",
+        }
 
         expected_trigger_type = event_to_trigger_map.get(context.trigger_type, context.trigger_type)
 
         # Find matching trigger
         start_node_id = None
         for trigger_config in triggers:
-            if trigger_config.get("type") == expected_trigger_type:
+            ttype = trigger_config.get("type")
+            if ttype == expected_trigger_type or ttype in (context.trigger_type,):
                 start_node_id = trigger_config.get("start_node_id")
                 logger.info(f"✅ Found matching trigger, starting at node: {start_node_id}")
                 break
@@ -218,11 +224,9 @@ async def execute_automation_flow(
         if not start_node_id:
             raise Exception(f"No matching trigger found for type: {expected_trigger_type}")
 
-        # ✅ CRITICAL FIX: EXECUTE THE FLOW STARTING FROM TRIGGER'S START NODE
         logger.info(f"🚀 Executing flow from start_node: {start_node_id}")
         await _execute_node(context, start_node_id, nodes, connections)
 
-        # Mark as successful (AFTER execution completes)
         context.mark_success()
         
         context.log(
@@ -234,7 +238,6 @@ async def execute_automation_flow(
         )
         
     except Exception as e:
-        # Mark as failed
         error_message = str(e)
         context.mark_failed(error_message)
         context.log(
@@ -246,10 +249,8 @@ async def execute_automation_flow(
         )
     
     finally:
-        # Save execution record
         await _save_execution_record(context)
         
-        # Update flow execution statistics
         if context.status == "success":
             from services.automation_service import increment_execution_count
             await increment_execution_count(org_id, flow_id)
@@ -263,12 +264,7 @@ async def _execute_node(
     nodes: Dict,
     connections: List[Dict]
 ) -> bool:
-    """
-    Execute a single node and its connected nodes
-    
-    Returns:
-        True if execution should continue, False if it should stop
-    """
+    """Execute a single node and its connected nodes"""
     if node_id not in nodes:
         context.log(
             node_id=node_id,
@@ -293,10 +289,7 @@ async def _execute_node(
     
     try:
         # Handle TRIGGER nodes - just log and continue
-        if node_type in ["instagram_dm_received", "instagram_comment", 
-                        "instagram_story_reply", "instagram_story_mention",
-                        "whatsapp_message_received", "contact_tag_added", 
-                        "contact_tag_removed"]:
+        if node_type in TRIGGER_NODE_TYPES:
             context.log(
                 node_id=node_id,
                 node_type=node_type,
@@ -305,7 +298,7 @@ async def _execute_node(
                 success=True
             )
         
-        # Handle CONDITION nodes (have multiple outputs)
+        # Handle CONDITION nodes
         elif node_type == "condition":
             result = await _execute_condition_node(context, node_id, node_config)
             next_nodes = _get_conditional_next_nodes(node_id, connections, result)
@@ -320,7 +313,7 @@ async def _execute_node(
                 await _execute_node(context, next_node_id, nodes, connections)
             return True
         
-        # Handle all ACTION nodes (delegate to automation_actions.py)
+        # Handle all ACTION nodes
         else:
             await execute_action_node(context, node_id, node_type, node_config)
         
@@ -342,60 +335,13 @@ async def _execute_node(
         raise
 
 
-async def _execute_delay_node(context: FlowExecutionContext, node_id: str, config: Dict):
-    """Execute a delay node"""
-    amount = config.get("amount", 1)
-    unit = config.get("unit", "seconds")
-    
-    # Convert to seconds
-    if unit == "minutes":
-        delay_seconds = amount * 60
-    elif unit == "hours":
-        delay_seconds = amount * 3600
-    elif unit == "days":
-        delay_seconds = amount * 86400
-    else:  # seconds
-        delay_seconds = amount
-    
-    # Cap delay at 5 minutes for safety (production should use scheduled tasks)
-    delay_seconds = min(delay_seconds, 300)
-    
-    context.log(
-        node_id=node_id,
-        node_type="delay",
-        action="delay_start",
-        message=f"Starting delay: {delay_seconds} seconds",
-        success=True
-    )
-    
-    await asyncio.sleep(delay_seconds)
-    
-    context.log(
-        node_id=node_id,
-        node_type="delay",
-        action="delay_complete",
-        message="Delay completed",
-        success=True
-    )
-
-
 async def _execute_condition_node(context: FlowExecutionContext, node_id: str, config: Dict) -> bool:
-    """
-    Execute a condition node
-    
-    Returns:
-        True if condition passed, False otherwise
-    """
     variable = config.get("variable")
     operator = config.get("operator")
     value = config.get("value")
-    
-    # Get variable value
     var_value = context.get_variable(variable)
     
-    # Evaluate condition
     result = False
-    
     if operator == "equals":
         result = str(var_value) == str(value)
     elif operator == "not_equals":
@@ -428,21 +374,12 @@ async def _execute_condition_node(context: FlowExecutionContext, node_id: str, c
 
 
 async def _execute_randomizer_node(context: FlowExecutionContext, node_id: str, connections: List[Dict]) -> Optional[str]:
-    """
-    Execute a randomizer node - randomly select one output path
-    
-    Returns:
-        Node ID of randomly selected path, or None
-    """
     import random
     
-    # Get all possible next nodes
     next_nodes = [conn["target"] for conn in connections if conn.get("source") == node_id]
-    
     if not next_nodes:
         return None
     
-    # Randomly select one
     selected_node = random.choice(next_nodes)
     
     context.log(
@@ -458,13 +395,10 @@ async def _execute_randomizer_node(context: FlowExecutionContext, node_id: str, 
 
 
 def _get_next_nodes(node_id: str, connections: List[Dict]) -> List[str]:
-    """Get all nodes connected from a given node"""
     return [conn["target"] for conn in connections if conn.get("source") == node_id]
 
 
 def _get_conditional_next_nodes(node_id: str, connections: List[Dict], condition_result: bool) -> List[str]:
-    """Get next nodes based on condition result"""
-    # Look for connections with sourceHandle indicating true/false path
     result_str = "true" if condition_result else "false"
     
     matching_nodes = []
@@ -474,7 +408,6 @@ def _get_conditional_next_nodes(node_id: str, connections: List[Dict], condition
             if result_str in source_handle.lower():
                 matching_nodes.append(conn["target"])
     
-    # If no specific handles, return all connections (backward compatibility)
     if not matching_nodes:
         matching_nodes = _get_next_nodes(node_id, connections)
     
@@ -482,10 +415,7 @@ def _get_conditional_next_nodes(node_id: str, connections: List[Dict], condition
 
 
 async def _save_execution_record(context: FlowExecutionContext):
-    """Save execution record to database"""
     collection = _automation_executions_collection()
-    
     execution_doc = context.to_dict()
     collection.insert_one(execution_doc)
-    
     logger.info(f"Saved execution record: {context.execution_id}, status: {context.status}")

@@ -2,9 +2,13 @@ import asyncio
 from fastapi.encoders import jsonable_encoder
 from core.services import services
 from fastapi import WebSocket, WebSocketDisconnect
+from database import get_mongo_db, get_async_mongo_db
 from core.logger import get_logger
+import json
+
 
 logger = get_logger(__name__)
+db = get_mongo_db()
 
 async def cleanup_client(client_id: str):
     """
@@ -31,6 +35,12 @@ async def cleanup_client(client_id: str):
 
     ig_id = meta.get("ig_id")
     wa_id = meta.get("wa_id")
+    user_id = meta.get("user_id")
+
+    if user_id and client_id in services.agent_clients.get(user_id, set()):
+        services.agent_clients[user_id].remove(client_id)
+        if not services.agent_clients[user_id]:
+            del services.agent_clients[user_id]
 
     if ig_id and client_id in services.instagram_clients[ig_id]:
         services.instagram_clients[ig_id].remove(client_id)
@@ -101,14 +111,15 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
     else:
         target_map = services.whatsapp_clients
 
-    if platform_id not in target_map:
+    client_ids = target_map.get(platform_id, [])
+    if not client_ids:
         return
 
     safe_payload = jsonable_encoder(payload)
 
     disconnected_clients = []
 
-    for client_id in target_map[platform_id]:
+    for client_id in client_ids:
 
         if exclude_client_id and client_id == exclude_client_id:
             continue
@@ -119,7 +130,6 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
             continue
 
         try:
-            logger.info(f"Sending {event_type} to client {client_id}")
             await ws.send_json({
                 "type": event_type,
                 "data":{
@@ -127,7 +137,6 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
                     **safe_payload
                 }
             })
-            logger.success(f"Sent {event_type} to {client_id}")
         except Exception as e:
             logger.error(f"Failed to send to {client_id}: {e}, marking as disconnected")
         except WebSocketDisconnect:
@@ -213,3 +222,114 @@ def leave_conversation_presence(org_id: str, conversation_id: str, client_id: st
     services.client_convo_map.pop(client_id, None)
     
     logger.info(f"Client {client_id} LEFT conversation {convo_key}")
+
+async def broadcast_on_stats_update(
+    org_id: str, 
+    target_date: str = None, 
+    start_date: str = None, 
+    end_date: str = None
+):
+    """
+    Unified broadcast function for the HeidelAI Dashboard.
+    Fetches full dashboard stats and broadcasts to connected clients.
+    """
+    from services.dashboard_service import aggregate_dashboard_stats
+    async_db = get_async_mongo_db()
+    
+    import time
+    start_time = time.time()
+    logger.info(f"🚀 Starting dashboard stats broadcast for org: {org_id} (Range: {start_date} to {end_date} or Date: {target_date or 'today'})")
+    
+    full_payload = await aggregate_dashboard_stats(
+        org_id, 
+        target_date_str=target_date, 
+        start_date_str=start_date, 
+        end_date_str=end_date
+    )
+    if not full_payload:
+        logger.warning(f"Empty payload for org {org_id}, skipping broadcast")
+        return
+
+    # Create a reduced payload for WebSocket to minimize traffic
+    # Only includes summary metrics and alert headers
+    stats_summary = full_payload.get("stats", {})
+    status_counters = full_payload.get("statusCounters", {})
+    # Remove heavy details from status counters if present
+    status_counters.pop("expiringWhatsAppDetails", None)
+
+    payload = {
+        "stats": stats_summary,
+        "leadPatrol": full_payload.get("leadPatrol", []),
+        "overallMetrics": full_payload.get("overallMetrics", {}),
+        "statusCounters": status_counters,
+        "conversationFlow": full_payload.get("conversationFlow", []),
+        "aiMetrics": full_payload.get("aiMetrics", {}),
+        "alerts": full_payload.get("alerts", []), # Include full alert details (like hot leads)
+        "newLeads": full_payload.get("newLeads", []) # Include the list of new leads
+    }
+
+    # Get organization metadata to find platform IDs
+    org_data = await async_db.organizations.find_one({"org_id": org_id}, {"ig_id": 1, "wa_id": 1})
+    if not org_data:
+        logger.error(f"❌ Could not find organization data for broadcast: {org_id}")
+        return
+        
+    ig_id = org_data.get("ig_id")
+    wa_id = org_data.get("wa_id")
+    
+    if ig_id:
+        await broadcast_main_ws(
+            platform_id=ig_id,
+            platform_type="instagram",
+            event_type="onStatsUpdate",
+            payload=payload
+        )
+    else:
+        logger.warning(f"⚠️ No ig_id found for org {org_id}")
+        
+    if wa_id:
+        await broadcast_main_ws(
+            platform_id=wa_id,
+            platform_type="whatsapp",
+            event_type="onStatsUpdate",
+            payload=payload
+        )
+    else:
+        logger.warning(f"⚠️ No wa_id found for org {org_id}")
+
+    end_time = time.time()
+    logger.success(f"✅ Dashboard stats broadcast completed for {org_id} in {end_time - start_time:.2f}s")
+
+async def broadcast_team_message(org_id: str, conversation_id: str, participants: list, payload: dict):
+    """
+    Broadcast an internal message to all online participants in a team chat.
+    """
+    logger.info(f"📡 Broadcasting team message to participants: {participants}")
+    
+    if not participants:
+        logger.warning(f"⚠️ No participants found for broadcasting in conversation {conversation_id}")
+        return
+
+    safe_payload = jsonable_encoder(payload)
+    
+    for user_id in participants:
+        if user_id in services.agent_clients:
+            for client_id in list(services.agent_clients[user_id]):
+                ws = services.active_clients.get(client_id)
+                if ws:
+                    try:
+                        await ws.send_json({
+                            "type": "new_team_message",
+                            "data": {
+                                "org_id": org_id,
+                                "conversation_id": conversation_id,
+                                **safe_payload
+                            }
+                        })
+                        logger.success(f"Sent team message to agent {user_id} (client {client_id})")
+                    except Exception as e:
+                        logger.error(f"Failed to send team message to {client_id}: {e}")
+                else:
+                    logger.warning(f"WebSocket not found for active client {client_id}")
+        else:
+            pass

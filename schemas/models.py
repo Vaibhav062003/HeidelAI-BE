@@ -155,8 +155,9 @@ class SetPasswordRequest(BaseModel):
 
 class VerifyOtpRequest(BaseModel):
     clerk_user_id: str
+    
 class SelectPlanRequest(BaseModel):
-    plan_id: Literal["free", "growth_monthly", "growth_yearly", "growth_monthly_test", "enterprise", "custom"]
+    plan_id: Literal["free", "growth_monthly_inr", "growth_yearly_inr", "growth_monthly_test", "growth_monthly_inr_test", "enterprise", "custom"]
 
 class InitPaymentRequest(BaseModel):
     phone_number: str
@@ -164,3 +165,19 @@ class InitPaymentRequest(BaseModel):
 class InviteTeamMembersRequest(BaseModel):
     org_name: str
     member_emails: List[EmailStr]
+
+class Template(BaseModel):
+    name: str
+    language: str
+    category: str
+    components: List[Dict[str, Any]]
+
+class BulkRecipient(BaseModel):
+    phone_number: str  # E.164 format without '+', e.g. "919876543210"
+
+class BulkMessageRequest(BaseModel):
+    template_name: str                               # Must be an APPROVED WhatsApp template
+    language_code: str                               # e.g. "en", "en_US", "hi"
+    recipients: List[BulkRecipient]                  # At least one recipient required
+    components: Optional[List[Dict[str, Any]]] = None  # Same for all recipients (header, body, etc.)
+    delay_seconds: float = 4.0                       # Seconds to wait between each send

@@ -6,8 +6,9 @@ from fastapi import Request, Header, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
+import httpx
 
-# Internal Modules
+# Internal Modules 
 from core.managers import manager
 from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
@@ -18,13 +19,27 @@ from services.wa_service import *
 from services.ig_service import *
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT
 from core.services import services
 from core.logger import get_logger
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
 logger = get_logger(__name__)
+
+async def forward_webhook_to_dev(body: bytes, headers: dict):
+    """
+    Forwards the raw webhook body and necessary headers to the dev environment.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            # We use `content=body` to send the exact raw bytes, 
+            # preserving the integrity of the payload for signature validation.
+            response = await client.post(DEV_WEBHOOK_URL, content=body, headers=headers)
+            response.raise_for_status()
+            logger.info(f"Successfully replicated webhook to Dev. Status: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Failed to forward webhook to Dev: {e}")
 
 def validate_signature(payload, signature):
     # Hash the payload with the app secret
@@ -49,18 +64,7 @@ async def signature_required(request: Request, x_hub_signature_256: str = Header
     if not validate_signature(payload, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
-# def validate_signature(payload, signature):
-#     expected_signature = hmac.new(
-#         bytes(APP_SECRET, 'latin-1'),
-#         msg=payload.encode('utf-8'),
-#         digestmod=hashlib.sha256
-#     ).hexdigest()
-    
-#     computed_signature = f"sha256={expected_signature}"
-#     print(f"Computed Signature: {computed_signature}")
-#     print(f"Received Signature: {signature}")
-    
-#     return hmac.compare_digest(computed_signature, signature)
+    return True # Added this return so the check in handle_webhook evaluates correctly
 
 def remove_expired_message_ids():
     current_time = time.time()
@@ -88,15 +92,22 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     """
     This weebhook accepts POST requests from 
     """
+    await signature_required(request, x_hub_signature_256)
 
-    if not signature_required(request, x_hub_signature_256):
-        # print("APP SECRET:", APP_SECRET)
-        raise HTTPException(status_code=403, detail="Invalid signature")
-    else:
-        logger.success("Signature validated successfully.")
+    logger.success("Signature validated successfully.")
 
     # First, validate the signature
     body = await request.body()
+
+    if background_tasks and DEV_WEBHOOK_URL:
+        # Cherry-pick only the necessary headers. 
+        # Don't forward the 'Host' header, as that will confuse your dev server.
+        forward_headers = {
+            "x-hub-signature-256": x_hub_signature_256,
+            "Content-Type": request.headers.get("content-type", "application/json")
+        }
+        background_tasks.add_task(forward_webhook_to_dev, body, forward_headers)
+
     payload_str = body.decode('utf-8')
 
     # payload_str = request.state.payload_body.decode('utf-8')
@@ -343,85 +354,111 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     context = {
                                         "mid": replied_message_id
                                     }
-                            
+                            # Get conversation doc to check if AI is enabled
+                            # convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                            # is_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else False
+
+                            org_doc = db.organizations.find_one({"org_id": org_id},{"is_ai_enabled": 1})
+                            is_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
+
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
                                 
                                 # Handling messages received on HeidelAI's whatsapp number
-                                if whatsapp_business_id == HEIDELAI_ORG_WA_ID:
-                                    chatbot_response = await send_to_chatbot(
-                                        customer_phone_no=customer_phone_no,
-                                        message_content=content
-                                    )
-                                    
-                                    # Storing messages from customers in the DB
-                                    # Create or update conversation
-                                    conversation_id = await create_or_update_whatsapp_conversation(
-                                        org_id=org_id,
-                                        recipient_id=whatsapp_business_id,
-                                        customer_phone_no=customer_phone_no,
-                                        customer_name=sender_name2,
-                                        last_message=content,
-                                        last_sender="customer",
-                                        mode="reply"
-                                    )
-                                    
-                                    # Store in WhatsApp-specific collections
-                                    message_id = await store_whatsapp_message(
-                                        org_id=org_id,
-                                        content=content,
-                                        conversation_id=conversation_id,
-                                        customer_phone_no=customer_phone_no,
-                                        type=message_type,
-                                        payload=message.get("payload"),
-                                        sender_name=sender_name2,
-                                        recipient_id=whatsapp_business_id,
-                                        role=MessageRole.CUSTOMER,
-                                        message_id=message_id,  # Use the ID from the webhook for deduplication
-                                        raw_data=message,
-                                        mode="reply",
-                                        context_type=context_type,
-                                        context=context
-                                    )
+                                # if (whatsapp_business_id == HEIDELAI_ORG_WA_ID) and (is_ai_enabled):  # Only send to chatbot in production and for HeidelAI's WA number
+                                if (whatsapp_business_id == HEIDELAI_ORG_WA_ID): # Only send to chatbot in production and for HeidelAI's WA number
+                                    if ENVIRONMENT == "production":
+                                        # Storing messages from customers in the DB
+                                        # Create or update conversation
+                                        conversation_id = await create_or_update_whatsapp_conversation(
+                                                org_id=org_id,
+                                                recipient_id=whatsapp_business_id,
+                                                customer_phone_no=customer_phone_no,
+                                                customer_name=sender_name2,
+                                                last_message=content,
+                                                last_sender="customer",
+                                                mode="reply"
+                                            )
+                                            
+                                            # Store in WhatsApp-specific collections
+                                        message_id = await store_whatsapp_message(
+                                                org_id=org_id,
+                                                content=content,
+                                                conversation_id=conversation_id,
+                                                customer_phone_no=customer_phone_no,
+                                                type=message_type,
+                                                payload=message.get("payload"),
+                                                sender_name=sender_name2,
+                                                recipient_id=whatsapp_business_id,
+                                                role=MessageRole.CUSTOMER,
+                                                message_id=message_id,  # Use the ID from the webhook for deduplication
+                                                raw_data=message,
+                                                mode="reply",
+                                                context_type=context_type,
+                                                context=context
+                                            )
 
-                                    # Storing chatbot response in the DB
-                                    # Create or update conversation
-                                    conversation_id = await create_or_update_whatsapp_conversation(
-                                        org_id=org_id,
-                                        recipient_id=whatsapp_business_id,
-                                        customer_phone_no=customer_phone_no,
-                                        customer_name=sender_name2,
-                                        last_message=chatbot_response,
-                                        last_sender="ai",
-                                        mode="reply"
-                                    )
+                                        contact_data = {
+                                            "whatsapp_id": whatsapp_business_id,
+                                            "full_name": sender_name2,
+                                            "phone_number": customer_phone_no,
+                                            "country": None,
+                                            "profile_url": None,
+                                            "conversation_id": f"whatsapp_{customer_phone_no}",
+                                            "email": None,
+                                            "categories": []
+                                        }
+                                        store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
+
+
+                                        chatbot_response = await send_to_chatbot(
+                                            customer_phone_no=customer_phone_no,
+                                            message_content=content
+                                        )
                                     
-                                    # Store in WhatsApp-specific collections
-                                    message_id = await store_whatsapp_message(
-                                        org_id=org_id,
-                                        content=chatbot_response,
-                                        conversation_id=conversation_id,
-                                        customer_phone_no=customer_phone_no,
-                                        type=message_type,
-                                        payload=None,
-                                        sender_name='ai',
-                                        recipient_id=whatsapp_business_id,
-                                        role=MessageRole.AI,
-                                        message_id=generate_message_id(),
-                                        raw_data=None,
-                                        mode="reply",
-                                        context_type=context_type,
-                                        context=context
-                                    )
+                                        # Storing chatbot response in the DB
+                                        # Create or update conversation
+                                        conversation_id = await create_or_update_whatsapp_conversation(
+                                            org_id=org_id,
+                                            recipient_id=whatsapp_business_id,
+                                            customer_phone_no=customer_phone_no,
+                                            customer_name=sender_name2,
+                                            last_message=chatbot_response,
+                                            last_sender="ai",
+                                            mode="reply"
+                                        )
+                                        
+                                        # Store in WhatsApp-specific collections
+                                        message_id = await store_whatsapp_message(
+                                            org_id=org_id,
+                                            content=chatbot_response,
+                                            conversation_id=conversation_id,
+                                            customer_phone_no=customer_phone_no,
+                                            type=message_type,
+                                            payload=None,
+                                            sender_name='ai',
+                                            recipient_id=whatsapp_business_id,
+                                            role=MessageRole.AI,
+                                            message_id=generate_message_id(),
+                                            raw_data=None,
+                                            mode="reply",
+                                            context_type=context_type,
+                                            context=context
+                                        )
 
-                                    res = await send_whatsapp_message({
-                                        "conversation_id": conversation_id,
-                                        "content": chatbot_response,
-                                        "sender_id": HEIDELAI_ORG_WA_ID,
-                                    }, org_id, "reply")
+                                        res = await send_whatsapp_message({
+                                            "conversation_id": conversation_id,
+                                            "content": chatbot_response,
+                                            "sender_id": HEIDELAI_ORG_WA_ID,
+                                        }, org_id, "reply")
 
+                                        return {"status": "ok"}
                                     return {"status": "ok"}
+
+                                elif (whatsapp_business_id == "892752546585378") and (is_ai_enabled):  # Parijat academy wa_id
+                                    if ENVIRONMENT == "production":
+                                        pass
 
 
                             elif message_type in ["image", "video", "document"]:
@@ -688,10 +725,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "message_id": deleted_message_id,
                                             "conversation_id": conversation_id
                                         })
+
+                                    # Update dashboard stats live after deletion
+                                    await broadcast_on_stats_update(org_id)
                                         
-                                        await broadcast_instagram_message(recipient_id, "conversation_updated", {
-                                            "conversation": conversation
-                                        })
+                                    await broadcast_instagram_message(recipient_id, "conversation_updated", {
+                                        "conversation": conversation
+                                    })
                         
                         # Return success early since we've handled the deletion event
                         return {"status": "ok"}
@@ -1111,9 +1151,10 @@ async def cashfree_webhook(request: Request):
         return {"status": "duplicate_ignored"}
 
     try:
+        logger.info(f"Processing Cashfree event: {event_type}")
         await process_cashfree_event(event_type, payload)
 
-        db.webhook_events.update_one(
+        db.cashfree_webhook_events.update_one(
             {"idempotency_key": idempotency_key},
             {"$set": {"processed": True}}
         )

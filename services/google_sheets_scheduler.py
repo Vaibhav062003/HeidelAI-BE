@@ -61,7 +61,6 @@ async def _poll_all_sheets() -> None:
     Find all sheets with polling_enabled=True whose orgs have active Google connections.
     Sync each one independently so one failure doesn't affect others.
     """
-    # Only poll sheets for orgs with an active connection
     active_org_ids = [
         doc["org_id"]
         for doc in db.google_connections.find(
@@ -86,7 +85,6 @@ async def _poll_all_sheets() -> None:
 
     logger.info(f"Google Sheets scheduler: polling {len(sheets)} sheet(s)")
 
-    # Run all sheets concurrently; errors are isolated per sheet
     await asyncio.gather(
         *[_safe_sync_sheet(s["org_id"], s["sheet_id"]) for s in sheets],
         return_exceptions=True
@@ -94,16 +92,24 @@ async def _poll_all_sheets() -> None:
 
 
 async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
-    """Sync a single sheet with full error isolation."""
+    """
+    Sync a single sheet with full error isolation.
+    After syncing new rows, triggers any google_sheet automation flows
+    that reference this sheet.
+    """
     try:
-        from services.google_sheets_routes import _sync_sheet
+        from api.google_sheets_routes import _sync_sheet
         result = await _sync_sheet(org_id, sheet_id)
         rows = result.get("rows_processed", 0)
+
         if rows > 0:
             logger.info(f"[Scheduler] Synced {rows} new row(s) from sheet {sheet_id} for org {org_id}")
+
+            # Trigger any google_sheet automation flows for this sheet
+            await _trigger_google_sheet_automations(org_id, sheet_id)
+
     except Exception as e:
         logger.error(f"[Scheduler] Failed to sync sheet {sheet_id} for org {org_id}: {str(e)}")
-        # Mark last_sync_error for debugging but don't crash
         try:
             db.google_sheets_connections.update_one(
                 {"org_id": org_id, "sheet_id": sheet_id},
@@ -113,7 +119,19 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
                 }}
             )
         except Exception:
-            pass  # Even the error recording failed — truly silent here
+            pass
+
+
+async def _trigger_google_sheet_automations(org_id: str, sheet_id: str) -> None:
+    """
+    Find all active google_sheet automation triggers for this sheet
+    and process any new phone numbers that haven't been messaged yet.
+    """
+    try:
+        from services.google_sheet_automation import process_new_sheet_rows
+        await process_new_sheet_rows(org_id, sheet_id)
+    except Exception as e:
+        logger.error(f"[Scheduler] Error triggering google_sheet automations for sheet {sheet_id}: {e}")
 
 
 # ─── MongoDB Indexes ──────────────────────────────────────────────────────────
@@ -129,9 +147,21 @@ def _ensure_indexes() -> None:
         db.google_sheets_connections.create_index([("org_id", 1), ("sheet_id", 1)], unique=True)
         db.google_sheets_connections.create_index([("org_id", 1), ("polling_enabled", 1)])
 
-        # Per-org row storage: unique on (sheet_id, row_number) to prevent duplicate inserts
-        # We use a dynamic collection per org, so we create indexes lazily in the sync function.
-        # This pre-creates for any orgs that already exist.
+        # automation_triggers index for google_sheet lookups
+        db.automation_triggers.create_index(
+            [("org_id", 1), ("trigger_type", 1), ("status", 1), ("filters.sheet_id", 1)],
+            name="google_sheet_trigger_idx",
+            sparse=True,
+        )
+
+        # google_sheet_sent_numbers deduplication index
+        db.google_sheet_sent_numbers.create_index(
+            [("org_id", 1), ("flow_id", 1), ("phone", 1)],
+            unique=True,
+            name="dedup_sent_idx",
+        )
+
+        # Per-org row storage indexes
         active_orgs = db.google_connections.distinct("org_id")
         for org_id in active_orgs:
             col = db[f"google_sheet_rows_{org_id}"]

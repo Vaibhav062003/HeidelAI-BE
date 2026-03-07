@@ -282,6 +282,49 @@ async def get_flow_executions(
 
 
 # =============================================================================
+# GOOGLE SHEET AUTOMATION — SENT NUMBERS STATS
+# =============================================================================
+
+@router.get("/{flow_id}/sheet-stats")
+async def get_google_sheet_flow_stats(flow_id: str, user: CurrentUser):
+    """
+    Get statistics for a google_sheet automation flow:
+    how many unique phone numbers have been messaged.
+    """
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        sent_count = db["google_sheet_sent_numbers"].count_documents(
+            {"org_id": org_id, "flow_id": flow_id}
+        )
+
+        recent_sent = list(
+            db["google_sheet_sent_numbers"]
+            .find({"org_id": org_id, "flow_id": flow_id}, {"_id": 0, "phone": 1, "sent_at": 1})
+            .sort("sent_at", -1)
+            .limit(20)
+        )
+
+        for record in recent_sent:
+            if record.get("sent_at") and hasattr(record["sent_at"], "isoformat"):
+                record["sent_at"] = record["sent_at"].isoformat()
+
+        return {
+            "flow_id": flow_id,
+            "total_sent": sent_count,
+            "recent_sent": recent_sent,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching sheet stats for flow {flow_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
 # FOLLOW-UP MANAGEMENT ENDPOINTS (WhatsApp Scheduler)
 # =============================================================================
 
@@ -292,10 +335,7 @@ async def get_flow_followups(
     status: Optional[str] = None,
     limit: int = 50,
 ):
-    """
-    List scheduled follow-up jobs for a specific flow.
-    Optionally filter by status: pending | executing | completed | failed | cancelled
-    """
+    """List scheduled follow-up jobs for a specific flow."""
     try:
         org_id = user.org_id
         if not org_id:
@@ -341,10 +381,7 @@ async def cancel_flow_followup(flow_id: str, schedule_id: str, user: CurrentUser
 
 @router.get("/followups/pending")
 async def get_pending_followups(user: CurrentUser):
-    """
-    List all pending and executing follow-up jobs for the organization.
-    Useful for a dashboard overview of active scheduled messages.
-    """
+    """List all pending and executing follow-up jobs for the organization."""
     try:
         org_id = user.org_id
         if not org_id:
@@ -369,10 +406,7 @@ async def get_pending_followups(user: CurrentUser):
 
 @router.get("/{flow_id}/followups/stats")
 async def get_followup_stats(flow_id: str, user: CurrentUser):
-    """
-    Aggregated statistics for follow-up jobs of a specific flow.
-    Returns counts grouped by status.
-    """
+    """Aggregated statistics for follow-up jobs of a specific flow."""
     try:
         org_id = user.org_id
         if not org_id:
@@ -386,7 +420,6 @@ async def get_followup_stats(flow_id: str, user: CurrentUser):
         raw = list(db["automation_scheduled_followups"].aggregate(pipeline))
         stats = {item["_id"]: item["count"] for item in raw}
 
-        # Ensure all statuses are represented
         for s in ["pending", "executing", "completed", "failed", "cancelled"]:
             stats.setdefault(s, 0)
 
@@ -453,7 +486,16 @@ async def get_available_triggers(user: CurrentUser):
             "platform": "both",
             "requires": ["tag"],
             "optional": []
-        }
+        },
+        # ─── NEW: Google Sheet trigger ────────────────────────────────────────
+        {
+            "type": "google_sheet",
+            "name": "Google Sheet Row",
+            "description": "Sends a WhatsApp message to phone numbers in a Google Sheet column. Each number receives the message only once. New entries trigger automatically.",
+            "platform": "google_sheet",
+            "requires": ["sheet_id", "column_name"],
+            "optional": ["row_start", "row_end"]
+        },
     ]
 
     return {"triggers": triggers}

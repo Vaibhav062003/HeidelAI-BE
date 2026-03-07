@@ -8,7 +8,8 @@ from datetime import datetime
 # Third-party modules
 import cloudinary
 from fastapi import (
-    APIRouter, 
+    APIRouter,
+    BackgroundTasks,
     HTTPException,
     Form,
     File,
@@ -19,8 +20,8 @@ from fastapi import (
 # Internal modules
 from core.services import services
 from services.utils import serialize_mongo
-from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates
+from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template, BulkMessageRequest
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, get_bulk_job, run_bulk_send_job
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
@@ -148,6 +149,7 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
                 detail="Failed to subscribe WhatsApp account to webhook"
             )
         
+        # TODO: test out if register step is needed or not
         # Check if phone number is verified
         if phone_verified != "VERIFIED":
             logger.warning(f"Phone number {phone} is currently {phone_verified}. Attempting registration to fix this...")
@@ -687,11 +689,15 @@ async def get_whatsapp_ai_status(conversation_id: str, user: CurrentUser):
             detail=f"Failed to check AI status: {str(e)}"
         )
 
-@router.post("/{whatsapp_id}/conversations/{conversation_id}/toggle_ai")
-async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body: dict, user: CurrentUser):
+@router.post("/conversations/{conversation_id}/toggle_ai")
+async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: CurrentUser):
     """Toggle AI status for a specific WhatsApp conversation"""
     try:
         org_id = user.org_id 
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        wa_id = org_document.get("wa_id")
+        logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
         
@@ -722,8 +728,8 @@ async def toggle_whatsapp_ai_status(whatsapp_id: str, conversation_id: str, body
                 broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
             
             # Broadcast to WhatsApp-specific connections
-            if whatsapp_id in services.whatsapp_connections_map:
-                await broadcast_whatsapp_message(whatsapp_id, "conversation_updated", {
+            if wa_id in services.whatsapp_connections_map:
+                await broadcast_whatsapp_message(wa_id, "conversation_updated", {
                     "conversation": broadcast_conversation
                 })
         
@@ -1031,3 +1037,155 @@ async def fetch_templates(user: CurrentUser):
     except Exception as e:
         logger.error(f"Error fetching prebuilt templates: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch prebuilt templates: {str(e)}")
+
+@router.post("/templates")
+async def whatsapp_create_template(user: CurrentUser, template: Template):
+    """
+        Create templates
+    """
+    try:
+        org_id = user.org_id
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        wa_id = org_document.get("wa_id")
+        logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
+
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0, "access_token": 1}
+        )
+
+        access_token = connection["access_token"] if connection else None
+
+        if not connection or "access_token" not in connection:
+            raise HTTPException(
+                status_code=404,
+                detail="WhatsApp connection not found or access token missing"
+            )
+
+        logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
+
+
+        templates = await create_templates(org_id, wa_id, access_token, template.name, template.language, template.category, template.components)
+
+        return {
+            "status": "success",
+            "message": "templates sent for review",
+            "templates": templates
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating templates: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create templates: {str(e)}")
+
+
+@router.post("/bulk/send")
+async def bulk_send_whatsapp_message(
+    request: BulkMessageRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser,
+):
+    """
+    Enqueue a bulk WhatsApp template send as a background job.
+
+    Returns immediately with a `job_id`. Poll `/bulk/status/{job_id}` to track progress.
+    - template_name: Name of an APPROVED template in your WhatsApp Business account.
+    - language_code: BCP-47 code (e.g. 'en', 'en_US', 'hi').
+    - recipients: List of objects with `phone_number` (E.164 without '+').
+    - delay_seconds: Pause between sends in seconds (minimum 0.5, default 4.0).
+    """
+    try:
+        import uuid as _uuid
+        org_id = user.org_id
+        logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(request.recipients)}")
+
+        if not request.recipients:
+            raise HTTPException(status_code=400, detail="At least one recipient is required")
+
+        # Look up the org's WhatsApp connection
+        org_document = db.organizations.find_one({"org_id": org_id})
+        if not org_document:
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        wa_id = org_document.get("wa_id")
+        if not wa_id:
+            raise HTTPException(status_code=404, detail="No WhatsApp account connected to this organization")
+
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0, "access_token": 1, "phone_id": 1}
+        )
+
+        if not connection or "access_token" not in connection:
+            raise HTTPException(
+                status_code=404,
+                detail="WhatsApp connection not found or access token missing"
+            )
+
+        access_token = connection["access_token"]
+        phone_id = connection.get("phone_id")
+
+        if not phone_id:
+            raise HTTPException(status_code=400, detail="Phone ID not found for this WhatsApp connection")
+
+        # Create the job record synchronously so the client gets the job_id immediately
+        job_id = _uuid.uuid4().hex
+        create_bulk_job(
+            org_id=org_id,
+            job_id=job_id,
+            template_name=request.template_name,
+            language_code=request.language_code,
+            total=len(request.recipients),
+        )
+
+        # Enqueue the heavy work as a background task
+        background_tasks.add_task(
+            run_bulk_send_job,
+            job_id=job_id,
+            org_id=org_id,
+            wa_id=wa_id,
+            phone_id=phone_id,
+            access_token=access_token,
+            template_name=request.template_name,
+            language_code=request.language_code,
+            recipients=request.recipients,
+            components=request.components,
+            delay_seconds=request.delay_seconds,
+        )
+
+        logger.success(f"Bulk WA | job={job_id} enqueued | org={org_id} | recipients={len(request.recipients)}")
+
+        return {
+            "status": "accepted",
+            "message": f"Bulk send job enqueued. Poll /bulk/status/{job_id} for progress.",
+            "job_id": job_id,
+            "total": len(request.recipients),
+        }
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Error enqueueing bulk WhatsApp send: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Bulk send failed: {str(e)}")
+
+
+@router.get("/bulk/status/{job_id}")
+async def get_bulk_send_status(job_id: str, user: CurrentUser):
+    """
+    Poll the status of a bulk WhatsApp send job.
+
+    Returns job metadata including current progress (`sent`, `failed`, `total`),
+    overall `status` (pending | running | completed | failed), and per-recipient `results`.
+    """
+    org_id = user.org_id
+    try:
+        job = get_bulk_job(job_id=job_id, org_id=org_id)
+
+        if not job:
+            raise HTTPException(status_code=404, detail="Bulk send job not found")
+
+        return serialize_mongo(job)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching bulk job status | job_id={job_id} org_id={org_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch job status: {str(e)}")

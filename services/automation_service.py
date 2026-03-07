@@ -167,8 +167,9 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
     """
     Publish (activate) an automation flow.
 
-    whatsapp_followup triggers  → schedule a timed job via automation_scheduler
-    All other trigger types     → register in automation_triggers collection (Instagram etc.)
+    google_sheet triggers      → register trigger, then immediately process all sheet rows
+    whatsapp_followup triggers → schedule a timed job via automation_scheduler
+    All other trigger types    → register in automation_triggers collection (Instagram etc.)
     """
     try:
         from services.automation_scheduler import schedule_followup, cancel_flow_followups
@@ -201,8 +202,20 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
                 logger.warning(f"Trigger {idx} missing start_node_id — skipping.")
                 continue
 
+            # ---- Google Sheet trigger: register + immediately process rows ----
+            if trigger_type == "google_sheet":
+                await _handle_google_sheet_trigger(
+                    org_id=org_id,
+                    flow_id=flow_id,
+                    idx=idx,
+                    config=config,
+                    start_node_id=start_node_id,
+                    nodes=nodes,
+                    connections=connections,
+                )
+
             # ---- WhatsApp Follow-Up: schedule a timed job -----------------
-            if trigger_type == "whatsapp_followup":
+            elif trigger_type == "whatsapp_followup":
                 conversation_id = config.get("conversation_id")
                 if not conversation_id:
                     logger.warning(f"whatsapp_followup trigger missing conversation_id — skipping.")
@@ -262,6 +275,8 @@ async def unpublish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]
     """
     Unpublish (deactivate) an automation flow.
     Cancels pending WhatsApp follow-up jobs and deactivates trigger registrations.
+    NOTE: For google_sheet triggers, sent records are NOT cleared so re-publish
+    won't re-message the same numbers.
     """
     try:
         from services.automation_scheduler import cancel_flow_followups
@@ -274,7 +289,7 @@ async def unpublish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]
         # Cancel pending follow-up jobs
         cancel_flow_followups(org_id, flow_id, reason="flow_unpublished")
 
-        # Deactivate registered triggers (instagram / tag-based triggers)
+        # Deactivate registered triggers (instagram / tag-based / google_sheet triggers)
         await _deactivate_flow_triggers(org_id, flow_id)
 
         now = datetime.now(timezone.utc)
@@ -338,15 +353,12 @@ def _extract_delay_and_message(
     """
     Walk graph: start_node (smart_delay) → message_node
     Returns (delay_seconds, message_text) or (None, None) on failure.
-
     """
     UNIT_TO_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
 
     delay_seconds = None
     message_text = None
 
-    # FIX BUG #1: start_node_id IS the smart_delay — read it directly,
-    # don't look for a smart_delay among its children.
     start_node = nodes.get(start_node_id, {})
 
     if start_node.get("type") == "smart_delay":
@@ -355,15 +367,130 @@ def _extract_delay_and_message(
         unit = config.get("unit", "seconds")
         delay_seconds = int(amount) * UNIT_TO_SECONDS.get(unit, 1)
 
-        # Now walk one level down to find the message node
         for msg_id in _children(start_node_id, connections):
             msg_node = nodes.get(msg_id, {})
             if msg_node.get("type") == "message":
-                # FIX BUG #2: text lives at node["content"]["text"], not node["config"]["content"]["text"]
-                message_text = msg_node.get("content", {}).get("text", "")
+                # Primary path: node.config.content.text
+                text = msg_node.get("config", {}).get("content", {}).get("text", "")
+                # Fallback path: node.content.text
+                if not text:
+                    text = msg_node.get("content", {}).get("text", "")
+                message_text = text
                 break
 
     return delay_seconds, message_text
+
+
+def _extract_message_from_start(
+    start_node_id: str,
+    nodes: dict,
+    connections: list,
+) -> Optional[str]:
+    """
+    Walk from start_node_id to find the first message node.
+    Used by _handle_google_sheet_trigger.
+
+    Handles both node structures the frontend may produce:
+      - node.config.content.text  (primary — used by execution engine)
+      - node.content.text         (fallback / alternate serialisation)
+    """
+    visited: set = set()
+    queue: list = [start_node_id]
+
+    while queue:
+        node_id = queue.pop(0)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+
+        node = nodes.get(node_id, {})
+        if node.get("type") == "message":
+            # Primary path: node.config.content.text
+            text = node.get("config", {}).get("content", {}).get("text", "")
+            # Fallback path: node.content.text
+            if not text:
+                text = node.get("content", {}).get("text", "")
+            if text:
+                return text
+
+        next_ids = _children(node_id, connections)
+        queue.extend(next_ids)
+
+    return None
+
+
+async def _handle_google_sheet_trigger(
+    org_id: str,
+    flow_id: str,
+    idx: int,
+    config: dict,
+    start_node_id: str,
+    nodes: dict,
+    connections: list,
+):
+    """
+    Handle a google_sheet trigger on publish:
+    1. Register in automation_triggers for future scheduler runs
+    2. Extract the message text from the connected node
+    3. Immediately process all existing sheet rows
+    """
+    sheet_id = config.get("sheet_id")
+    column_name = config.get("column_name")
+
+    if not sheet_id or not column_name:
+        logger.warning(
+            f"google_sheet trigger for flow {flow_id} missing sheet_id or column_name — skipping."
+        )
+        return
+
+    # Get message text from the flow's message node
+    message_text = _extract_message_from_start(start_node_id, nodes, connections)
+    if not message_text:
+        logger.warning(f"No message text found for google_sheet flow {flow_id} — skipping.")
+        return
+
+    # Register the trigger (with message_text stored for scheduler use)
+    triggers_collection = _automation_triggers_collection()
+    trigger_doc = {
+        "trigger_id": f"trigger_{flow_id}_{idx}",
+        "flow_id": flow_id,
+        "org_id": org_id,
+        "platform": "google_sheet",
+        "trigger_type": "google_sheet",
+        "filters": {
+            "sheet_id": config.get("sheet_id"),
+            "sheet_name": config.get("sheet_name"),
+            "column_name": config.get("column_name"),
+            "row_start": config.get("row_start"),
+            "row_end": config.get("row_end"),
+        },
+        "message_text": message_text,
+        "start_node_id": start_node_id,
+        "status": "active",
+        "registered_at": datetime.now(timezone.utc),
+        "last_triggered_at": None,
+    }
+
+    triggers_collection.update_one(
+        {"trigger_id": trigger_doc["trigger_id"]},
+        {"$set": trigger_doc},
+        upsert=True,
+    )
+    logger.info(f"Registered google_sheet trigger for flow {flow_id}, sheet {sheet_id}")
+
+    # Immediately process all existing rows (don't await — run in background)
+    import asyncio
+    from services.google_sheet_automation import process_google_sheet_trigger
+
+    asyncio.create_task(
+        process_google_sheet_trigger(
+            org_id=org_id,
+            flow_id=flow_id,
+            trigger_config=config,
+            message_text=message_text,
+        )
+    )
+    logger.success(f"Started immediate processing for google_sheet flow {flow_id}")
 
 
 async def _register_single_trigger(
@@ -374,7 +501,7 @@ async def _register_single_trigger(
     config: dict,
     start_node_id: str,
 ):
-    """Register a single non-followup trigger in automation_triggers."""
+    """Register a single non-followup, non-google_sheet trigger in automation_triggers."""
     triggers_collection = _automation_triggers_collection()
 
     platform = "instagram" if "instagram" in trigger_type else "whatsapp"
@@ -414,11 +541,10 @@ async def _register_single_trigger(
 async def _register_flow_triggers(org_id: str, flow_id: str, flow_data: Dict):
     """
     Register all non-followup triggers. Kept for backward compatibility.
-    publish_automation_flow() calls _register_single_trigger directly now.
     """
     for idx, trigger_config in enumerate(flow_data.get("triggers", [])):
         trigger_type = trigger_config.get("type")
-        if trigger_type == "whatsapp_followup":
+        if trigger_type in ("whatsapp_followup", "google_sheet"):
             continue
         config = trigger_config.get("config", {})
         start_node_id = trigger_config.get("start_node_id")
@@ -467,6 +593,22 @@ def validate_flow_structure(flow_data: Dict) -> tuple:
                 return False, "Each trigger must have 'start_node_id'"
             if trigger["start_node_id"] not in nodes:
                 return False, f"Trigger start_node_id '{trigger['start_node_id']}' not found in nodes"
+
+            # Extra validation for google_sheet triggers
+            if trigger.get("type") == "google_sheet":
+                config = trigger.get("config", {})
+                if not config.get("sheet_id"):
+                    return False, "Google Sheet trigger requires 'sheet_id'"
+                if not config.get("column_name"):
+                    return False, "Google Sheet trigger requires 'column_name' (phone number column)"
+
+                # Validate row range if provided
+                row_start = config.get("row_start")
+                row_end = config.get("row_end")
+                if row_start is not None and row_start < 1:
+                    return False, "row_start must be >= 1"
+                if row_end is not None and row_start is not None and row_end < row_start:
+                    return False, "row_end must be >= row_start"
 
         return True, None
 
