@@ -24,11 +24,11 @@ from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID
 from core.services import services
-from core.logger import get_logger
+from loguru import logger
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
-logger = get_logger(__name__)
+
 
 async def forward_webhook_to_dev(body: bytes, headers: dict):
     """

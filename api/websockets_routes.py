@@ -10,9 +10,8 @@ from fastapi.security import HTTPAuthorizationCredentials
 import json
 
 from services.websocket_service import *
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 router = APIRouter(tags=["Websockets"])
 

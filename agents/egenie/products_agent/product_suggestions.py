@@ -6,9 +6,8 @@ import aiohttp
 from fastapi import HTTPException
 from typing import List
 from config.settings import KOYEB2, MONGODB_URI
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client['Cluster0']

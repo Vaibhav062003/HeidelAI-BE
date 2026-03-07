@@ -7,10 +7,7 @@ from pymongo.errors import PyMongoError
 # === Internal Modules ===
 from database import get_mongo_db
 from .followup_agent_service import get_followup_message
-from core.logger import get_logger
-# from services.websocket_service import broadcast_on_stats_update
-
-logger = get_logger(__name__)
+from loguru import logger
 
 db = get_mongo_db()
 

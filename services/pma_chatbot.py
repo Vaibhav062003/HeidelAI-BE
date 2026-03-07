@@ -1,6 +1,6 @@
 import httpx
 from typing import Dict, Any, Optional
-import logging
+from loguru import logger
 
 from datetime import datetime, timezone
 
@@ -13,9 +13,6 @@ from services.wa_service import send_interactive_whatsapp_message
 db = get_async_mongo_db()
 
 ORG_ID = settings.PMA_ORG_ID
-
-# Configure logging
-logger = logging.getLogger(__name__)
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://heidelai-chatbot-2.koyeb.app"

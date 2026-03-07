@@ -10,9 +10,8 @@ from services.automation_service import (
     list_automation_flows,
     validate_flow_structure
 )
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/automation_flows", tags=["Automation Flows"])

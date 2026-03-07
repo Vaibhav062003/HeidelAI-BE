@@ -1,9 +1,7 @@
 import httpx
 from typing import Dict, Any, Optional
-import logging
+from loguru import logger
 
-# Configure logging
-logger = logging.getLogger(__name__)
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://heidelai-backend2.koyeb.app"
