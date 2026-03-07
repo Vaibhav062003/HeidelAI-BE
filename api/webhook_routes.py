@@ -29,6 +29,7 @@ from loguru import logger
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
 
+logger.info(f"DEV_WEBHOOK_URL repr: {repr(DEV_WEBHOOK_URL)}")
 
 async def forward_webhook_to_dev(body: bytes, headers: dict):
     """
