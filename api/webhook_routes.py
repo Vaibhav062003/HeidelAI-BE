@@ -688,7 +688,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context=context
                                     )
 
-                                if whatsapp_flow and ai_enabled and is_production:
+                                if whatsapp_flow and ai_enabled and is_dev:
                                     automation_response = await execute_whatsapp_flow(
                                         flow=whatsapp_flow,
                                         org_id=org_id,
