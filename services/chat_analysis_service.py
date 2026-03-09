@@ -111,7 +111,7 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
                     logger.warning(f"No contact found for conversation_id: {conversation_id}")
             except PyMongoError as e:
                 logger.error(f"Failed to update contact categories/labels for {conversation_id}: {e}")
-
+                raise
             
             # Update result_data to return
             result_data.summary = analysis_result.summary
