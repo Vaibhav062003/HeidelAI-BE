@@ -183,158 +183,141 @@ def validate_flow_structure(flow_data: Dict) -> tuple:
         return False, f"Validation error: {str(e)}"
 
 
+# Helper functions
+async def _send_text_message(org_id: str, whatsapp_business_id: str, conversation_id: str, raw_content: str, template_variables: dict):
+    personalized = inject_variables(raw_content, template_variables)
+    await send_whatsapp_message(
+        org_id=org_id,
+        mode="reply",
+        message={
+            "sender_id": whatsapp_business_id,
+            "conversation_id": conversation_id,
+            "content": personalized,
+        },
+    )
+
+async def _send_interactive_message(org_id: str, whatsapp_business_id: str, conversation_id: str, raw_data: dict, template_variables: dict, label: str) -> bool:
+    try:
+        personalized = inject_variables(raw_data, template_variables)
+        validated = InteractiveMessageAdapter.validate_python(personalized)
+        await send_interactive_whatsapp_message(
+            org_id=org_id,
+            conversation_id=conversation_id,
+            sender_id=whatsapp_business_id,
+            interactive_message=validated,
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[{org_id}] Failed to validate interactive data for '{label}': {e}")
+        return False
+
+def _complete_onboarding(org_id: str, conversation_id: str):
+    db[f"conversations_{org_id}"].update_one(
+        {"conversation_id": conversation_id},
+        {"$set": {"onboarding_stage": "completed"}},
+    )
+    logger.info(f"[{org_id}] Onboarding stage marked as completed for {conversation_id}")
+
 # TODO: flow doc must have an index on status, trigger_event, trigger_from
 async def execute_whatsapp_flow(
-        flow: dict,
-        org_id: str,
-        conversation_id: str,
-        stage: str,
-        customer_name: str,
-        trigger_event: str,
-        trigger_messages: str,
-        message_content: str,  # For interactive message_type, this is the selection_id
-        whatsapp_business_id: str,
-        message_type: str,
-    ):
+    flow: dict,
+    org_id: str,
+    conversation_id: str,
+    stage: str,
+    customer_name: str,
+    trigger_event: str,
+    trigger_messages: str,
+    message_content: str,
+    whatsapp_business_id: str,
+    message_type: str,
+):
     logger.info(f"[{org_id}] Executing WhatsApp flow for conversation: {conversation_id} | Stage: {stage} | Type: {message_type}")
-    
+
     welcome_message = flow.get("welcome_message")
+    welcome_message_ids = [btn["reply"]["id"] for btn in welcome_message.get("interactive", {}).get("buttons", [])] if welcome_message and welcome_message.get("type") == "interactive" else []
+    introduction_message = flow.get("introduction_message")
     flow_nodes = flow.get("nodes", {})
-    
-    # Safely parse trigger keywords
+
     trigger_keywords = [msg.strip().lower() for msg in trigger_messages.split(",")] if trigger_messages else []
+    template_variables = {"customer_name": get_first_name(customer_name)}
 
-    first_name = get_first_name(customer_name)
-    template_variables = {
-        "customer_name": first_name,
-    }
+    ctx = dict(org_id=org_id, whatsapp_business_id=whatsapp_business_id, conversation_id=conversation_id)
 
-    # User clicked a button or list item
+    # Interactive (button / list click)
     if message_type == "interactive":
-        selection_id = message_content  # The ID of the button/list item clicked
+        selection_id = message_content
         logger.info(f"[{org_id}] Processing interactive selection ID: '{selection_id}'")
-        
-        if selection_id in flow_nodes:
-            node_data = flow_nodes[selection_id]
-            node_type = node_data.get("type")
 
-            # The user successfully clicked a button, so we graduate them from the onboarding stage
-            db[f"conversations_{org_id}"].update_one(
-                {"conversation_id": conversation_id},
-                {"$set": {"onboarding_stage": "completed"}},
-            )
-            logger.info(f"[{org_id}] Onboarding stage marked as completed for {conversation_id}")
-
-            if node_type == "text":
-                logger.info(f"[{org_id}] Sending text node response for '{selection_id}'")
-                raw_content = node_data.get("content", "")
-                personalized_content = inject_variables(raw_content, template_variables)
-
-                await send_whatsapp_message(
-                    org_id=org_id,
-                    mode="reply",
-                    message={
-                        "sender_id": whatsapp_business_id,
-                        "conversation_id": conversation_id,
-                        "content": personalized_content
-                    }
-                )
-
-                logger.success(f"[{org_id}] Successfully sent text node response for '{selection_id}'")
-                return True
-            
-            # Note: Currently we only support button, list, and cta_url 
-            # TODO: Add support for more interactive types
-            elif node_type in ["button", "list", "cta_url"]:
-                try:
-                    logger.info(f"[{org_id}] Sending interactive node response for '{selection_id}' (Type: {node_type})")
-                    # Inject variables into the raw dictionary
-                    personalized_dict = inject_variables(node_data, template_variables)
-                    
-                    # Validate the personalized dictionary with Pydantic
-                    validated_interactive_msg = InteractiveMessageAdapter.validate_python(personalized_dict)
-                    
-                    await send_interactive_whatsapp_message(
-                        org_id=org_id,
-                        conversation_id=conversation_id,
-                        sender_id=whatsapp_business_id,
-                        interactive_message=validated_interactive_msg
-                    )
-
-                    logger.success(f"[{org_id}] Successfully sent interactive node response for '{selection_id}'")
-                    return True
-                except Exception as e:
-                    logger.error(f"[{org_id}] Failed to validate interactive node data for '{selection_id}': {e}")
-                    return False
-            else:
-                logger.warning(f"[{org_id}] Unknown node_type '{node_type}' for selection '{selection_id}'")
-
-        else:
-            # The button ID isn't in the flow JSON. 
+        if selection_id not in flow_nodes:
             logger.warning(f"[{org_id}] Node '{selection_id}' not found in flow, routing to AI...")
-            # await send_to_pma_chatbot(...)
             return False
 
-    # Triggering the Welcome Message
-    elif welcome_message:
-        is_new_session = (stage == "welcome")
+        if selection_id in welcome_message_ids:
+            logger.info(f"[{org_id}] Selection ID '{selection_id}' is a welcome message button. Updating conversations collection.")
+
+        node_data = flow_nodes[selection_id]
+        node_type = node_data.get("type")
+
+        _complete_onboarding(org_id, conversation_id)
+
+        if node_type == "text":
+            logger.info(f"[{org_id}] Sending text node response for '{selection_id}'")
+            await _send_text_message(**ctx, raw_content=node_data.get("content", ""), template_variables=template_variables)
+            logger.success(f"[{org_id}] Successfully sent text node response for '{selection_id}'")
+            return True
+
+        # Note: Currently only button, list, and cta_url are supported
+        # TODO: Add support for more interactive types
+        elif node_type in {"button", "list", "cta_url"}:
+            logger.info(f"[{org_id}] Sending interactive node response for '{selection_id}' (Type: {node_type})")
+            ok = await _send_interactive_message(**ctx, raw_data=node_data, template_variables=template_variables, label=selection_id)
+            if ok:
+                logger.success(f"[{org_id}] Successfully sent interactive node response for '{selection_id}'")
+            return ok
+
+        else:
+            logger.warning(f"[{org_id}] Unknown node_type '{node_type}' for selection '{selection_id}'")
+            return False
+
+    # Welcome / keyword trigger
+    if welcome_message:
+        is_new_session = stage == "welcome"
         is_keyword_match = (
-            message_type == "text" 
-            and trigger_event == "message_received" 
+            message_type == "text"
+            and trigger_event == "message_received"
             and message_content.strip().lower() in trigger_keywords
         )
 
-        if is_new_session or is_keyword_match:
-            welcome_type = welcome_message.get("type")
-            logger.info(f"[{org_id}] Trigger conditions met. Sending welcome message (Type: {welcome_type})")
-
-            if welcome_type == "text":
-                raw_content = welcome_message.get("content", "")
-                personalized_content = inject_variables(raw_content, template_variables)
-
-                await send_whatsapp_message(
-                    org_id=org_id,
-                    mode="reply",
-                    message={
-                        "sender_id": whatsapp_business_id,
-                        "conversation_id": conversation_id,
-                        "content": personalized_content
-                    }
-                )
-
-                # It's a plain text welcome, mark as complete immediately
-                db[f"conversations_{org_id}"].update_one(
-                    {"conversation_id": conversation_id},
-                    {"$set": {"onboarding_stage": "completed"}},
-                )
-                logger.success(f"[{org_id}] Successfully sent text welcome message and completed onboarding.")
-                return True
-
-            elif welcome_type == "interactive":
-                try:
-                    raw_interactive_data = welcome_message.get("interactive", {})
-                    personalized_welcome_dict = inject_variables(raw_interactive_data, template_variables)
-                    
-                    validated_welcome_msg = InteractiveMessageAdapter.validate_python(personalized_welcome_dict)
-                    
-                    await send_interactive_whatsapp_message(
-                        org_id=org_id,
-                        conversation_id=conversation_id,
-                        sender_id=whatsapp_business_id,
-                        interactive_message=validated_welcome_msg
-                    )
-
-                    # DO NOT update DB stage here. Keep it as "welcome" until they click a button.
-                    logger.success(f"[{org_id}] Successfully sent interactive welcome message. Awaiting user selection.")
-                    return True
-                    
-                except Exception as e:
-                    logger.error(f"[{org_id}] Failed to validate welcome interactive data: {e}")
-                    return False
-
-        else:
+        if not (is_new_session or is_keyword_match):
             logger.info(f"[{org_id}] Message did not match welcome flow triggers, routing to AI...")
             return False
+
+        welcome_type = welcome_message.get("type")
+        logger.info(f"[{org_id}] Trigger conditions met. Sending welcome message (Type: {welcome_type})")
+
+        # Send optional introduction first
+        if introduction_message:
+            intro_type = introduction_message.get("type")
+            if intro_type == "text":
+                await _send_text_message(**ctx, raw_content=introduction_message.get("content", ""), template_variables=template_variables)
+                logger.info(f"[{org_id}] Successfully sent introduction text message.")
+            elif intro_type == "interactive":
+                await _send_interactive_message(**ctx, raw_data=introduction_message.get("interactive", {}), template_variables=template_variables, label="introduction")
+                logger.info(f"[{org_id}] Successfully sent introduction interactive message.")
+
+        # Send welcome message
+        if welcome_type == "text":
+            await _send_text_message(**ctx, raw_content=welcome_message.get("content", ""), template_variables=template_variables)
+            _complete_onboarding(org_id, conversation_id)  # plain-text welcome → done immediately
+            logger.success(f"[{org_id}] Successfully sent text welcome message and completed onboarding.")
+            return True
+
+        elif welcome_type == "interactive":
+            ok = await _send_interactive_message(**ctx, raw_data=welcome_message.get("interactive", {}), template_variables=template_variables, label="welcome")
+            if ok:
+                # Keep stage as "welcome" until they actually click a button
+                logger.success(f"[{org_id}] Successfully sent interactive welcome message. Awaiting user selection.")
+            return ok
 
     logger.warning(f"[{org_id}] Flow execution fell through all scenarios. Routing to AI...")
     return False

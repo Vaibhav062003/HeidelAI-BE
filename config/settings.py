@@ -99,3 +99,4 @@ os.environ["AZURE_OPENAI_ENDPOINT"] =os.getenv("AZURE_OPENAI_ENDPOINT")
 os.environ["AZURE_OPENAI_DEPLOYMENT"] =os.getenv("AZURE_DEPLOYMENT")
 
 PMA_ORG_ID=os.getenv("PMA_ORG_ID")
+CGSV_ORG_WA_ID=os.getenv("CGSV_ORG_WA_ID")

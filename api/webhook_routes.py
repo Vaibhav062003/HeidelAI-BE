@@ -17,12 +17,13 @@ from services.cloudinary_service import upload_and_send_whatsapp_media_backgroun
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
 from services.heidelai_bot import send_to_chatbot
+from services.agent_service import send_to_agent
 from services.wa_service import *
 from services.ig_service import *
 from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButton, InteractiveReplyButtonMessage
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, CGSV_ORG_WA_ID
 from core.services import services
 from loguru import logger
 
@@ -385,6 +386,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             
                             is_heidelai = whatsapp_business_id == HEIDELAI_ORG_WA_ID
                             is_pma_wa = whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID
+                            is_cgsv_wa = whatsapp_business_id == CGSV_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
                             # fetch org + convo flags
@@ -392,6 +394,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             logger.info(f"is_heidelai: {is_heidelai}")
                             logger.info(f"is_pma_wa: {is_pma_wa}")
+                            logger.info(f"is_cgsv_wa: {is_cgsv_wa}")
                             logger.info(f"is_production: {is_production}")
                             logger.info(f"is_dev: {is_dev}")
                             logger.info(f"ai_enabled: {ai_enabled}") 
@@ -464,6 +467,39 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     if automation_response:
                                         return {"status": "ok"}
+                                    else:
+                                        chatbot_response = await send_to_agent(
+                                            conversation_id=conversation_id,
+                                            user_input=content,
+                                            persona=convo_doc.get("persona", "fallback"),
+                                            location=convo_doc.get("location", "india"),
+                                            customer_name=sender_name2,
+                                            org_id=org_id,
+                                            source="webhook",
+                                        )
+
+                                        final_response = chatbot_response["final_response"]
+
+                                        # Storing chatbot response in the DB
+                                        # Create or update conversation
+                                        conversation_id = await create_or_update_whatsapp_conversation(
+                                            org_id=org_id,
+                                            recipient_id=whatsapp_business_id,
+                                            customer_phone_no=customer_phone_no,
+                                            customer_name=sender_name2,
+                                            last_message=final_response,
+                                            last_sender="ai",
+                                            mode="ai",
+                                        )
+
+                                        # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
+                                        res = await send_whatsapp_message({
+                                            "conversation_id": conversation_id,
+                                            "content": final_response,
+                                            "sender_id": whatsapp_business_id,
+                                            }, org_id, "ai")
+
+                                    return {"status":"ok"}
 
                                 # Handling messages received on HeidelAI's whatsapp number
                                 if is_heidelai and ai_enabled and is_production:
@@ -539,7 +575,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
                                         }, org_id, "ai")
 
-                                return {"status":"ok"}
+                                return {"status": "ok"}
 
                             elif message_type in ["image", "video", "document"]:
                                 media_data = message[message_type]
@@ -845,9 +881,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                             }
                                                         },
                                                         body_text=(
-                                                            "☀️ *Vedic Maths Summer Program*\n\n"
-                                                            "⚠️ Seats are LIMITED because we believe every child deserves attention.\n\n"
-                                                            "Once full, admissions will close."
+                                                            "☀️ This Summer, Make Maths Your Child’s Superpower!\n\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n\n💥 Special Early Bird Offer\n\n🎯 Register before 15th March\n💰 Only Rs. 2750/-\n\n⏳ After 15th March\n💰 Fees: Rs. 3500/-\n\n⚡ Limited Seats Available – Book Now!\n\n✨ Let’s Make Maths Your Child’s Best Friend this Summer....!!!🥳",
                                                         ),
                                                         button_text="Register Now",
                                                         url="https://forms.gle/hPMw7inpe7H1E4gF9"
