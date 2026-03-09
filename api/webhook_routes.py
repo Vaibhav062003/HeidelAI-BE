@@ -451,7 +451,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 }
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
-                                if whatsapp_flow and ai_enabled and is_dev:
+                                if whatsapp_flow and ai_enabled and is_production:
                                     automation_response = await execute_whatsapp_flow(
                                         flow=whatsapp_flow,
                                         org_id=org_id,
@@ -530,7 +530,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_dev:
+                                elif is_pma_wa and ai_enabled and is_production:
 
                                     flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                         
