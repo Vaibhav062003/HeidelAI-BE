@@ -183,7 +183,7 @@ def validate_flow_structure(flow_data: Dict) -> tuple:
         return False, f"Validation error: {str(e)}"
 
 
-# Helpers functions
+# Helper functions
 async def _send_text_message(org_id: str, whatsapp_business_id: str, conversation_id: str, raw_content: str, template_variables: dict):
     personalized = inject_variables(raw_content, template_variables)
     await send_whatsapp_message(

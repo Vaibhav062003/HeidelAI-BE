@@ -392,12 +392,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
 
-                            logger.info("is_heidelai: ", is_heidelai)
-                            logger.info("is_pma_wa: ", is_pma_wa)
-                            logger.info("is_cgsv_wa: ", is_cgsv_wa)
-                            logger.info("is_production: ", is_production)
-                            logger.info("is_dev: ", is_dev)
-                            logger.info("ai_enabled: ", ai_enabled) 
+                            logger.info(f"is_heidelai: {is_heidelai}")
+                            logger.info(f"is_pma_wa: {is_pma_wa}")
+                            logger.info(f"is_cgsv_wa: {is_cgsv_wa}")
+                            logger.info(f"is_production: {is_production}")
+                            logger.info(f"is_dev: {is_dev}")
+                            logger.info(f"ai_enabled: {ai_enabled}") 
 
                             whatsapp_flow = flow_collection.find_one({"trigger_from": "webhook", "trigger_event": "message_received", "status": "active"})
                             logger.info(
