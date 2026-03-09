@@ -880,12 +880,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                                 "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1772623405/WhatsApp_Image_2026-03-04_at_4.32.48_PM_ej7mnt.jpg"
                                                             }
                                                         },
-                                                        body_text=(
-                                                            "☀️ This Summer, Make Maths Your Child’s Superpower!\n\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n\n💥 Special Early Bird Offer\n\n🎯 Register before 15th March\n💰 Only Rs. 2750/-\n\n⏳ After 15th March\n💰 Fees: Rs. 3500/-\n\n⚡ Limited Seats Available – Book Now!\n\n✨ Let’s Make Maths Your Child’s Best Friend this Summer....!!!🥳",
-                                                        ),
+                                                        body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n\n💥 Special Early Bird Offer\n\n🎯 Register before 15th March\n💰 Only Rs. 2750/-\n\n⏳ After 15th March\n💰 Fees: Rs. 3500/-\n\n⚡ Limited Seats Available – Book Now!\n\n✨ Let’s Make Maths Your Child’s Best Friend this Summer....!!!🥳",
                                                         button_text="Register Now",
                                                         url="https://forms.gle/hPMw7inpe7H1E4gF9"
-
                                                     )
                                                 )
 
