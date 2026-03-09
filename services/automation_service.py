@@ -234,6 +234,7 @@ async def execute_whatsapp_flow(
     logger.info(f"[{org_id}] Executing WhatsApp flow for conversation: {conversation_id} | Stage: {stage} | Type: {message_type}")
 
     welcome_message = flow.get("welcome_message")
+    welcome_message_ids = [btn["reply"]["id"] for btn in welcome_message.get("interactive", {}).get("buttons", [])] if welcome_message and welcome_message.get("type") == "interactive" else []
     introduction_message = flow.get("introduction_message")
     flow_nodes = flow.get("nodes", {})
 
@@ -250,6 +251,9 @@ async def execute_whatsapp_flow(
         if selection_id not in flow_nodes:
             logger.warning(f"[{org_id}] Node '{selection_id}' not found in flow, routing to AI...")
             return False
+
+        if selection_id in welcome_message_ids:
+            logger.info(f"[{org_id}] Selection ID '{selection_id}' is a welcome message button. Updating conversations collection.")
 
         node_data = flow_nodes[selection_id]
         node_type = node_data.get("type")
