@@ -217,28 +217,12 @@ async def process_onboarding_if_needed(user_input: str, conversation_id: str, or
                 header={
                     "type": "image",
                     "image": {
-                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1772559110/intro_image_pma_p0tae1.jpg"
+                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1773070610/WhatsApp_Image_2026-03-09_at_3.02.13_PM_tcdpby.jpg"
                     }
                 },
-                body_text=(
-                    "🌟 FREE VEDIC MATHS MASTERCLASS 🌟\n\n"
-                    "Does your child feel Exam Stress in Maths? 😟\n"
-                    "✨ Now let the Exam Stress Just Go Away! ✨\n"
-                    "Give your child the power of Vedic Maths and watch confidence grow! 🚀\n\n"
-                    "🎯 In This FREE Masterclass Students Will Learn:\n"
-                    "✅ Faster Calculations\n"
-                    "✅ Better Accuracy\n"
-                    "✅ Improved Concentration\n"
-                    "✅ More Confidence in Exams\n"
-                    "✅ Fear of Maths will disappear\n\n"
-                    "🎓 100% FREE Session\n"
-                    "🚀 Limited Seats, Register Now!\n\n" 
-                    "🌐 www.paarijatacademy.in\n"
-                    "📞 Call / WhatsApp:\n"
-                    "8055579965 / 9503498556"
-                ),
+                body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n\n💥 Special Early Bird Offer\n\n🎯 Register before 15th March\n💰 Only Rs. 2750/-\n\n⏳ After 15th March\n💰 Fees: Rs. 3500/-\n\n⚡ Limited Seats Available – Book Now!\n\n✨ Let’s Make Maths Your Child’s Best Friend this Summer....!!!🥳",
                 button_text="Register Now",
-                url="https://forms.gle/xWnKQCt8CVepAbYb9"
+                url="https://forms.gle/hPMw7inpe7H1E4gF9"
             )
         )
 
