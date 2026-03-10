@@ -50,20 +50,11 @@ async def fetch_conversations_new(
         "_id": 0,
     }
 
-    # Filtering logic for Team Chat
-    # 1. Customer conversations: type != "team"
-    # 2. Team conversations: type == "team" AND current_user_id in participants
-    # TODO: seperate out the team and non-team conversations filtering don't add both in one call
+    # Only customer conversations — team conversations are in their own
+    # dedicated collection (team_conversations_{org_id}) and fetched
+    # via GET /api/team/conversations
     base_conditions = [
-        {
-            "$or": [
-                {"type": {"$ne": "team"}},
-                {
-                    "type": "team",
-                    "participants": current_user_id
-                }
-            ]
-        }
+        {"type": {"$ne": "team"}}
     ]
 
     # Tab filters
@@ -290,25 +281,11 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
              )
              assigned_convo = current_convo
 
-        # Reset unread count
-        if assigned_convo and assigned_convo.get("type") == "team":
-            convo_collection.update_one(
-                {"conversation_id": conversation_id},
-                {
-                    "$set": {
-                        f"unread.{agent_id}": 0
-                    }
-                }
-            )
-        else:
-            convo_collection.update_one(
-                {"conversation_id": conversation_id},
-                {
-                    "$set": {
-                        "unread_count": 0
-                    }
-                }
-            )
+        # Reset unread count (customer conversations only)
+        convo_collection.update_one(
+            {"conversation_id": conversation_id},
+            {"$set": {"unread_count": 0}}
+        )
 
         messages = []
         notes = []
@@ -648,7 +625,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             conversation_id = f"team_{sorted_ids[0]}_{sorted_ids[1]}"
         
         now = datetime.now(timezone.utc)
-        convo_collection = db[f"conversations_{org_id}"]
+        # Team conversations and messages live in their own dedicated collections
+        convo_collection = db[f"team_conversations_{org_id}"]
         
         convo = convo_collection.find_one({"conversation_id": conversation_id})
         
@@ -699,7 +677,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                     }
                 )
         
-        messages_collection = db[f"messages_{org_id}"]
+        messages_collection = db[f"team_messages_{org_id}"]
         sender_id = context.get("sender_id") if context else None
         sender_name = context.get("sender_name") if context else None
         
