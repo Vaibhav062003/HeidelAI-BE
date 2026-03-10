@@ -1185,7 +1185,8 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
 
     Behavior:
     - If `wa_id` is provided, the function fetches templates created under that WhatsApp account.
-    - Uses the provided `access_token` to authenticate requests to the WhatsApp (Meta) Graph API.
+    - If `wa_id` is not provided or is falsy, no request is made and an empty template list is returned.
+    - The provided `access_token` is used to authenticate requests to the WhatsApp (Meta) Graph API when a request is made.
     """
 
     
