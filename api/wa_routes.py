@@ -1119,13 +1119,13 @@ async def bulk_send_whatsapp_message(
             {"_id": 0, "access_token": 1, "phone_id": 1}
         )
 
-        if not connection or "access_token" not in connection:
+        if not connection or not connection.get("access_token"):
             raise HTTPException(
                 status_code=404,
                 detail="WhatsApp connection not found or access token missing"
             )
 
-        access_token = connection["access_token"]
+        access_token = connection.get("access_token")
         phone_id = connection.get("phone_id")
 
         if not phone_id:
