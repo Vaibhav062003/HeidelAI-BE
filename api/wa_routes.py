@@ -1092,7 +1092,7 @@ async def bulk_send_whatsapp_message(
     """
     Enqueue a bulk WhatsApp template send as a background job.
 
-    Returns immediately with a `job_id`. Poll `/bulk/status/{job_id}` to track progress.
+    Returns immediately with a `job_id`. Poll `/sse/bulk-status/{job_id}` to track progress.
     - template_name: Name of an APPROVED template in your WhatsApp Business account.
     - language_code: BCP-47 code (e.g. 'en', 'en_US', 'hi').
     - recipients: List of objects with `phone_number` (E.164 digits only).
