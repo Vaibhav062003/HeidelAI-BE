@@ -1571,11 +1571,11 @@ def create_bulk_job(
 
 def get_bulk_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
     """
-    Fetch a bulk-send job record from memory, scoped to an org if org_id is provided.
-    Returns None if the job doesn't exist.
+    Retrieves a bulk job by ID, verifying org_id if provided.
+    Returns a copy of the job record.
     """
     job = _bulk_jobs.get(job_id)
-    if job is None:
+    if not job:
         return None
     
     if org_id and job.get("org_id") != org_id:
@@ -1584,7 +1584,7 @@ def get_bulk_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
     # Return a copy where results is also a new list instance,
     # so concurrent appends to job["results"] aren't visible
     # if the caller iterates over it.
-    return {**job, "results": list(job["results"])}
+    return {**job, "results": list(job.get("results", []))}
 
 
 async def run_bulk_send_job(
@@ -1611,7 +1611,7 @@ async def run_bulk_send_job(
         language_code: BCP-47 code e.g. "en", "en_US", "hi"
         recipients:    List of BulkRecipient objects
         components:    Optional shared template components (header/body variables)
-        delay_seconds: Seconds between API calls (min 0.5, default 8.0)
+        delay_seconds: Seconds between API calls (min 8.0, default 8.0)
     """
     url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
     headers = {
@@ -1621,11 +1621,12 @@ async def run_bulk_send_job(
 
     sent = 0
     failed = 0
-    results = []
-
-    # Mark job as running
-    _bulk_jobs[job_id]["status"] = "running"
-    _bulk_jobs[job_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+    
+    # Initialize job state
+    job_record = _bulk_jobs[job_id]
+    job_record["status"] = "running"
+    job_record["updated_at"] = datetime.now(timezone.utc).isoformat()
+    job_record["results"] = []
 
     try:
         # Use a single client for the entire job to reuse connections
@@ -1691,23 +1692,21 @@ async def run_bulk_send_job(
                     }
                     failed += 1
 
-                results.append(result_entry)
-
-                # Update in-memory progress after every recipient
-                _bulk_jobs[job_id].update({
+                # Update in-place for cleaner logic
+                job_record["results"].append(result_entry)
+                job_record.update({
                     "sent": sent,
                     "failed": failed,
-                    "results": results,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 })
 
                 # Rate-limit delay between sends (skip after the last one)
                 if index < len(recipients) - 1:
-                    await asyncio.sleep(max(delay_seconds, 0.5))
+                    await asyncio.sleep(delay_seconds)
 
         # Mark job complete
         now = datetime.now(timezone.utc).isoformat()
-        _bulk_jobs[job_id].update({
+        job_record.update({
             "status": "completed",
             "updated_at": now,
             "completed_at": now,
@@ -1719,7 +1718,7 @@ async def run_bulk_send_job(
 
     except Exception as e:
         logger.error(f"Bulk WA | job={job_id} | fatal error: {e}")
-        _bulk_jobs[job_id].update({
+        job_record.update({
             "status": "failed",
             "error": str(e),
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1739,12 +1738,14 @@ async def bulk_job_status_generator(job_id: str):
     """
     Yields the status of a bulk WhatsApp send job over SSE.
     """
-    max_retries = 60  # ~2 minutes total (60 * 2s)
+    logger.info(f"SSE | Starting status stream for job={job_id}")
+    max_retries = 600  # ~20 minutes total (600 * 2s) to support larger jobs
     retries = 0
 
     while retries < max_retries:
         job = get_bulk_job(job_id)
         if not job:
+            logger.warning(f"SSE | Job not found: {job_id}")
             yield f"data: {json.dumps({'status': 'ERROR', 'message': 'Job not found'})}\n\n"
             return
 
@@ -1757,4 +1758,4 @@ async def bulk_job_status_generator(job_id: str):
         retries += 1
     
     if retries >= max_retries:
-        yield f"data: {json.dumps({'status': 'TIMEOUT', 'message': 'Job tracking timed out'})}\n\n"
+        yield f"data: {json.dumps({'status': 'TIMEOUT', 'message': 'Job tracking timed out. Refresh to resume.'})}\n\n"

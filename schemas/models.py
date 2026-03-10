@@ -257,7 +257,7 @@ WhatsAppInteractiveMessage = Annotated[
 
 
 class BulkRecipient(BaseModel):
-    phone_number: str  # E.164 format without '+', e.g. "919876543210"
+    phone_number: str = Field(..., pattern=r"^\d{7,15}$")  # E.164 digits only, 7-15 chars
 
 class BulkMessageRequest(BaseModel):
     template_name: str                               # Must be an APPROVED WhatsApp template

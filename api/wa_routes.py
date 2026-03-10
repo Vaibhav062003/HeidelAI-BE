@@ -1095,8 +1095,8 @@ async def bulk_send_whatsapp_message(
     Returns immediately with a `job_id`. Poll `/bulk/status/{job_id}` to track progress.
     - template_name: Name of an APPROVED template in your WhatsApp Business account.
     - language_code: BCP-47 code (e.g. 'en', 'en_US', 'hi').
-    - recipients: List of objects with `phone_number` (E.164 without '+').
-    - delay_seconds: Pause between sends in seconds (minimum 0.5, default 4.0).
+    - recipients: List of objects with `phone_number` (E.164 digits only).
+    - delay_seconds: Pause between sends in seconds (minimum 8.0, default 8.0).
     """
     try:
         org_id = user.org_id
