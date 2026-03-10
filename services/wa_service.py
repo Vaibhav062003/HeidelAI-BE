@@ -1,5 +1,6 @@
 # Built-in modules
 import httpx
+import asyncio
 import json, requests
 import uuid
 import io
@@ -23,7 +24,6 @@ from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from core.logger import get_logger
 from schemas.models import WhatsAppInteractiveMessage
-import asyncio
 
 logger = get_logger(__name__)
 db = get_mongo_db()
@@ -1581,20 +1581,22 @@ def get_bulk_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
     if org_id and job.get("org_id") != org_id:
         return None
         
-    return dict(job)  # return a copy so callers can't mutate state
+    # Return a copy where results is also a new list instance,
+    # so concurrent appends to job["results"] aren't visible
+    # if the caller iterates over it.
+    return {**job, "results": list(job["results"])}
 
 
 async def run_bulk_send_job(
     job_id: str,
     org_id: str,
-    wa_id: str,
     phone_id: str,
     access_token: str,
     template_name: str,
     language_code: str,
     recipients: list,
     components: Optional[list] = None,
-    delay_seconds: float = 4.0,
+    delay_seconds: float = 8.0,
 ) -> None:
     """
     Background worker: sends a WhatsApp template to each recipient one by one,
@@ -1603,14 +1605,13 @@ async def run_bulk_send_job(
     Args:
         job_id:        UUID string created before enqueueing this background task
         org_id:        Organization ID
-        wa_id:         WhatsApp Business Account ID
         phone_id:      WhatsApp Phone Number ID (sender)
         access_token:  Meta API access token
         template_name: Name of an APPROVED WhatsApp template
         language_code: BCP-47 code e.g. "en", "en_US", "hi"
         recipients:    List of BulkRecipient objects
         components:    Optional shared template components (header/body variables)
-        delay_seconds: Seconds between API calls (min 0.5, default 4.0)
+        delay_seconds: Seconds between API calls (min 0.5, default 8.0)
     """
     url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
     headers = {
@@ -1627,80 +1628,82 @@ async def run_bulk_send_job(
     _bulk_jobs[job_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
-        for index, recipient in enumerate(recipients):
-            phone_number = recipient.phone_number
+        # Use a single client for the entire job to reuse connections
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for index, recipient in enumerate(recipients):
+                phone_number = recipient.phone_number
 
-            template_payload = {
-                "name": template_name,
-                "language": {"code": language_code},
-            }
-            if components:
-                template_payload["components"] = components
+                template_payload = {
+                    "name": template_name,
+                    "language": {"code": language_code},
+                }
+                if components:
+                    template_payload["components"] = components
 
-            logger.info(
-                f"Bulk WA | job={job_id} | [{index + 1}/{len(recipients)}] "
-                f"sending to {phone_number} | template={template_name}"
-            )
+                logger.info(
+                    f"Bulk WA | job={job_id} | [{index + 1}/{len(recipients)}] "
+                    f"sending to {phone_number} | template={template_name}"
+                )
 
-            payload = {
-                "messaging_product": "whatsapp",
-                "recipient_type": "individual",
-                "to": phone_number,
-                "type": "template",
-                "template": template_payload,
-            }
+                payload = {
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": phone_number,
+                    "type": "template",
+                    "template": template_payload,
+                }
 
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
+                try:
                     response = await client.post(url, headers=headers, json=payload)
 
-                if response.status_code == 200:
-                    messages = response.json().get("messages") or [{}]
-                    message_id = messages[0].get("id")
-                    logger.success(                        f"Bulk WA | job={job_id} | sent to {phone_number} | msg_id={message_id}"
-                    )
-                    result_entry = {
-                        "phone_number": phone_number,
-                        "status": "sent",
-                        "message_id": message_id,
-                    }
-                    sent += 1
-                else:
-                    error_detail = response.json().get("error", {}).get("message", response.text)
+                    if response.status_code == 200:
+                        messages = response.json().get("messages") or [{}]
+                        message_id = messages[0].get("id")
+                        logger.success(
+                            f"Bulk WA | job={job_id} | sent to {phone_number} | msg_id={message_id}"
+                        )
+                        result_entry = {
+                            "phone_number": phone_number,
+                            "status": "sent",
+                            "message_id": message_id,
+                        }
+                        sent += 1
+                    else:
+                        error_detail = response.json().get("error", {}).get("message", response.text)
+                        logger.error(
+                            f"Bulk WA | job={job_id} | failed for {phone_number} | error={error_detail}"
+                        )
+                        result_entry = {
+                            "phone_number": phone_number,
+                            "status": "failed",
+                            "error": error_detail,
+                        }
+                        failed += 1
+
+                except Exception as e:
                     logger.error(
-                        f"Bulk WA | job={job_id} | failed for {phone_number} | error={error_detail}"
+                        f"Bulk WA | job={job_id} | exception for {phone_number} | error={str(e)}"
                     )
                     result_entry = {
                         "phone_number": phone_number,
                         "status": "failed",
-                        "error": error_detail,
+                        "error": str(e),
                     }
                     failed += 1
 
-            except Exception as e:
-                logger.error(
-                    f"Bulk WA | job={job_id} | exception for {phone_number} | error={str(e)}"
-                )
-                result_entry = {
-                    "phone_number": phone_number,
-                    "status": "failed",
-                    "error": str(e),
-                }
-                failed += 1
+                results.append(result_entry)
 
-            results.append(result_entry)
+                # Update in-memory progress after every recipient
+                _bulk_jobs[job_id].update({
+                    "sent": sent,
+                    "failed": failed,
+                    "results": results,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
 
-            # Update in-memory progress after every recipient
-            _bulk_jobs[job_id].update({
-                "sent": sent,
-                "failed": failed,
-                "results": results,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
-
-            # Rate-limit delay between sends (skip after the last one)
-            if index < len(recipients) - 1:
-                await asyncio.sleep(max(delay_seconds, 0.5))
+                # Rate-limit delay between sends (skip after the last one)
+                if index < len(recipients) - 1:
+                    await asyncio.sleep(max(delay_seconds, 0.5))
 
         # Mark job complete
         now = datetime.now(timezone.utc).isoformat()
@@ -1721,13 +1724,25 @@ async def run_bulk_send_job(
             "error": str(e),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
+    finally:
+        # Schedule cleanup: remove job record after 30 minutes to manage memory
+        async def scheduled_cleanup():
+            await asyncio.sleep(1800) # 30 minutes
+            if job_id in _bulk_jobs:
+                logger.info(f"Cleaning up bulk job record: {job_id}")
+                del _bulk_jobs[job_id]
+        
+        asyncio.create_task(scheduled_cleanup())
 
 
 async def bulk_job_status_generator(job_id: str):
     """
     Yields the status of a bulk WhatsApp send job over SSE.
     """
-    while True:
+    max_retries = 60  # ~2 minutes total (60 * 2s)
+    retries = 0
+
+    while retries < max_retries:
         job = get_bulk_job(job_id)
         if not job:
             yield f"data: {json.dumps({'status': 'ERROR', 'message': 'Job not found'})}\n\n"
@@ -1739,3 +1754,7 @@ async def bulk_job_status_generator(job_id: str):
             break
 
         await asyncio.sleep(2)
+        retries += 1
+    
+    if retries >= max_retries:
+        yield f"data: {json.dumps({'status': 'TIMEOUT', 'message': 'Job tracking timed out'})}\n\n"

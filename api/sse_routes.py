@@ -1,9 +1,9 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
 from services.payment_service import subscription_status_generator
 from services.wa_service import bulk_job_status_generator
-import json
+from auth.dependencies import CurrentUser
 
 router = APIRouter(prefix="/sse", tags=["SSE"])
 
@@ -13,12 +13,12 @@ async def stream_payment_status(sub_id: str):
     SSE Endpoint consumed by the frontend.
     """
     return StreamingResponse(
-        subscription_status_generator(sub_id), 
+        subscription_status_generator(sub_id),
         media_type="text/event-stream"
     )
 
 @router.get("/bulk-status/{job_id}")
-async def stream_bulk_status(job_id: str):
+async def stream_bulk_status(job_id: str, user: CurrentUser):
     """
     SSE Endpoint to track bulk job status.
     """

@@ -21,7 +21,7 @@ from fastapi import (
 from core.services import services
 from services.utils import serialize_mongo
 from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template, BulkMessageRequest
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, get_bulk_job, run_bulk_send_job
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, run_bulk_send_job
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
@@ -1099,7 +1099,6 @@ async def bulk_send_whatsapp_message(
     - delay_seconds: Pause between sends in seconds (minimum 0.5, default 4.0).
     """
     try:
-        import uuid as _uuid
         org_id = user.org_id
         logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(request.recipients)}")
 
@@ -1133,7 +1132,7 @@ async def bulk_send_whatsapp_message(
             raise HTTPException(status_code=400, detail="Phone ID not found for this WhatsApp connection")
 
         # Create the job record synchronously so the client gets the job_id immediately
-        job_id = _uuid.uuid4().hex
+        job_id = uuid.uuid4().hex
         create_bulk_job(
             org_id=org_id,
             job_id=job_id,
@@ -1147,7 +1146,6 @@ async def bulk_send_whatsapp_message(
             run_bulk_send_job,
             job_id=job_id,
             org_id=org_id,
-            wa_id=wa_id,
             phone_id=phone_id,
             access_token=access_token,
             template_name=request.template_name,
