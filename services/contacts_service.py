@@ -9,6 +9,8 @@ from pymongo import UpdateOne
 from core.services import services
 from database import get_mongo_db
 from loguru import logger
+from services.websocket_service import broadcast_on_stats_update
+
 
 
 db = get_mongo_db()
@@ -141,6 +143,7 @@ async def update_contact_labels(org_id: str, conversation_id: str, labels: list)
         if "_id" in result:
             del result["_id"]
 
+        services.broadcast_on_stats_update(org_id)
         return {"contact": result}
 
     except PyMongoError as e:

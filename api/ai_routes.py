@@ -125,7 +125,11 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
             {"_id": 0, "categories": 1, "labels": 1}
         )
 
-        logger.info(f"Contact: {contact}")
+        logger.debug(
+            "Contact document %s for conversation_id=%s",
+            "found" if contact else "not found",
+            conversation_id,
+        )
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found.")
         
