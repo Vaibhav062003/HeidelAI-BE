@@ -5,9 +5,8 @@ from database import get_mongo_db
 from schemas.models import ChatAnalysis
 from agents.support_agent.agent import analyze_conversation
 import services.contacts_service as contacts_service
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 db = get_mongo_db()
 

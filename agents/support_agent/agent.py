@@ -6,9 +6,8 @@ from config.settings import AZURE_MODEL
 from pydantic import BaseModel, Field
 from agno.agent import Agent, RunResponse
 from pymongo import MongoClient
-from core.logger import get_logger
+from loguru import logger
 import json
-logger = get_logger(__name__)
 
 load_dotenv()
 

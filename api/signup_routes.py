@@ -7,12 +7,12 @@ from pymongo import ReturnDocument, DESCENDING
 
 # internal modules
 from database import get_mongo_db
-from core.logger import get_logger
+
 from schemas.models import InitPaymentRequest, InitSignupRequest, InviteTeamMembersRequest, SelectPlanRequest, SetPasswordRequest, VerifyOtpRequest
 from services.clerk_service import create_clerk_signup, create_organization, invite_users_to_organization, update_password_and_send_otp, verify_clerk_otp
 from services.payment_service import create_subscription
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/signup", tags=["Signup"])
@@ -168,7 +168,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         
         return {"success": True, "next_step": "SUCCESS", "org_id" : organization.get("id")}
     
-    elif plan_id in ["growth_monthly_inr", "growth_yearly_inr", "growth_monthly_test", "growth_monthly_inr_test"]:
+    elif plan_id in ["growth_monthly_inr_3499", "growth_yearly_inr_37789"]:
         # Update session with paid plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 

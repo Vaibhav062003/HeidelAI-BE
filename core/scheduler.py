@@ -7,10 +7,9 @@ from database import get_mongo_db
 from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
-from services.websocket_service import broadcast_on_stats_update
-from core.logger import get_logger
+# from services.websocket_service import broadcast_on_stats_update
+from loguru import logger
 
-logger = get_logger(__name__)
 
 db = get_mongo_db()
 scheduled_collection = db["scheduled_messages"]
@@ -109,9 +108,9 @@ async def process_scheduled_messages():
             logger.success(f"Updated {result.modified_count} message statuses")
             
             # Broadcast updates for all affected orgs
-            org_ids = {msg["org_id"] for msg in pending}
-            for org_id in org_ids:
-                await broadcast_on_stats_update(org_id)
+            # org_ids = {msg["org_id"] for msg in pending}
+            # for org_id in org_ids:
+            #     await broadcast_on_stats_update(org_id)
                 
         except Exception as e:
             logger.error(f"Error updating message statuses: {e}")

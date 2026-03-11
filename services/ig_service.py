@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from services.cloudinary_service import upload_media_to_cloudinary
-from services.websocket_service import broadcast_main_ws, broadcast_on_stats_update
+from services.websocket_service import broadcast_main_ws
 from supabase import create_client, Client
 from pymongo import UpdateOne, ReturnDocument
 from fastapi import HTTPException
@@ -28,9 +28,8 @@ from config.settings import (
     SUPABASE_INSTA_DM_TABLE,  
     IG_ACCESS_TOKEN
 )
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -566,7 +565,7 @@ async def create_or_update_instagram_conversation(org_id: str,
         })
         
     # Broadcast stats update for every message to ensure live dashboard refresh
-    await broadcast_on_stats_update(org_id)
+    # await broadcast_on_stats_update(org_id)
         
     return conversation_id
 

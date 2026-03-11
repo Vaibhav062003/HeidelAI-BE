@@ -8,9 +8,8 @@ from pymongo import UpdateOne
 # Internal Modules
 from core.services import services
 from database import get_mongo_db
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 db = get_mongo_db()
 
@@ -101,9 +100,9 @@ async def update_contact_tag_categories(org_id: str, conversation_id: str, categ
             raise HTTPException(status_code=404, detail="Contact not found")
 
         # Live Update: Trigger dashboard refresh
-        from services.websocket_service import broadcast_on_stats_update
-        import asyncio
-        asyncio.create_task(broadcast_on_stats_update(org_id))
+        # from services.websocket_service import broadcast_on_stats_update
+        # import asyncio
+        # asyncio.create_task(broadcast_on_stats_update(org_id))
         
         if "_id" in result:
             del result["_id"]
