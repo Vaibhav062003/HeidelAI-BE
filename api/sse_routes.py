@@ -17,11 +17,11 @@ async def stream_payment_status(sub_id: str):
     )
 
 @router.get("/bulk-status/{job_id}")
-async def stream_bulk_status(job_id: str):
+async def stream_bulk_status(job_id: str, org_id: str = None):
     """
     SSE Endpoint to track bulk job status.
     """
     return StreamingResponse(
-        bulk_job_status_generator(job_id),
+        bulk_job_status_generator(job_id, org_id=org_id),
         media_type="text/event-stream"
     )

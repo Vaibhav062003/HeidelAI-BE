@@ -1734,7 +1734,7 @@ async def run_bulk_send_job(
         asyncio.create_task(scheduled_cleanup())
 
 
-async def bulk_job_status_generator(job_id: str):
+async def bulk_job_status_generator(job_id: str, org_id: Optional[str] = None):
     """
     Yields the status of a bulk WhatsApp send job over SSE.
     """
@@ -1743,10 +1743,10 @@ async def bulk_job_status_generator(job_id: str):
     retries = 0
 
     while retries < max_retries:
-        job = get_bulk_job(job_id)
+        job = get_bulk_job(job_id, org_id=org_id)
         if not job:
             logger.warning(f"SSE | Job not found: {job_id}")
-            yield f"data: {json.dumps({'status': 'ERROR', 'message': 'Job not found'})}\n\n"
+            yield f"data: {json.dumps({'status': 'error', 'message': 'Job not found'})}\n\n"
             return
 
         yield f"data: {json.dumps(job)}\n\n"
@@ -1758,4 +1758,4 @@ async def bulk_job_status_generator(job_id: str):
         retries += 1
     
     if retries >= max_retries:
-        yield f"data: {json.dumps({'status': 'TIMEOUT', 'message': 'Job tracking timed out. Refresh to resume.'})}\n\n"
+        yield f"data: {json.dumps({'status': 'timeout', 'message': 'Job tracking timed out. Refresh to resume.'})}\n\n"
