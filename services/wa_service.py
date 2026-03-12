@@ -1624,7 +1624,22 @@ async def run_bulk_send_job(
     failed = 0
     
     # Initialize job state
-    job_record = _bulk_jobs[job_id]
+    job_record = _bulk_jobs.get(job_id)
+    if job_record is None:
+        now = datetime.now(timezone.utc).isoformat()
+        error_msg = (
+            f"Bulk WA | job={job_id} | org={org_id} | "
+            "missing job record in _bulk_jobs; marking as failed"
+        )
+        logger.error(error_msg)
+        _bulk_jobs[job_id] = {
+            "status": "failed",
+            "error": error_msg,
+            "updated_at": now,
+            "completed_at": now,
+            "results": [],
+        }
+        return
     job_record["status"] = "running"
     job_record["updated_at"] = datetime.now(timezone.utc).isoformat()
     job_record["results"] = []
