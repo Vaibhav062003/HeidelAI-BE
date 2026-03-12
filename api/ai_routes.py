@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 
 # === Internal Modules ===
-from core.logger import get_logger
+from loguru import logger
 from database import get_mongo_db
 from services.scheduler_service import schedule_followup_message
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
@@ -14,7 +14,7 @@ from services.ai_chatbot import update_prompt_in_cache, get_prompt
 from services.chat_analysis_service import analyze_and_update_conversation
 
 db = get_mongo_db()
-logger = get_logger(__name__)
+
 
 router = APIRouter(prefix="/api/ai", tags=["AI Routes"])
 
@@ -125,11 +125,7 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
             {"_id": 0, "categories": 1, "labels": 1}
         )
 
-        logger.debug(
-            "Contact document %s for conversation_id=%s",
-            "found" if contact else "not found",
-            conversation_id,
-        )
+        logger.debug(f"Contact document {'found' if contact else 'not found'} for conversation_id={conversation_id}")
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found.")
         
