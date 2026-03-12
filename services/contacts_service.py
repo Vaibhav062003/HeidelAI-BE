@@ -143,7 +143,7 @@ async def update_contact_labels(org_id: str, conversation_id: str, labels: list)
         if "_id" in result:
             del result["_id"]
 
-        services.broadcast_on_stats_update(org_id)
+        await broadcast_on_stats_update(org_id)
         return {"contact": result}
 
     except PyMongoError as e:
@@ -168,6 +168,7 @@ async def add_tag_to_org_metadata(org_id: str, tag: str):
     )
     
     return result.modified_count > 0 or result.upserted_id is not None
+
 async def add_label_to_org_metadata(org_id: str, label: str):
     """Add a label to the organization's metadata."""
 
