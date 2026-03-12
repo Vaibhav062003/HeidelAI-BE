@@ -1185,7 +1185,8 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
 
     Behavior:
     - If `wa_id` is provided, the function fetches templates created under that WhatsApp account.
-    - Uses the provided `access_token` to authenticate requests to the WhatsApp (Meta) Graph API.
+    - If `wa_id` is not provided or is falsy, no request is made and an empty template list is returned.
+    - The provided `access_token` is used to authenticate requests to the WhatsApp (Meta) Graph API when a request is made.
     """
 
     
@@ -1623,7 +1624,22 @@ async def run_bulk_send_job(
     failed = 0
     
     # Initialize job state
-    job_record = _bulk_jobs[job_id]
+    job_record = _bulk_jobs.get(job_id)
+    if job_record is None:
+        now = datetime.now(timezone.utc).isoformat()
+        error_msg = (
+            f"Bulk WA | job={job_id} | org={org_id} | "
+            "missing job record in _bulk_jobs; marking as failed"
+        )
+        logger.error(error_msg)
+        _bulk_jobs[job_id] = {
+            "status": "failed",
+            "error": error_msg,
+            "updated_at": now,
+            "completed_at": now,
+            "results": [],
+        }
+        return
     job_record["status"] = "running"
     job_record["updated_at"] = datetime.now(timezone.utc).isoformat()
     job_record["results"] = []
