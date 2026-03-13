@@ -1,7 +1,7 @@
 # Built-in Modules
 import time, json, hmac, hashlib
 from fastapi import APIRouter, HTTPException
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from fastapi import Request, Header, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pymongo import ReturnDocument
@@ -12,7 +12,6 @@ import httpx
 from core.managers import manager
 from services.automation_service import execute_whatsapp_flow
 from services.pma_chatbot import process_onboarding_if_needed, send_to_pma_chatbot
-from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
@@ -26,11 +25,10 @@ from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, CGSV_ORG_WA_ID
 from core.services import services
 from loguru import logger
+from services.webhook_service import calculate_whatsapp_reply_window
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
-
-logger.info(f"DEV_WEBHOOK_URL repr: {repr(DEV_WEBHOOK_URL)}")
 
 async def forward_webhook_to_dev(body: bytes, headers: dict):
     """
@@ -365,6 +363,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             context_type = None
                             context = None
 
+                            try:
+                                reply_window_info = calculate_whatsapp_reply_window(message)
+                                reply_window_expiry_time_utc = reply_window_info["expiry_time_utc"]
+                                is_ad_referral = reply_window_info["is_ad_referral"]
+                            except ValueError as exc:
+                                logger.warning(
+                                    f"Failed to calculate WhatsApp reply window due to invalid/missing timestamp; "
+                                    f"using default 24h window. Error: {exc}"
+                                )
+                                reply_window_expiry_time_utc = datetime.now(timezone.utc) + timedelta(hours=24)
+                                is_ad_referral = False
+
                             if message_context:
                                 replied_message_id = message_context.get("id")
 
@@ -418,6 +428,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_name=sender_name2,
                                         last_message=content,
                                         last_sender="customer",
+                                        reply_window_expiry=reply_window_expiry_time_utc,
+                                        is_ad_referral=is_ad_referral,
                                         mode="reply"
                                     )
                                     
@@ -605,6 +617,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     sender_name2=sender_name2,
                                     message_id=message_id,
                                     conversation_id=conversation_id,
+                                    reply_window_expiry_time_utc=reply_window_expiry_time_utc,
+                                    is_ad_referral=is_ad_referral,
                                     media_name=media_name,
                                     caption=media_data.get("caption", None)
                                 )
@@ -667,6 +681,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_name=sender_name2,
                                         last_message=content,
                                         last_sender="customer",
+                                        reply_window_expiry=reply_window_expiry_time_utc,
+                                        is_ad_referral=is_ad_referral,
                                         mode="reply"
                                     )
                                     
@@ -924,7 +940,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 return {"status":"ok"}
                                 
                             elif message_type == "unsupported":
-                                continue  # Skip unsupported messages
+                                content = "[Unsupported message type]"
                             elif message_type == "reaction":
                                 continue  # Handled above
                             else:
@@ -940,7 +956,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 customer_name=sender_name2,
                                 last_message=content,
                                 last_sender="customer",
-                                mode="reply"
+                                reply_window_expiry=reply_window_expiry_time_utc,
+                                is_ad_referral=is_ad_referral,
+                                mode="reply",
                             )
                             
                             # Store in WhatsApp-specific collections
