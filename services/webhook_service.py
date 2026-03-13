@@ -12,7 +12,7 @@ async def calculate_whatsapp_reply_window(message_payload):
     # Extract the base timestamp provided by WhatsApp (Unix epoch)
     timestamp_str = message_payload.get("timestamp")
     if timestamp_str is None:
-        logger.error("Missing 'timestamp' in WhatsApp message payload: %s", message_payload)
+        logger.error("Missing 'timestamp' in WhatsApp message payload: {}", message_payload)
         raise ValueError("Missing 'timestamp' in WhatsApp message payload")
     try:
         message_timestamp = int(timestamp_str)
@@ -22,7 +22,7 @@ async def calculate_whatsapp_reply_window(message_payload):
         )
     except (TypeError, ValueError, OSError) as exc:
         logger.error(
-            "Invalid 'timestamp' value in WhatsApp message payload: %s (error: %s)",
+            "Invalid 'timestamp' value in WhatsApp message payload: {} (error: {})",
             timestamp_str,
             exc,
         )

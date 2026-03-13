@@ -12,7 +12,6 @@ import httpx
 from core.managers import manager
 from services.automation_service import execute_whatsapp_flow
 from services.pma_chatbot import process_onboarding_if_needed, send_to_pma_chatbot
-# from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature

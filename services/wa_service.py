@@ -36,7 +36,7 @@ async def create_or_update_whatsapp_conversation(
     last_message, 
     last_sender,
     reply_window_expiry: Optional[datetime] = None,
-    is_ad_referral: Optional[bool] = False,
+    is_ad_referral: Optional[bool] = None,
     is_auto_followup: bool = False,
     mode: Optional[str] = None,
 ) -> str:
@@ -46,9 +46,10 @@ async def create_or_update_whatsapp_conversation(
     Args:
         org_id: Organization ID for the current context
         recipient_id: WhatsApp business account ID
-        sender_id: WhatsApp user phone number who sent the message
+        customer_phone_no: WhatsApp user phone number who sent the message        
         customer_name: Name of the customer
         last_message: The content of the last message
+        last_sender: Identifier indicating who sent the last message (e.g., "agent" or "customer")
         reply_window_expiry: The expiry time for the reply window
         is_ad_referral: Whether the message originated from a CTWA ad
         is_auto_followup: Whether the message is an auto-follow-up
@@ -83,7 +84,6 @@ async def create_or_update_whatsapp_conversation(
         "last_message_is_private_note": mode == "private",
         "last_sender": last_sender,
         "status": "open",
-        "is_ad_referral": is_ad_referral
     }
 
     # Fields that ONLY get set if a NEW conversation is created
@@ -126,6 +126,7 @@ async def create_or_update_whatsapp_conversation(
     # Safely apply $max ONLY if we have a valid expiry from the customer
     if last_sender == "customer" and reply_window_expiry:
         mongo_update["$max"] = {"reply_window_ends_at": reply_window_expiry}
+        update_set["is_ad_referral"] = is_ad_referral 
 
     # Execute atomic update
     updated_conversation = conversations_collection.find_one_and_update(
