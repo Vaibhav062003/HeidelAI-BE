@@ -111,7 +111,7 @@ async def create_or_update_whatsapp_conversation(
     if last_sender == "customer":
         update_set["reminder_stage"] = 0
         update_set["next_action_at"] = None
-    elif last_sender == "agent" and not is_auto_followup:
+    elif (last_sender == "agent" or last_sender == "ai") and (not is_auto_followup):
         # Manual agent message resets the inactivity countdown 
         update_set["reminder_stage"] = 0
         update_set["next_action_at"] = now + timedelta(hours=6)

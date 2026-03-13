@@ -1,7 +1,7 @@
 # Built-in Modules
 import time, json, hmac, hashlib
 from fastapi import APIRouter, HTTPException
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from fastapi import Request, Header, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pymongo import ReturnDocument
@@ -363,9 +363,17 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             context_type = None
                             context = None
 
-                            reply_window_info = await calculate_whatsapp_reply_window(message)
-                            reply_window_expiry_time_utc = reply_window_info["expiry_time_utc"]
-                            is_ad_referral = reply_window_info["is_ad_referral"]
+                            try:
+                                reply_window_info = await calculate_whatsapp_reply_window(message)
+                                reply_window_expiry_time_utc = reply_window_info["expiry_time_utc"]
+                                is_ad_referral = reply_window_info["is_ad_referral"]
+                            except ValueError as exc:
+                                logger.warning(
+                                    f"Failed to calculate WhatsApp reply window due to invalid/missing timestamp; "
+                                    f"using default 24h window. Error: {exc}"
+                                )
+                                reply_window_expiry_time_utc = datetime.now(timezone.utc) + timedelta(hours=24)
+                                is_ad_referral = False
 
                             if message_context:
                                 replied_message_id = message_context.get("id")
