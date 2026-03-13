@@ -2,12 +2,9 @@
 import datetime
 
 # Internal modules
-from database import get_mongo_db
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
-
-async def calculate_whatsapp_repy_window(message_payload):
+async def calculate_whatsapp_reply_window(message_payload):
     """
     Parses the WhatsApp message payload and returns the calculated 
     expiry datetime in UTC.

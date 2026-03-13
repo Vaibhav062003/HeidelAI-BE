@@ -81,7 +81,7 @@ async def create_or_update_whatsapp_conversation(
 
     # Fields that ONLY get set if a NEW conversation is created
     update_set_on_insert = {
-        "is_ai_enabled": False,  #TODO: By default AI tick is false
+        "is_ai_enabled": True,  #TODO: By default AI tick is true
         "started_at": now,
         "created_at": now,
         "closed_at": None

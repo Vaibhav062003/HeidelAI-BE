@@ -22,7 +22,7 @@ from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT
 from core.services import services
 from core.logger import get_logger
-from services.webhook_service import calculate_whatsapp_repy_window
+from services.webhook_service import calculate_whatsapp_reply_window
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -517,7 +517,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                            
                             logger.info(f"WhatsApp Message Received from {sender_name2}, Message: {content}")
 
-                            reply_window_expiry_time_utc = await calculate_whatsapp_repy_window(message)
+                            reply_window_expiry_time_utc = await calculate_whatsapp_reply_window(message)
                             
                             # Create or update conversation
                             conversation_id = await create_or_update_whatsapp_conversation(
