@@ -364,7 +364,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             context = None
 
                             try:
-                                reply_window_info = await calculate_whatsapp_reply_window(message)
+                                reply_window_info = calculate_whatsapp_reply_window(message)
                                 reply_window_expiry_time_utc = reply_window_info["expiry_time_utc"]
                                 is_ad_referral = reply_window_info["is_ad_referral"]
                             except ValueError as exc:
@@ -617,6 +617,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     sender_name2=sender_name2,
                                     message_id=message_id,
                                     conversation_id=conversation_id,
+                                    reply_window_expiry=reply_window_expiry_time_utc,
+                                    is_ad_referral=is_ad_referral,
                                     media_name=media_name,
                                     caption=media_data.get("caption", None)
                                 )

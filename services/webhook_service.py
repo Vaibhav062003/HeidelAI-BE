@@ -4,7 +4,7 @@ import datetime
 # Internal modules
 from loguru import logger
 
-async def calculate_whatsapp_reply_window(message_payload):
+def calculate_whatsapp_reply_window(message_payload):
     """
     Parses the WhatsApp message payload and returns the calculated 
     expiry datetime in UTC.
