@@ -15,15 +15,16 @@ from core.managers import manager
 from database import get_mongo_db, get_mongo_client
 from core.services import services
 from config.settings import IG_VERSION, VERSION, APP_ID
-from schemas.models import MessageRole
+from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
-from services.websocket_service import broadcast_main_ws, broadcast_on_stats_update
+from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
-from core.logger import get_logger
+from loguru import logger
+from schemas.models import WhatsAppInteractiveMessage
 
-logger = get_logger(__name__)
+
 db = get_mongo_db()
 mongo_client = get_mongo_client()
 
@@ -36,7 +37,7 @@ async def create_or_update_whatsapp_conversation(
     last_sender,
     reply_window_expiry: Optional[datetime] = None,
     is_auto_followup: bool = False,
-    mode: Optional[str] = None
+    mode: Optional[str] = None,
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -157,7 +158,7 @@ async def create_or_update_whatsapp_conversation(
         })
     
     # Broadcast stats update for every message to ensure live dashboard refresh
-    await broadcast_on_stats_update(org_id)
+    # await broadcast_on_stats_update(org_id)
         
     return conversation_id
 
@@ -177,7 +178,8 @@ async def store_whatsapp_message(
     status: Optional[str] = "received",
     temp_id: Optional[str] = None,
     context_type: Optional[str] = None,
-    context: Optional[dict] = None
+    context: Optional[dict] = None,
+    bot_context: Optional[dict] = None
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -223,7 +225,8 @@ async def store_whatsapp_message(
         "status": status,
         "temp_id": temp_id,
         "raw_data": raw_data,
-        "mode": mode
+        "mode": mode,
+        "ai_metadata" : bot_context if bot_context else None
     }   
     
     # Store message in WhatsApp-specific collection
@@ -344,7 +347,15 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
                 if not services.whatsapp_connections_map[whatsapp_id]:
                     del services.whatsapp_connections_map[whatsapp_id]
 
-async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None) -> dict:
+async def send_whatsapp_message(
+        message: dict, 
+        org_id: str, 
+        mode:str, 
+        temp_id: Optional[str] = None, 
+        context_type: Optional[str] = None, 
+        context: Optional[dict] = None,
+        bot_context: Optional[dict] = None
+    ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
     
@@ -358,12 +369,23 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
     """
     whatsapp_id = message.get("sender_id")
 
+    if not whatsapp_id:
+        logger.error("Missing 'sender_id' in outbound WhatsApp message payload")
+        raise HTTPException(status_code=422, detail="Missing 'sender_id'")
+        
+    # Query the database to validate the ID
     wa_connection = db.whatsapp_connections.find_one(
         {"wa_id": whatsapp_id},
         {"wa_id": 1, "_id": 0}
     )
     
+    if not wa_connection:
+        logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
+        raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
+        
+    # safe to use wa_id
     whatsapp_business_id = wa_connection["wa_id"]
+        
     
     try:
         conversation_id = message["conversation_id"]
@@ -390,7 +412,7 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
                 "message_id": context.get("mid")
             }
         
-        if mode == "reply":
+        if mode == "reply" or mode == "ai":
             
             # Send message via WhatsApp Cloud API
             url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
@@ -417,10 +439,17 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
         
         now = datetime.now(timezone.utc)
 
+        if mode == "private":
+            last_message = f"Private Note: {content}"
+        elif mode == "ai":
+            last_message= f"AI: {content}"
+        else:
+            last_message = f"You: {content}"
+
         wa_conversation = {
-            "last_message": f"Private Note: {content}" if mode == "private" else f"You: {content}",
+            "last_message": last_message,
             "last_message_timestamp": now,
-            "last_sender": "agent",
+            "last_sender": "ai" if mode == "ai" else "agent" ,
             "reminder_stage": 0,
             "next_action_at": now + timedelta(hours=6),
             "last_message_is_private_note": mode == "private"
@@ -450,16 +479,17 @@ async def send_whatsapp_message(message: dict, org_id: str, mode:str, temp_id: O
             customer_phone_no=recipient_id,
             type="text",
             payload=None,
-            sender_name="Agent",
+            sender_name="AI" if mode == "ai" else "Agent",
             recipient_id=whatsapp_business_id,
-            role=MessageRole.AGENT,
+            role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
             mode=mode,
             message_id=message_id,
             raw_data=response_data,
             status="delivered" if mode == "private" else "sending",
             temp_id=temp_id,
             context=context,
-            context_type=context_type
+            context_type=context_type,
+            bot_context=bot_context
         )
         
         return {"message": "Message sent", "message_id": mid}
@@ -584,7 +614,18 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
             detail=f"Failed to send template message: {str(e)}"
         )
 
-async def send_wa_media_message(recipient_id: str, media_url: str, media_type: str, wa_id: str, content: Optional[str], org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
+async def send_wa_media_message(
+        recipient_id: str, 
+        media_url: str, 
+        media_type: str, 
+        wa_id: str, 
+        content: Optional[str], 
+        org_id: str, 
+        temp_id: Optional[str], 
+        mode: str, 
+        context_type: Optional[str], 
+        context: Optional[dict]
+    ) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """
@@ -1149,8 +1190,7 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
             "Content-Type": "application/json"
         }
         
-    user_created = []
-    prebuilt =[]
+    templates = []
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
         if wa_id:
@@ -1158,26 +1198,14 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
             response = await client.get(org_url, headers=headers)
 
             if response.status_code == 200:
-                user_created = response.json().get("data", [])
+                templates = response.json().get("data", [])
                 logger.info(
-                     f"User-created templates = {len(user_created)}"
+                     f"User-created templates = {len( templates)}"
                 )
-
-        global_url = "https://graph.facebook.com/v24.0/message_template_library"
-        response = await client.get(global_url, headers=headers)
-
-        if response.status_code == 200:
-            prebuilt = response.json().get("data", [])
-            logger.info(
-                 f"Pre-built templates = {len(prebuilt)}"
-            )
-
         return {
-            "user_created": user_created,
-            "prebuilt": prebuilt,
+            "templates": templates,
             "meta": {
-                "has_user_created": len(user_created) > 0,
-                "has_prebuilt": len(prebuilt) > 0,
+                "has_templates": len(templates) > 0,
             }
         }
         
@@ -1250,4 +1278,255 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
         raise HTTPException(
             status_code=500,
             detail="Internal server error while creating WhatsApp template"
+        )
+
+# WhatsApp Interactive Messages (Free to send)
+
+def build_list_message_payload(message_data: InteractiveListMessage) -> dict:
+    """
+    Constructs the Meta WhatsApp API payload for a 'list' interactive message.
+    
+    Args:
+        message_data (InteractiveListMessage): A validated Pydantic model containing 
+            the list message details (body, footer, button text, and sections/rows).
+            
+    Returns:
+        dict: The dictionary representing the 'interactive' JSON object required 
+            by the Meta Cloud API.
+    """
+
+    interactive_content = {
+        "type": "list",
+        "body": {
+            "text": message_data.body_text
+        },
+        "footer": {
+            "text": message_data.footer_text
+        },
+        "action": {
+            "button": message_data.button_text,
+            "sections": [section.model_dump(exclude_none=True) for section in message_data.sections]
+        }
+    }
+
+    if message_data.header_text:
+        interactive_content["header"] = {
+            "type": "text",
+            "text": message_data.header_text
+        }
+
+    return interactive_content
+
+def build_url_button_message_payload(message_data: InteractiveUrlButtonMessage) -> dict:
+    """
+    Constructs the Meta WhatsApp API payload for a 'cta_url' (Call To Action URL) interactive message.
+    
+    Args:
+        message_data (InteractiveUrlButtonMessage): A validated Pydantic model containing 
+            the URL button details (optional media/text header, body, footer, button text, and URL).
+            
+    Returns:
+        dict: The dictionary representing the 'interactive' JSON object required 
+            by the Meta Cloud API.
+    """
+
+    interactive_content = {
+        "type": "cta_url",
+        "body": {
+            "text": message_data.body_text
+        },
+        "footer": {
+            "text": message_data.footer_text
+        },
+        "action": {
+            "name": "cta_url",
+            "parameters": {
+                "display_text": message_data.button_text,
+                "url": message_data.url
+            }
+        }
+    }
+
+    # Dump the polymorphic header directly if it exists
+    if message_data.header:
+        interactive_content["header"] = message_data.header.model_dump(exclude_none=True)
+
+    return interactive_content
+
+def build_reply_button_message_payload(message_data: InteractiveReplyButtonMessage) -> dict:
+    """
+    Constructs the Meta WhatsApp API payload for a 'button' (Quick Reply) interactive message.
+    
+    Args:
+        message_data (InteractiveReplyButtonMessage): A validated Pydantic model containing 
+            the reply button details (optional media/text header, body, footer, and up to 3 buttons).
+            
+    Returns:
+        dict: The dictionary representing the 'interactive' JSON object required 
+            by the Meta Cloud API.
+    """
+
+    interactive_content = {
+        "type": "button",
+        "body": {
+            "text": message_data.body_text
+        },
+        "footer": {
+            "text": message_data.footer_text
+        },
+        "action": {
+            "buttons": [button.model_dump(exclude_none=True) for button in message_data.buttons]
+        }
+    }
+
+    # Dump the polymorphic header directly if it exists
+    if message_data.header:
+        interactive_content["header"] = message_data.header.model_dump(exclude_none=True)
+
+    return interactive_content
+
+# For routing to different interactive message types
+ROUTER_MAP = {
+    "list": build_list_message_payload,
+    "cta_url": build_url_button_message_payload,
+    "button": build_reply_button_message_payload,
+}
+
+async def send_interactive_whatsapp_message(
+        org_id: str, 
+        conversation_id: str, 
+        sender_id: str, 
+        interactive_message: WhatsAppInteractiveMessage, 
+    ) -> dict:
+    """
+    Routes and sends a polymorphic interactive WhatsApp message via the Meta Cloud API,
+    and logs the interaction in the database.
+
+    Args:
+        org_id (str): Organization ID of the sender's HeidelAI org (used to store the 
+            sent message in the appropriate org's collections).
+        conversation_id (str): Formatted as 'whatsapp_{recipient_phone_number}', used 
+            to extract the recipient ID and update the correct conversation thread.
+        sender_id (str): The WhatsApp Business Account ID (wa_id) used to fetch the 
+            sender's access token and phone number from the database.
+        interactive_message (WhatsAppInteractiveMessage): A discriminated union Pydantic 
+            model representing the message data. It routes based on the 'type' field 
+            (e.g., "list", "cta_url", "button").
+
+    Returns:
+        dict: A dictionary containing a success message and the internal database 'message_id'.
+
+    Raises:
+        HTTPException: If the sender_id is unregistered, the connection is misconfigured,
+            the message type is unsupported, or the Meta API rejects the request.
+    """
+
+    whatsapp_id = sender_id
+    if not whatsapp_id:
+        logger.error("Webhook payload is missing 'sender_id'")
+        raise HTTPException(status_code=404, detail="Error: Webhook payload is missing 'sender_id'")
+        
+    # Query the database to validate the ID
+    wa_connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_id})
+    if not wa_connection:
+        logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
+        raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
+    
+    whatsapp_business_id = wa_connection.get("wa_id")
+    access_token = wa_connection.get("access_token")
+    phone_id = wa_connection.get("phone_id")
+    recipient_id = conversation_id.replace("whatsapp_", "")
+
+    if not access_token or not phone_id or not whatsapp_business_id:
+        raise HTTPException(status_code=404, detail="WhatsApp connection not properly configured")
+    
+    try:    
+        # Route to the appropriate handler function based on the interactive message type
+        handler_function = ROUTER_MAP.get(interactive_message.type)
+        
+        if handler_function:
+            interactive_content = handler_function(interactive_message)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported interactive message type")
+
+        data = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient_id,
+            "type": "interactive",
+            "interactive": interactive_content
+        }
+
+        # Send message via WhatsApp Cloud API
+        url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        } 
+        
+        response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code != 200:
+            logger.error(f"WhatsApp API error: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Failed to send WhatsApp message"
+            )
+        
+        response_data = response.json()
+        message_id = response_data.get("messages", [{}])[0].get("id")
+        
+        now = datetime.now(timezone.utc)
+        last_message = f"AI: Sent an Interactive Message"
+
+        wa_conversation = {
+            "last_message": last_message,
+            "last_message_timestamp": now,
+            "last_sender": "ai",
+            "reminder_stage": 0,
+            "next_action_at": now + timedelta(hours=6),
+            "last_message_is_private_note": False
+        }
+
+        conversation = db[f"conversations_{org_id}"].find_one_and_update(
+            {"conversation_id": conversation_id},
+            {"$set": wa_conversation},
+            return_document=ReturnDocument.AFTER  
+        )
+
+        if "_id" in conversation:
+            conversation["_id"] = str(conversation["_id"])
+
+        await broadcast_main_ws(
+            platform_id=whatsapp_business_id,
+            platform_type="whatsapp",
+            event_type="conversation_updated",
+            payload={"conversation": conversation}
+        )
+
+        # Store message in WhatsApp-specific collection
+        mid = await store_whatsapp_message(
+            org_id=org_id,
+            content=interactive_message.body_text,
+            conversation_id=conversation_id,
+            customer_phone_no=recipient_id,
+            type="interactive",
+            payload=interactive_message.model_dump(exclude_none=True),
+            sender_name="AI",
+            recipient_id=whatsapp_business_id,
+            role=MessageRole.AI,
+            mode="reply",
+            message_id=message_id,
+            status="sending",
+        )
+        
+        return {"message": "Message sent", "message_id": mid}
+    
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error sending WhatsApp message: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to send message: {str(e)}"
         )
