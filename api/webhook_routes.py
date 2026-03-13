@@ -12,7 +12,7 @@ import httpx
 from core.managers import manager
 from services.automation_service import execute_whatsapp_flow
 from services.pma_chatbot import process_onboarding_if_needed, send_to_pma_chatbot
-from services.utils import generate_message_id
+# from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
@@ -30,8 +30,6 @@ from services.webhook_service import calculate_whatsapp_reply_window
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
-
-logger.info(f"DEV_WEBHOOK_URL repr: {repr(DEV_WEBHOOK_URL)}")
 
 async def forward_webhook_to_dev(body: bytes, headers: dict):
     """
@@ -366,6 +364,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             context_type = None
                             context = None
 
+                            reply_window_info = await calculate_whatsapp_reply_window(message)
+                            reply_window_expiry_time_utc = reply_window_info["expiry_time_utc"]
+                            is_ad_referral = reply_window_info["is_ad_referral"]
+
                             if message_context:
                                 replied_message_id = message_context.get("id")
 
@@ -419,6 +421,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_name=sender_name2,
                                         last_message=content,
                                         last_sender="customer",
+                                        reply_window_expiry=reply_window_expiry_time_utc,
+                                        is_ad_referral=is_ad_referral,
                                         mode="reply"
                                     )
                                     
@@ -668,6 +672,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_name=sender_name2,
                                         last_message=content,
                                         last_sender="customer",
+                                        reply_window_expiry=reply_window_expiry_time_utc,
+                                        is_ad_referral=is_ad_referral,
                                         mode="reply"
                                     )
                                     
@@ -925,15 +931,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 return {"status":"ok"}
                                 
                             elif message_type == "unsupported":
-                                continue  # Skip unsupported messages
+                                content = "[Unsupported message type]"
                             elif message_type == "reaction":
                                 continue  # Handled above
                             else:
                                 content = f"[Unsupported message type: {message_type}]"
                            
                             logger.info(f"WhatsApp Message Received from {sender_name2}, Message: {content}")
-
-                            reply_window_expiry_time_utc = await calculate_whatsapp_reply_window(message)
                             
                             # Create or update conversation
                             conversation_id = await create_or_update_whatsapp_conversation(
@@ -944,6 +948,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 last_message=content,
                                 last_sender="customer",
                                 reply_window_expiry=reply_window_expiry_time_utc,
+                                is_ad_referral=is_ad_referral,
                                 mode="reply",
                             )
                             

@@ -36,6 +36,7 @@ async def create_or_update_whatsapp_conversation(
     last_message, 
     last_sender,
     reply_window_expiry: Optional[datetime] = None,
+    is_ad_referral: Optional[bool] = False,
     is_auto_followup: bool = False,
     mode: Optional[str] = None,
 ) -> str:
@@ -48,7 +49,11 @@ async def create_or_update_whatsapp_conversation(
         sender_id: WhatsApp user phone number who sent the message
         customer_name: Name of the customer
         last_message: The content of the last message
-        
+        reply_window_expiry: The expiry time for the reply window
+        is_ad_referral: Whether the message originated from a CTWA ad
+        is_auto_followup: Whether the message is an auto-follow-up
+        mode: The mode of the message (e.g., "private")
+
     Returns:
         str: The conversation ID
     """
@@ -77,12 +82,13 @@ async def create_or_update_whatsapp_conversation(
         "last_message_timestamp": now,
         "last_message_is_private_note": mode == "private",
         "last_sender": last_sender,
-        "status": "open"
+        "status": "open",
+        "is_ad_referral": is_ad_referral
     }
 
     # Fields that ONLY get set if a NEW conversation is created
     update_set_on_insert = {
-        "is_ai_enabled": True,  #TODO: By default AI tick is true
+        "is_ai_enabled": True,  #TODO: By default AI tick is true (Maybe have a setting to control this at org level in the future? On FE - "New conversations have AI Enabled Y/N")
         "started_at": now,
         "created_at": now,
         "closed_at": None

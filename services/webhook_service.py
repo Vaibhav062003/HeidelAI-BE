@@ -40,4 +40,4 @@ async def calculate_whatsapp_reply_window(message_payload):
     # Calculate the exact expiry time
     expiry_time_utc = message_time_utc + datetime.timedelta(hours=window_hours)
     
-    return expiry_time_utc
+    return {"expiry_time_utc": expiry_time_utc, "is_ad_referral": is_ad_referral}
