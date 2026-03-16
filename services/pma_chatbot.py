@@ -1,6 +1,6 @@
 import httpx
 from typing import Dict, Any, Optional
-import logging
+from loguru import logger
 
 from datetime import datetime, timezone
 
@@ -13,9 +13,6 @@ from services.wa_service import send_interactive_whatsapp_message
 db = get_async_mongo_db()
 
 ORG_ID = settings.PMA_ORG_ID
-
-# Configure logging
-logger = logging.getLogger(__name__)
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://heidelai-chatbot-2.koyeb.app"
@@ -103,7 +100,7 @@ async def send_to_pma_chatbot(
         return { "final_response" : "I apologize, but I'm experiencing technical difficulties. Please try again later."}  
         
     except Exception as e:
-        logger.error(f"Unexpected error calling chatbot: {str(e)}", exc_info=True)
+        logger.opt(exception=True).error(f"Unexpected error calling chatbot: {str(e)}")
         return { "final_response" : "I apologize, but something went wrong. Please try again later."}  
 
 """
@@ -203,7 +200,7 @@ def get_location_message(sender_name: str):
     )
 
 async def process_onboarding_if_needed(user_input: str, conversation_id: str, org_id: str, stage: str, whatsapp_business_id: str, sender_name: str):
-    logger.info("Processing onboarding for conversation_id=%s at stage=%s with user_input=%s", conversation_id, stage, user_input)
+    logger.info(f"Processing onboarding for conversation_id={conversation_id} at stage={stage} with user_input={user_input}")
     user_input = user_input.strip().lower()
 
     # ───────────────────────────────────
@@ -220,28 +217,12 @@ async def process_onboarding_if_needed(user_input: str, conversation_id: str, or
                 header={
                     "type": "image",
                     "image": {
-                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1772559110/intro_image_pma_p0tae1.jpg"
+                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1773070610/WhatsApp_Image_2026-03-09_at_3.02.13_PM_tcdpby.jpg"
                     }
                 },
-                body_text=(
-                    "🌟 FREE VEDIC MATHS MASTERCLASS 🌟\n\n"
-                    "Does your child feel Exam Stress in Maths? 😟\n"
-                    "✨ Now let the Exam Stress Just Go Away! ✨\n"
-                    "Give your child the power of Vedic Maths and watch confidence grow! 🚀\n\n"
-                    "🎯 In This FREE Masterclass Students Will Learn:\n"
-                    "✅ Faster Calculations\n"
-                    "✅ Better Accuracy\n"
-                    "✅ Improved Concentration\n"
-                    "✅ More Confidence in Exams\n"
-                    "✅ Fear of Maths will disappear\n\n"
-                    "🎓 100% FREE Session\n"
-                    "🚀 Limited Seats, Register Now!\n\n" 
-                    "🌐 www.paarijatacademy.in\n"
-                    "📞 Call / WhatsApp:\n"
-                    "8055579965 / 9503498556"
-                ),
+                body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n🕰️ Eve 4 to 5.30 PM\n\n💥 Special Early Bird Offer\n🎯Register before 15th March\n💰 Only Rs. 2750/-\n\n⏳ After 15th March\n💰 Fees: Rs. 3500/-\n\n⚡ Limited Seats Available – Book Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 8055579965\n\n✨ Let’s Make Maths Your Child’s Best Friend!",
                 button_text="Register Now",
-                url="https://forms.gle/xWnKQCt8CVepAbYb9"
+                url="https://forms.gle/hPMw7inpe7H1E4gF9"
             )
         )
 

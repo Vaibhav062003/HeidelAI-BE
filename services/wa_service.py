@@ -22,10 +22,10 @@ from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
-from core.logger import get_logger
+from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
 
-logger = get_logger(__name__)
+
 db = get_mongo_db()
 mongo_client = get_mongo_client()
 
@@ -37,6 +37,8 @@ async def create_or_update_whatsapp_conversation(
     customer_name, 
     last_message, 
     last_sender,
+    reply_window_expiry: Optional[datetime] = None,
+    is_ad_referral: Optional[bool] = None,
     is_auto_followup: bool = False,
     mode: Optional[str] = None,
 ) -> str:
@@ -46,10 +48,15 @@ async def create_or_update_whatsapp_conversation(
     Args:
         org_id: Organization ID for the current context
         recipient_id: WhatsApp business account ID
-        sender_id: WhatsApp user phone number who sent the message
+        customer_phone_no: WhatsApp user phone number who sent the message        
         customer_name: Name of the customer
         last_message: The content of the last message
-        
+        last_sender: Identifier indicating who sent the last message (e.g., "agent" or "customer")
+        reply_window_expiry: The expiry time for the reply window
+        is_ad_referral: Whether the message originated from a CTWA ad
+        is_auto_followup: Whether the message is an auto-follow-up
+        mode: The mode of the message (e.g., "private")
+
     Returns:
         str: The conversation ID
     """
@@ -62,77 +69,73 @@ async def create_or_update_whatsapp_conversation(
     
     # Check if conversation already exists
     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
-
     convo_key = (org_id, conversation_id)
     
     # Check if the viewers set exists and is not empty
     is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
-    
-    if existing_conversation:
 
+    # Base fields that ALWAYS get updated
+    update_set = {
+        "platform": "whatsapp",
+        "conversation_id": conversation_id,
+        "whatsapp_id": recipient_id,
+        "customer_id": customer_phone_no,
+        "customer_name": customer_name,
+        "last_message": last_message,
+        "last_message_timestamp": now,
+        "last_message_is_private_note": mode == "private",
+        "last_sender": last_sender,
+        "status": "open",
+    }
+
+    # Fields that ONLY get set if a NEW conversation is created
+    update_set_on_insert = {
+        "is_ai_enabled": True,  #TODO: By default AI tick is true (Maybe have a setting to control this at org level in the future? On FE - "New conversations have AI Enabled Y/N")
+        "started_at": now,
+        "created_at": now,
+        "closed_at": None
+    }
+
+    # Counters to increment atomically
+    update_inc = {
+        "message_counter": 1,
+        "unread_count": 0 if is_being_viewed else 1
+    }
+
+    # Handle Agent vs Customer logic
+    if existing_conversation:
         abort_result = await abort_scheduled_message(org_id, conversation_id)
         logger.success(f"Aborted Scheduled message: {abort_result}")
 
         reopen_result = await reopen_conversation(org_id, conversation_id)
         logger.success(f"Reopened conversation: {reopen_result}")
 
-        # Update existing conversation without modifying is_ai_enabled
-        wa_conversation = {
-            "platform": "whatsapp",
-            "conversation_id": conversation_id,
-            "whatsapp_id": recipient_id,
-            "customer_id": customer_phone_no,
-            "customer_name": customer_name,
-            "last_message": last_message,
-            "last_message_timestamp": now,
-            "last_message_is_private_note": mode == "private",
-            "last_sender": last_sender,
-            "status": "open",
-            "message_counter": existing_conversation.get("message_counter", 0) + 1,
-            "unread_count": existing_conversation.get("unread_count", 0) + (0 if is_being_viewed else 1),
-        }
-        
-        if last_sender == "customer":
-            # Reset inactivity reminders on customer reply
-            wa_conversation["reminder_stage"] = 0
-            wa_conversation["next_action_at"] = None
-
-        elif last_sender == "agent" and not is_auto_followup:
-            # Manual agent message resets the inactivity countdown
-            wa_conversation["reminder_stage"] = 0
-            wa_conversation["next_action_at"] = now + timedelta(hours=6)
-
-    else:
-        # Create new conversation with is_ai_enabled set to True
-        wa_conversation = {
-            "platform": "whatsapp",
-            "conversation_id": conversation_id,
-            "whatsapp_id": recipient_id,
-            "customer_id": customer_phone_no,
-            "customer_name": customer_name,
-            "last_message": last_message,
-            "last_message_timestamp": now,
-            "last_message_is_private_note": mode == "private",
-            "unread_count": 1,
-            "message_counter": 1,
-            "is_ai_enabled": True,  
-            "status": "open",
-            "last_sender": last_sender,
-            "started_at": now,
-            "created_at": now,
-            "reminder_stage": 0,
-            "next_action_at": now + timedelta(hours=6),
-            "closed_at": None
-        }
-
     if last_sender == "customer":
-        wa_conversation["reply_window_ends_at"] = now + timedelta(hours=24)
-    
+        update_set["reminder_stage"] = 0
+        update_set["next_action_at"] = None
+    elif (last_sender == "agent" or last_sender == "ai") and (not is_auto_followup):
+        # Manual agent message resets the inactivity countdown 
+        update_set["reminder_stage"] = 0
+        update_set["next_action_at"] = now + timedelta(hours=6)
+
+    # Assemble the final MongoDB update document safely
+    mongo_update = {
+        "$set": update_set,
+        "$setOnInsert": update_set_on_insert,
+        "$inc": update_inc
+    }
+
+    # Safely apply $max ONLY if we have a valid expiry from the customer
+    if last_sender == "customer" and reply_window_expiry:
+        mongo_update["$max"] = {"reply_window_ends_at": reply_window_expiry}
+        update_set["is_ad_referral"] = is_ad_referral 
+
+    # Execute atomic update
     updated_conversation = conversations_collection.find_one_and_update(
         {"conversation_id": conversation_id},
-        {"$set": wa_conversation},
-        upsert=True,                          # Create if it doesn't exist
-        return_document=ReturnDocument.AFTER  # Return the NEW/UPDATED document
+        mongo_update,
+        upsert=True,
+        return_document=ReturnDocument.AFTER
     )
 
     logger.success(f"Whatsapp conversation updated: {updated_conversation}")

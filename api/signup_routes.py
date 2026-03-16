@@ -7,12 +7,12 @@ from pymongo import ReturnDocument, DESCENDING
 
 # internal modules
 from database import get_mongo_db
-from core.logger import get_logger
+
 from schemas.models import InitPaymentRequest, InitSignupRequest, InviteTeamMembersRequest, SelectPlanRequest, SetPasswordRequest, VerifyOtpRequest
 from services.clerk_service import create_clerk_signup, create_organization, invite_users_to_organization, update_password_and_send_otp, verify_clerk_otp
 from services.payment_service import create_subscription
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/signup", tags=["Signup"])

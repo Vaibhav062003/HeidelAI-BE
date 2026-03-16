@@ -5,10 +5,11 @@ from jose import JWTError
 
 from .service import decode_jwt
 from .models import CurrentUserModel
-from core.logger import get_logger
+from loguru import logger
+
 
 security = HTTPBearer()
-logger = get_logger(__name__)
+
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),

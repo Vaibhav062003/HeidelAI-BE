@@ -12,11 +12,10 @@ from pymongo import ReturnDocument
 
 # internal modules
 from database import get_mongo_db
-from core.logger import get_logger
+from loguru import logger
 from config.settings import CASHFREE_URL, CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_VERSION
 from typing import Literal
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 

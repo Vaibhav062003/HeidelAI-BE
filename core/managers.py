@@ -1,8 +1,7 @@
 from fastapi import WebSocket
 from typing import Dict
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 # WebSocket Manager
 class ConnectionManager:
