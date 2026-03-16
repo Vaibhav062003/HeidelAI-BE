@@ -5,19 +5,14 @@ from agno.models.azure import AzureOpenAI
 from config.settings import AZURE_MODEL
 from pydantic import BaseModel, Field
 from agno.agent import Agent, RunResponse
-from pymongo import MongoClient
 from loguru import logger
 import json
 
 load_dotenv()
 
-MONGODB_URI = os.getenv("MONGODB_URI")
 # GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # LLM_MODEL = os.getenv("LLM_MODEL")
-
-mongo_client = MongoClient(MONGODB_URI)
-db = mongo_client['Cluster0']
 
 class ConversationSummary(BaseModel):
     summary: List[str] = Field(
@@ -33,11 +28,11 @@ class ConversationSummary(BaseModel):
         example="positive"
     )
     tags: List[str] = Field(
-        default=[], description="A list of 1-2 tags selected from the provided available tags list. Only use tags from the provided list. Return empty list if no available tags are provided.",
+        default_factory=list, description="A list of 1-2 tags selected from the provided available tags list. Only use tags from the provided list. Return empty list if no available tags are provided.",
         example=["product_inquiry", "macbook"]
     )
     labels: List[str] = Field(
-        default=[], description="A list of 1-2 labels selected from the provided available labels list. Only use labels from the provided list. Return empty list if no available labels are provided.",
+        default_factory=list, description="A list of 1-2 labels selected from the provided available labels list. Only use labels from the provided list. Return empty list if no available labels are provided.",
         example=["Leads"]
     )
     suggestions: List[str] = Field(
