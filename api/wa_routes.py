@@ -1149,7 +1149,7 @@ async def bulk_send_whatsapp_message(
             language_code=request.language_code,
             recipients=request.recipients,
             components=request.components,
-            delay_seconds=request.delay_seconds,
+            # max_concurrent=20, # Optional: can be passed if needed
         )
 
         logger.success(f"Bulk WA | job={job_id} enqueued | org={org_id} | recipients={len(request.recipients)}")
