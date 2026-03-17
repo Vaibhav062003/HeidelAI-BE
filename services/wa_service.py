@@ -1253,15 +1253,26 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
             f"status={response.status_code} response={response.json()}"
         )
         if response.status_code != 200:
-            error_payload = response.json() if response.content else {}
+            try:
+                error_payload = response.json()
+            except Exception:
+                error_payload = {"error": {"message": response.text}}
+
             logger.error(
                 f"WhatsApp API error | org_id={org_id} wa_id={wa_id} template={template_name} "
                 f"status={response.status_code} response={error_payload}"
             )
 
+            # Extract the most descriptive error message
+            error_msg = "Failed to create WhatsApp message template"
+            if isinstance(error_payload, dict):
+                error_body = error_payload.get("error", {})
+                # Prioritize error_user_msg as it is often more descriptive
+                error_msg = error_body.get("error_user_msg") or error_body.get("message") or str(error_payload)
+
             raise HTTPException(
                 status_code=response.status_code,
-                detail=error_payload or "Failed to create WhatsApp message template"
+                detail=error_msg
             )
         logger.info(
             f"WhatsApp template created | org_id={org_id} wa_id={wa_id} "
@@ -1279,13 +1290,16 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
             detail="Unable to reach WhatsApp API"
         )
 
+    except HTTPException as e:
+        raise e
+
     except Exception as e:
         logger.exception(
-            f"Unexpected error creating WhatsApp template | org_id={org_id}"
+            f"Unexpected error creating WhatsApp template | org_id={org_id} | error={str(e)}"
         )
         raise HTTPException(
             status_code=500,
-            detail="Internal server error while creating WhatsApp template"
+            detail=f"Internal server error while creating WhatsApp template: {str(e)}"
         )
 
 # WhatsApp Interactive Messages (Free to send)
@@ -1543,11 +1557,14 @@ async def send_interactive_whatsapp_message(
 
 # Bulk jobs are now stored in the "bulk_jobs" collection in MongoDB.
 # This ensures they survive restarts and work across multiple instances.
-# A TTL index is created on "created_at" to clean up old jobs after 7 days.
+# A TTL index is created on "created_at" to clean up old jobs after 7 days (604800 seconds).
 try:
     db.bulk_jobs.create_index("created_at", expireAfterSeconds=604800)
+    # Also index job_results by job_id for performance and by created_at for TTL cleanup.
+    db.bulk_job_results.create_index("job_id")
+    db.bulk_job_results.create_index("created_at", expireAfterSeconds=604800)
 except Exception as e:
-    logger.warning(f"Failed to create TTL index for bulk_jobs: {e}")
+    logger.warning(f"Failed to create indices for bulk_jobs or bulk_job_results: {e}")
 
 
 def create_bulk_job(
@@ -1570,7 +1587,7 @@ def create_bulk_job(
         "total": total,
         "sent": 0,
         "failed": 0,
-        "results": [],
+        # RESULTS SHOULD BE STORED IN A SEPARATE COLLECTION TO AVOID 16MB LIMIT
         "created_at": now,
         "updated_at": now,
         "completed_at": None,
@@ -1590,7 +1607,7 @@ def get_bulk_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
     if not job:
         return None
     
-    # Remove _id for serialization
+    # Remove _id (or convert to string) for serialization
     if "_id" in job:
         job["_id"] = str(job["_id"])
     
@@ -1598,6 +1615,24 @@ def get_bulk_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
     for key in ["created_at", "updated_at", "completed_at"]:
         if job.get(key) and isinstance(job[key], datetime):
             job[key] = job[key].isoformat()
+
+    # Fetch a capped tail of recent results from the separate collection
+    try:
+        # Fetch the most recent 1000 results for this job_id
+        cursor = (
+            db.bulk_job_results.find({"job_id": job_id})
+            .sort("_id", -1)
+            .limit(1000)
+        )
+        # Reverse to return results in chronological order
+        results = list(cursor)[::-1]
+        for r in results:
+            if "_id" in r:
+                r["_id"] = str(r["_id"])
+        job["results"] = results
+    except Exception:
+        # Graceful degradation if results fetch fails
+        job.setdefault("results", [])
 
     return job
 
@@ -1611,11 +1646,12 @@ async def run_bulk_send_job(
     language_code: str,
     recipients: list,
     components: Optional[list] = None,
-    max_concurrent: int = 20,
+    delay_seconds: float = 8.0,
+    max_concurrent: int = 50,
 ) -> None:
     """
-    Background worker: sends WhatsApp templates concurrently using a semaphore,
-    updating the MongoDB job record after every send so the frontend can poll.
+    Background worker: sends WhatsApp templates using a bounded worker queue,
+    offloading sync DB updates to threads to avoid blocking the event loop.
     """
     url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
     headers = {
@@ -1623,21 +1659,19 @@ async def run_bulk_send_job(
         "Content-Type": "application/json",
     }
 
-    # Initialize job state
-    job_record = db.bulk_jobs.find_one({"job_id": job_id})
+    # Offload sync MongoDB calls to threads to avoid blocking the loop
+    job_record = await asyncio.to_thread(db.bulk_jobs.find_one, {"job_id": job_id, "org_id": org_id})
     if job_record is None:
         logger.error(f"Bulk WA | job={job_id} | org={org_id} | missing job record in MongoDB")
         return
 
-    db.bulk_jobs.update_one(
-        {"job_id": job_id},
+    await asyncio.to_thread(
+        db.bulk_jobs.update_one,
+        {"job_id": job_id, "org_id": org_id},
         {"$set": {"status": "running", "updated_at": datetime.now(timezone.utc)}}
     )
 
-    semaphore = asyncio.Semaphore(max_concurrent)
-    
     async def send_to_recipient(index, recipient, client):
-        nonlocal sent, failed
         phone_number = recipient.phone_number
         
         template_payload = {
@@ -1655,66 +1689,81 @@ async def run_bulk_send_job(
             "template": template_payload,
         }
 
-        async with semaphore:
-            try:
-                logger.info(f"Bulk WA | job={job_id} | [{index + 1}/{len(recipients)}] sending to {phone_number}")
-                response = await client.post(url, headers=headers, json=payload)
-                
-                if response.status_code == 200:
-                    messages = response.json().get("messages") or [{}]
-                    message_id = messages[0].get("id")
-                    logger.success(f"Bulk WA | job={job_id} | sent to {phone_number} | msg_id={message_id}")
-                    result_entry = {
-                        "phone_number": phone_number,
-                        "status": "sent",
-                        "message_id": message_id,
-                    }
-                    update_fields = {"$inc": {"sent": 1}, "$push": {"results": result_entry}, "$set": {"updated_at": datetime.now(timezone.utc)}}
-                else:
-                    error_detail = response.json().get("error", {}).get("message", response.text)
-                    logger.error(f"Bulk WA | job={job_id} | failed for {phone_number} | error={error_detail}")
-                    result_entry = {
-                        "phone_number": phone_number,
-                        "status": "failed",
-                        "error": error_detail,
-                    }
-                    update_fields = {"$inc": {"failed": 1}, "$push": {"results": result_entry}, "$set": {"updated_at": datetime.now(timezone.utc)}}
-
-            except Exception as e:
-                logger.error(f"Bulk WA | job={job_id} | exception for {phone_number} | error={str(e)}")
+        try:
+            logger.debug(f"Bulk WA | job={job_id} | [{index + 1}] sending to {phone_number}")
+            response = await client.post(url, headers=headers, json=payload)
+            
+            if response.status_code == 200:
+                messages = response.json().get("messages") or [{}]
+                message_id = messages[0].get("id")
                 result_entry = {
+                    "job_id": job_id,
+                    "phone_number": phone_number,
+                    "status": "sent",
+                    "message_id": message_id,
+                    "created_at": datetime.now(timezone.utc)
+                }
+                update_fields = {"$inc": {"sent": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}
+            else:
+                error_detail = response.json().get("error", {}).get("message", response.text)
+                logger.error(f"Bulk WA | job={job_id} | failed for {phone_number} | error={error_detail}")
+                result_entry = {
+                    "job_id": job_id,
                     "phone_number": phone_number,
                     "status": "failed",
-                    "error": str(e),
+                    "error": error_detail,
+                    "created_at": datetime.now(timezone.utc)
                 }
-                update_fields = {"$inc": {"failed": 1}, "$push": {"results": result_entry}, "$set": {"updated_at": datetime.now(timezone.utc)}}
+                update_fields = {"$inc": {"failed": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}
+        except Exception as e:
+            logger.error(f"Bulk WA | job={job_id} | exception for {phone_number} | error={str(e)}")
+            result_entry = {
+                "job_id": job_id,
+                "phone_number": phone_number,
+                "status": "failed",
+                "error": str(e),
+                "created_at": datetime.now(timezone.utc)
+            }
+            update_fields = {"$inc": {"failed": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}
 
-            # Atomic update in MongoDB
-            db.bulk_jobs.update_one({"job_id": job_id}, update_fields)
+        # Atomic updates in threads
+        await asyncio.gather(
+            asyncio.to_thread(db.bulk_job_results.insert_one, result_entry),
+            asyncio.to_thread(db.bulk_jobs.update_one, {"job_id": job_id, "org_id": org_id}, update_fields)
+        )
 
-    sent = 0
-    failed = 0
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            tasks = [send_to_recipient(i, r, client) for i, r in enumerate(recipients)]
-            await asyncio.gather(*tasks)
+            # Process in chunks of max_concurrent
+            for i in range(0, len(recipients), max_concurrent):
+                chunk = recipients[i : i + max_concurrent]
+                logger.info(f"Bulk WA | job={job_id} | processing batch {i//max_concurrent + 1} | size={len(chunk)}")
+                
+                tasks = [send_to_recipient(i + idx, r, client) for idx, r in enumerate(chunk)]
+                await asyncio.gather(*tasks)
+                
+                # Delay between batches if there are more messages left
+                if i + max_concurrent < len(recipients) and delay_seconds > 0:
+                    logger.info(f"Bulk WA | job={job_id} | sleeping for {delay_seconds}s before next batch")
+                    await asyncio.sleep(delay_seconds)
 
         # Mark job complete
         now = datetime.now(timezone.utc)
-        db.bulk_jobs.update_one(
-            {"job_id": job_id},
+        await asyncio.to_thread(
+            db.bulk_jobs.update_one,
+            {"job_id": job_id, "org_id": org_id},
             {"$set": {"status": "completed", "updated_at": now, "completed_at": now}}
         )
         logger.success(f"Bulk WA | job={job_id} | complete | org={org_id} | total={len(recipients)}")
 
     except Exception as e:
         logger.error(f"Bulk WA | job={job_id} | fatal error: {e}")
-        db.bulk_jobs.update_one(
-            {"job_id": job_id},
+        await asyncio.to_thread(
+            db.bulk_jobs.update_one,
+            {"job_id": job_id, "org_id": org_id},
             {"$set": {"status": "failed", "error": str(e), "updated_at": datetime.now(timezone.utc)}}
         )
     finally:
-        # Note: MongoDB TTL index handles cleanup after 7 days.
         pass
 
 

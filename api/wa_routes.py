@@ -1064,9 +1064,8 @@ async def whatsapp_create_template(user: CurrentUser, template: Template):
                 detail="WhatsApp connection not found or access token missing"
             )
 
-        logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
-
-
+        logger.info(f"Creating WhatsApp template: name={template.name}, language={template.language}, category={template.category}, components_count={len(template.components)}")
+        
         templates = await create_templates(org_id, wa_id, access_token, template.name, template.language, template.category, template.components)
 
         return {
@@ -1075,10 +1074,90 @@ async def whatsapp_create_template(user: CurrentUser, template: Template):
             "templates": templates
         }
 
+    except HTTPException as e:
+        # Re-raise HTTPException to preserve status code and detail from create_templates
+        logger.error(f"HTTP Error creating templates: {e.detail}")
+        raise e
     except Exception as e:
-        logger.error(f"Error creating templates: {str(e)}")
+        logger.error(f"Unexpected error creating templates: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create templates: {str(e)}")
 
+
+@router.delete("/templates/{template_name}")
+async def delete_whatsapp_template(template_name: str, user: CurrentUser):
+    """
+    Delete a WhatsApp template by name.
+    """
+    try:
+        org_id = user.org_id
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        if not org_document:
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        wa_id = org_document.get("wa_id")
+        
+        if not wa_id:
+            raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
+
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0, "access_token": 1}
+        )
+
+        if not connection or "access_token" not in connection:
+            raise HTTPException(
+                status_code=404,
+                detail="WhatsApp connection not found or access token missing"
+            )
+
+        access_token = connection["access_token"]
+        
+        # Split template names if multiple are provided (e.g., "template1,template2")
+        template_names = [name.strip() for name in template_name.split(",")]
+        
+        url = f"https://graph.facebook.com/v24.0/{wa_id}/message_templates"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        
+        results = []
+        errors = []
+
+        async with httpx.AsyncClient() as client:
+            for name in template_names:
+                params = {"name": name}
+                try:
+                    response = await client.delete(url, headers=headers, params=params)
+                    if response.status_code == 200:
+                        results.append(name)
+                        logger.success(f"Successfully deleted WhatsApp template: {name}")
+                    else:
+                        error_data = response.json()
+                        error_msg = error_data.get("error", {}).get("message", "Unknown error")
+                        errors.append({"name": name, "error": error_msg})
+                        logger.error(f"Failed to delete WhatsApp template {name}: {error_msg}")
+                except Exception as e:
+                    errors.append({"name": name, "error": str(e)})
+                    logger.error(f"Exception deleting WhatsApp template {name}: {str(e)}")
+
+        if errors and not results:
+            # If everything failed
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "Failed to delete templates", "errors": errors}
+            )
+
+        return {
+            "status": "success",
+            "message": f"Templates deleted successfully",
+            "deleted": results,
+            "failed": errors
+        }
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Unexpected error deleting WhatsApp template: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete template: {str(e)}")
 
 @router.post("/bulk/send")
 async def bulk_send_whatsapp_message(
@@ -1149,6 +1228,7 @@ async def bulk_send_whatsapp_message(
             language_code=request.language_code,
             recipients=request.recipients,
             components=request.components,
+            delay_seconds=request.delay_seconds,
             # max_concurrent=20, # Optional: can be passed if needed
         )
 
@@ -1156,7 +1236,7 @@ async def bulk_send_whatsapp_message(
 
         return {
             "status": "accepted",
-            "message": f"Bulk send job enqueued. Poll /bulk/status/{job_id} for progress.",
+            "message": "Bulk send job enqueued.",
             "job_id": job_id,
             "total": len(request.recipients),
         }
