@@ -223,12 +223,12 @@ async def main_ws(websocket: WebSocket, client_id: str):
                     target_date = data.get("date") # Optional date from frontend
                     start_date = data.get("start_date") # Optional start date range
                     end_date = data.get("end_date") # Optional end date range
-                    await broadcast_on_stats_update(
-                        user.org_id, 
-                        target_date=target_date, 
-                        start_date=start_date, 
-                        end_date=end_date
-                    )
+                    # await broadcast_on_stats_update(
+                    #     user.org_id, 
+                    #     target_date=target_date, 
+                    #     start_date=start_date, 
+                    #     end_date=end_date
+                    # )
                 
             except WebSocketDisconnect:
                 # 🛑 STOP the loop if the client disconnects
