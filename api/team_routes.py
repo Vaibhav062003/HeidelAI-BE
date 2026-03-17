@@ -20,10 +20,10 @@ from auth.dependencies import CurrentUser
 from services.team_service import fetch_team_conversations, fetch_team_messages
 
 
-router = APIRouter(tags=["Team Routes"])
+router = APIRouter(prefix="/api/team", tags=["Team Routes"])
 
 
-@router.get("/api/team/conversations")
+@router.get("/conversations")
 async def get_team_conversations(user: CurrentUser):
     """
     List all team (internal) conversations for the authenticated user.
@@ -43,11 +43,11 @@ async def get_team_conversations(user: CurrentUser):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[team_routes] get_team_conversations error for org={org_id}: {e}")
+        logger.error(f"get_team_conversations error for org={org_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch team conversations")
 
 
-@router.get("/api/team/conversations/{conversation_id}/messages")
+@router.get("/conversations/{conversation_id}/messages")
 async def get_team_messages(conversation_id: str, user: CurrentUser):
     """
     Fetch all messages for a specific team (internal) conversation.
@@ -69,6 +69,6 @@ async def get_team_messages(conversation_id: str, user: CurrentUser):
         raise
     except Exception as e:
         logger.error(
-            f"[team_routes] get_team_messages error for conv={conversation_id} org={org_id}: {e}"
+            f"get_team_messages error for conv={conversation_id} org={org_id}: {e}"
         )
         raise HTTPException(status_code=500, detail="Failed to fetch team messages")

@@ -114,65 +114,33 @@ async def fetch_conversations_new(
         conv_type = doc.get("type")
         platform = doc.get("platform")
         
-        if conv_type == "team":
-            # For Team chats, use participants but check online status
-            participants = doc.get("participants", [])
-            other_participants = [p for p in participants if p != current_user_id]
-            
-            # logic for "is_online": if ANY other participant is online
-            is_online = False
-            if other_participants:
-                for p_id in other_participants:
-                    if p_id in services.agent_clients and services.agent_clients[p_id]:
-                        is_online = True
-                        break
-            
-            unread_map = doc.get("unread", {})
-            user_unread = unread_map.get(current_user_id, 0) if current_user_id else 0
-            
-            conv_obj = {
-                "id": doc.get("conversation_id"),
-                "customer_name": doc.get("customer_name") or doc.get("conversation_id"),
-                "last_message": doc.get("last_message", ""),
-                "timestamp": (
-                    doc["last_message_timestamp"].isoformat()
-                    if isinstance(doc.get("last_message_timestamp"), datetime)
-                    else None
-                ),
-                "unread_count": user_unread,
-                "platform": platform or "internal",
-                "type": "team",
-                "participants": participants,
-                "is_online": is_online
-            }
-        else:
-            conv_obj = {
-                "id": doc.get("conversation_id"),
-                "platform": platform,
-                "type": conv_type,
-                "customer_id": doc.get("customer_username"),
-                "phone_number": doc.get("customer_id") if platform == "whatsapp" else None,
-                "customer_name": doc.get("customer_name") or "Unknown",
-                "last_message": doc.get("last_message") or "",
-                "last_message_is_private_note": doc.get("last_message_is_private_note", False),
-                "timestamp": (
-                    doc["last_message_timestamp"].isoformat()
-                    if isinstance(doc.get("last_message_timestamp"), datetime)
-                    else None
-                ),
-                "unread_count": doc.get("unread_count", 0),
-                "status": doc.get("status"),
-                "priority": doc.get("priority"),
-                "sentiment": doc.get("sentiment"),
-                "assigned_agent": doc.get("assigned_agent", {}),
-                "is_ai_enabled": doc.get("is_ai_enabled"),
-                "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
-                "assignment_history": doc.get("assignment_history", []),
-                "suggestions": doc.get("suggestions", []),
-                "summary": doc.get("summary", []),
-                "participants": doc.get("participants", []),
-                "unread": doc.get("unread", {})
-            }
+        conv_obj = {
+            "id": doc.get("conversation_id"),
+            "platform": platform,
+            "type": conv_type,
+            "customer_id": doc.get("customer_username"),
+            "phone_number": doc.get("customer_id") if platform == "whatsapp" else None,
+            "customer_name": doc.get("customer_name") or "Unknown",
+            "last_message": doc.get("last_message") or "",
+            "last_message_is_private_note": doc.get("last_message_is_private_note", False),
+            "timestamp": (
+                doc["last_message_timestamp"].isoformat()
+                if isinstance(doc.get("last_message_timestamp"), datetime)
+                else None
+            ),
+            "unread_count": doc.get("unread_count", 0),
+            "status": doc.get("status"),
+            "priority": doc.get("priority"),
+            "sentiment": doc.get("sentiment"),
+            "assigned_agent": doc.get("assigned_agent", {}),
+            "is_ai_enabled": doc.get("is_ai_enabled"),
+            "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
+            "assignment_history": doc.get("assignment_history", []),
+            "suggestions": doc.get("suggestions", []),
+            "summary": doc.get("summary", []),
+            "participants": doc.get("participants", []),
+            "unread": doc.get("unread", {})
+        }
             
         result.append(conv_obj)
 
