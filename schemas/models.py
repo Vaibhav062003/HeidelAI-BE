@@ -61,6 +61,8 @@ class ChatAnalysis(BaseModel):
     priority: Optional[Literal["low", "medium", "high"]] = None
     sentiment: Optional[Literal["positive", "neutral", "negative"]] = None
     suggestions: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    labels: List[str] = Field(default_factory=list)
     last_analyzed: Optional[datetime] = None
 
 class UnarchiveRequest(BaseModel):
@@ -84,6 +86,10 @@ class PrivateNoteRequest(BaseModel):
 class UpdateCategoriesRequest(BaseModel):
     conversation_id: str = Field(..., description="Unique conversation ID of the contact")
     categories: List[str] = Field(..., description="List of categories to assign to this contact")
+
+class UpdateLabelsRequest(BaseModel):
+    conversation_id: str = Field(..., description="Unique conversation ID of the contact")
+    labels: List[str] = Field(..., description="List of labels to assign to this contact")
 
 class SendReactionRequest(BaseModel):
     message_id: str = Field(..., description="Message ID of the message to react to")

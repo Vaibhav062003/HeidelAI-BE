@@ -4,7 +4,7 @@ from pymongo.errors import PyMongoError
 from database import get_mongo_db
 from schemas.models import ChatAnalysis
 from agents.support_agent.agent import analyze_conversation
-
+import services.contacts_service as contacts_service
 from loguru import logger
 
 
@@ -26,6 +26,8 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
         summary=[],
         priority=None,
         sentiment=None,
+        tags=[],
+        labels=[],
         suggestions=[],
         last_analyzed=None,
     )
@@ -52,14 +54,19 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
         # Combine message content into a single string
         conversation_text = "\n".join([msg["content"] for msg in messages])
 
-        # Call LLM to analyze
+        # Fetch existing tags and labels from org metadata
+        available_tags = await contacts_service.get_tags_from_org_metadata(org_id)
+        available_labels = await contacts_service.get_labels_from_org_metadata(org_id)
+        # logger.info(f"Available tags: {available_tags}, Available labels: {available_labels}")
 
-        analysis_result = await analyze_conversation(conversation_text)
+        # Call LLM to analyze (constrained to existing tags/labels)
+        analysis_result = await analyze_conversation(conversation_text, available_tags, available_labels)
+        logger.info(f"Analysis result: {analysis_result}")
 
         if analysis_result:
             timestamp = datetime.now(timezone.utc)
 
-            # Update DB
+            # Update DB - Conversation
             update_fields = {
                 "priority": analysis_result.priority,
                 "summary": analysis_result.summary,
@@ -73,12 +80,46 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
                 {"$set": update_fields},
             )
 
+            # Filter tags/labels to only include values from org metadata
+            if available_tags:
+                analysis_result.tags = [t for t in analysis_result.tags if t in available_tags]
+            else:
+                analysis_result.tags = []
+
+            if available_labels:
+                analysis_result.labels = [l for l in analysis_result.labels if l in available_labels]
+            else:
+                analysis_result.labels = []
+
+            # Update Contact (Categories & Labels)
+            contacts_collection = db[f"contacts_{org_id}"]
+            # logger.info(f"contact before update: {contacts_collection.find_one({'conversation_id': conversation_id}).get('categories')}")
+            try:
+                result = contacts_collection.update_one(
+                    {"conversation_id": conversation_id},
+                    {
+                        "$addToSet": {
+                            "categories": {"$each": analysis_result.tags},
+                            "labels": {"$each": analysis_result.labels}
+                        }
+                    }
+                )
+                # logger.info(f"contact after update: {contacts_collection.find_one({'conversation_id': conversation_id}).get('categories')}")
+                
+                if result.matched_count == 0:
+                    logger.warning(f"No contact found for conversation_id: {conversation_id}")
+            except PyMongoError as e:
+                logger.error(f"Failed to update contact categories/labels for {conversation_id}: {e}")
+                raise
+            
             # Update result_data to return
             result_data.summary = analysis_result.summary
             result_data.priority = analysis_result.priority
             result_data.sentiment = analysis_result.sentiment
             result_data.suggestions = analysis_result.suggestions
             result_data.last_analyzed = timestamp
+            result_data.tags = analysis_result.tags
+            result_data.labels = analysis_result.labels
 
             return result_data
 
