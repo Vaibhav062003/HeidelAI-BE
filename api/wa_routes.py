@@ -1131,8 +1131,12 @@ async def delete_whatsapp_template(template_name: str, user: CurrentUser):
                         results.append(name)
                         logger.success(f"Successfully deleted WhatsApp template: {name}")
                     else:
-                        error_data = response.json()
-                        error_msg = error_data.get("error", {}).get("message", "Unknown error")
+                        try:
+                            error_data = response.json()
+                            error_msg = error_data.get("error", {}).get("message", "Unknown error")
+                        except ValueError:
+                            body_text = response.text or ""
+                            error_msg = body_text if body_text.strip() else "Unknown error"
                         errors.append({"name": name, "error": error_msg})
                         logger.error(f"Failed to delete WhatsApp template {name}: {error_msg}")
                 except Exception as e:
@@ -1172,7 +1176,8 @@ async def bulk_send_whatsapp_message(
     - template_name: Name of an APPROVED template in your WhatsApp Business account.
     - language_code: BCP-47 code (e.g. 'en', 'en_US', 'hi').
     - recipients: List of objects with `phone_number` (E.164 digits only).
-    - delay_seconds: Pause between sends in seconds (minimum 8.0, default 8.0).
+    - delay_seconds: Pause between batches of sends in seconds (minimum 8.0, default 8.0). Each batch
+      can include up to `max_concurrent` recipients.
     """
     try:
         org_id = user.org_id
@@ -1207,9 +1212,10 @@ async def bulk_send_whatsapp_message(
         if not phone_id:
             raise HTTPException(status_code=400, detail="Phone ID not found for this WhatsApp connection")
 
-        # Create the job record synchronously so the client gets the job_id immediately
+        # Create the job record off the event loop so the client gets the job_id immediately
         job_id = uuid.uuid4().hex
-        create_bulk_job(
+        await asyncio.to_thread(
+            create_bulk_job,
             org_id=org_id,
             job_id=job_id,
             template_name=request.template_name,

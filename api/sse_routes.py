@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
+from typing import Optional
 
 from services.payment_service import subscription_status_generator
 from services.wa_service import bulk_job_status_generator
