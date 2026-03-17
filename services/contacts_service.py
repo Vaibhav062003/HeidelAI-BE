@@ -143,7 +143,7 @@ async def update_contact_labels(org_id: str, conversation_id: str, labels: list)
         if "_id" in result:
             del result["_id"]
 
-        await broadcast_on_stats_update(org_id)
+        # await broadcast_on_stats_update(org_id)
         return {"contact": result}
 
     except PyMongoError as e:
