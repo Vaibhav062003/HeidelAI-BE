@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends
 
 # === Internal Modules ===
+from loguru import logger
 from database import get_mongo_db
 from services.scheduler_service import schedule_followup_message
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
@@ -13,6 +14,7 @@ from services.ai_chatbot import update_prompt_in_cache, get_prompt
 from services.chat_analysis_service import analyze_and_update_conversation
 
 db = get_mongo_db()
+
 
 router = APIRouter(prefix="/api/ai", tags=["AI Routes"])
 
@@ -26,6 +28,8 @@ def conversation_doc_to_analysis(doc: dict) -> ChatAnalysis:
         priority=doc.get("priority"),
         sentiment=doc.get("sentiment"),
         suggestions=doc.get("suggestions", []),
+        tags=doc.get("tags", []),
+        labels=doc.get("labels", []),
         last_analyzed=doc.get("last_analyzed"),
     )
 
@@ -96,7 +100,9 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
     try:
         # get conversation from DB
         conversation_collection_name = f"conversations_{org_id}"
+        contact_collection_name = f"contacts_{org_id}"
         conversation_collection = db[conversation_collection_name]
+        contact_collection = db[contact_collection_name]
 
         projection = {
             "_id": 0,
@@ -105,6 +111,8 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
             "priority": 1,
             "sentiment": 1,
             "suggestions": 1,
+            "tags": 1,
+            "labels": 1,
             "last_analyzed": 1,
         }
 
@@ -112,10 +120,21 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
             {"conversation_id": conversation_id}, projection
         )
 
+        contact = contact_collection.find_one(
+            {"conversation_id": conversation_id},
+            {"_id": 0, "categories": 1, "labels": 1}
+        )
+
+        logger.debug(f"Contact document {'found' if contact else 'not found'} for conversation_id={conversation_id}")
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found.")
         
         cached_analysis = conversation_doc_to_analysis(conversation)
+
+        # Merge tags/labels from contact document
+        if contact:
+            cached_analysis.tags = contact.get("categories", [])
+            cached_analysis.labels = contact.get("labels", [])
 
         # check last analysis time
         last_analysis_time = conversation.get("last_analyzed", None)
@@ -128,8 +147,16 @@ async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool
         if force or not last_analysis_time or ((datetime.now(timezone.utc) - last_analysis_time).total_seconds()/60 >= 10):
             new_result = await analyze_and_update_conversation(org_id, conversation_id) 
 
-            if new_result is None:
-                return cached_analysis
+            if new_result is not None:
+                # Re-fetch contact to get updated tags/labels
+                contact = contact_collection.find_one(
+                    {"conversation_id": conversation_id},
+                    {"_id": 0, "categories": 1, "labels": 1}
+                )
+                if contact:
+                    new_result.tags = contact.get("categories", [])
+                    new_result.labels = contact.get("labels", [])
+                return new_result
                 
         return cached_analysis
 

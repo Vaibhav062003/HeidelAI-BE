@@ -9,6 +9,8 @@ from pymongo import UpdateOne
 from core.services import services
 from database import get_mongo_db
 from loguru import logger
+from services.websocket_service import broadcast_on_stats_update
+
 
 
 db = get_mongo_db()
@@ -141,6 +143,7 @@ async def update_contact_labels(org_id: str, conversation_id: str, labels: list)
         if "_id" in result:
             del result["_id"]
 
+        # await broadcast_on_stats_update(org_id)
         return {"contact": result}
 
     except PyMongoError as e:
@@ -164,7 +167,7 @@ async def add_tag_to_org_metadata(org_id: str, tag: str):
         upsert=True
     )
     
-    return result.modified_count > 0
+    return result.modified_count > 0 or result.upserted_id is not None
 
 async def add_label_to_org_metadata(org_id: str, label: str):
     """Add a label to the organization's metadata."""
@@ -177,6 +180,7 @@ async def add_label_to_org_metadata(org_id: str, label: str):
     )
     
     return result.modified_count > 0 or result.upserted_id is not None
+    
 async def remove_tag_from_org_metadata(org_id: str, tag: str):
     """Remove a tag from the organization's metadata."""
 
