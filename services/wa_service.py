@@ -1790,8 +1790,6 @@ async def run_bulk_send_job(
             }
             update_fields = {"$inc": {"failed": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}
 
-            update_fields = {"$inc": {"failed": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}
-
         return result_entry, update_fields
 
     try:
