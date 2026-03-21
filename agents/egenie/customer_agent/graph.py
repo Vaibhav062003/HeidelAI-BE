@@ -8,10 +8,8 @@ from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 from typing import TypedDict, Sequence, Annotated, Union
 from langchain_core.messages import BaseMessage
+from loguru import logger
 
-from core.logger import get_logger
-
-logger = get_logger(__name__)
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]

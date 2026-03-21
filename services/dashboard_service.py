@@ -1,10 +1,9 @@
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 from bson import ObjectId
-from core.logger import get_logger
+from loguru import logger
 from database import get_async_mongo_db
 
-logger = get_logger(__name__)
 
 async def aggregate_dashboard_stats(
     org_id: str, 
@@ -65,10 +64,10 @@ async def aggregate_dashboard_stats(
 
         async def get_stats_for_range(start, end):
             # Define labels of interest with flexible matching
-            LEAD_REGEX = r"^(label:)?(Lead|New customer)$"
-            CONVERSION_REGEX = r"^(label:)?(Order complete|Paid)$"
-            INTENT_REGEX = r"^(label:)?(New order|Pending payment)$"
-            ALL_REGEX = r"^(label:)?(Lead|New customer|Order complete|Paid|New order|Pending payment)$"
+            LEAD_REGEX = r"^(Lead|New customer)$"
+            CONVERSION_REGEX = r"^(Order complete|Paid)$"
+            INTENT_REGEX = r"^(New order|Pending payment)$"
+            ALL_REGEX = r"^(Lead|New customer|Order complete|Paid|New order|Pending payment)$"
 
             pipeline = [
                 {
@@ -81,7 +80,8 @@ async def aggregate_dashboard_stats(
                 },
                 {
                     "$set": {
-                        "categories": {"$ifNull": [{"$arrayElemAt": ["$contact_info.categories", 0]}, []]}
+                        "contact_labels": {"$ifNull": [{"$arrayElemAt": ["$contact_info.labels", 0]}, []]},
+                        "contact_categories": {"$ifNull": [{"$arrayElemAt": ["$contact_info.categories", 0]}, []]}
                     }
                 },
                 {
@@ -89,7 +89,7 @@ async def aggregate_dashboard_stats(
                         "$or": [
                             {"last_message_timestamp": {"$gte": start, "$lt": end}},
                             {"created_at": {"$gte": start, "$lt": end}},
-                            {"categories": {"$elemMatch": {"$regex": ALL_REGEX, "$options": "i"}}}
+                            {"contact_labels": {"$elemMatch": {"$regex": ALL_REGEX, "$options": "i"}}}
                         ]
                     }
                 },
@@ -109,9 +109,9 @@ async def aggregate_dashboard_stats(
                                                         {"$gt": [
                                                             {"$size": {
                                                                 "$filter": {
-                                                                    "input": "$categories",
-                                                                    "as": "cat",
-                                                                    "cond": {"$regexMatch": {"input": "$$cat", "regex": LEAD_REGEX, "options": "i"}}
+                                                                    "input": "$contact_labels",
+                                                                    "as": "lbl",
+                                                                    "cond": {"$regexMatch": {"input": "$$lbl", "regex": LEAD_REGEX, "options": "i"}}
                                                                 }
                                                             }},
                                                             0
@@ -132,9 +132,9 @@ async def aggregate_dashboard_stats(
                                                         {"$gt": [
                                                             {"$size": {
                                                                 "$filter": {
-                                                                    "input": "$categories",
-                                                                    "as": "cat",
-                                                                    "cond": {"$regexMatch": {"input": "$$cat", "regex": INTENT_REGEX, "options": "i"}}
+                                                                    "input": "$contact_labels",
+                                                                    "as": "lbl",
+                                                                    "cond": {"$regexMatch": {"input": "$$lbl", "regex": INTENT_REGEX, "options": "i"}}
                                                                 }
                                                             }},
                                                             0
@@ -152,9 +152,9 @@ async def aggregate_dashboard_stats(
                                                 {"$gt": [
                                                     {"$size": {
                                                         "$filter": {
-                                                            "input": "$categories",
-                                                            "as": "cat",
-                                                            "cond": {"$regexMatch": {"input": "$$cat", "regex": CONVERSION_REGEX, "options": "i"}}
+                                                            "input": "$contact_labels",
+                                                            "as": "lbl",
+                                                            "cond": {"$regexMatch": {"input": "$$lbl", "regex": CONVERSION_REGEX, "options": "i"}}
                                                         }
                                                     }},
                                                     0
@@ -198,7 +198,7 @@ async def aggregate_dashboard_stats(
                                                 {"_id": {"$gte": ObjectId.from_datetime(start), "$lt": ObjectId.from_datetime(end)}}
                                             ]
                                         },
-                                        {"$expr": {"$gt": [{"$size": {"$filter": {"input": "$categories", "as": "cat", "cond": {"$regexMatch": {"input": "$$cat", "regex": LEAD_REGEX, "options": "i"}}}}}, 0]}}
+                                        {"$expr": {"$gt": [{"$size": {"$filter": {"input": "$contact_labels", "as": "lbl", "cond": {"$regexMatch": {"input": "$$lbl", "regex": LEAD_REGEX, "options": "i"}}}}}, 0]}}
                                     ]
                                 }
                             },
@@ -216,7 +216,8 @@ async def aggregate_dashboard_stats(
                                     "last_message_timestamp": 1,
                                     "status": 1,
                                     "priority": 1,
-                                    "categories": 1
+                                    "labels": "$contact_labels",
+                                    "categories": "$contact_categories"
                                 }
                             }
                         ],

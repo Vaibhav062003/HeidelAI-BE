@@ -8,9 +8,8 @@ import aiohttp
 # from config.settings import SENTENCE_TRANSFORMERS_MODEL
 
 from config.settings import KOYEB2
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 index = get_pinecone_db()
 # model = SentenceTransformer(SENTENCE_TRANSFORMERS_MODEL)

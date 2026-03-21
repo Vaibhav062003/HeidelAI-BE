@@ -8,9 +8,10 @@ from pymongo import UpdateOne
 # Internal Modules
 from core.services import services
 from database import get_mongo_db
-from core.logger import get_logger
+from loguru import logger
+from services.websocket_service import broadcast_on_stats_update
 
-logger = get_logger(__name__)
+
 
 db = get_mongo_db()
 
@@ -101,9 +102,9 @@ async def update_contact_tag_categories(org_id: str, conversation_id: str, categ
             raise HTTPException(status_code=404, detail="Contact not found")
 
         # Live Update: Trigger dashboard refresh
-        from services.websocket_service import broadcast_on_stats_update
-        import asyncio
-        asyncio.create_task(broadcast_on_stats_update(org_id))
+        # from services.websocket_service import broadcast_on_stats_update
+        # import asyncio
+        # asyncio.create_task(broadcast_on_stats_update(org_id))
         
         if "_id" in result:
             del result["_id"]
@@ -117,6 +118,44 @@ async def update_contact_tag_categories(org_id: str, conversation_id: str, categ
     except Exception as e:
         logger.error(f"Unexpected error in update_contact_categories: {e}")
         raise HTTPException(status_code=500, detail="Unexpected error occurred")
+
+async def update_contact_labels(org_id: str, conversation_id: str, labels: list):
+    """
+    Update the labels array for a specific contact by conversation_id.
+    """
+    try:
+        collection_name = f"contacts_{org_id}"
+
+        if collection_name not in db.list_collection_names():
+            raise HTTPException(status_code=404, detail=f"No contacts found for org {org_id}")
+
+        contacts_collection = db[collection_name]
+
+        result = contacts_collection.find_one_and_update(
+            {"conversation_id": conversation_id},
+            {"$set": {"labels": labels}},
+            return_document=True
+        )
+
+        if not result:
+            raise HTTPException(status_code=404, detail="Contact not found")
+        
+        if "_id" in result:
+            del result["_id"]
+
+        # await broadcast_on_stats_update(org_id)
+        return {"contact": result}
+
+    except PyMongoError as e:
+        logger.error(f"MongoDB error while updating labels for {org_id}: {e}")
+        raise HTTPException(status_code=500, detail="Database error occurred")
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Unexpected error in update_contact_labels: {e}")
+        raise HTTPException(status_code=500, detail="Unexpected error occurred")
     
 async def add_tag_to_org_metadata(org_id: str, tag: str):
     """Add a tag to the organization's metadata."""
@@ -128,8 +167,20 @@ async def add_tag_to_org_metadata(org_id: str, tag: str):
         upsert=True
     )
     
-    return result.modified_count > 0
+    return result.modified_count > 0 or result.upserted_id is not None
 
+async def add_label_to_org_metadata(org_id: str, label: str):
+    """Add a label to the organization's metadata."""
+
+    metadata = db.organizations_metadata
+    result = metadata.update_one(
+        {"org_id": org_id},
+        {"$addToSet": {"labels": label}},
+        upsert=True
+    )
+    
+    return result.modified_count > 0 or result.upserted_id is not None
+    
 async def remove_tag_from_org_metadata(org_id: str, tag: str):
     """Remove a tag from the organization's metadata."""
 
@@ -137,6 +188,17 @@ async def remove_tag_from_org_metadata(org_id: str, tag: str):
     metadata.update_one(
         {"org_id": org_id},
         {"$pull": {"tags": tag}}
+    )
+
+    return True
+
+async def remove_label_from_org_metadata(org_id: str, label: str):
+    """Remove a label from the organization's metadata."""
+
+    metadata = db.organizations_metadata
+    metadata.update_one(
+        {"org_id": org_id},
+        {"$pull": {"labels": label}}
     )
 
     return True
@@ -151,6 +213,18 @@ async def get_tags_from_org_metadata(org_id: str):
         return org_metadata["tags"]
     else:
         return []
+
+async def get_labels_from_org_metadata(org_id: str):
+    """Get labels for the organization."""
+
+    metadata = db.organizations_metadata
+    org_metadata = metadata.find_one({"org_id": org_id}, {"_id": 0, "labels": 1})
+
+    if org_metadata and "labels" in org_metadata:
+        return org_metadata["labels"]
+    else:
+        return []
+
 
 def process_bulk_wa_contact_upload(org_id: str, file_content: bytes, filename: str):
     try:
@@ -201,9 +275,11 @@ def process_bulk_wa_contact_upload(org_id: str, file_content: bytes, filename: s
             "conversation_id": f"whatsapp_{clean_phone}",
             "email": None,
             "categories": [],
+            "labels": [],
             "platform": "whatsapp",
             "created_at": now
         }
+
 
         bulk_ops.append(
             UpdateOne(

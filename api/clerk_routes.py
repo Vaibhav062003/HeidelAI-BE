@@ -4,9 +4,8 @@ from pydantic import BaseModel, EmailStr
 
 from auth.dependencies import CurrentUser
 from config.settings import CLERK_TOKEN
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 
 router = APIRouter(prefix="/api/clerk", tags=["clerk"])

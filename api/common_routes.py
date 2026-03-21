@@ -11,7 +11,7 @@ import httpx
 
 from auth.dependencies import CurrentUser
 from core.services import services
-from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, CannedResponse, SendReactionRequest
+from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, UpdateLabelsRequest, CannedResponse, SendReactionRequest
 from services.conversation_utils import reopen_conversation
 from services.common_service import (
     fetch_conversations_new, 
@@ -25,11 +25,16 @@ from services.common_service import (
 from services.contacts_service import (
     get_contacts_for_org, 
     update_contact_tag_categories,
+    update_contact_labels,
     add_tag_to_org_metadata,
+    add_label_to_org_metadata,
     remove_tag_from_org_metadata,
+    remove_label_from_org_metadata,
     get_tags_from_org_metadata,
+    get_labels_from_org_metadata,
     process_bulk_wa_contact_upload
     )
+
 from services.ig_service import send_instagram_reaction
 from services.products_service import (
     get_products_for_org, 
@@ -40,11 +45,8 @@ from services.products_service import (
 )
 
 from services.wa_service import send_whatsapp_reaction
-from core.logger import get_logger
+from loguru import logger
 
-
-
-logger = get_logger(__name__)
 
 router = APIRouter(tags=["Common Routes"])
 db = get_mongo_db()
@@ -313,6 +315,19 @@ async def update_contact_categories(body: UpdateCategoriesRequest, user: Current
     
     return await update_contact_tag_categories(org_id, body.conversation_id, body.categories)
 
+@router.post("/api/contacts/update-labels")
+async def update_contact_labels_endpoint(body: UpdateLabelsRequest, user: CurrentUser):
+    """
+    Replace the labels array for a specific contact.
+    """
+    org_id = user.org_id
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    
+    return await update_contact_labels(org_id, body.conversation_id, body.labels)
+
+
 @router.get("/api/products")
 def list_products(user: CurrentUser):
     """
@@ -387,6 +402,20 @@ async def add_tag(user: CurrentUser, tag: str):
         # tag already exists
         raise HTTPException(status_code=400, detail="Tag already exists.")
     
+@router.patch("/api/org/metadata/labels/add")
+async def add_label(user: CurrentUser, label: str):
+    """
+    Add a label to the organization's metadata.
+    """
+
+    result = await add_label_to_org_metadata(user.org_id, label)
+
+    if result == True:
+        return {"message": "Label added successfully."}
+    else:
+        # label already exists
+        raise HTTPException(status_code=400, detail="Label already exists.")
+    
 @router.patch("/api/org/metadata/tags/remove")
 async def remove_tag(user: CurrentUser, tag: str):
     """
@@ -397,6 +426,16 @@ async def remove_tag(user: CurrentUser, tag: str):
 
     return {"message": "Tag removed successfully."}
 
+@router.patch("/api/org/metadata/labels/remove")
+async def remove_label(user: CurrentUser, label: str):
+    """
+    Remove a label from the organization's metadata.
+    """
+
+    result = await remove_label_from_org_metadata(user.org_id, label)
+
+    return {"message": "Label removed successfully."}
+
 @router.get("/api/org/metadata/tags")
 async def get_tags(user: CurrentUser):
     """Get tags for the organization."""
@@ -404,6 +443,15 @@ async def get_tags(user: CurrentUser):
     result = await get_tags_from_org_metadata(user.org_id)
 
     return {"tags": result}
+
+@router.get("/api/org/metadata/labels")
+async def get_labels(user: CurrentUser):
+    """Get labels for the organization."""
+
+    result = await get_labels_from_org_metadata(user.org_id)
+
+    return {"labels": result}
+
 
 @router.get("/api/agents-on-conversation")
 async def get_agents_on_conversation():

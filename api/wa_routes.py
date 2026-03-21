@@ -37,11 +37,8 @@ from config.settings import (
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET
 )
-from core.logger import get_logger
+from loguru import logger
 
-
-
-logger = get_logger(__name__)
 
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD_NAME,
@@ -149,7 +146,11 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
                 detail="Failed to subscribe WhatsApp account to webhook"
             )
         
-        # TODO: test out if register step is needed or not
+        # TODO: test out if register step is needed or not 
+        # Turns out it is needed for numbers that are not yet on WhatsApp but not needed for numbers that are already on WhatsApp
+        # Add a check here for the same and only call register if the number is not on WhatsApp
+        # the below check is useless
+        
         # Check if phone number is verified
         if phone_verified != "VERIFIED":
             logger.warning(f"Phone number {phone} is currently {phone_verified}. Attempting registration to fix this...")

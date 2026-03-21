@@ -14,9 +14,8 @@ from database import get_mongo_db
 from pymongo import ReturnDocument
 import cloudinary
 
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 
 instagram_service = InstagramService()
