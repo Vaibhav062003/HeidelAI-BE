@@ -2,6 +2,7 @@ import uuid
 from typing import Optional, Dict, List
 from datetime import datetime, timezone
 from pymongo import ReturnDocument
+from pydantic import TypeAdapter
 
 # Internal Modules
 from database import get_mongo_db
