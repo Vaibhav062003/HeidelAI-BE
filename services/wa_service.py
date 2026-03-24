@@ -1295,9 +1295,6 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
             detail="Unable to reach WhatsApp API"
         )
 
-    except HTTPException as e:
-        raise e
-
     except Exception as e:
         logger.exception(
             f"Unexpected error creating WhatsApp template | org_id={org_id} | error={str(e)}"
