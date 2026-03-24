@@ -274,4 +274,4 @@ class BulkMessageRequest(BaseModel):
     )
     recipients: List[BulkRecipient] = Field(..., min_length=1)  # At least one recipient required
     components: Optional[List[Dict[str, Any]]] = None  # Same for all recipients (header, body, etc.)
-    delay_seconds: float = Field(default=8.0, ge=8.0)  # Seconds to wait between each send
+    delay_seconds: float = Field(default=8.0, ge=8.0)  # Seconds to wait between each batch of sends (applied per batch, not per recipient)

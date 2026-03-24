@@ -1295,9 +1295,6 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
             detail="Unable to reach WhatsApp API"
         )
 
-    except HTTPException as e:
-        raise e
-
     except Exception as e:
         logger.exception(
             f"Unexpected error creating WhatsApp template | org_id={org_id} | error={str(e)}"
@@ -1578,6 +1575,9 @@ def ensure_bulk_job_indexes() -> None:
         return
     try:
         db.bulk_jobs.create_index("created_at", expireAfterSeconds=604800)
+        # Index bulk_jobs by job_id and (job_id, org_id) to support common lookups/updates.
+        db.bulk_jobs.create_index([("job_id", 1)])
+        db.bulk_jobs.create_index([("job_id", 1), ("org_id", 1)])
         # Also index job_results by job_id for performance and by created_at for TTL cleanup.
         db.bulk_job_results.create_index("job_id")
         db.bulk_job_results.create_index("created_at", expireAfterSeconds=604800)
@@ -1788,8 +1788,6 @@ async def run_bulk_send_job(
                 "error": str(e),
                 "created_at": datetime.now(timezone.utc)
             }
-            update_fields = {"$inc": {"failed": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}
-
             update_fields = {"$inc": {"failed": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}
 
         return result_entry, update_fields
