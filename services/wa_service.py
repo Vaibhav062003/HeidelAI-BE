@@ -1590,23 +1590,33 @@ def ensure_bulk_job_indexes() -> None:
 
 def recover_stale_bulk_jobs() -> None:
     """
-    On startup, find any jobs that were left in the 'running' state (e.g., due to a crash)
-    and mark them as 'failed' so they don't remain stuck.
+    To avoid interfering with jobs that are still actively being processed by other
+    workers in a multi-instance deployment, only jobs that appear stale (i.e., have
+    not been updated for longer than a heartbeat threshold) are recovered.
     """
     try:
         now = datetime.now(timezone.utc)
+        # Consider running jobs stale if they have not been updated for more than 10 minutes.
+        # This assumes workers periodically update `updated_at` while processing.
+        stale_before = now - timedelta(minutes=10)
         result = db.bulk_jobs.update_many(
-            {"status": "running"},
+            {
+                "status": "running",
+                "updated_at": {"$lt": stale_before},
+            },
             {
                 "$set": {
                     "status": "failed",
                     "error": "Job interrupted (server restart or crash)",
-                    "updated_at": now
+                    "updated_at": now,
                 }
-            }
+            },
         )
         if result.modified_count > 0:
-            logger.info(f"Bulk WA | Recovered {result.modified_count} stale running jobs")
+            logger.info(
+                f"Bulk WA | Recovered {result.modified_count} stale running jobs "
+                f"(no updates since before {stale_before.isoformat()})"
+            )
     except Exception as e:
         logger.warning(f"Failed to recover stale bulk jobs: {e}")
 
@@ -1639,7 +1649,11 @@ def create_bulk_job(
     db.bulk_jobs.insert_one(job_data)
 
 
-def get_bulk_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
+def get_bulk_job(
+    job_id: str,
+    org_id: Optional[str] = None,
+    include_results: bool = True,
+) -> Optional[dict]:
     """
     Retrieves a bulk job from MongoDB by ID, verifying org_id if provided.
     """
@@ -1660,30 +1674,31 @@ def get_bulk_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
         if job.get(key) and isinstance(job[key], datetime):
             job[key] = job[key].isoformat()
 
-    # Fetch a capped tail of recent results from the separate collection
-    try:
-        # Fetch the most recent 1000 results for this job_id
-        cursor = (
-            db.bulk_job_results.find({"job_id": job_id})
-            .sort("_id", -1)
-            .limit(1000)
-        )
-        # Reverse to return results in chronological order
-        results = list(cursor)[::-1]
-        for r in results:
-            if "_id" in r:
-                r["_id"] = str(r["_id"])
-            # Format datetimes in result documents for serializability
-            for key in ["created_at", "updated_at", "completed_at"]:
-                if r.get(key) and isinstance(r[key], datetime):
-                    r[key] = r[key].isoformat()
-            # Remove sensitive fields such as phone numbers before exposing results
-            if "phone_number" in r:
-                r.pop("phone_number", None)
-        job["results"] = results
-    except Exception:
-        # Graceful degradation if results fetch fails
-        job.setdefault("results", [])
+    # Optionally fetch a capped tail of recent results from the separate collection
+    if include_results:
+        try:
+            # Fetch the most recent 1000 results for this job_id
+            cursor = (
+                db.bulk_job_results.find({"job_id": job_id})
+                .sort("_id", -1)
+                .limit(1000)
+            )
+            # Reverse to return results in chronological order
+            results = list(cursor)[::-1]
+            for r in results:
+                if "_id" in r:
+                    r["_id"] = str(r["_id"])
+                # Format datetimes in result documents for serializability
+                for key in ["created_at", "updated_at", "completed_at"]:
+                    if r.get(key) and isinstance(r[key], datetime):
+                        r[key] = r[key].isoformat()
+                # Remove sensitive fields such as phone numbers before exposing results
+                if "phone_number" in r:
+                    r.pop("phone_number", None)
+            job["results"] = results
+        except Exception:
+            # Graceful degradation if results fetch fails
+            job.setdefault("results", [])
 
     return job
 
@@ -1857,7 +1872,7 @@ async def bulk_job_status_generator(job_id: str, org_id: Optional[str] = None):
     max_retries = None # Estimated dynamically
     
     while True:
-        job = await asyncio.to_thread(get_bulk_job, job_id, org_id=org_id)
+        job = await asyncio.to_thread(get_bulk_job, job_id, org_id=org_id, include_results=False)
         if not job:
             logger.warning(f"SSE | Job not found in MongoDB: {job_id}")
             yield f"data: {json.dumps({'status': 'error', 'message': 'Job not found'})}\n\n"
