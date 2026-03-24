@@ -1575,6 +1575,9 @@ def ensure_bulk_job_indexes() -> None:
         return
     try:
         db.bulk_jobs.create_index("created_at", expireAfterSeconds=604800)
+        # Index bulk_jobs by job_id and (job_id, org_id) to support common lookups/updates.
+        db.bulk_jobs.create_index([("job_id", 1)])
+        db.bulk_jobs.create_index([("job_id", 1), ("org_id", 1)])
         # Also index job_results by job_id for performance and by created_at for TTL cleanup.
         db.bulk_job_results.create_index("job_id")
         db.bulk_job_results.create_index("created_at", expireAfterSeconds=604800)
