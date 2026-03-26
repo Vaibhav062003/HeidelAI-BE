@@ -464,7 +464,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
-                                if ai_enabled and is_dev and not is_heidelai and not is_pma_wa:
+                                if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
                                     
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     if whatsapp_flow:
