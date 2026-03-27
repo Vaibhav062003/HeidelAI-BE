@@ -13,11 +13,12 @@ Message sending continues to use the existing shared endpoint:
 WebSocket events (new_team_message) are also unchanged.
 """
 
+from services.team_service import fetch_team_messages
+from services.team_service import fetch_team_conversations
 from fastapi import APIRouter, HTTPException
 from loguru import logger
 
 from auth.dependencies import CurrentUser
-from services.team_service import fetch_team_conversations, fetch_team_messages
 
 
 router = APIRouter(prefix="/api/team", tags=["Team Routes"])

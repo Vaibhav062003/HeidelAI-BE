@@ -249,11 +249,14 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
              )
              assigned_convo = current_convo
 
-        # Reset unread count (customer conversations only)
-        convo_collection.update_one(
-            {"conversation_id": conversation_id},
-            {"$set": {"unread_count": 0}}
-        )
+        # For team conversations, unread is tracked per user (unread.{agent_id}),
+        # so we avoid resetting the aggregate unread_count here to prevent
+        # inconsistent unread state.
+        if not assigned_convo or assigned_convo.get("type") != "team":
+            convo_collection.update_one(
+                {"conversation_id": conversation_id},
+                {"$set": {"unread_count": 0}}
+            )
 
         messages = []
         notes = []
