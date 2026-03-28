@@ -185,7 +185,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
             raise HTTPException(status_code=400, detail="Invalid Session")
         
         org_name = f"{session.get('first_name')}'s Organization"
-        max_allowed_members = 2
+        max_allowed_members = 4
         owner = {
             "clerk_user_id": session.get("clerk_user_id"),
             "owner_email": session.get("email"),
@@ -199,7 +199,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
             max_allowed_members=max_allowed_members,
             session_id=session_id,
             owner=owner,
-            plan="free"
+            plan="growth_monthly" if "monthly" in plan_id else "growth_yearly"
         )
 
         if not organization:
