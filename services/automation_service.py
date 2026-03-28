@@ -1,5 +1,5 @@
 import uuid
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from datetime import datetime, timezone
 from pydantic import TypeAdapter
 
@@ -19,67 +19,54 @@ def _automation_flows_collection(org_id: str):
     """Get the automation flows collection for an organization"""
     return db[f"automation_flows_{org_id}"]
 
+def _col(org_id: str):
+    """Return the per-org automation-flows collection."""
+    return db[f"automation_flows_{org_id}"]
 
 # CREATE AUTOMATION FLOW
 async def create_automation_flow(
     org_id: str,
     name: str,
     description: Optional[str] = None,
-    flow_data: Optional[Dict] = None,
-    created_by: Optional[str] = None
+    flow_data: Optional[Any] = None,
+    trigger_type: Optional[str] = None,
+    created_by: Optional[str] = None,
 ) -> Dict:
     """
-    Create a new automation flow
-    
-    Args:
-        org_id: Organization ID
-        name: Flow name
-        description: Flow description (optional)
-        flow_data: Flow structure with nodes, connections, triggers (optional)
-        created_by: User ID who created the flow
-    
-    Returns:
-        Created flow document (without _id field)
+    Insert a new draft flow document.
+    Returns the serialised document (no _id).
     """
     try:
-        collection = _automation_flows_collection(org_id)
-        
-        # Generate unique flow ID
+        col = _col(org_id)
         flow_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
-        
-        # Create flow document
-        flow_doc = {
-            "flow_id": flow_id,
-            "org_id": org_id,
-            "name": name,
-            "description": description,
-            "status": "draft",  # Always start as draft
-            "flow_data": flow_data or {
-                "nodes": {},
-                "connections": [],
-                "triggers": []
-            },
-            "version": 1,
-            "created_at": now,
-            "updated_at": now,
-            "created_by": created_by,
-            "updated_by": created_by,
-            "published_at": None,
+
+        doc = {
+            "flow_id":        flow_id,
+            "org_id":         org_id,
+            "name":           name,
+            "description":    description,
+            "status":         "draft",
+            "trigger_type":   trigger_type,
+            "flow_data":      flow_data or {},
+            "version":        1,
+            "created_at":     now,
+            "updated_at":     now,
+            "published_at":   None,
+            "created_by":     created_by,
+            "updated_by":     created_by,
             "execution_count": 0,
-            "last_executed_at": None
+            "last_executed_at": None,
+            "trigger_count":  0,
+            "last_run":       None,
         }
-        
-        # Insert into database
-        collection.insert_one(flow_doc)
-        
-        logger.info(f"Created automation flow: {flow_id} for org: {org_id}")
-        
-        # Return serialized document (removes _id field)
-        return serialize_mongo(flow_doc)
-        
+
+        col.insert_one(doc)
+        logger.info(f"Created automation flow {flow_id} for org {org_id}")
+        return serialize_mongo(doc)
+
     except Exception as e:
-        logger.error(f"Error creating automation flow: {str(e)}")
+        logger.error(f"create_automation_flow error: {e}")
         raise
 
 
