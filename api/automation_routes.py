@@ -28,7 +28,6 @@ class CreateFlowRequest(BaseModel):
     description: Optional[str] = Field(None, max_length=500)
     # WaBotEditor sends the entire nested schema here
     flow_data: Optional[Any] = None
-    status: str = Field(default="draft")
     trigger_type: Optional[str] = None
 
 

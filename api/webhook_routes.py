@@ -214,7 +214,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     access_token = connection.get("access_token")
 
                     # Get organization's automation flow collection
-                    flow_collection_name = f"automation_flows_{org_id}"
+                    flow_collection_name = f"wa_bot_flows_{org_id}"
                     flow_collection = db[flow_collection_name]
 
                     # Get sender name from contacts if available

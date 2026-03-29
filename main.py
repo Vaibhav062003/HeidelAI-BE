@@ -14,6 +14,7 @@ from api import router
 from core.lifespan import lifespan
 from config.settings import INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET
 from services.utils import format_in_ist
+from api.wa_bot_routes import router as wa_bot_router
 
 logger.remove()
 logger.add(sys.stdout, format=format_in_ist, colorize=True)
@@ -49,6 +50,7 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
     return await http_exception_handler(request, exc)
 
 app.include_router(router)
+app.include_router(wa_bot_router)
 
 app.add_middleware(
     CORSMiddleware,
