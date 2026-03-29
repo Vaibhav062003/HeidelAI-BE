@@ -131,8 +131,10 @@ async def process_google_sheet_trigger(
             stats["skipped"] += 1
             continue
 
-        # Deduplication check
-        if _already_sent(org_id, flow_id, phone):
+        # Atomic deduplication check:
+        # Tries to insert a record for this (org, flow, phone).
+        # Proceed only if it's the first time this combination is being processed.
+        if not _try_claim_send(org_id, flow_id, phone):
             stats["skipped"] += 1
             continue
 
@@ -184,7 +186,6 @@ async def process_google_sheet_trigger(
         await run_bulk_send_job(
             job_id=job_id,
             org_id=org_id,
-            wa_id=wa_id,
             phone_id=phone_id,
             access_token=wa_access_token,
             template_name="",
@@ -213,7 +214,8 @@ async def process_google_sheet_trigger(
                     message_text=resolved_text,
                     message_id=message_id,
                 )
-                _mark_sent(org_id, flow_id, phone, sheet_id)
+                # _mark_sent is now redundant as we claim at the start of the loop
+                # _mark_sent(org_id, flow_id, phone, sheet_id)
                 stats["sent"] += 1
                 logger.success(
                     f"[GoogleSheetAuto] ✅ Sent to {phone} | flow={flow_id} "
@@ -389,14 +391,30 @@ def _get_wa_connection(org_id: str) -> Optional[dict]:
     return db.whatsapp_connections.find_one({"wa_id": wa_id, "org_id": org_id})
 
 
-def _already_sent(org_id: str, flow_id: str, phone: str) -> bool:
-    """Check if a message has already been sent to this phone for this flow."""
-    return (
-        db[SENT_COLLECTION].find_one(
-            {"org_id": org_id, "flow_id": flow_id, "phone": phone}
+def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
+    """
+    Atomic deduplication: Tries to claim a phone number as 'in-progress/sent' for a flow.
+    Returns True if the claim was successful (first time), False otherwise.
+    Uses update_one with upsert=True and $setOnInsert to ensure atomicity.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        result = db[SENT_COLLECTION].update_one(
+            {"org_id": org_id, "flow_id": flow_id, "phone": phone},
+            {"$setOnInsert": {
+                "org_id": org_id,
+                "flow_id": flow_id,
+                "phone": phone,
+                "sent_at": now.isoformat()
+            }},
+            upsert=True
         )
-        is not None
-    )
+        # upserted_id is only present if a new document was created
+        return result.upserted_id is not None
+    except Exception as e:
+        # logger is loguru.logger, imported above
+        logger.error(f"[GoogleSheetAuto] Error in _try_claim_send: {e}")
+        return False
 
 
 def _mark_sent(org_id: str, flow_id: str, phone: str, sheet_id: str):

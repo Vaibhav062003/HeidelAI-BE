@@ -134,7 +134,7 @@ async def update_flow(flow_id: str, payload: UpdateFlowRequest, user: CurrentUse
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         if payload.flow_data:
-            is_valid, error_message = validate_flow_structure(payload.flow_data.dict())
+            is_valid, error_message = validate_flow_structure(payload.flow_data.model_dump())
             if not is_valid:
                 raise HTTPException(status_code=400, detail=f"Invalid flow structure: {error_message}")
 
@@ -144,7 +144,7 @@ async def update_flow(flow_id: str, payload: UpdateFlowRequest, user: CurrentUse
         if payload.description is not None:
             update_data["description"] = payload.description
         if payload.flow_data is not None:
-            update_data["flow_data"] = payload.flow_data.dict()
+            update_data["flow_data"] = payload.flow_data.model_dump()
         if payload.status is not None:
             update_data["status"] = payload.status
 

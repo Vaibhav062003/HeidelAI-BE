@@ -1715,7 +1715,6 @@ async def run_bulk_send_job(
     components: Optional[list] = None,
     delay_seconds: float = 8.0,
     max_concurrent: int = 50,
-    wa_id: Optional[str] = None,
     message_text: Optional[str] = None,
 ) -> None:
     """

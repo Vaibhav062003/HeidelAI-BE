@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 
 # === Internal Modules ===
 from database import get_mongo_db
-from core.logger import get_logger
 from services.automation_execution import execute_automation_flow
 from loguru import logger
 

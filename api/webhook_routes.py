@@ -1460,9 +1460,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     )
                     
                     if not message_echo:
-                        
-
-                        await check_and_trigger_automations(
+                        background_tasks.add_task(
+                            check_and_trigger_automations,
                             org_id=org_id,
                             platform="instagram",
                             event_type="message_received",

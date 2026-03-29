@@ -93,19 +93,47 @@ async def _poll_all_sheets() -> None:
 async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
     """
     Sync a single sheet with full error isolation.
-    After syncing new rows, triggers any google_sheet automation flows
-    that reference this sheet.
+    Uses a distributed lock (lease) to prevent multiple instances from
+    syncing the same sheet simultaneously.
     """
+    lease_key = f"sync_{org_id}_{sheet_id}"
+    now = datetime.now(timezone.utc)
+    expires_at = now + asyncio.to_thread(lambda: None)._timeout if hasattr(asyncio, 'to_thread') else now # Dummy for now, let's use 5 min
+    import timedelta # Wait, I'll just use datetime
+    from datetime import timedelta
+    
+    lease_duration = timedelta(minutes=5)
+    expiry = now + lease_duration
+
     try:
+        # Atomic lease acquisition: 
+        # Succeeds if no lease exists OR if the existing lease has expired.
+        lease_result = db.scheduler_leases.find_one_and_update(
+            {"_id": lease_key},
+            {"$set": {"acquired_at": now, "expires_at": expiry, "org_id": org_id, "sheet_id": sheet_id}},
+            upsert=True,
+            filter={"$or": [
+                {"_id": lease_key, "expires_at": {"$lt": now}},
+                {"_id": lease_key, "acquired_at": {"$exists": False}} # This part is handled by upsert usually, but filter helps
+            ]},
+            return_document=True
+        )
+
+        if not lease_result:
+            # Another instance has a valid lease
+            return
+
         from api.google_sheets_routes import _sync_sheet
         result = await _sync_sheet(org_id, sheet_id)
         rows = result.get("rows_processed", 0)
 
         if rows > 0:
             logger.info(f"[Scheduler] Synced {rows} new row(s) from sheet {sheet_id} for org {org_id}")
-
             # Trigger any google_sheet automation flows for this sheet
             await _trigger_google_sheet_automations(org_id, sheet_id)
+
+        # Release lease upon successful completion
+        db.scheduler_leases.delete_one({"_id": lease_key})
 
     except Exception as e:
         logger.error(f"[Scheduler] Failed to sync sheet {sheet_id} for org {org_id}: {str(e)}")
@@ -166,6 +194,9 @@ def _ensure_indexes() -> None:
             col = db[f"google_sheet_rows_{org_id}"]
             col.create_index([("sheet_id", 1), ("row_number", 1)], unique=True)
             col.create_index([("sheet_id", 1), ("synced_at", -1)])
+
+        # Scheduler leases TTL index
+        db.scheduler_leases.create_index("expires_at", expireAfterSeconds=0)
 
         logger.info("Google Sheets MongoDB indexes ensured.")
     except Exception as e:

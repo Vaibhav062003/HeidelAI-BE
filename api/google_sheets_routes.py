@@ -427,11 +427,21 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             (headers[i] if i < len(headers) else f"col_{i+1}"): v
             for i, v in enumerate(row_values)
         }
-        if not collection.find_one({"sheet_id": sheet_id, "row_number": actual_row}):
-            collection.insert_one({
-                "org_id": org_id, "sheet_id": sheet_id, "sheet_name": sheet_name,
-                "row_number": actual_row, "row_data": row_data, "synced_at": now,
-            })
+        result = collection.update_one(
+            {"sheet_id": sheet_id, "row_number": actual_row},
+            {
+                "$setOnInsert": {
+                    "org_id": org_id,
+                    "sheet_id": sheet_id,
+                    "sheet_name": sheet_name,
+                    "row_number": actual_row,
+                    "row_data": row_data,
+                    "synced_at": now,
+                }
+            },
+            upsert=True,
+        )
+        if result.upserted_id is not None:
             rows_processed += 1
             new_last_row = actual_row
 
