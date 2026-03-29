@@ -24,7 +24,7 @@ from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
-import asyncio
+
 
 
 db = get_mongo_db()
@@ -1715,6 +1715,8 @@ async def run_bulk_send_job(
     components: Optional[list] = None,
     delay_seconds: float = 8.0,
     max_concurrent: int = 50,
+    wa_id: Optional[str] = None,
+    message_text: Optional[str] = None,
 ) -> None:
     """
     Background worker: sends WhatsApp templates using a bounded worker queue,
@@ -1746,20 +1748,31 @@ async def run_bulk_send_job(
         phone_number = recipient.phone_number
         masked_phone = mask_phone(phone_number)
         
-        template_payload = {
-            "name": template_name,
-            "language": {"code": language_code},
-        }
-        if components:
-            template_payload["components"] = components
+        if message_text:
+            # Plain-text mode (used by Google Sheet automations)
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": phone_number,
+                "type": "text",
+                "text": {"body": message_text},
+            }
+        else:
+            # Standard template mode
+            template_payload = {
+                "name": template_name,
+                "language": {"code": language_code},
+            }
+            if components:
+                template_payload["components"] = components
 
-        payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": phone_number,
-            "type": "template",
-            "template": template_payload,
-        }
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": phone_number,
+                "type": "template",
+                "template": template_payload,
+            }
 
         try:
             logger.debug(f"Bulk WA | job={job_id} | [{index + 1}] sending to {masked_phone}")

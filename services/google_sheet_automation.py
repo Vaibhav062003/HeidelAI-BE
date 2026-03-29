@@ -13,7 +13,7 @@ Key behaviors:
 
 import re
 import uuid as _uuid
-import requests
+import httpx
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -77,7 +77,7 @@ async def process_google_sheet_trigger(
     sheet_doc = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": sheet_id})
     tab_name = sheet_doc.get("tab_name", "Sheet1") if sheet_doc else "Sheet1"
 
-    headers = _fetch_headers(sheet_id, tab_name, access_token)
+    headers = await _fetch_headers(sheet_id, tab_name, access_token)
     if not headers:
         logger.error(f"[GoogleSheetAuto] Could not fetch headers for sheet {sheet_id}")
         return {"sent": 0, "skipped": 0, "errors": 1}
@@ -91,7 +91,7 @@ async def process_google_sheet_trigger(
         return {"sent": 0, "skipped": 0, "errors": 1}
 
     # 3. Fetch data rows within range
-    rows_with_data = _fetch_rows(sheet_id, tab_name, access_token, row_start, row_end)
+    rows_with_data = await _fetch_rows(sheet_id, tab_name, access_token, row_start, row_end)
 
     # 4. Get WhatsApp connection for this org
     wa_connection = _get_wa_connection(org_id)
@@ -337,22 +337,23 @@ async def _store_sent_message(
     )
 
 
-def _fetch_headers(sheet_id: str, tab_name: str, access_token: str) -> list:
+async def _fetch_headers(sheet_id: str, tab_name: str, access_token: str) -> list:
     """Fetch the first row (headers) from the Google Sheet."""
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
         f"/values/{tab_name}!A1:ZZ1"
     )
-    resp = requests.get(
-        url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
-    )
-    if resp.status_code != 200:
-        return []
-    values = resp.json().get("values", [[]])
-    return values[0] if values else []
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
+        )
+        if resp.status_code != 200:
+            return []
+        values = resp.json().get("values", [[]])
+        return values[0] if values else []
 
 
-def _fetch_rows(
+async def _fetch_rows(
     sheet_id: str,
     tab_name: str,
     access_token: str,
@@ -370,13 +371,14 @@ def _fetch_rows(
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
         f"/values/{tab_name}!A{sheet_start}:ZZ{sheet_end}"
     )
-    resp = requests.get(
-        url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
-    )
-    if resp.status_code != 200:
-        logger.error(f"[GoogleSheetAuto] Rows fetch error: {resp.text}")
-        return []
-    return resp.json().get("values", [])
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
+        )
+        if resp.status_code != 200:
+            logger.error(f"[GoogleSheetAuto] Rows fetch error: {resp.text}")
+            return []
+        return resp.json().get("values", [])
 
 
 def _get_wa_connection(org_id: str) -> Optional[dict]:

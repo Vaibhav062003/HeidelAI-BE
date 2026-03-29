@@ -270,6 +270,15 @@ async def manual_sync_sheet(request: ManualSyncRequest, user: CurrentUser):
         rows_processed = result.get("rows_processed", 0)
         if rows_processed == 0:
             return {"status": "no_new_data", "rows_processed": 0}
+
+        # Trigger google_sheet automations for this sheet (Manual Sync)
+        try:
+            from services.google_sheet_automation import process_new_sheet_rows
+            import asyncio
+            asyncio.create_task(process_new_sheet_rows(org_id, request.sheet_id))
+        except Exception as e:
+            logger.warning(f"Could not trigger google_sheet automations after manual sync: {e}")
+
         return {"status": "synced", "rows_processed": rows_processed}
 
     except HTTPException:
@@ -436,13 +445,5 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
                 "updated_at": now.isoformat(),
             }}
         )
-
-        # Trigger google_sheet automations for this sheet
-        try:
-            from services.google_sheet_automation import process_new_sheet_rows
-            import asyncio
-            asyncio.create_task(process_new_sheet_rows(org_id, sheet_id))
-        except Exception as e:
-            logger.warning(f"Could not trigger google_sheet automations after sync: {e}")
 
     return {"rows_processed": rows_processed}
