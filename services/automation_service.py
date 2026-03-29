@@ -1,410 +1,626 @@
-"""
-automation_service.py
-─────────────────────
-Handles all database operations for automation flows.
-
-DOCUMENT LAYOUT
-───────────────
-Each org's flows are stored in a per-org collection:
-    automation_flows_{org_id}
-
-A saved document looks like this (fields added by the service):
-
-{
-    # ── Identity ──────────────────────────────────────────────────────────────
-    "flow_id":        str,          # UUID, stable primary key
-    "org_id":         str,
-    "name":           str,
-    "description":    str | None,
-    "status":         "draft" | "published" | "archived",
-    "trigger_type":   str | None,   # e.g. "whatsapp_message_received"
-    "version":        int,
-
-    # ── The full canvas snapshot (stored as-is from the frontend) ─────────────
-    "flow_data": {
-        "trigger_event":    "message_received",
-        "trigger_from":     "webhook",
-        "trigger_messages": "hi,hey,hello,menu",
-        "welcome_message":  {...},   # WA interactive message
-        "nodes":            {...},   # keyed by node id
-        "ui_config":        {"nodes": {"node_id": {"x": ..., "y": ...}}},
-        ...
-    },
-
-    # ── Webhook-runtime fields (only present when status == "active") ─────────
-    # These are PROMOTED from flow_data so the webhook handler can find
-    # them with a single top-level query:
-    #   flow_collection.find_one({"trigger_from": "webhook",
-    #                             "trigger_event": "message_received",
-    #                             "status": "active"})
-    "trigger_from":     "webhook",
-    "trigger_event":    "message_received",
-    "trigger_messages": "hi,hey,hello,menu",
-    "welcome_message":  {...},
-    "nodes":            {...},
-
-    # ── Timestamps / audit ────────────────────────────────────────────────────
-    "created_at":       datetime,
-    "updated_at":       datetime,
-    "published_at":     datetime | None,
-    "created_by":       str | None,
-    "updated_by":       str | None,
-
-    # ── Metrics ───────────────────────────────────────────────────────────────
-    "execution_count":  int,
-    "last_executed_at": datetime | None,
-    "trigger_count":    int,
-    "last_run":         datetime | None,
-}
-"""
-
 import uuid
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List
 from datetime import datetime, timezone
+from pymongo import ReturnDocument
+from pydantic import TypeAdapter
 
+# Internal Modules
 from database import get_mongo_db
-from services.utils import serialize_mongo
+from schemas.models import WhatsAppInteractiveMessage
+from services.utils import get_first_name, inject_variables, serialize_mongo
+from services.wa_service import send_interactive_whatsapp_message, send_whatsapp_message
 from loguru import logger
 
 db = get_mongo_db()
 
+InteractiveMessageAdapter = TypeAdapter(WhatsAppInteractiveMessage)
 
-# ─── Internal helpers ─────────────────────────────────────────────────────────
-
-def _col(org_id: str):
-    """Return the per-org automation-flows collection."""
+def _automation_flows_collection(org_id: str):
     return db[f"automation_flows_{org_id}"]
 
 
-def _extract_wabot_runtime_fields(flow_data: dict) -> dict:
-    """
-    Pull the fields that the webhook handler reads at runtime out of flow_data
-    and return them as a flat dict ready to be $set at the document root.
-
-    The webhook handler (webhook_routes.py) does:
-        flow_collection.find_one({
-            "trigger_from":  "webhook",
-            "trigger_event": "message_received",
-            "status":        "active",
-        })
-
-    And execute_whatsapp_flow() then reads:
-        flow.get("trigger_messages")
-        flow.get("welcome_message")
-        flow.get("nodes", {})
-    """
-    if not flow_data or not isinstance(flow_data, dict):
-        return {}
-
-    return {
-        "trigger_from":     flow_data.get("trigger_from",     "webhook"),
-        "trigger_event":    flow_data.get("trigger_event",    "message_received"),
-        "trigger_messages": flow_data.get("trigger_messages", ""),
-        "welcome_message":  flow_data.get("welcome_message"),
-        "nodes":            flow_data.get("nodes", {}),
-    }
+def _automation_triggers_collection():
+    return db["automation_triggers"]
 
 
-# ─── CREATE ───────────────────────────────────────────────────────────────────
+# =============================================================================
+# CREATE
+# =============================================================================
 
 async def create_automation_flow(
     org_id: str,
     name: str,
     description: Optional[str] = None,
-    flow_data: Optional[Any] = None,
-    trigger_type: Optional[str] = None,
-    created_by: Optional[str] = None,
+    flow_data: Optional[Dict] = None,
+    created_by: Optional[str] = None
 ) -> Dict:
-    """
-    Insert a new draft flow document.
-    Returns the serialised document (no _id).
-    """
     try:
-        col = _col(org_id)
+        collection = _automation_flows_collection(org_id)
         flow_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
 
-        doc = {
-            "flow_id":        flow_id,
-            "org_id":         org_id,
-            "name":           name,
-            "description":    description,
-            "status":         "draft",
-            "trigger_type":   trigger_type,
-            "flow_data":      flow_data or {},
-            "version":        1,
-            "created_at":     now,
-            "updated_at":     now,
-            "published_at":   None,
-            "created_by":     created_by,
-            "updated_by":     created_by,
+        flow_doc = {
+            "flow_id": flow_id,
+            "org_id": org_id,
+            "name": name,
+            "description": description,
+            "status": "draft",
+            "flow_data": flow_data or {"nodes": {}, "connections": [], "triggers": []},
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+            "created_by": created_by,
+            "updated_by": created_by,
+            "published_at": None,
             "execution_count": 0,
             "last_executed_at": None,
-            "trigger_count":  0,
-            "last_run":       None,
         }
 
-        col.insert_one(doc)
-        logger.info(f"Created automation flow {flow_id} for org {org_id}")
-        return serialize_mongo(doc)
+        collection.insert_one(flow_doc)
+        logger.info(f"Created automation flow: {flow_id} for org: {org_id}")
+        return serialize_mongo(flow_doc)
 
     except Exception as e:
-        logger.error(f"create_automation_flow error: {e}")
+        logger.error(f"Error creating automation flow: {str(e)}")
         raise
 
 
-# ─── LIST ─────────────────────────────────────────────────────────────────────
+# =============================================================================
+# LIST
+# =============================================================================
 
-async def list_automation_flows(
-    org_id: str,
-    status: Optional[str] = None,
-) -> List[Dict]:
-    """
-    Return all flows for the org, newest first.
-    DashboardView expects a plain list — the route returns it unwrapped.
-    """
+async def list_automation_flows(org_id: str, status: Optional[str] = None) -> List[Dict]:
     try:
-        col = _col(org_id)
-        query: Dict[str, Any] = {"org_id": org_id}
+        collection = _automation_flows_collection(org_id)
+        query = {"org_id": org_id}
         if status:
             query["status"] = status
-
-        flows = list(col.find(query).sort("created_at", -1))
-        logger.info(f"Listed {len(flows)} flows for org {org_id}")
-        return [serialize_mongo(f) for f in flows]
-
+        flows = list(collection.find(query).sort("created_at", -1))
+        logger.info(f"Listed {len(flows)} automation flows for org: {org_id}")
+        return [serialize_mongo(flow) for flow in flows]
     except Exception as e:
-        logger.error(f"list_automation_flows error: {e}")
+        logger.error(f"Error listing automation flows: {str(e)}")
         raise
 
 
-# ─── GET ONE ──────────────────────────────────────────────────────────────────
+# =============================================================================
+# GET
+# =============================================================================
 
 async def get_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
-    """
-    Fetch a single flow by flow_id, scoped to org_id.
-
-    WaBotEditor calls GET /api/automation_flows/{flow_id} when opening an
-    existing flow.  It reads:
-        const raw  = res.data?.flow || res.data
-        const data = raw?.flow_data || raw
-
-    So we return the document as-is (serialised).  The editor then
-    reconstructs nodes from data.welcome_message, data.nodes, data.ui_config.
-    """
     try:
-        col = _col(org_id)
-        doc = col.find_one({"flow_id": flow_id, "org_id": org_id})
-        if not doc:
-            return None
-        return serialize_mongo(doc)
-
+        collection = _automation_flows_collection(org_id)
+        flow = collection.find_one({"flow_id": flow_id, "org_id": org_id})
+        if flow:
+            return serialize_mongo(flow)
+        return None
     except Exception as e:
-        logger.error(f"get_automation_flow error: {e}")
+        logger.error(f"Error getting automation flow: {str(e)}")
         raise
 
 
-# ─── UPDATE (PATCH) ───────────────────────────────────────────────────────────
+# =============================================================================
+# UPDATE
+# =============================================================================
 
 async def update_automation_flow(
     org_id: str,
     flow_id: str,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
-    flow_data: Optional[Any] = None,
-    status: Optional[str] = None,
-    trigger_type: Optional[str] = None,
-    updated_by: Optional[str] = None,
+    update_data: Dict,
+    updated_by: Optional[str] = None
 ) -> Optional[Dict]:
-    """
-    Partial update.  Only the supplied fields are changed.
-
-    If status is explicitly set to "archived" we keep it as-is but do NOT
-    promote runtime fields (archiving ≠ publishing).
-    """
     try:
-        col = _col(org_id)
-        now = datetime.now(timezone.utc)
+        collection = _automation_flows_collection(org_id)
 
-        set_fields: Dict[str, Any] = {"updated_at": now, "updated_by": updated_by}
-
-        if name is not None:
-            set_fields["name"] = name
-        if description is not None:
-            set_fields["description"] = description
-        if flow_data is not None:
-            set_fields["flow_data"] = flow_data
-        if status is not None:
-            set_fields["status"] = status
-        if trigger_type is not None:
-            set_fields["trigger_type"] = trigger_type
-
-        result = col.find_one_and_update(
-            {"flow_id": flow_id, "org_id": org_id},
-            {"$set": set_fields},
-            return_document=True,
-        )
-
-        if not result:
-            return None
-
-        logger.info(f"Updated flow {flow_id} for org {org_id}")
-        return serialize_mongo(result)
-
-    except Exception as e:
-        logger.error(f"update_automation_flow error: {e}")
-        raise
-
-
-# ─── DELETE ───────────────────────────────────────────────────────────────────
-
-async def delete_automation_flow(org_id: str, flow_id: str) -> bool:
-    """
-    Permanently delete a flow document.
-    Returns True if something was actually deleted.
-    """
-    try:
-        col = _col(org_id)
-        result = col.delete_one({"flow_id": flow_id, "org_id": org_id})
-        deleted = result.deleted_count > 0
-
-        if deleted:
-            logger.info(f"Deleted flow {flow_id} for org {org_id}")
-        else:
-            logger.warning(f"delete_automation_flow: flow {flow_id} not found for org {org_id}")
-
-        return deleted
-
-    except Exception as e:
-        logger.error(f"delete_automation_flow error: {e}")
-        raise
-
-
-# ─── PUBLISH ──────────────────────────────────────────────────────────────────
-
-async def publish_automation_flow(
-    org_id: str,
-    flow_id: str,
-    updated_by: Optional[str] = None,
-) -> Optional[Dict]:
-    """
-    Publish a flow.
-
-    Two things happen:
-    1.  status is set to "active"  ← what the webhook query looks for
-    2.  The WaBot runtime fields are PROMOTED from flow_data to the document
-        root so the webhook handler finds them with a simple flat query.
-
-    The frontend always saves the WaBot schema inside flow_data, so we read
-    from there:
-        flow_data.trigger_from
-        flow_data.trigger_event
-        flow_data.trigger_messages
-        flow_data.welcome_message
-        flow_data.nodes
-    """
-    try:
-        col = _col(org_id)
-
-        # Fetch the current document so we can read flow_data
-        current = col.find_one({"flow_id": flow_id, "org_id": org_id})
-        if not current:
-            return None
-
-        now = datetime.now(timezone.utc)
-        flow_data = current.get("flow_data") or {}
-
-        # Promote runtime fields to doc root
-        runtime_fields = _extract_wabot_runtime_fields(flow_data)
-
-        set_fields: Dict[str, Any] = {
-            "status":       "active",   # <-- webhook query looks for "active"
-            "published_at": now,
-            "updated_at":   now,
-            "updated_by":   updated_by,
-            **runtime_fields,
+        update_doc = {
+            "updated_at": datetime.now(timezone.utc),
+            "updated_by": updated_by,
         }
 
-        result = col.find_one_and_update(
+        if "name" in update_data:
+            update_doc["name"] = update_data["name"]
+        if "description" in update_data:
+            update_doc["description"] = update_data["description"]
+        if "flow_data" in update_data:
+            update_doc["flow_data"] = update_data["flow_data"]
+            collection.update_one(
+                {"flow_id": flow_id, "org_id": org_id},
+                {"$inc": {"version": 1}}
+            )
+        if "status" in update_data:
+            update_doc["status"] = update_data["status"]
+
+        flow = collection.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
-            {"$set": set_fields},
-            return_document=True,
+            {"$set": update_doc},
+            return_document=ReturnDocument.AFTER,
         )
 
-        if not result:
-            return None
-
-        logger.info(f"Published flow {flow_id} for org {org_id}")
-        return serialize_mongo(result)
+        if flow:
+            return serialize_mongo(flow)
+        return None
 
     except Exception as e:
-        logger.error(f"publish_automation_flow error: {e}")
+        logger.error(f"Error updating automation flow: {str(e)}")
         raise
 
 
-# ─── UNPUBLISH ────────────────────────────────────────────────────────────────
+# =============================================================================
+# DELETE
+# =============================================================================
 
-async def unpublish_automation_flow(
-    org_id: str,
-    flow_id: str,
-    updated_by: Optional[str] = None,
-) -> Optional[Dict]:
+async def delete_automation_flow(org_id: str, flow_id: str) -> bool:
+    try:
+        collection = _automation_flows_collection(org_id)
+        result = collection.delete_one({"flow_id": flow_id, "org_id": org_id})
+        if result.deleted_count > 0:
+            logger.info(f"Deleted automation flow: {flow_id} for org: {org_id}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error deleting automation flow: {str(e)}")
+        raise
+
+
+# =============================================================================
+# PUBLISH
+# =============================================================================
+
+async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
     """
-    Revert a published flow back to draft.
+    Publish (activate) an automation flow.
 
-    We also REMOVE the top-level runtime fields so the webhook handler no
-    longer picks up this flow (those fields are still safely in flow_data
-    for when the user re-publishes).
+    google_sheet triggers      → register trigger, then immediately process all sheet rows
+    whatsapp_followup triggers → schedule a timed job via automation_scheduler
+    All other trigger types    → register in automation_triggers collection (Instagram etc.)
     """
     try:
-        col = _col(org_id)
-        now = datetime.now(timezone.utc)
+        from services.automation_scheduler import schedule_followup, cancel_flow_followups
 
-        result = col.find_one_and_update(
-            {"flow_id": flow_id, "org_id": org_id},
-            {
-                "$set": {
-                    "status":     "draft",
-                    "updated_at": now,
-                    "updated_by": updated_by,
-                },
-                # Remove the promoted runtime fields
-                "$unset": {
-                    "trigger_from":     "",
-                    "trigger_event":    "",
-                    "trigger_messages": "",
-                    "welcome_message":  "",
-                    "nodes":            "",
-                },
-            },
-            return_document=True,
-        )
-
-        if not result:
+        collection = _automation_flows_collection(org_id)
+        flow = collection.find_one({"flow_id": flow_id, "org_id": org_id})
+        if not flow:
             return None
 
-        logger.info(f"Unpublished flow {flow_id} for org {org_id}")
-        return serialize_mongo(result)
+        flow_data = flow.get("flow_data", {})
+        triggers = flow_data.get("triggers", [])
+        if not triggers:
+            raise ValueError("Flow must have at least one trigger")
+
+        nodes = flow_data.get("nodes", {})
+        connections = flow_data.get("connections", [])
+
+        # Cancel any old pending follow-up jobs before creating new ones (re-publish safety)
+        cancel_flow_followups(org_id, flow_id, reason="republished")
+
+        # ------------------------------------------------------------------
+        # Process each trigger
+        # ------------------------------------------------------------------
+        for idx, trigger_config in enumerate(triggers):
+            trigger_type = trigger_config.get("type")
+            config = trigger_config.get("config", {})
+            start_node_id = trigger_config.get("start_node_id")
+
+            if not start_node_id:
+                logger.warning(f"Trigger {idx} missing start_node_id — skipping.")
+                continue
+
+            # ---- Google Sheet trigger: register + immediately process rows ----
+            if trigger_type == "google_sheet":
+                await _handle_google_sheet_trigger(
+                    org_id=org_id,
+                    flow_id=flow_id,
+                    idx=idx,
+                    config=config,
+                    start_node_id=start_node_id,
+                    nodes=nodes,
+                    connections=connections,
+                )
+
+            # ---- WhatsApp Follow-Up: schedule a timed job -----------------
+            elif trigger_type == "whatsapp_followup":
+                conversation_id = config.get("conversation_id")
+                if not conversation_id:
+                    logger.warning(f"whatsapp_followup trigger missing conversation_id — skipping.")
+                    continue
+
+                delay_seconds, message_text = _extract_delay_and_message(
+                    start_node_id, nodes, connections
+                )
+
+                if delay_seconds is None or message_text is None:
+                    logger.warning(
+                        f"Could not extract delay/message from flow {flow_id}. "
+                        f"Ensure a smart_delay node and a message node are connected."
+                    )
+                    continue
+
+                schedule_followup(
+                    org_id=org_id,
+                    flow_id=flow_id,
+                    conversation_id=conversation_id,
+                    delay_seconds=delay_seconds,
+                    message_config={"text": message_text},
+                )
+                logger.success(
+                    f"Scheduled WhatsApp follow-up — flow={flow_id}, "
+                    f"conversation={conversation_id}, delay={delay_seconds}s"
+                )
+
+            # ---- All other triggers: register in automation_triggers ------
+            else:
+                await _register_single_trigger(
+                    org_id, flow_id, idx, trigger_type, config, start_node_id
+                )
+
+        # Update flow status
+        now = datetime.now(timezone.utc)
+        updated_flow = collection.find_one_and_update(
+            {"flow_id": flow_id, "org_id": org_id},
+            {"$set": {"status": "published", "published_at": now, "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if updated_flow:
+            return serialize_mongo(updated_flow)
+        return None
 
     except Exception as e:
-        logger.error(f"unpublish_automation_flow error: {e}")
+        logger.error(f"Error publishing automation flow: {str(e)}")
         raise
 
 
-# ─── Flow validation (kept for backward compat with old route import) ─────────
+# =============================================================================
+# UNPUBLISH
+# =============================================================================
 
-def validate_flow_structure(flow_data: dict) -> tuple:
-    """Basic structural validation — returns (is_valid, error_message)."""
-    if not isinstance(flow_data, dict):
-        return False, "flow_data must be a dict"
-    return True, None
+async def unpublish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
+    """
+    Unpublish (deactivate) an automation flow.
+    Cancels pending WhatsApp follow-up jobs and deactivates trigger registrations.
+    NOTE: For google_sheet triggers, sent records are NOT cleared so re-publish
+    won't re-message the same numbers.
+    """
+    try:
+        from services.automation_scheduler import cancel_flow_followups
+
+        collection = _automation_flows_collection(org_id)
+        flow = collection.find_one({"flow_id": flow_id, "org_id": org_id})
+        if not flow:
+            return None
+
+        # Cancel pending follow-up jobs
+        cancel_flow_followups(org_id, flow_id, reason="flow_unpublished")
+
+        # Deactivate registered triggers (instagram / tag-based / google_sheet triggers)
+        await _deactivate_flow_triggers(org_id, flow_id)
+
+        now = datetime.now(timezone.utc)
+        updated_flow = collection.find_one_and_update(
+            {"flow_id": flow_id, "org_id": org_id},
+            {"$set": {"status": "draft", "unpublished_at": now, "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if updated_flow:
+            logger.info(f"Unpublished automation flow: {flow_id}")
+            return serialize_mongo(updated_flow)
+        return None
+
+    except Exception as e:
+        logger.error(f"Error unpublishing automation flow: {str(e)}")
+        raise
 
 
-# ─── Execute WhatsApp flow (unchanged, kept here for import compatibility) ────
+async def _deactivate_flow_triggers(org_id: str, flow_id: str):
+    """Deactivate trigger registrations for a flow."""
+    triggers_collection = _automation_triggers_collection()
+    result = triggers_collection.update_many(
+        {"flow_id": flow_id, "org_id": org_id},
+        {"$set": {"status": "inactive", "deactivated_at": datetime.now(timezone.utc)}},
+    )
+    logger.info(f"Deactivated {result.modified_count} triggers for flow {flow_id}")
 
-async def _send_text_message(org_id, whatsapp_business_id, conversation_id, raw_content, template_variables):
-    from services.utils import inject_variables
-    from services.wa_service import send_whatsapp_message
+
+# =============================================================================
+# EXECUTION COUNT
+# =============================================================================
+
+async def increment_execution_count(org_id: str, flow_id: str):
+    try:
+        collection = _automation_flows_collection(org_id)
+        collection.update_one(
+            {"flow_id": flow_id, "org_id": org_id},
+            {
+                "$inc": {"execution_count": 1},
+                "$set": {"last_executed_at": datetime.now(timezone.utc)},
+            },
+        )
+    except Exception as e:
+        logger.error(f"Error incrementing execution count: {str(e)}")
+
+
+# =============================================================================
+# INTERNAL HELPERS
+# =============================================================================
+
+def _children(node_id: str, connections: list) -> list:
+    return [c["target"] for c in connections if c.get("source") == node_id]
+
+
+def _extract_delay_and_message(
+    start_node_id: str,
+    nodes: dict,
+    connections: list,
+) -> tuple:
+    """
+    Walk graph: start_node (smart_delay) → message_node
+    Returns (delay_seconds, message_text) or (None, None) on failure.
+    """
+    UNIT_TO_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+
+    delay_seconds = None
+    message_text = None
+
+    start_node = nodes.get(start_node_id, {})
+
+    if start_node.get("type") == "smart_delay":
+        config = start_node.get("config", {})
+        amount = config.get("amount", 0)
+        unit = config.get("unit", "seconds")
+        delay_seconds = int(amount) * UNIT_TO_SECONDS.get(unit, 1)
+
+        for msg_id in _children(start_node_id, connections):
+            msg_node = nodes.get(msg_id, {})
+            if msg_node.get("type") == "message":
+                # Primary path: node.config.content.text
+                text = msg_node.get("config", {}).get("content", {}).get("text", "")
+                # Fallback path: node.content.text
+                if not text:
+                    text = msg_node.get("content", {}).get("text", "")
+                message_text = text
+                break
+
+    return delay_seconds, message_text
+
+
+def _extract_message_from_start(
+    start_node_id: str,
+    nodes: dict,
+    connections: list,
+) -> Optional[str]:
+    """
+    Walk from start_node_id to find the first message node.
+    Used by _handle_google_sheet_trigger.
+
+    Handles both node structures the frontend may produce:
+      - node.config.content.text  (primary — used by execution engine)
+      - node.content.text         (fallback / alternate serialisation)
+    """
+    visited: set = set()
+    queue: list = [start_node_id]
+
+    while queue:
+        node_id = queue.pop(0)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+
+        node = nodes.get(node_id, {})
+        if node.get("type") == "message":
+            # Primary path: node.config.content.text
+            text = node.get("config", {}).get("content", {}).get("text", "")
+            # Fallback path: node.content.text
+            if not text:
+                text = node.get("content", {}).get("text", "")
+            if text:
+                return text
+
+        next_ids = _children(node_id, connections)
+        queue.extend(next_ids)
+
+    return None
+
+
+async def _handle_google_sheet_trigger(
+    org_id: str,
+    flow_id: str,
+    idx: int,
+    config: dict,
+    start_node_id: str,
+    nodes: dict,
+    connections: list,
+):
+    """
+    Handle a google_sheet trigger on publish:
+    1. Register in automation_triggers for future scheduler runs
+    2. Extract the message text from the connected node
+    3. Immediately process all existing sheet rows
+    """
+    sheet_id = config.get("sheet_id")
+    column_name = config.get("column_name")
+
+    if not sheet_id or not column_name:
+        logger.warning(
+            f"google_sheet trigger for flow {flow_id} missing sheet_id or column_name — skipping."
+        )
+        return
+
+    # Get message text from the flow's message node
+    message_text = _extract_message_from_start(start_node_id, nodes, connections)
+    if not message_text:
+        logger.warning(f"No message text found for google_sheet flow {flow_id} — skipping.")
+        return
+
+    # Register the trigger (with message_text stored for scheduler use)
+    triggers_collection = _automation_triggers_collection()
+    trigger_doc = {
+        "trigger_id": f"trigger_{flow_id}_{idx}",
+        "flow_id": flow_id,
+        "org_id": org_id,
+        "platform": "google_sheet",
+        "trigger_type": "google_sheet",
+        "filters": {
+            "sheet_id": config.get("sheet_id"),
+            "sheet_name": config.get("sheet_name"),
+            "column_name": config.get("column_name"),
+            "row_start": config.get("row_start"),
+            "row_end": config.get("row_end"),
+        },
+        "message_text": message_text,
+        "start_node_id": start_node_id,
+        "status": "active",
+        "registered_at": datetime.now(timezone.utc),
+        "last_triggered_at": None,
+    }
+
+    triggers_collection.update_one(
+        {"trigger_id": trigger_doc["trigger_id"]},
+        {"$set": trigger_doc},
+        upsert=True,
+    )
+    logger.info(f"Registered google_sheet trigger for flow {flow_id}, sheet {sheet_id}")
+
+    # Immediately process all existing rows (don't await — run in background)
+    import asyncio
+    from services.google_sheet_automation import process_google_sheet_trigger
+
+    asyncio.create_task(
+        process_google_sheet_trigger(
+            org_id=org_id,
+            flow_id=flow_id,
+            trigger_config=config,
+            message_text=message_text,
+        )
+    )
+    logger.success(f"Started immediate processing for google_sheet flow {flow_id}")
+
+
+async def _register_single_trigger(
+    org_id: str,
+    flow_id: str,
+    idx: int,
+    trigger_type: str,
+    config: dict,
+    start_node_id: str,
+):
+    """Register a single non-followup, non-google_sheet trigger in automation_triggers."""
+    triggers_collection = _automation_triggers_collection()
+
+    platform = "instagram" if "instagram" in trigger_type else "whatsapp"
+
+    keyword_value = config.get("keyword", "")
+    if isinstance(keyword_value, list):
+        keyword_value = "|".join(keyword_value)
+
+    filters = {
+        "keyword": keyword_value,
+        "post_id": config.get("post_id"),
+        "story_id": config.get("story_id"),
+        "tag": config.get("tag"),
+    }
+
+    trigger_doc = {
+        "trigger_id": f"trigger_{flow_id}_{idx}",
+        "flow_id": flow_id,
+        "org_id": org_id,
+        "platform": platform,
+        "trigger_type": trigger_type,
+        "filters": filters,
+        "start_node_id": start_node_id,
+        "status": "active",
+        "registered_at": datetime.now(timezone.utc),
+        "last_triggered_at": None,
+    }
+
+    triggers_collection.update_one(
+        {"trigger_id": trigger_doc["trigger_id"]},
+        {"$set": trigger_doc},
+        upsert=True,
+    )
+    logger.info(f"Registered trigger: {trigger_type} for flow {flow_id}")
+
+
+async def _register_flow_triggers(org_id: str, flow_id: str, flow_data: Dict):
+    """
+    Register all non-followup triggers. Kept for backward compatibility.
+    """
+    for idx, trigger_config in enumerate(flow_data.get("triggers", [])):
+        trigger_type = trigger_config.get("type")
+        if trigger_type in ("whatsapp_followup", "google_sheet"):
+            continue
+        config = trigger_config.get("config", {})
+        start_node_id = trigger_config.get("start_node_id")
+        if not start_node_id:
+            continue
+        await _register_single_trigger(org_id, flow_id, idx, trigger_type, config, start_node_id)
+
+
+# =============================================================================
+# FLOW VALIDATION
+# =============================================================================
+
+def validate_flow_structure(flow_data: Dict) -> tuple:
+    try:
+        if not isinstance(flow_data, dict):
+            return False, "Flow data must be a dictionary"
+        if "nodes" not in flow_data:
+            return False, "Flow data must contain 'nodes'"
+        if "connections" not in flow_data:
+            return False, "Flow data must contain 'connections'"
+        if "triggers" not in flow_data:
+            return False, "Flow data must contain 'triggers'"
+
+        nodes = flow_data.get("nodes", {})
+        if not isinstance(nodes, dict):
+            return False, "'nodes' must be a dictionary"
+
+        connections = flow_data.get("connections", [])
+        if not isinstance(connections, list):
+            return False, "'connections' must be a list"
+
+        for conn in connections:
+            if "source" not in conn or "target" not in conn:
+                return False, "Each connection must have 'source' and 'target'"
+            if conn["source"] not in nodes:
+                return False, f"Connection source '{conn['source']}' not found in nodes"
+            if conn["target"] not in nodes:
+                return False, f"Connection target '{conn['target']}' not found in nodes"
+
+        triggers = flow_data.get("triggers", [])
+        if not isinstance(triggers, list):
+            return False, "'triggers' must be a list"
+
+        for trigger in triggers:
+            if "start_node_id" not in trigger:
+                return False, "Each trigger must have 'start_node_id'"
+            if trigger["start_node_id"] not in nodes:
+                return False, f"Trigger start_node_id '{trigger['start_node_id']}' not found in nodes"
+
+            # Extra validation for google_sheet triggers
+            if trigger.get("type") == "google_sheet":
+                config = trigger.get("config", {})
+                if not config.get("sheet_id"):
+                    return False, "Google Sheet trigger requires 'sheet_id'"
+                if not config.get("column_name"):
+                    return False, "Google Sheet trigger requires 'column_name' (phone number column)"
+
+                # Validate row range if provided
+                row_start = config.get("row_start")
+                row_end = config.get("row_end")
+                if row_start is not None and row_start < 1:
+                    return False, "row_start must be >= 1"
+                if row_end is not None and row_start is not None and row_end < row_start:
+                    return False, "row_end must be >= row_start"
+
+        return True, None
+
+    except Exception as e:
+        return False, f"Validation error: {str(e)}"
+
+
+# Helper functions
+async def _send_text_message(org_id: str, whatsapp_business_id: str, conversation_id: str, raw_content: str, template_variables: dict):
     personalized = inject_variables(raw_content, template_variables)
     await send_whatsapp_message(
         org_id=org_id,
@@ -416,13 +632,7 @@ async def _send_text_message(org_id, whatsapp_business_id, conversation_id, raw_
         },
     )
 
-
-async def _send_interactive_message(org_id, whatsapp_business_id, conversation_id, raw_data, template_variables, label):
-    from pydantic import TypeAdapter
-    from schemas.models import WhatsAppInteractiveMessage
-    from services.utils import inject_variables
-    from services.wa_service import send_interactive_whatsapp_message
-    InteractiveMessageAdapter = TypeAdapter(WhatsAppInteractiveMessage)
+async def _send_interactive_message(org_id: str, whatsapp_business_id: str, conversation_id: str, raw_data: dict, template_variables: dict, label: str) -> bool:
     try:
         personalized = inject_variables(raw_data, template_variables)
         validated = InteractiveMessageAdapter.validate_python(personalized)
@@ -437,15 +647,14 @@ async def _send_interactive_message(org_id, whatsapp_business_id, conversation_i
         logger.error(f"[{org_id}] Failed to validate interactive data for '{label}': {e}")
         return False
 
-
-def _complete_onboarding(org_id, conversation_id):
+def _complete_onboarding(org_id: str, conversation_id: str):
     db[f"conversations_{org_id}"].update_one(
         {"conversation_id": conversation_id},
         {"$set": {"onboarding_stage": "completed"}},
     )
-    logger.info(f"[{org_id}] Onboarding completed for {conversation_id}")
+    logger.info(f"[{org_id}] Onboarding stage marked as completed for {conversation_id}")
 
-
+# TODO: flow doc must have an index on status, trigger_event, trigger_from
 async def execute_whatsapp_flow(
     flow: dict,
     org_id: str,
@@ -458,79 +667,55 @@ async def execute_whatsapp_flow(
     whatsapp_business_id: str,
     message_type: str,
 ):
-    """
-    Execute the next step in a WhatsApp automation flow.
-
-    The flow document now has all relevant fields at the top level after
-    publish_automation_flow() promotes them, so direct access works:
-        flow["welcome_message"]
-        flow["nodes"]
-        flow["trigger_messages"]
-    """
-    from services.utils import get_first_name
-
-    logger.info(
-        f"[{org_id}] Executing WA flow for conversation {conversation_id} "
-        f"| stage={stage} | type={message_type}"
-    )
+    logger.info(f"[{org_id}] Executing WhatsApp flow for conversation: {conversation_id} | Stage: {stage} | Type: {message_type}")
 
     welcome_message = flow.get("welcome_message")
-    welcome_message_ids = (
-        [btn["reply"]["id"]
-         for btn in welcome_message.get("interactive", {}).get("buttons", [])]
-        if welcome_message and welcome_message.get("type") == "interactive"
-        else []
-    )
+    welcome_message_ids = [btn["reply"]["id"] for btn in welcome_message.get("interactive", {}).get("buttons", [])] if welcome_message and welcome_message.get("type") == "interactive" else []
+    introduction_message = flow.get("introduction_message")
     flow_nodes = flow.get("nodes", {})
-    trigger_keywords = (
-        [m.strip().lower() for m in trigger_messages.split(",")]
-        if trigger_messages else []
-    )
-    template_variables = {"customer_name": get_first_name(customer_name)}
-    ctx = dict(
-        org_id=org_id,
-        whatsapp_business_id=whatsapp_business_id,
-        conversation_id=conversation_id,
-    )
 
-    # ── Interactive (button / list click) ────────────────────────────────────
+    trigger_keywords = [msg.strip().lower() for msg in trigger_messages.split(",")] if trigger_messages else []
+    template_variables = {"customer_name": get_first_name(customer_name)}
+
+    ctx = dict(org_id=org_id, whatsapp_business_id=whatsapp_business_id, conversation_id=conversation_id)
+
+    # Interactive (button / list click)
     if message_type == "interactive":
         selection_id = message_content
-        logger.info(f"[{org_id}] Interactive selection ID: '{selection_id}'")
+        logger.info(f"[{org_id}] Processing interactive selection ID: '{selection_id}'")
 
         if selection_id not in flow_nodes:
-            logger.warning(f"[{org_id}] Node '{selection_id}' not found → routing to AI")
+            logger.warning(f"[{org_id}] Node '{selection_id}' not found in flow, routing to AI...")
             return False
 
         if selection_id in welcome_message_ids:
-            logger.info(f"[{org_id}] Selection '{selection_id}' is a welcome-message button")
+            logger.info(f"[{org_id}] Selection ID '{selection_id}' is a welcome message button. Updating conversations collection.")
 
         node_data = flow_nodes[selection_id]
         node_type = node_data.get("type")
+
         _complete_onboarding(org_id, conversation_id)
 
         if node_type == "text":
-            await _send_text_message(
-                **ctx,
-                raw_content=node_data.get("content", ""),
-                template_variables=template_variables,
-            )
+            logger.info(f"[{org_id}] Sending text node response for '{selection_id}'")
+            await _send_text_message(**ctx, raw_content=node_data.get("content", ""), template_variables=template_variables)
+            logger.success(f"[{org_id}] Successfully sent text node response for '{selection_id}'")
             return True
 
+        # Note: Currently only button, list, and cta_url are supported
+        # TODO: Add support for more interactive types
         elif node_type in {"button", "list", "cta_url"}:
-            ok = await _send_interactive_message(
-                **ctx,
-                raw_data=node_data,
-                template_variables=template_variables,
-                label=selection_id,
-            )
+            logger.info(f"[{org_id}] Sending interactive node response for '{selection_id}' (Type: {node_type})")
+            ok = await _send_interactive_message(**ctx, raw_data=node_data, template_variables=template_variables, label=selection_id)
+            if ok:
+                logger.success(f"[{org_id}] Successfully sent interactive node response for '{selection_id}'")
             return ok
 
         else:
-            logger.warning(f"[{org_id}] Unknown node_type '{node_type}' for '{selection_id}'")
+            logger.warning(f"[{org_id}] Unknown node_type '{node_type}' for selection '{selection_id}'")
             return False
 
-    # ── Welcome / keyword trigger ────────────────────────────────────────────
+    # Welcome / keyword trigger
     if welcome_message:
         is_new_session = stage == "welcome"
         is_keyword_match = (
@@ -540,29 +725,35 @@ async def execute_whatsapp_flow(
         )
 
         if not (is_new_session or is_keyword_match):
-            logger.info(f"[{org_id}] No trigger match → routing to AI")
+            logger.info(f"[{org_id}] Message did not match welcome flow triggers, routing to AI...")
             return False
 
         welcome_type = welcome_message.get("type")
-        logger.info(f"[{org_id}] Trigger matched. Sending welcome (type={welcome_type})")
+        logger.info(f"[{org_id}] Trigger conditions met. Sending welcome message (Type: {welcome_type})")
 
+        # Send optional introduction first
+        if introduction_message:
+            intro_type = introduction_message.get("type")
+            if intro_type == "text":
+                await _send_text_message(**ctx, raw_content=introduction_message.get("content", ""), template_variables=template_variables)
+                logger.info(f"[{org_id}] Successfully sent introduction text message.")
+            elif intro_type == "interactive":
+                await _send_interactive_message(**ctx, raw_data=introduction_message.get("interactive", {}), template_variables=template_variables, label="introduction")
+                logger.info(f"[{org_id}] Successfully sent introduction interactive message.")
+
+        # Send welcome message
         if welcome_type == "text":
-            await _send_text_message(
-                **ctx,
-                raw_content=welcome_message.get("content", ""),
-                template_variables=template_variables,
-            )
-            _complete_onboarding(org_id, conversation_id)
+            await _send_text_message(**ctx, raw_content=welcome_message.get("content", ""), template_variables=template_variables)
+            _complete_onboarding(org_id, conversation_id)  # plain-text welcome → done immediately
+            logger.success(f"[{org_id}] Successfully sent text welcome message and completed onboarding.")
             return True
 
         elif welcome_type == "interactive":
-            ok = await _send_interactive_message(
-                **ctx,
-                raw_data=welcome_message.get("interactive", {}),
-                template_variables=template_variables,
-                label="welcome",
-            )
+            ok = await _send_interactive_message(**ctx, raw_data=welcome_message.get("interactive", {}), template_variables=template_variables, label="welcome")
+            if ok:
+                # Keep stage as "welcome" until they actually click a button
+                logger.success(f"[{org_id}] Successfully sent interactive welcome message. Awaiting user selection.")
             return ok
 
-    logger.warning(f"[{org_id}] Flow fell through all scenarios → routing to AI")
+    logger.warning(f"[{org_id}] Flow execution fell through all scenarios. Routing to AI...")
     return False

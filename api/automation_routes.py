@@ -1,4 +1,4 @@
-from typing import Optional, Any
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
@@ -13,6 +13,7 @@ from services.automation_service import (
     delete_automation_flow,
     publish_automation_flow,
     unpublish_automation_flow,
+    validate_flow_structure
 )
 from loguru import logger
 
@@ -21,201 +22,552 @@ db = get_mongo_db()
 router = APIRouter(prefix="/api/automation_flows", tags=["Automation Flows"])
 
 
-# ─── Request / Response Models ────────────────────────────────────────────────
+# Request/Response Models
+class FlowNodePayload(BaseModel):
+    """Represents a node's configuration in the flow"""
+    type: str
+    app: Optional[str] = None
+    config: dict = Field(default_factory=dict)
+    position: Optional[dict] = None
+
+
+class FlowDocument(BaseModel):
+    """Complete flow document structure"""
+    nodes: dict = Field(default_factory=dict)
+    connections: list = Field(default_factory=list)
+    triggers: list = Field(default_factory=list)
+
 
 class CreateFlowRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(..., min_length=3, max_length=255)
     description: Optional[str] = Field(None, max_length=500)
-    # WaBotEditor sends the entire nested schema here
-    flow_data: Optional[Any] = None
-    trigger_type: Optional[str] = None
+    flow_data: Optional[FlowDocument] = None
+    status: str = Field(default="draft")
 
 
 class UpdateFlowRequest(BaseModel):
-    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    name: Optional[str] = Field(None, min_length=3, max_length=255)
     description: Optional[str] = Field(None, max_length=500)
-    flow_data: Optional[Any] = None
+    flow_data: Optional[FlowDocument] = None
     status: Optional[str] = None
-    trigger_type: Optional[str] = None
 
 
-# ─── CREATE ───────────────────────────────────────────────────────────────────
+# =============================================================================
+# FLOW CRUD
+# =============================================================================
 
-@router.post("", status_code=201)
+@router.post("")
 async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
-    """
-    Create a new automation flow (always saved as draft).
-    WaBotEditor POSTs here on first save.
-    """
+    """Create a new automation flow"""
     try:
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
+        if payload.flow_data:
+            is_valid, error_message = validate_flow_structure(payload.flow_data.dict())
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=f"Invalid flow structure: {error_message}")
+
         flow = await create_automation_flow(
             org_id=org_id,
             name=payload.name,
             description=payload.description,
-            flow_data=payload.flow_data,
-            trigger_type=payload.trigger_type,
-            created_by=user.user_id,
+            flow_data=payload.flow_data.dict() if payload.flow_data else None,
+            created_by=user.user_id
         )
+
         return {"flow": flow}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error creating automation flow: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create automation flow: {e}")
+        logger.error(f"Error creating automation flow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create automation flow: {str(e)}")
 
-
-# ─── LIST ─────────────────────────────────────────────────────────────────────
 
 @router.get("")
 async def list_flows(user: CurrentUser, status: Optional[str] = None):
-    """
-    List all automation flows for the caller's organisation.
-    Optional ?status=draft|published|archived filter.
-    """
+    """List all automation flows for the organization"""
     try:
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         flows = await list_automation_flows(org_id=org_id, status=status)
-        return flows  # DashboardView expects a plain list (array)
+        return {"flows": flows}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error listing automation flows: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to list automation flows: {e}")
+        logger.error(f"Error listing automation flows: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to list automation flows: {str(e)}")
 
-
-# ─── GET ONE ──────────────────────────────────────────────────────────────────
 
 @router.get("/{flow_id}")
 async def get_flow(flow_id: str, user: CurrentUser):
-    """
-    Fetch a single flow by its flow_id.
-    WaBotEditor calls this when opening an existing flow to hydrate the canvas.
-    """
+    """Get a specific automation flow by ID"""
     try:
         org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
         flow = await get_automation_flow(org_id=org_id, flow_id=flow_id)
         if not flow:
-            raise HTTPException(status_code=404, detail="Flow not found")
-        return flow  # WaBotEditor reads response.data directly
+            raise HTTPException(status_code=404, detail="Automation flow not found")
+
+        return {"flow": flow}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching automation flow {flow_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch automation flow: {e}")
+        logger.error(f"Error getting automation flow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get automation flow: {str(e)}")
 
-
-# ─── UPDATE (PATCH) ───────────────────────────────────────────────────────────
 
 @router.patch("/{flow_id}")
 async def update_flow(flow_id: str, payload: UpdateFlowRequest, user: CurrentUser):
-    """
-    Partial update of a flow.
-    WaBotEditor PATCHes here on subsequent saves and on unpublish.
-    """
+    """Update an existing automation flow"""
     try:
         org_id = user.org_id
-        updated = await update_automation_flow(
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        if payload.flow_data:
+            is_valid, error_message = validate_flow_structure(payload.flow_data.dict())
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=f"Invalid flow structure: {error_message}")
+
+        update_data = {}
+        if payload.name is not None:
+            update_data["name"] = payload.name
+        if payload.description is not None:
+            update_data["description"] = payload.description
+        if payload.flow_data is not None:
+            update_data["flow_data"] = payload.flow_data.dict()
+        if payload.status is not None:
+            update_data["status"] = payload.status
+
+        flow = await update_automation_flow(
             org_id=org_id,
             flow_id=flow_id,
-            name=payload.name,
-            description=payload.description,
-            flow_data=payload.flow_data,
-            status=payload.status,
-            trigger_type=payload.trigger_type,
-            updated_by=user.user_id,
+            update_data=update_data,
+            updated_by=user.user_id
         )
-        if not updated:
-            raise HTTPException(status_code=404, detail="Flow not found")
-        return {"flow": updated}
+
+        if not flow:
+            raise HTTPException(status_code=404, detail="Automation flow not found")
+
+        return {"flow": flow}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error updating automation flow {flow_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to update automation flow: {e}")
+        logger.error(f"Error updating automation flow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update automation flow: {str(e)}")
 
-
-# ─── DELETE ───────────────────────────────────────────────────────────────────
 
 @router.delete("/{flow_id}")
 async def delete_flow(flow_id: str, user: CurrentUser):
-    """
-    Permanently delete a flow.
-    DashboardView calls this from the ⋯ menu.
-    """
+    """Delete an automation flow"""
     try:
         org_id = user.org_id
-        deleted = await delete_automation_flow(org_id=org_id, flow_id=flow_id)
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Flow not found")
-        return {"message": "Flow deleted successfully"}
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        success = await delete_automation_flow(org_id=org_id, flow_id=flow_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Automation flow not found")
+
+        return {"message": "Automation flow deleted successfully"}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error deleting automation flow {flow_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete automation flow: {e}")
+        logger.error(f"Error deleting automation flow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete automation flow: {str(e)}")
 
 
-# ─── PUBLISH ──────────────────────────────────────────────────────────────────
+# =============================================================================
+# PUBLISH / UNPUBLISH
+# =============================================================================
 
 @router.post("/{flow_id}/publish")
 async def publish_flow(flow_id: str, user: CurrentUser):
-    """
-    Publish a flow.
-    Sets status → "published" / "active" AND flattens the WaBot fields
-    (trigger_from, trigger_event, trigger_messages, welcome_message, nodes)
-    to the document root so the webhook handler can find them with a simple query.
-    """
+    """Publish (activate) an automation flow"""
     try:
         org_id = user.org_id
-        flow = await publish_automation_flow(
-            org_id=org_id,
-            flow_id=flow_id,
-            updated_by=user.user_id,
-        )
-        if not flow:
-            raise HTTPException(status_code=404, detail="Flow not found")
-        return {"flow": flow, "message": "Flow published successfully"}
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
 
+        flow = await publish_automation_flow(org_id=org_id, flow_id=flow_id)
+        if not flow:
+            raise HTTPException(status_code=404, detail="Automation flow not found")
+
+        return {"flow": flow, "message": "Automation flow published successfully"}
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error publishing automation flow {flow_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to publish automation flow: {e}")
+        logger.error(f"Error publishing automation flow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to publish automation flow: {str(e)}")
 
-
-# ─── UNPUBLISH ────────────────────────────────────────────────────────────────
 
 @router.post("/{flow_id}/unpublish")
 async def unpublish_flow(flow_id: str, user: CurrentUser):
+    """Unpublish (deactivate) an automation flow"""
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        flow = await unpublish_automation_flow(org_id=org_id, flow_id=flow_id)
+        if not flow:
+            raise HTTPException(status_code=404, detail="Automation flow not found")
+
+        return {"flow": flow, "message": "Automation flow unpublished successfully"}
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error unpublishing automation flow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to unpublish automation flow: {str(e)}")
+
+
+# =============================================================================
+# EXECUTION HISTORY
+# =============================================================================
+
+@router.get("/{flow_id}/executions")
+async def get_flow_executions(
+    flow_id: str,
+    user: CurrentUser,
+    limit: int = 50,
+    skip: int = 0
+):
+    """Get execution history for a flow"""
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        executions_collection = db["automation_executions"]
+
+        executions = list(
+            executions_collection.find({"flow_id": flow_id, "org_id": org_id})
+            .sort("created_at", -1)
+            .skip(skip)
+            .limit(limit)
+        )
+
+        for exec in executions:
+            exec["_id"] = str(exec["_id"])
+            if exec.get("created_at"):
+                exec["created_at"] = exec["created_at"].isoformat()
+            if exec.get("completed_at"):
+                exec["completed_at"] = exec["completed_at"].isoformat()
+            if exec.get("error") and exec["error"].get("timestamp"):
+                exec["error"]["timestamp"] = exec["error"]["timestamp"].isoformat()
+
+        return {"executions": executions, "total": len(executions)}
+
+    except Exception as e:
+        logger.error(f"Error fetching executions: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# GOOGLE SHEET AUTOMATION — SENT NUMBERS STATS
+# =============================================================================
+
+@router.get("/{flow_id}/sheet-stats")
+async def get_google_sheet_flow_stats(flow_id: str, user: CurrentUser):
     """
-    Unpublish a flow — sets status back to draft and removes the
-    top-level webhook fields so it stops being triggered.
+    Get statistics for a google_sheet automation flow:
+    how many unique phone numbers have been messaged.
     """
     try:
         org_id = user.org_id
-        flow = await unpublish_automation_flow(
-            org_id=org_id,
-            flow_id=flow_id,
-            updated_by=user.user_id,
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        sent_count = db["google_sheet_sent_numbers"].count_documents(
+            {"org_id": org_id, "flow_id": flow_id}
         )
-        if not flow:
-            raise HTTPException(status_code=404, detail="Flow not found")
-        return {"flow": flow, "message": "Flow unpublished successfully"}
+
+        recent_sent = list(
+            db["google_sheet_sent_numbers"]
+            .find({"org_id": org_id, "flow_id": flow_id}, {"_id": 0, "phone": 1, "sent_at": 1})
+            .sort("sent_at", -1)
+            .limit(20)
+        )
+
+        for record in recent_sent:
+            if record.get("sent_at") and hasattr(record["sent_at"], "isoformat"):
+                record["sent_at"] = record["sent_at"].isoformat()
+
+        return {
+            "flow_id": flow_id,
+            "total_sent": sent_count,
+            "recent_sent": recent_sent,
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error unpublishing automation flow {flow_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to unpublish automation flow: {e}")
+        logger.error(f"Error fetching sheet stats for flow {flow_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# FOLLOW-UP MANAGEMENT ENDPOINTS (WhatsApp Scheduler)
+# =============================================================================
+
+@router.get("/{flow_id}/followups")
+async def get_flow_followups(
+    flow_id: str,
+    user: CurrentUser,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    """List scheduled follow-up jobs for a specific flow."""
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        from services.automation_scheduler import list_followups_for_flow
+        followups = list_followups_for_flow(org_id, flow_id, status=status, limit=limit)
+
+        return {"followups": followups, "total": len(followups)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching followups for flow {flow_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{flow_id}/followups/{schedule_id}")
+async def cancel_flow_followup(flow_id: str, schedule_id: str, user: CurrentUser):
+    """Cancel a specific pending follow-up job."""
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        from services.automation_scheduler import cancel_followup
+        cancelled = cancel_followup(schedule_id=schedule_id, org_id=org_id)
+
+        if not cancelled:
+            raise HTTPException(
+                status_code=404,
+                detail="Follow-up not found or already in terminal state (completed/failed/cancelled)"
+            )
+
+        return {"message": f"Follow-up {schedule_id} cancelled successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling followup {schedule_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/followups/pending")
+async def get_pending_followups(user: CurrentUser):
+    """List all pending and executing follow-up jobs for the organization."""
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        from services.automation_scheduler import list_followups_for_org
+        pending = list_followups_for_org(org_id, status="pending", limit=100)
+        executing = list_followups_for_org(org_id, status="executing", limit=100)
+
+        return {
+            "pending": pending,
+            "executing": executing,
+            "total_active": len(pending) + len(executing),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching pending followups: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{flow_id}/followups/stats")
+async def get_followup_stats(flow_id: str, user: CurrentUser):
+    """Aggregated statistics for follow-up jobs of a specific flow."""
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        pipeline = [
+            {"$match": {"org_id": org_id, "flow_id": flow_id}},
+            {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+        ]
+
+        raw = list(db["automation_scheduled_followups"].aggregate(pipeline))
+        stats = {item["_id"]: item["count"] for item in raw}
+
+        for s in ["pending", "executing", "completed", "failed", "cancelled"]:
+            stats.setdefault(s, 0)
+
+        stats["total"] = sum(stats.values())
+        return {"flow_id": flow_id, "stats": stats}
+
+    except Exception as e:
+        logger.error(f"Error fetching followup stats for flow {flow_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# AVAILABLE TRIGGERS & ACTIONS (discovery endpoints)
+# =============================================================================
+
+@router.get("/triggers/available")
+async def get_available_triggers(user: CurrentUser):
+    """Get list of available trigger types"""
+    triggers = [
+        {
+            "type": "instagram_comment",
+            "name": "Instagram Post Comment",
+            "description": "Triggers when someone comments on your Instagram post",
+            "platform": "instagram",
+            "requires": ["post_id"],
+            "optional": ["keyword"]
+        },
+        {
+            "type": "instagram_dm_received",
+            "name": "Instagram DM Received",
+            "description": "Triggers when you receive a DM on Instagram",
+            "platform": "instagram",
+            "requires": [],
+            "optional": ["keyword"]
+        },
+        {
+            "type": "instagram_story_reply",
+            "name": "Instagram Story Reply",
+            "description": "Triggers when someone replies to your story",
+            "platform": "instagram",
+            "requires": ["story_id"],
+            "optional": []
+        },
+        {
+            "type": "whatsapp_message_received",
+            "name": "WhatsApp Message Received",
+            "description": "Triggers when you receive a WhatsApp message",
+            "platform": "whatsapp",
+            "requires": [],
+            "optional": ["keyword"]
+        },
+        {
+            "type": "whatsapp_followup",
+            "name": "WhatsApp Follow-Up",
+            "description": "Schedule an automated follow-up message to a specific WhatsApp conversation",
+            "platform": "whatsapp",
+            "requires": ["conversation_id"],
+            "optional": []
+        },
+        {
+            "type": "contact_tag_added",
+            "name": "Tag Added",
+            "description": "Triggers when a tag is added to a contact",
+            "platform": "both",
+            "requires": ["tag"],
+            "optional": []
+        },
+        # ─── NEW: Google Sheet trigger ────────────────────────────────────────
+        {
+            "type": "google_sheet",
+            "name": "Google Sheet Row",
+            "description": "Sends a WhatsApp message to phone numbers in a Google Sheet column. Each number receives the message only once. New entries trigger automatically.",
+            "platform": "google_sheet",
+            "requires": ["sheet_id", "column_name"],
+            "optional": ["row_start", "row_end"]
+        },
+    ]
+
+    return {"triggers": triggers}
+
+
+@router.get("/actions/available")
+async def get_available_actions(user: CurrentUser):
+    """Get list of available action types"""
+    actions = [
+        {
+            "type": "reply_to_comment",
+            "name": "Reply to Comment",
+            "description": "Reply to an Instagram comment",
+            "platform": "instagram",
+            "requires": ["text"]
+        },
+        {
+            "type": "send_dm",
+            "name": "Send DM",
+            "description": "Send a direct message on Instagram",
+            "platform": "instagram",
+            "requires": ["text"],
+            "optional": ["link_url", "button_title"]
+        },
+        {
+            "type": "instagram_message",
+            "name": "Send Instagram Message",
+            "description": "Send a message on Instagram",
+            "platform": "instagram",
+            "requires": ["messageType", "text"]
+        },
+        {
+            "type": "whatsapp_message",
+            "name": "Send WhatsApp Message",
+            "description": "Send a WhatsApp message",
+            "platform": "whatsapp",
+            "requires": ["messageType", "text"]
+        },
+        {
+            "type": "add_tag",
+            "name": "Add Tag",
+            "description": "Add a tag to a contact",
+            "platform": "both",
+            "requires": ["tag"]
+        },
+        {
+            "type": "remove_tag",
+            "name": "Remove Tag",
+            "description": "Remove a tag from a contact",
+            "platform": "both",
+            "requires": ["tag"]
+        },
+        {
+            "type": "delay",
+            "name": "Delay",
+            "description": "Wait for a specified duration",
+            "platform": "both",
+            "requires": ["amount", "unit"]
+        },
+        {
+            "type": "smart_delay",
+            "name": "Smart Delay",
+            "description": "Wait for a specified duration before the next action",
+            "platform": "both",
+            "requires": ["amount", "unit"]
+        },
+        {
+            "type": "condition",
+            "name": "Condition",
+            "description": "Branch based on a condition",
+            "platform": "both",
+            "requires": ["variable", "operator", "value"]
+        }
+    ]
+
+    return {"actions": actions}
