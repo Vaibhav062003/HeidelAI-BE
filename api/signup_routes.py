@@ -168,7 +168,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
         
         return {"success": True, "next_step": "SUCCESS", "org_id" : organization.get("id")}
     
-    elif plan_id in ["growth_monthly_inr_3499", "growth_yearly_inr_37789"]:
+    elif plan_id in ["growth_monthly_inr_3499", "growth_yearly_inr_37789", "growth_yearly_usd_456", "growth_monthly_usd_46"]:
         # Update session with paid plan
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
@@ -185,7 +185,7 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
             raise HTTPException(status_code=400, detail="Invalid Session")
         
         org_name = f"{session.get('first_name')}'s Organization"
-        max_allowed_members = 2
+        max_allowed_members = 4
         owner = {
             "clerk_user_id": session.get("clerk_user_id"),
             "owner_email": session.get("email"),
@@ -199,13 +199,14 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
             max_allowed_members=max_allowed_members,
             session_id=session_id,
             owner=owner,
-            plan="free"
+            plan="growth_monthly" if "monthly" in plan_id else "growth_yearly"
         )
 
         if not organization:
             raise HTTPException(status_code=500, detail="Failed to create organization")
         
         return {"success": True, "next_step": "PHONE_NUMBER", "org_id" : organization.get("id")}
+    
     elif plan_id in ["enterprise"]:
         # Update session with enterprise plan
         session = db.onboarding_sessions.find_one_and_update(
