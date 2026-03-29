@@ -1517,6 +1517,23 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
             logger.info(f"Duplicate comment ID {comment_id}, skipping processing.")
             return
         
+        # Record this comment ID to prevent duplicate processing on webhook retries
+        current_time = datetime.now(timezone.utc).timestamp()
+        services.processed_message_ids[comment_id] = current_time
+
+        # Cleanup expired processed message IDs to keep the map from growing indefinitely
+        expiry_seconds = 60 * 60  # 1 hour TTL
+        expired_ids = [
+            msg_id for msg_id, ts in list(services.processed_message_ids.items())
+            if current_time - ts > expiry_seconds
+        ]
+        for msg_id in expired_ids:
+            try:
+                del services.processed_message_ids[msg_id]
+            except KeyError:
+                # Entry may have been removed concurrently; safe to ignore
+                pass
+        
         logger.info(f" Instagram Comment Received: @{commenter_username} on post {post_id}: '{comment_text}'")
         
         #  Get connection from instagram_connections 
