@@ -867,71 +867,6 @@ async def send_private_reply(
         logger.error(f"❌ Error sending DM: {str(e)}")
         return False
 
-async def process_comments_events(value, ig_account_id): 
-    comment_id = value.get('id')
-    text = value.get('text', '').lower()
-    from_user = value.get('from', {}).get('username', 'unknown_user')
-    media_id = value.get('media', {}).get('id')
-    user_id = value.get('from', {}).get('id')
-
-    logger.info(f"new comment by @{from_user}: {text} on media_id {media_id}")
-
-    if not media_id or not user_id:
-        logger.error("Missing media_id or user_id.")
-        return
-
-    # ADD THIS: Get org_id and trigger automation
-    from services.automation_trigger_handler import check_and_trigger_automations
-    
-    org_data = db.organizations.find_one({"ig_id": ig_account_id})
-    if org_data:
-        org_id = org_data.get("org_id")
-        
-        # Trigger automation check BEFORE existing keyword logic
-        await check_and_trigger_automations(
-            org_id=org_id,
-            platform="instagram",
-            event_type="post_comment",
-            trigger_data={
-                "platform": "instagram",
-                "platform_id": ig_account_id,
-                "comment_id": comment_id,
-                "comment_text": text,
-                "commenter_username": from_user,
-                "commenter_id": user_id,
-                "post_id": media_id,
-                "message_text": text  # For keyword matching
-            }
-        )
-
-    media_info = media_data.get(str(media_id))
-
-    if media_info and media_info['keyword'].lower() in text:
-        # Initialize the set if media_id not seen before
-        if str(media_id) not in services.responded_users_by_media:
-            services.responded_users_by_media[str(media_id)] = set()
-
-        if user_id not in services.responded_users_by_media[str(media_id)]:
-            logger.success(f"Keyword match found: '{media_info['keyword']}' in comment text. First time responding.")
-            reply_message = media_info['reply']
-            link_url = media_info.get('link')
-            button_title = media_info.get('button_title', 'View Offer')
-
-            await reply_to_comment(comment_id,reply_message, ig_account_id)
-
-            await send_private_reply(
-                comment_id=comment_id,
-                ig_account_id=ig_account_id,
-                message_text=reply_message,
-                link_url=link_url,
-                button_title=button_title
-            )
-
-            services.responded_users_by_media[str(media_id)].add(user_id)
-        else:
-            logger.info(f"Already responded to user_id {user_id} for media_id {media_id}. Skipping.")
-    else:
-        logger.warning("No matching keyword or media not tracked.")
 
 # === Disconnect and Archive helpers for Instagram ===
 
@@ -1575,7 +1510,7 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
-        # Trigger automation system with correct event_type
+        #  Add tasks to background_tasks to trigger automation system
         from services.automation_trigger_handler import check_and_trigger_automations
         
         background_tasks.add_task(
@@ -1585,9 +1520,39 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
             event_type="post_comment",  # Maps to "instagram_comment" trigger
             trigger_data=trigger_data
         )
+
+        #  Legacy keyword matching logic (Supabase)
+        media_info = media_data.get(str(post_id))
+        if media_info and media_info['keyword'].lower() in comment_text.lower():
+            # Initialize responded users for this media if needed
+            if str(post_id) not in services.responded_users_by_media:
+                services.responded_users_by_media[str(post_id)] = set()
+
+            if str(commenter_id) not in services.responded_users_by_media[str(post_id)]:
+                logger.success(f"✅ Keyword match found: '{media_info['keyword']}' for commenter {commenter_id}")
+                reply_message = media_info['reply']
+                link_url = media_info.get('link')
+                button_title = media_info.get('button_title', 'View Offer')
+
+                # Public Reply 
+                await reply_to_comment(comment_id, reply_message, ig_account_id)
+
+                # Private DM
+                await send_private_reply(
+                    comment_id=comment_id,
+                    ig_account_id=ig_account_id,
+                    message_text=reply_message,
+                    link_url=link_url,
+                    button_title=button_title
+                )
+
+                # Record that we responded to this user on this media
+                services.responded_users_by_media[str(post_id)].add(str(commenter_id))
+            else:
+                logger.info(f"⏭ Already responded to user_id {commenter_id} for post {post_id}. Skipping keyword reply.")
         
-        logger.success(f" Processed Instagram comment automation for comment {comment_id}")
+        logger.success(f"✅ Processed Instagram comment {comment_id} successfully.")
         
     except Exception as e:
-        logger.error(f"Error processing Instagram comment event: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error processing Instagram comment event: {str(e)}", exc_info=True)
 
