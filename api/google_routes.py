@@ -1,4 +1,5 @@
 import requests
+import uuid
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -6,9 +7,7 @@ from pydantic import BaseModel
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
 from config.settings import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
-from core.logger import get_logger
-
-logger = get_logger(__name__)
+from loguru import logger
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/google", tags=["Google"])
@@ -102,7 +101,9 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
             now.timestamp() + expires_in, tz=timezone.utc
         )
 
+        google_id = f"goog_{uuid.uuid4().hex}"
         connection_doc = {
+            "id": google_id,
             "org_id": org_id,
             "status": "active",
             "email": email,
@@ -136,7 +137,13 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
             upsert=True
         )
 
-        logger.info(f"Google connection stored for org {org_id} ({email})")
+        # Update organization document with google_id
+        db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"google_id": google_id}}
+        )
+
+        logger.info(f"Google connection stored and linked for org {org_id} ({email})")
 
         # ── Step 4: Return sanitized profile to frontend ──────────────────────
         return {
@@ -234,6 +241,12 @@ async def google_disconnect(user: CurrentUser):
             {"$set": {"status": "inactive", "disconnected_at": now.isoformat(), "updated_at": now.isoformat()}}
         )
 
+        # Update organization document to clear google_id
+        db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"google_id": None}}
+        )
+
         # ── Step 3: Disable polling on all sheets ─────────────────────────────
         result = db.google_sheets_connections.update_many(
             {"org_id": org_id},
@@ -241,7 +254,7 @@ async def google_disconnect(user: CurrentUser):
         )
         logger.info(f"Disabled polling on {result.modified_count} sheets for org {org_id}")
 
-        logger.info(f"Google account disconnected for org {org_id}")
+        logger.info(f"Google account disconnected and unlinked for org {org_id}")
 
         return {"message": "Google account disconnected successfully"}
 

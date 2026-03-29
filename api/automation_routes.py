@@ -437,137 +437,36 @@ async def get_followup_stats(flow_id: str, user: CurrentUser):
 @router.get("/triggers/available")
 async def get_available_triggers(user: CurrentUser):
     """Get list of available trigger types"""
-    triggers = [
-        {
-            "type": "instagram_comment",
-            "name": "Instagram Post Comment",
-            "description": "Triggers when someone comments on your Instagram post",
-            "platform": "instagram",
-            "requires": ["post_id"],
-            "optional": ["keyword"]
-        },
-        {
-            "type": "instagram_dm_received",
-            "name": "Instagram DM Received",
-            "description": "Triggers when you receive a DM on Instagram",
-            "platform": "instagram",
-            "requires": [],
-            "optional": ["keyword"]
-        },
-        {
-            "type": "instagram_story_reply",
-            "name": "Instagram Story Reply",
-            "description": "Triggers when someone replies to your story",
-            "platform": "instagram",
-            "requires": ["story_id"],
-            "optional": []
-        },
-        {
-            "type": "whatsapp_message_received",
-            "name": "WhatsApp Message Received",
-            "description": "Triggers when you receive a WhatsApp message",
-            "platform": "whatsapp",
-            "requires": [],
-            "optional": ["keyword"]
-        },
-        {
-            "type": "whatsapp_followup",
-            "name": "WhatsApp Follow-Up",
-            "description": "Schedule an automated follow-up message to a specific WhatsApp conversation",
-            "platform": "whatsapp",
-            "requires": ["conversation_id"],
-            "optional": []
-        },
-        {
-            "type": "contact_tag_added",
-            "name": "Tag Added",
-            "description": "Triggers when a tag is added to a contact",
-            "platform": "both",
-            "requires": ["tag"],
-            "optional": []
-        },
-        # ─── NEW: Google Sheet trigger ────────────────────────────────────────
-        {
-            "type": "google_sheet",
-            "name": "Google Sheet Row",
-            "description": "Sends a WhatsApp message to phone numbers in a Google Sheet column. Each number receives the message only once. New entries trigger automatically.",
-            "platform": "google_sheet",
-            "requires": ["sheet_id", "column_name"],
-            "optional": ["row_start", "row_end"]
-        },
-    ]
+    try:
+        triggers_collection = db["automation_trigger_types"]
 
-    return {"triggers": triggers}
+        triggers = list(
+            triggers_collection.find(
+                {}, {"_id": 0}
+            )
+        )
+
+        return {"triggers": triggers}
+
+    except Exception as e:
+        logger.error(f"Error fetching triggers: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch triggers")
 
 
 @router.get("/actions/available")
 async def get_available_actions(user: CurrentUser):
     """Get list of available action types"""
-    actions = [
-        {
-            "type": "reply_to_comment",
-            "name": "Reply to Comment",
-            "description": "Reply to an Instagram comment",
-            "platform": "instagram",
-            "requires": ["text"]
-        },
-        {
-            "type": "send_dm",
-            "name": "Send DM",
-            "description": "Send a direct message on Instagram",
-            "platform": "instagram",
-            "requires": ["text"],
-            "optional": ["link_url", "button_title"]
-        },
-        {
-            "type": "instagram_message",
-            "name": "Send Instagram Message",
-            "description": "Send a message on Instagram",
-            "platform": "instagram",
-            "requires": ["messageType", "text"]
-        },
-        {
-            "type": "whatsapp_message",
-            "name": "Send WhatsApp Message",
-            "description": "Send a WhatsApp message",
-            "platform": "whatsapp",
-            "requires": ["messageType", "text"]
-        },
-        {
-            "type": "add_tag",
-            "name": "Add Tag",
-            "description": "Add a tag to a contact",
-            "platform": "both",
-            "requires": ["tag"]
-        },
-        {
-            "type": "remove_tag",
-            "name": "Remove Tag",
-            "description": "Remove a tag from a contact",
-            "platform": "both",
-            "requires": ["tag"]
-        },
-        {
-            "type": "delay",
-            "name": "Delay",
-            "description": "Wait for a specified duration",
-            "platform": "both",
-            "requires": ["amount", "unit"]
-        },
-        {
-            "type": "smart_delay",
-            "name": "Smart Delay",
-            "description": "Wait for a specified duration before the next action",
-            "platform": "both",
-            "requires": ["amount", "unit"]
-        },
-        {
-            "type": "condition",
-            "name": "Condition",
-            "description": "Branch based on a condition",
-            "platform": "both",
-            "requires": ["variable", "operator", "value"]
-        }
-    ]
+    try:
+        actions_collection = db["automation_action_types"]
 
-    return {"actions": actions}
+        actions = list(
+            actions_collection.find(
+                {}, {"_id": 0}
+            )
+        )
+
+        return {"actions": actions}
+
+    except Exception as e:
+        logger.error(f"Error fetching actions: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch actions")

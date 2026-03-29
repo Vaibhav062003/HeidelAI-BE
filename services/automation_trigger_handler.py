@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from database import get_mongo_db
 from core.logger import get_logger
 from services.automation_execution import execute_automation_flow
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 

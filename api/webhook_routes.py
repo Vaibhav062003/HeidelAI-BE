@@ -26,6 +26,7 @@ from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WE
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
+from services.automation_trigger_handler import check_and_trigger_automations
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -1459,7 +1460,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     )
                     
                     if not message_echo:
-                        from services.automation_trigger_handler import check_and_trigger_automations
+                        
 
                         await check_and_trigger_automations(
                             org_id=org_id,

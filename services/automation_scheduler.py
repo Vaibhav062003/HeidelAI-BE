@@ -24,9 +24,8 @@ from typing import Optional, List, Dict
 
 from database import get_mongo_db
 from services.utils import serialize_mongo
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 
 db = get_mongo_db()
 

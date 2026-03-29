@@ -21,9 +21,8 @@ from pydantic import BaseModel
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
 from config.settings import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/google-sheets", tags=["Google Sheets"])

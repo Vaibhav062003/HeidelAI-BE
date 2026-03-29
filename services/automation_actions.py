@@ -5,9 +5,8 @@ from typing import Dict, Any
 from database import get_mongo_db
 from services.ig_service import send_ig_message, send_ig_media_message
 from services.wa_service import send_whatsapp_message
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 

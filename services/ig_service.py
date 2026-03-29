@@ -698,10 +698,10 @@ media_data = fetch_media_data()
 
 import httpx
 from database import get_mongo_db
-from core.logger import get_logger
+
 
 db = get_mongo_db()
-logger = get_logger(__name__)
+
 
 
 async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str) -> bool:

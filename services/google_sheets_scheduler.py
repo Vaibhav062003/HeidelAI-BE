@@ -3,9 +3,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from database import get_mongo_db
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 POLL_INTERVAL_SECONDS = 60
