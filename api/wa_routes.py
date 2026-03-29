@@ -1,5 +1,6 @@
 # Built-in modules
 import uuid
+import asyncio
 import httpx
 import requests
 from typing import Optional
@@ -21,7 +22,7 @@ from fastapi import (
 from core.services import services
 from services.utils import serialize_mongo
 from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template, BulkMessageRequest
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, get_bulk_job, run_bulk_send_job
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, run_bulk_send_job
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_mongo_db
@@ -1064,9 +1065,8 @@ async def whatsapp_create_template(user: CurrentUser, template: Template):
                 detail="WhatsApp connection not found or access token missing"
             )
 
-        logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
-
-
+        logger.info(f"Creating WhatsApp template: name={template.name}, language={template.language}, category={template.category}, components_count={len(template.components)}")
+        
         templates = await create_templates(org_id, wa_id, access_token, template.name, template.language, template.category, template.components)
 
         return {
@@ -1075,10 +1075,94 @@ async def whatsapp_create_template(user: CurrentUser, template: Template):
             "templates": templates
         }
 
+    except HTTPException as e:
+        # Re-raise HTTPException to preserve status code and detail from create_templates
+        logger.error(f"HTTP Error creating templates: {e.detail}")
+        raise e
     except Exception as e:
-        logger.error(f"Error creating templates: {str(e)}")
+        logger.error(f"Unexpected error creating templates: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create templates: {str(e)}")
 
+
+@router.delete("/templates/{template_name}")
+async def delete_whatsapp_template(template_name: str, user: CurrentUser):
+    """
+    Delete a WhatsApp template by name.
+    """
+    try:
+        org_id = user.org_id
+        org_document = db.organizations.find_one({"org_id": org_id})
+
+        if not org_document:
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        wa_id = org_document.get("wa_id")
+        
+        if not wa_id:
+            raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
+
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": wa_id, "org_id": org_id},
+            {"_id": 0, "access_token": 1}
+        )
+
+        if not connection or "access_token" not in connection:
+            raise HTTPException(
+                status_code=404,
+                detail="WhatsApp connection not found or access token missing"
+            )
+
+        access_token = connection["access_token"]
+        
+        # Split template names if multiple are provided (e.g., "template1,template2")
+        template_names = [name.strip() for name in template_name.split(",")]
+        
+        url = f"https://graph.facebook.com/v24.0/{wa_id}/message_templates"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        
+        results = []
+        errors = []
+
+        async with httpx.AsyncClient() as client:
+            for name in template_names:
+                params = {"name": name}
+                try:
+                    response = await client.delete(url, headers=headers, params=params)
+                    if response.status_code == 200:
+                        results.append(name)
+                        logger.success(f"Successfully deleted WhatsApp template: {name}")
+                    else:
+                        try:
+                            error_data = response.json()
+                            error_msg = error_data.get("error", {}).get("message", "Unknown error")
+                        except ValueError:
+                            body_text = response.text or ""
+                            error_msg = body_text if body_text.strip() else "Unknown error"
+                        errors.append({"name": name, "error": error_msg})
+                        logger.error(f"Failed to delete WhatsApp template {name}: {error_msg}")
+                except Exception as e:
+                    errors.append({"name": name, "error": str(e)})
+                    logger.error(f"Exception deleting WhatsApp template {name}: {str(e)}")
+
+        if errors and not results:
+            # If everything failed
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "Failed to delete templates", "errors": errors}
+            )
+
+        return {
+            "status": "success",
+            "message": f"Templates deleted successfully",
+            "deleted": results,
+            "failed": errors
+        }
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        logger.error(f"Unexpected error deleting WhatsApp template: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete template: {str(e)}")
 
 @router.post("/bulk/send")
 async def bulk_send_whatsapp_message(
@@ -1089,14 +1173,14 @@ async def bulk_send_whatsapp_message(
     """
     Enqueue a bulk WhatsApp template send as a background job.
 
-    Returns immediately with a `job_id`. Poll `/bulk/status/{job_id}` to track progress.
+    Returns immediately with a `job_id`. Poll `/sse/bulk-status/{job_id}` to track progress.
     - template_name: Name of an APPROVED template in your WhatsApp Business account.
     - language_code: BCP-47 code (e.g. 'en', 'en_US', 'hi').
-    - recipients: List of objects with `phone_number` (E.164 without '+').
-    - delay_seconds: Pause between sends in seconds (minimum 0.5, default 4.0).
+    - recipients: List of objects with `phone_number` (E.164 digits only).
+    - delay_seconds: Pause between batches of sends in seconds (minimum 8.0, default 8.0). Each batch
+      can include up to `max_concurrent` recipients.
     """
     try:
-        import uuid as _uuid
         org_id = user.org_id
         logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(request.recipients)}")
 
@@ -1117,21 +1201,22 @@ async def bulk_send_whatsapp_message(
             {"_id": 0, "access_token": 1, "phone_id": 1}
         )
 
-        if not connection or "access_token" not in connection:
+        if not connection or not connection.get("access_token"):
             raise HTTPException(
                 status_code=404,
                 detail="WhatsApp connection not found or access token missing"
             )
 
-        access_token = connection["access_token"]
+        access_token = connection.get("access_token")
         phone_id = connection.get("phone_id")
 
         if not phone_id:
             raise HTTPException(status_code=400, detail="Phone ID not found for this WhatsApp connection")
 
-        # Create the job record synchronously so the client gets the job_id immediately
-        job_id = _uuid.uuid4().hex
-        create_bulk_job(
+        # Create the job record off the event loop so the client gets the job_id immediately
+        job_id = uuid.uuid4().hex
+        await asyncio.to_thread(
+            create_bulk_job,
             org_id=org_id,
             job_id=job_id,
             template_name=request.template_name,
@@ -1144,7 +1229,6 @@ async def bulk_send_whatsapp_message(
             run_bulk_send_job,
             job_id=job_id,
             org_id=org_id,
-            wa_id=wa_id,
             phone_id=phone_id,
             access_token=access_token,
             template_name=request.template_name,
@@ -1152,13 +1236,14 @@ async def bulk_send_whatsapp_message(
             recipients=request.recipients,
             components=request.components,
             delay_seconds=request.delay_seconds,
+            # max_concurrent=20, # Optional: can be passed if needed
         )
 
         logger.success(f"Bulk WA | job={job_id} enqueued | org={org_id} | recipients={len(request.recipients)}")
 
         return {
             "status": "accepted",
-            "message": f"Bulk send job enqueued. Poll /bulk/status/{job_id} for progress.",
+            "message": "Bulk send job enqueued.",
             "job_id": job_id,
             "total": len(request.recipients),
         }
@@ -1169,24 +1254,3 @@ async def bulk_send_whatsapp_message(
         raise HTTPException(status_code=500, detail=f"Bulk send failed: {str(e)}")
 
 
-@router.get("/bulk/status/{job_id}")
-async def get_bulk_send_status(job_id: str, user: CurrentUser):
-    """
-    Poll the status of a bulk WhatsApp send job.
-
-    Returns job metadata including current progress (`sent`, `failed`, `total`),
-    overall `status` (pending | running | completed | failed), and per-recipient `results`.
-    """
-    org_id = user.org_id
-    try:
-        job = get_bulk_job(job_id=job_id, org_id=org_id)
-
-        if not job:
-            raise HTTPException(status_code=404, detail="Bulk send job not found")
-
-        return serialize_mongo(job)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching bulk job status | job_id={job_id} org_id={org_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch job status: {str(e)}")

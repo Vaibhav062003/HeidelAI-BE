@@ -20,7 +20,7 @@ db = get_mongo_db()
 
 
 async def create_subscription(
-    plan_id: Literal["growth_monthly_inr_3499", "growth_yearly_inr_37789"],
+    plan_id: Literal["growth_monthly_inr_3499", "growth_yearly_inr_37789", "growth_yearly_usd_456", "growth_monthly_usd_46"],
     customer_full_name: str,
     customer_email: str,
     customer_phone: str,
@@ -31,6 +31,8 @@ async def create_subscription(
     PLAN_CONFIG = {
         "growth_monthly_inr_3499": {"amount": 3499.00, "days": 30}, 
         "growth_yearly_inr_37789":  {"amount": 37789.00, "days": 365},
+        "growth_yearly_usd_456":  {"amount": 456.00, "days": 365},
+        "growth_monthly_usd_46":  {"amount": 46.00, "days": 30}
     }
     
     if plan_id not in PLAN_CONFIG:
