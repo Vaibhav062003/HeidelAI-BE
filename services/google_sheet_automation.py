@@ -126,7 +126,7 @@ async def process_google_sheet_trigger(
         if not phone_raw:
             continue
 
-        phone = _normalize_phone(phone_raw)
+        phone = phone_raw
         if not phone:
             logger.warning(f"[GoogleSheetAuto] Invalid phone '{phone_raw}' — skipping")
             stats["skipped"] += 1
@@ -386,26 +386,6 @@ def _get_wa_connection(org_id: str) -> Optional[dict]:
         return None
     wa_id = org["wa_id"]
     return db.whatsapp_connections.find_one({"wa_id": wa_id, "org_id": org_id})
-
-
-def _normalize_phone(phone: str) -> Optional[str]:
-    """
-    Normalize phone number to E.164 format.
-    Returns None if the number looks invalid.
-    """
-    cleaned = re.sub(r"[\s\-\(\)\.]", "", phone)
-
-    if cleaned.startswith("+"):
-        digits = cleaned[1:]
-    elif cleaned.startswith("00"):
-        digits = cleaned[2:]
-    else:
-        digits = cleaned
-
-    if not digits.isdigit() or len(digits) < 7 or len(digits) > 15:
-        return None
-
-    return "+" + digits if not cleaned.startswith("+") else cleaned
 
 
 def _already_sent(org_id: str, flow_id: str, phone: str) -> bool:
