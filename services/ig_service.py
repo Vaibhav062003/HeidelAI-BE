@@ -697,12 +697,6 @@ media_data = fetch_media_data()
 # INSTAGRAM COMMENT AUTOMATION FUNCTIONS
 # ============================================================================
 
-import httpx
-from database import get_mongo_db
-
-
-db = get_mongo_db()
-
 
 
 async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str) -> bool:
@@ -1449,23 +1443,23 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
             logger.warning("Missing comment_id or post_id in webhook payload")
             return
         
-        if comment_id in services.processed_message_ids:
+        if comment_id in services.processed_comment_ids:
             logger.info(f"Duplicate comment ID {comment_id}, skipping processing.")
             return
         
         # Record this comment ID to prevent duplicate processing on webhook retries
         current_time = datetime.now(timezone.utc).timestamp()
-        services.processed_message_ids[comment_id] = current_time
+        services.processed_comment_ids[comment_id] = current_time
 
-        # Cleanup expired processed message IDs to keep the map from growing indefinitely
+        # Cleanup expired processed comment IDs to keep the map from growing indefinitely
         expiry_seconds = 60 * 60  # 1 hour TTL
         expired_ids = [
-            msg_id for msg_id, ts in list(services.processed_message_ids.items())
+            msg_id for msg_id, ts in list(services.processed_comment_ids.items())
             if current_time - ts > expiry_seconds
         ]
         for msg_id in expired_ids:
             try:
-                del services.processed_message_ids[msg_id]
+                del services.processed_comment_ids[msg_id]
             except KeyError:
                 # Entry may have been removed concurrently; safe to ignore
                 pass

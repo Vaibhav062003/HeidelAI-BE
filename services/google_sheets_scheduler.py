@@ -128,6 +128,8 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
 
         if rows > 0:
             logger.info(f"[Scheduler] Synced {rows} new row(s) from sheet {sheet_id} for org {org_id}")
+            # Ensure per-org indexes exist before processing
+            ensure_org_row_indexes(org_id)
             # Trigger any google_sheet automation flows for this sheet
             await _trigger_google_sheet_automations(org_id, sheet_id)
 

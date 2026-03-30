@@ -20,8 +20,11 @@ from typing import Optional
 from database import get_mongo_db
 from loguru import logger
 import asyncio
+from collections import namedtuple
 
 db = get_mongo_db()
+
+Recipient = namedtuple("Recipient", ["phone_number"])
 
 SENT_COLLECTION = "google_sheet_sent_numbers"
 
@@ -195,7 +198,7 @@ async def process_google_sheet_trigger(
             access_token=wa_access_token,
             template_name="",
             language_code="",
-            recipients=[type("R", (), {"phone_number": phone})()],
+            recipients=[Recipient(phone_number=phone)],
             components=None,
             delay_seconds=1.0,
             message_text=resolved_text,   # plain-text mode
@@ -269,7 +272,12 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
         message_text = trigger.get("message_text", "")
 
         if not message_text:
-            message_text = _get_flow_message_text(org_id, flow_id, trigger.get("start_node_id"))
+            message_text = await asyncio.to_thread(
+                _get_flow_message_text,
+                org_id,
+                flow_id,
+                trigger.get("start_node_id"),
+            )
 
         if not message_text:
             logger.warning(
@@ -404,11 +412,20 @@ async def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
     def _sync_claim():
         try:
             now = datetime.now(timezone.utc)
-            # We use a status field so we can differentiate between "claimed but failed" 
-            # and "sent successfully" in the future if needed, though for now we 
-            # just need to ensure atomic first-time processing.
+            # If the record already exists, only allow re-claiming if it's "pending" 
+            # and stayed that way for more than 1 hour (handling transient failures).
+            expiry_threshold = now - timedelta(hours=1)
+            
             result = db[SENT_COLLECTION].update_one(
-                {"org_id": org_id, "flow_id": flow_id, "phone": phone},
+                {
+                    "org_id": org_id, 
+                    "flow_id": flow_id, 
+                    "phone": phone,
+                    "$or": [
+                        {"status": {"$exists": False}}, # Legacy support
+                        {"status": "pending", "updated_at": {"$lt": expiry_threshold}}
+                    ]
+                },
                 {"$setOnInsert": {
                     "org_id": org_id,
                     "flow_id": flow_id,
@@ -429,6 +446,7 @@ async def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
 
 def _mark_sent(org_id: str, flow_id: str, phone: str, sheet_id: str):
     """Record that a message was sent to this phone number for this flow."""
+    now = datetime.now(timezone.utc)
     db[SENT_COLLECTION].update_one(
         {"org_id": org_id, "flow_id": flow_id, "phone": phone},
         {
@@ -437,7 +455,9 @@ def _mark_sent(org_id: str, flow_id: str, phone: str, sheet_id: str):
                 "flow_id": flow_id,
                 "phone": phone,
                 "sheet_id": sheet_id,
-                "sent_at": datetime.now(timezone.utc),
+                "status": "sent",
+                "sent_at": now,
+                "updated_at": now
             }
         },
         upsert=True,

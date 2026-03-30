@@ -15,6 +15,7 @@ class Services:
         self.address_details = []
         self.responded_users_by_media = {}
         self.processed_message_ids = OrderedDict()
+        self.processed_comment_ids = OrderedDict()
         self.processed_message_reaction_ids = OrderedDict()
         self.active_connections: List[WebSocket] = []
         self.whatsapp_connections_map: Dict[str, Set[str]] = {}

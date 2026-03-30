@@ -507,7 +507,14 @@ async def _register_single_trigger(
     """Register a single non-followup, non-google_sheet trigger in automation_triggers."""
     triggers_collection = _automation_triggers_collection()
 
-    platform = "instagram" if "instagram" in trigger_type else "whatsapp"
+    # Determine platform from trigger type
+    if any(ig_key in trigger_type for ig_key in ["instagram", "ig_comment", "ig_dm", "ig_story"]):
+        platform = "instagram"
+    elif any(wa_key in trigger_type for wa_key in ["whatsapp", "wa_"]):
+        platform = "whatsapp"
+    else:
+        # Fallback based on trigger type context or existing defaults
+        platform = "whatsapp"
 
     keyword_value = config.get("keyword", "")
     if isinstance(keyword_value, list):
