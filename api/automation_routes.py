@@ -65,7 +65,7 @@ async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         if payload.flow_data:
-            is_valid, error_message = validate_flow_structure(payload.flow_data.dict())
+            is_valid, error_message = validate_flow_structure(payload.flow_data.model_dump())
             if not is_valid:
                 raise HTTPException(status_code=400, detail=f"Invalid flow structure: {error_message}")
 
@@ -73,7 +73,7 @@ async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
             org_id=org_id,
             name=payload.name,
             description=payload.description,
-            flow_data=payload.flow_data.dict() if payload.flow_data else None,
+            flow_data=payload.flow_data.model_dump() if payload.flow_data else None,
             created_by=user.user_id
         )
 

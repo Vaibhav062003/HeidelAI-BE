@@ -20,6 +20,7 @@ from database import get_mongo_db, get_mongo_client
 from core.services import services
 from services.scheduler_service import abort_scheduled_message
 from services.conversation_utils import reopen_conversation
+from services.automation_trigger_handler import check_and_trigger_automations
 from config.settings import (
     IG_ID, 
     IG_ACCESS_TOKEN, 
@@ -1427,7 +1428,7 @@ async def get_comment_details(comment_id: str, ig_account_id: str) -> dict:
 
 
 
-async def process_comments_events(value: dict, ig_account_id: str, background_tasks: BackgroundTasks):
+async def process_comments_events(value: dict, ig_account_id: str, background_tasks: Optional[BackgroundTasks] = None):
     """
     Process Instagram comment events from webhook
     """
@@ -1511,15 +1512,18 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
         }
         
         #  Add tasks to background_tasks to trigger automation system
-        from services.automation_trigger_handler import check_and_trigger_automations
-        
-        background_tasks.add_task(
-            check_and_trigger_automations,
-            org_id=org_id,
-            platform="instagram",
-            event_type="post_comment",  # Maps to "instagram_comment" trigger
-            trigger_data=trigger_data
-        )
+        if background_tasks:
+            
+            
+            background_tasks.add_task(
+                check_and_trigger_automations,
+                org_id=org_id,
+                platform="instagram",
+                event_type="post_comment",  # Maps to "instagram_comment" trigger
+                trigger_data=trigger_data
+            )
+        else:
+            logger.warning("No background_tasks provided, skipping automation trigger.")
 
         #  Legacy keyword matching logic (Supabase)
         media_info = media_data.get(str(post_id))

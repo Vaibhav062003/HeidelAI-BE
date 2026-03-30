@@ -22,6 +22,7 @@ from database import get_mongo_db
 from auth.dependencies import CurrentUser
 from config.settings import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 from loguru import logger
+import asyncio
 
 db = get_mongo_db()
 
@@ -273,7 +274,7 @@ async def manual_sync_sheet(request: ManualSyncRequest, user: CurrentUser):
         # Trigger google_sheet automations for this sheet (Manual Sync)
         try:
             from services.google_sheet_automation import process_new_sheet_rows
-            import asyncio
+           
             asyncio.create_task(process_new_sheet_rows(org_id, request.sheet_id))
         except Exception as e:
             logger.warning(f"Could not trigger google_sheet automations after manual sync: {e}")
@@ -314,7 +315,10 @@ async def toggle_sheet_polling(sheet_id: str, user: CurrentUser):
 # ─── Internal Helpers ──────────────────────────────────────────────────────────
 
 async def refresh_google_token(org_id: str) -> str:
-    connection = db.google_connections.find_one({"org_id": org_id, "status": "active"})
+   
+    connection = await asyncio.to_thread(
+        db.google_connections.find_one, {"org_id": org_id, "status": "active"}
+    )
     if not connection:
         raise HTTPException(status_code=404, detail=f"No active Google connection for org {org_id}")
 
@@ -336,21 +340,25 @@ async def refresh_google_token(org_id: str) -> str:
     if not refresh_token:
         raise HTTPException(status_code=401, detail="Google refresh token missing. Please reconnect.")
 
-    token_response = requests.post(
-        "https://oauth2.googleapis.com/token",
-        data={
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        },
-        timeout=10
-    )
+    def _do_post():
+        return requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=10
+        )
+
+    token_response = await asyncio.to_thread(_do_post)
 
     if token_response.status_code != 200:
         error_info = token_response.json()
         if error_info.get("error") in ("invalid_grant", "token_expired"):
-            db.google_connections.update_one(
+            await asyncio.to_thread(
+                db.google_connections.update_one,
                 {"org_id": org_id},
                 {"$set": {"status": "inactive", "updated_at": datetime.now(timezone.utc).isoformat()}}
             )
@@ -360,7 +368,8 @@ async def refresh_google_token(org_id: str) -> str:
     new_access_token = token_info["access_token"]
     new_expiry = datetime.now(timezone.utc) + timedelta(seconds=token_info.get("expires_in", 3600))
 
-    db.google_connections.update_one(
+    await asyncio.to_thread(
+        db.google_connections.update_one,
         {"org_id": org_id},
         {"$set": {
             "credentials.access_token": new_access_token,
@@ -372,7 +381,9 @@ async def refresh_google_token(org_id: str) -> str:
 
 
 async def _force_token_refresh(org_id: str) -> str:
-    db.google_connections.update_one(
+  
+    await asyncio.to_thread(
+        db.google_connections.update_one,
         {"org_id": org_id},
         {"$set": {"credentials.token_expiry": "2000-01-01T00:00:00+00:00"}}
     )
@@ -380,7 +391,10 @@ async def _force_token_refresh(org_id: str) -> str:
 
 
 async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
-    sheet_doc = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": sheet_id})
+
+    sheet_doc = await asyncio.to_thread(
+        db.google_sheets_connections.find_one, {"org_id": org_id, "sheet_id": sheet_id}
+    )
     if not sheet_doc:
         raise HTTPException(status_code=404, detail=f"Sheet {sheet_id} not found for org {org_id}")
 
@@ -393,10 +407,13 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     end_row = start_row + 999
     sheets_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab_name}!A{start_row}:ZZ{end_row}"
 
-    response = requests.get(sheets_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+    def _do_get_rows(token):
+        return requests.get(sheets_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+
+    response = await asyncio.to_thread(_do_get_rows, access_token)
     if response.status_code == 401:
         access_token = await _force_token_refresh(org_id)
-        response = requests.get(sheets_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        response = await asyncio.to_thread(_do_get_rows, access_token)
 
     if response.status_code == 404:
         raise HTTPException(status_code=404, detail="Spreadsheet not found. It may have been deleted or access revoked.")
@@ -407,10 +424,13 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     if not values:
         return {"rows_processed": 0}
 
-    headers_resp = requests.get(
-        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab_name}!A1:ZZ1",
-        headers={"Authorization": f"Bearer {access_token}"}, timeout=10
-    )
+    def _do_get_headers(token):
+        return requests.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab_name}!A1:ZZ1",
+            headers={"Authorization": f"Bearer {token}"}, timeout=10
+        )
+
+    headers_resp = await asyncio.to_thread(_do_get_headers, access_token)
     headers = []
     if headers_resp.status_code == 200:
         hv = headers_resp.json().get("values", [[]])
@@ -427,7 +447,8 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             (headers[i] if i < len(headers) else f"col_{i+1}"): v
             for i, v in enumerate(row_values)
         }
-        result = collection.update_one(
+        result = await asyncio.to_thread(
+            collection.update_one,
             {"sheet_id": sheet_id, "row_number": actual_row},
             {
                 "$setOnInsert": {
@@ -446,7 +467,8 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             new_last_row = actual_row
 
     if rows_processed > 0:
-        db.google_sheets_connections.update_one(
+        await asyncio.to_thread(
+            db.google_sheets_connections.update_one,
             {"org_id": org_id, "sheet_id": sheet_id},
             {"$set": {
                 "last_synced_at": now, "last_sync_rows": rows_processed,

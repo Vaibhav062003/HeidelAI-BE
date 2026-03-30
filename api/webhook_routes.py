@@ -1460,23 +1460,26 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     )
                     
                     if not message_echo:
-                        background_tasks.add_task(
-                            check_and_trigger_automations,
-                            org_id=org_id,
-                            platform="instagram",
-                            event_type="message_received",
-                            trigger_data={
-                                "platform": "instagram",    
-                                "platform_id": recipient_id,
-                                "conversation_id": conversation_id,
-                                "customer_id": sender_id,
-                                "customer_name": name,
-                                "customer_username": username,
-                                "message_text": message_text,
-                                "message_type": attachment_type,
-                                "message_id": ig_message_id
-                            }
-                        )
+                        if background_tasks:
+                            background_tasks.add_task(
+                                check_and_trigger_automations,
+                                org_id=org_id,
+                                platform="instagram",
+                                event_type="message_received",
+                                trigger_data={
+                                    "platform": "instagram",    
+                                    "platform_id": recipient_id,
+                                    "conversation_id": conversation_id,
+                                    "customer_id": sender_id,
+                                    "customer_name": name,
+                                    "customer_username": username,
+                                    "message_text": message_text,
+                                    "message_type": attachment_type,
+                                    "message_id": ig_message_id
+                                }
+                            )
+                        else:
+                            logger.warning("No background_tasks provided, skipping automation trigger for message_received.")
 
                     # Check if conversation exists
                     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})

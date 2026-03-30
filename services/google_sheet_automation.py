@@ -19,6 +19,7 @@ from typing import Optional
 
 from database import get_mongo_db
 from loguru import logger
+import asyncio
 
 db = get_mongo_db()
 
@@ -73,7 +74,10 @@ async def process_google_sheet_trigger(
         return {"sent": 0, "skipped": 0, "errors": 1}
 
     # 2. Fetch headers (row 1) to find the column index
-    sheet_doc = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": sheet_id})
+  
+    sheet_doc = await asyncio.to_thread(
+        db.google_sheets_connections.find_one, {"org_id": org_id, "sheet_id": sheet_id}
+    )
     tab_name = sheet_doc.get("tab_name", "Sheet1") if sheet_doc else "Sheet1"
 
     headers = await _fetch_headers(sheet_id, tab_name, access_token)
@@ -93,7 +97,7 @@ async def process_google_sheet_trigger(
     rows_with_data = await _fetch_rows(sheet_id, tab_name, access_token, row_start, row_end)
 
     # 4. Get WhatsApp connection for this org
-    wa_connection = _get_wa_connection(org_id)
+    wa_connection = await asyncio.to_thread(_get_wa_connection, org_id)
     if not wa_connection:
         logger.error(f"[GoogleSheetAuto] No WhatsApp connection found for org {org_id}")
         return {"sent": 0, "skipped": 0, "errors": 1}
@@ -110,7 +114,7 @@ async def process_google_sheet_trigger(
         return {"sent": 0, "skipped": 0, "errors": 1}
 
     # 5. Ensure deduplication index exists
-    _ensure_sent_index()
+    await asyncio.to_thread(_ensure_sent_index)
 
     # 6. Build eligible recipient list with pre-resolved text per recipient
     stats = {"sent": 0, "skipped": 0, "errors": 0}
@@ -134,7 +138,7 @@ async def process_google_sheet_trigger(
         # Atomic deduplication check:
         # Tries to insert a record for this (org, flow, phone).
         # Proceed only if it's the first time this combination is being processed.
-        if not _try_claim_send(org_id, flow_id, phone):
+        if not await _try_claim_send(org_id, flow_id, phone):
             stats["skipped"] += 1
             continue
 
@@ -175,7 +179,8 @@ async def process_google_sheet_trigger(
         resolved_text = recipient["resolved_text"]
 
         job_id = _uuid.uuid4().hex
-        create_bulk_job(
+        await asyncio.to_thread(
+            create_bulk_job,
             org_id=org_id,
             job_id=job_id,
             template_name="",
@@ -197,7 +202,7 @@ async def process_google_sheet_trigger(
         )
 
         # Read result from in-memory job store
-        job = get_bulk_job(job_id=job_id, org_id=org_id)
+        job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
         send_succeeded = job and job.get("sent", 0) > 0
 
         if send_succeeded:
@@ -214,9 +219,8 @@ async def process_google_sheet_trigger(
                     message_text=resolved_text,
                     message_id=message_id,
                 )
-                # _mark_sent is now redundant as we claim at the start of the loop
-                # _mark_sent(org_id, flow_id, phone, sheet_id)
                 stats["sent"] += 1
+                await _mark_sent(org_id, flow_id, phone, sheet_id)
                 logger.success(
                     f"[GoogleSheetAuto] ✅ Sent to {phone} | flow={flow_id} "
                     f"| msg_id={message_id}"
@@ -391,30 +395,36 @@ def _get_wa_connection(org_id: str) -> Optional[dict]:
     return db.whatsapp_connections.find_one({"wa_id": wa_id, "org_id": org_id})
 
 
-def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
+async def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
     """
-    Atomic deduplication: Tries to claim a phone number as 'in-progress/sent' for a flow.
+    Atomic deduplication: Tries to claim a phone number as 'pending' for a flow.
     Returns True if the claim was successful (first time), False otherwise.
     Uses update_one with upsert=True and $setOnInsert to ensure atomicity.
     """
-    try:
-        now = datetime.now(timezone.utc)
-        result = db[SENT_COLLECTION].update_one(
-            {"org_id": org_id, "flow_id": flow_id, "phone": phone},
-            {"$setOnInsert": {
-                "org_id": org_id,
-                "flow_id": flow_id,
-                "phone": phone,
-                "sent_at": now.isoformat()
-            }},
-            upsert=True
-        )
-        # upserted_id is only present if a new document was created
-        return result.upserted_id is not None
-    except Exception as e:
-        # logger is loguru.logger, imported above
-        logger.error(f"[GoogleSheetAuto] Error in _try_claim_send: {e}")
-        return False
+    def _sync_claim():
+        try:
+            now = datetime.now(timezone.utc)
+            # We use a status field so we can differentiate between "claimed but failed" 
+            # and "sent successfully" in the future if needed, though for now we 
+            # just need to ensure atomic first-time processing.
+            result = db[SENT_COLLECTION].update_one(
+                {"org_id": org_id, "flow_id": flow_id, "phone": phone},
+                {"$setOnInsert": {
+                    "org_id": org_id,
+                    "flow_id": flow_id,
+                    "phone": phone,
+                    "status": "pending",
+                    "created_at": now,
+                    "updated_at": now
+                }},
+                upsert=True
+            )
+            return result.upserted_id is not None
+        except Exception as e:
+            logger.error(f"[GoogleSheetAuto] Error in _try_claim_send: {e}")
+            return False
+
+    return await asyncio.to_thread(_sync_claim)
 
 
 def _mark_sent(org_id: str, flow_id: str, phone: str, sheet_id: str):
