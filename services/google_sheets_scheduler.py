@@ -1,6 +1,8 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+from pymongo import ReturnDocument
 
 from database import get_mongo_db
 from loguru import logger
@@ -98,25 +100,22 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
     """
     lease_key = f"sync_{org_id}_{sheet_id}"
     now = datetime.now(timezone.utc)
-    expires_at = now + asyncio.to_thread(lambda: None)._timeout if hasattr(asyncio, 'to_thread') else now # Dummy for now, let's use 5 min
-    import timedelta # Wait, I'll just use datetime
-    from datetime import timedelta
-    
-    lease_duration = timedelta(minutes=5)
-    expiry = now + lease_duration
+    expiry = now + timedelta(minutes=5)
 
     try:
         # Atomic lease acquisition: 
         # Succeeds if no lease exists OR if the existing lease has expired.
         lease_result = db.scheduler_leases.find_one_and_update(
-            {"_id": lease_key},
+            {
+                "_id": lease_key, 
+                "$or": [
+                    {"expires_at": {"$lt": now}},
+                    {"acquired_at": {"$exists": False}}
+                ]
+            },
             {"$set": {"acquired_at": now, "expires_at": expiry, "org_id": org_id, "sheet_id": sheet_id}},
             upsert=True,
-            filter={"$or": [
-                {"_id": lease_key, "expires_at": {"$lt": now}},
-                {"_id": lease_key, "acquired_at": {"$exists": False}} # This part is handled by upsert usually, but filter helps
-            ]},
-            return_document=True
+            return_document=ReturnDocument.AFTER
         )
 
         if not lease_result:
