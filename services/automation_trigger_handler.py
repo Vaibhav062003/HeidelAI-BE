@@ -186,10 +186,11 @@ def _trigger_matches_criteria(trigger: Dict, trigger_data: Dict) -> bool:
 async def _update_trigger_timestamp(trigger_id: str):
     """Update last_triggered_at timestamp for a trigger"""
     triggers_collection = _automation_triggers_collection()
-    
-    triggers_collection.update_one(
+
+    await asyncio.to_thread(
+        triggers_collection.update_one,
         {"trigger_id": trigger_id},
-        {"$set": {"last_triggered_at": datetime.now(timezone.utc)}}
+        {"$set": {"last_triggered_at": datetime.now(timezone.utc)}},
     )
 
 
