@@ -1,6 +1,7 @@
 # Built-in modules
 import uuid
 import requests
+import httpx
 import json
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -714,7 +715,9 @@ async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str)
     try:
         # Get page access token
         connection = db.instagram_connections.find_one(
-            {"instagram_id": ig_account_id, "is_active": True}
+            {"instagram_id": ig_account_id, "is_active": True},
+            {"page_access_token": 1},
+            sort=[("last_updated", -1)]
         )
         
         if not connection:
@@ -775,7 +778,9 @@ async def send_private_reply(
     try:
         # Get page access token
         connection = db.instagram_connections.find_one(
-            {"instagram_id": ig_account_id, "is_active": True}
+            {"instagram_id": ig_account_id, "is_active": True},
+            {"page_access_token": 1},
+            sort=[("last_updated", -1)]
         )
         
         if not connection:

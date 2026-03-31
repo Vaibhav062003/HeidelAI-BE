@@ -426,17 +426,22 @@ async def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
                         {"status": "pending", "updated_at": {"$lt": expiry_threshold}}
                     ]
                 },
-                {"$setOnInsert": {
-                    "org_id": org_id,
-                    "flow_id": flow_id,
-                    "phone": phone,
-                    "status": "pending",
-                    "created_at": now,
-                    "updated_at": now
-                }},
+                {
+                    "$set": {
+                        "status": "pending",
+                        "updated_at": now
+                    },
+                    "$setOnInsert": {
+                        "org_id": org_id,
+                        "flow_id": flow_id,
+                        "phone": phone,
+                        "created_at": now
+                    }
+                },
                 upsert=True
             )
-            return result.upserted_id is not None
+            # True if we newly inserted OR if we updated an existing stale record
+            return (result.upserted_id is not None) or (result.modified_count > 0)
         except Exception as e:
             logger.error(f"[GoogleSheetAuto] Error in _try_claim_send: {e}")
             return False
