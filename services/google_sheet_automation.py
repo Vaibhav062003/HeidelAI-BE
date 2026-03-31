@@ -223,7 +223,7 @@ async def process_google_sheet_trigger(
                     message_id=message_id,
                 )
                 stats["sent"] += 1
-                await _mark_sent(org_id, flow_id, phone, sheet_id)
+                await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id)
                 logger.success(
                     f"[GoogleSheetAuto] ✅ Sent to {phone} | flow={flow_id} "
                     f"| msg_id={message_id}"
