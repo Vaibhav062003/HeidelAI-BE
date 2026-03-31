@@ -14,8 +14,8 @@ from . import signup_routes
 from . import sse_routes
 from . import dashboard_routes
 from . import automation_routes
-from . import google_routes    
-from . import google_sheets_routes 
+from . import google_routes
+from . import google_sheets_routes
 
 router = APIRouter()
 
