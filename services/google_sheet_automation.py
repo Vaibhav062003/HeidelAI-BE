@@ -20,6 +20,7 @@ from typing import Optional
 from database import get_mongo_db
 from loguru import logger
 import asyncio
+from pymongo.errors import DuplicateKeyError
 from collections import namedtuple
 
 db = get_mongo_db()
@@ -416,13 +417,14 @@ async def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
             # and stayed that way for more than 1 hour (handling transient failures).
             expiry_threshold = now - timedelta(hours=1)
             
+            # Step 1: Try to reclaim a stale "pending" record
             result = db[SENT_COLLECTION].update_one(
                 {
                     "org_id": org_id, 
                     "flow_id": flow_id, 
                     "phone": phone,
                     "$or": [
-                        {"status": {"$exists": False}}, # Legacy support
+                        {"status": {"$exists": False}}, 
                         {"status": "pending", "updated_at": {"$lt": expiry_threshold}}
                     ]
                 },
@@ -430,18 +432,28 @@ async def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
                     "$set": {
                         "status": "pending",
                         "updated_at": now
-                    },
-                    "$setOnInsert": {
-                        "org_id": org_id,
-                        "flow_id": flow_id,
-                        "phone": phone,
-                        "created_at": now
                     }
                 },
-                upsert=True
+                upsert=False
             )
-            # True if we newly inserted OR if we updated an existing stale record
-            return (result.upserted_id is not None) or (result.modified_count > 0)
+            if result.modified_count > 0:
+                return True
+
+            # Step 2: If no stale record was reclaimed, try to claim by inserting a new one.
+            # Catch DuplicateKeyError if the record already exists (e.g., status is "sent").
+            try:
+                db[SENT_COLLECTION].insert_one({
+                    "org_id": org_id,
+                    "flow_id": flow_id,
+                    "phone": phone,
+                    "status": "pending",
+                    "created_at": now,
+                    "updated_at": now
+                })
+                return True
+            except DuplicateKeyError:
+                # Already exists and not stale pending -> skip
+                return False
         except Exception as e:
             logger.error(f"[GoogleSheetAuto] Error in _try_claim_send: {e}")
             return False

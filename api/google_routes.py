@@ -1,4 +1,4 @@
-import requests
+import httpx
 import uuid
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
@@ -52,7 +52,8 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
             "redirect_uri": redirect_uri,
         }
 
-        token_response = requests.post(token_url, data=token_data, timeout=10)
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(token_url, data=token_data, timeout=10)
 
         if token_response.status_code != 200:
             logger.error(f"Google token exchange failed: {token_response.text}")
@@ -74,11 +75,12 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
 
         # ── Step 2: Fetch user profile ─────────────────────────────────────────
         profile_url = "https://www.googleapis.com/oauth2/v2/userinfo"
-        profile_response = requests.get(
-            profile_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10
-        )
+        async with httpx.AsyncClient() as client:
+            profile_response = await client.get(
+                profile_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10
+            )
 
         if profile_response.status_code != 200:
             logger.error(f"Google profile fetch failed: {profile_response.text}")
@@ -114,8 +116,6 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
                 "access_token": access_token,
                 "refresh_token": refresh_token,   # May be None if already had one
                 "token_expiry": token_expiry.isoformat(),
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
             },
             "connected_at": now.isoformat(),
             "updated_at": now.isoformat(),
@@ -219,12 +219,13 @@ async def google_disconnect(user: CurrentUser):
         token_to_revoke = refresh_token or access_token
         if token_to_revoke:
             try:
-                revoke_response = requests.post(
-                    "https://oauth2.googleapis.com/revoke",
-                    params={"token": token_to_revoke},
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=5
-                )
+                async with httpx.AsyncClient() as client:
+                    revoke_response = await client.post(
+                        "https://oauth2.googleapis.com/revoke",
+                        params={"token": token_to_revoke},
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=5
+                    )
                 if revoke_response.status_code == 200:
                     logger.info(f"Google token revoked for org {org_id}")
                 else:

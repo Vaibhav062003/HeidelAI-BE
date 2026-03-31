@@ -11,7 +11,7 @@ Endpoints:
   PATCH  /api/google-sheets/connections/{sheet_id}/toggle-polling
 """
 
-import requests
+import httpx
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -52,8 +52,8 @@ async def list_available_sheets(user: CurrentUser):
         org_id = user.org_id
         access_token = await refresh_google_token(org_id)
 
-        def _fetch(token):
-            return requests.get(
+        async with httpx.AsyncClient() as client:
+            drive_response = await client.get(
                 "https://www.googleapis.com/drive/v3/files",
                 params={
                     "q": "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
@@ -61,14 +61,23 @@ async def list_available_sheets(user: CurrentUser):
                     "orderBy": "modifiedTime desc",
                     "pageSize": 100,
                 },
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {access_token}"},
                 timeout=15
             )
 
-        drive_response = _fetch(access_token)
-        if drive_response.status_code == 401:
-            access_token = await _force_token_refresh(org_id)
-            drive_response = _fetch(access_token)
+            if drive_response.status_code == 401:
+                access_token = await _force_token_refresh(org_id)
+                drive_response = await client.get(
+                    "https://www.googleapis.com/drive/v3/files",
+                    params={
+                        "q": "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+                        "fields": "files(id,name,modifiedTime)",
+                        "orderBy": "modifiedTime desc",
+                        "pageSize": 100,
+                    },
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=15
+                )
 
         if drive_response.status_code != 200:
             error_msg = drive_response.json().get("error", {}).get("message", "Unknown error")
@@ -213,21 +222,25 @@ async def get_sheet_columns(
         # Get a valid access token
         access_token = await refresh_google_token(org_id)
 
-        def _fetch_headers(token):
-            url = (
-                f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-                f"/values/{tab_name}!A1:ZZ1"
-            )
-            return requests.get(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
+        async with httpx.AsyncClient() as client:
+            def _get_headers_url():
+                return (
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
+                    f"/values/{tab_name}!A1:ZZ1"
+                )
+
+            resp = await client.get(
+                _get_headers_url(),
+                headers={"Authorization": f"Bearer {access_token}"},
                 timeout=15
             )
-
-        resp = _fetch_headers(access_token)
-        if resp.status_code == 401:
-            access_token = await _force_token_refresh(org_id)
-            resp = _fetch_headers(access_token)
+            if resp.status_code == 401:
+                access_token = await _force_token_refresh(org_id)
+                resp = await client.get(
+                    _get_headers_url(),
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    timeout=15
+                )
 
         if resp.status_code == 404:
             raise HTTPException(
@@ -340,8 +353,8 @@ async def refresh_google_token(org_id: str) -> str:
     if not refresh_token:
         raise HTTPException(status_code=401, detail="Google refresh token missing. Please reconnect.")
 
-    def _do_post():
-        return requests.post(
+    async with httpx.AsyncClient() as client:
+        token_response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
                 "client_id": GOOGLE_CLIENT_ID,
@@ -351,8 +364,6 @@ async def refresh_google_token(org_id: str) -> str:
             },
             timeout=10
         )
-
-    token_response = await asyncio.to_thread(_do_post)
 
     if token_response.status_code != 200:
         error_info = token_response.json()
@@ -407,13 +418,19 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     end_row = start_row + 999
     sheets_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab_name}!A{start_row}:ZZ{end_row}"
 
-    def _do_get_rows(token):
-        return requests.get(sheets_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-
-    response = await asyncio.to_thread(_do_get_rows, access_token)
-    if response.status_code == 401:
-        access_token = await _force_token_refresh(org_id)
-        response = await asyncio.to_thread(_do_get_rows, access_token)
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            sheets_url, 
+            headers={"Authorization": f"Bearer {access_token}"}, 
+            timeout=15
+        )
+        if response.status_code == 401:
+            access_token = await _force_token_refresh(org_id)
+            response = await client.get(
+                sheets_url, 
+                headers={"Authorization": f"Bearer {access_token}"}, 
+                timeout=15
+            )
 
     if response.status_code == 404:
         raise HTTPException(status_code=404, detail="Spreadsheet not found. It may have been deleted or access revoked.")
@@ -424,13 +441,12 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     if not values:
         return {"rows_processed": 0}
 
-    def _do_get_headers(token):
-        return requests.get(
+    async with httpx.AsyncClient() as client:
+        headers_resp = await client.get(
             f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab_name}!A1:ZZ1",
-            headers={"Authorization": f"Bearer {token}"}, timeout=10
+            headers={"Authorization": f"Bearer {access_token}"}, 
+            timeout=10
         )
-
-    headers_resp = await asyncio.to_thread(_do_get_headers, access_token)
     headers = []
     if headers_resp.status_code == 200:
         hv = headers_resp.json().get("values", [[]])
