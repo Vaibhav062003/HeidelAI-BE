@@ -1,6 +1,5 @@
 # Built-in modules
 import uuid
-import requests
 import httpx
 import json
 from typing import Optional
@@ -101,11 +100,12 @@ async def send_ig_message(id, message_text, instagram_id, mode, org_id) -> dict:
             }
 
             # Send the message
-            response = requests.post(url, headers=headers, json=data)
-            logger.info(f"Instagram message response: {response.status_code}, {response.json()}")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=data)
+                
+            logger.info(f"Instagram message response: {response.status_code}, {response.text}")
             
             # Return the response for further processing
-            sent_message_id = response.json().get("message_id")
             return response.json()
         else:
             message_id = f"privatenote_{uuid.uuid4()}"
@@ -201,8 +201,10 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
             }
 
             # Send the media message
-            response = requests.post(url, headers=headers, json=data)
-            logger.info(f"Instagram media message response: {response.status_code}, {response.json()}")
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(url, headers=headers, json=data)
+            
+            logger.info(f"Instagram media message response: {response.status_code}, {response.text}")
             
             # Return the response for further processing
             return response.json()
@@ -624,10 +626,11 @@ async def get_ig_username(sender_id, page_access_token):
         "access_token" : page_access_token
     }
 
-    response = requests.get(url, headers=headers, params=params)
-    logger.info(f"Response: {response.status_code}, {response.json()}")
-    response = response.json()
-    return response
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, headers=headers, params=params)
+        
+    logger.info(f"Response: {response.status_code}, {response.text}")
+    return response.json()
 
 async def get_ig_media_owner(media_id, page_access_token):
     url = f"https://graph.instagram.com/{media_id}"
@@ -639,7 +642,8 @@ async def get_ig_media_owner(media_id, page_access_token):
         "access_token" : page_access_token
     }
 
-    response = requests.get(url, headers=headers, params=params)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, headers=headers, params=params)
     response = response.json()
     if 'username' in response:
         owner_username = response['username']
@@ -665,7 +669,8 @@ async def get_ig_profile_picture(user_id, page_access_token):
         "access_token" : page_access_token
     }
 
-    response = requests.get(url, headers=headers, params=params)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, headers=headers, params=params)
     response = response.json()
     if 'profile_picture_url' in response:
         return response['profile_picture_url']
@@ -887,10 +892,11 @@ async def revoke_instagram_access(org_id: str, user_id: str):
         access_token = connection.get("page_access_token")
         if access_token:
             try:
-                response = requests.delete(
-                    f"https://graph.instagram.com/{user_id}/permissions",
-                    params={"access_token": access_token}
-                )
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    response = await client.delete(
+                        f"https://graph.instagram.com/{user_id}/permissions",
+                        params={"access_token": access_token}
+                    )
                 logger.info(f"Token revocation response: {response.status_code} - {response.text}")
             except Exception as revoke_error:
                 logger.error(f"Error revoking Instagram token: {revoke_error}")
@@ -1080,7 +1086,8 @@ async def send_instagram_reaction(org_id, message_id, emoji):
             "fields": "name,profile_picture_url,username"
         }
         
-        response = requests.get(url, params=params)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, params=params)
         
         if response.status_code != 200:
             logger.error(f"Instagram API Error: {response.text}")
@@ -1199,7 +1206,8 @@ async def send_message_reaction(message_id: str, instagram_id: str, page_access_
             }
         }
 
-        response = requests.post(url, headers=headers, json=body)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(url, headers=headers, json=body)
         if response.status_code != 200:
             logger.error(f"Error sending message reaction: {response.text}")
             return "error"

@@ -133,8 +133,8 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             "last_sync_rows": 0,
             "polling_enabled": True,
             "last_processed_row_number": 1,
-            "connected_at": now.isoformat(),
-            "updated_at": now.isoformat(),
+            "connected_at": now,
+            "updated_at": now,
         })
 
         logger.info(f"Sheet {request.sheet_id} connected for org {org_id}")
@@ -352,6 +352,10 @@ async def refresh_google_token(org_id: str) -> str:
 
     if not refresh_token:
         raise HTTPException(status_code=401, detail="Google refresh token missing. Please reconnect.")
+
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        logger.error("GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET not configured.")
+        raise HTTPException(status_code=500, detail="Google OAuth credentials not configured on server.")
 
     async with httpx.AsyncClient() as client:
         token_response = await client.post(

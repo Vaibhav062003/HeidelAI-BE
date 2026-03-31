@@ -178,66 +178,74 @@ async def process_google_sheet_trigger(
     #    run_bulk_send_job uses message_text param (plain-text mode) when provided.
     from services.wa_service import create_bulk_job, run_bulk_send_job, get_bulk_job
 
-    for recipient in eligible:
-        phone = recipient["phone_number"]
-        resolved_text = recipient["resolved_text"]
+    # Use bounded concurrency to process multiple recipients in parallel
+    concurrency_limit = 10 
+    sem = asyncio.Semaphore(concurrency_limit)
+    
+    async def _send_one(recipient):
+        async with sem:
+            phone = recipient["phone_number"]
+            resolved_text = recipient["resolved_text"]
 
-        job_id = _uuid.uuid4().hex
-        await asyncio.to_thread(
-            create_bulk_job,
-            org_id=org_id,
-            job_id=job_id,
-            template_name="",
-            language_code="",
-            total=1,
-        )
+            job_id = _uuid.uuid4().hex
+            await asyncio.to_thread(
+                create_bulk_job,
+                org_id=org_id,
+                job_id=job_id,
+                template_name="",
+                language_code="",
+                total=1,
+            )
 
-        await run_bulk_send_job(
-            job_id=job_id,
-            org_id=org_id,
-            phone_id=phone_id,
-            access_token=wa_access_token,
-            template_name="",
-            language_code="",
-            recipients=[Recipient(phone_number=phone)],
-            components=None,
-            delay_seconds=1.0,
-            message_text=resolved_text,   # plain-text mode
-        )
+            await run_bulk_send_job(
+                job_id=job_id,
+                org_id=org_id,
+                phone_id=phone_id,
+                access_token=wa_access_token,
+                template_name="",
+                language_code="",
+                recipients=[Recipient(phone_number=phone)],
+                components=None,
+                delay_seconds=1.0,
+                message_text=resolved_text,   # plain-text mode
+            )
 
-        # Read result from in-memory job store
-        job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
-        send_succeeded = job and job.get("sent", 0) > 0
+            # Read result from in-memory job store
+            job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
+            send_succeeded = job and job.get("sent", 0) > 0
 
-        if send_succeeded:
-            message_id = ""
-            results = job.get("results", [])
-            if results:
-                message_id = results[0].get("message_id", "")
+            if send_succeeded:
+                message_id = ""
+                results = job.get("results", [])
+                if results:
+                    message_id = results[0].get("message_id", "")
 
-            try:
-                await _store_sent_message(
-                    org_id=org_id,
-                    wa_id=wa_id,
-                    phone=phone,
-                    message_text=resolved_text,
-                    message_id=message_id,
-                )
-                stats["sent"] += 1
-                await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id)
-                logger.success(
-                    f"[GoogleSheetAuto] ✅ Sent to {phone} | flow={flow_id} "
-                    f"| msg_id={message_id}"
-                )
-            except Exception as e:
+                try:
+                    await _store_sent_message(
+                        org_id=org_id,
+                        wa_id=wa_id,
+                        phone=phone,
+                        message_text=resolved_text,
+                        message_id=message_id,
+                    )
+                    stats["sent"] += 1
+                    await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id)
+                    logger.success(
+                        f"[GoogleSheetAuto] ✅ Sent to {phone} | flow={flow_id} "
+                        f"| msg_id={message_id}"
+                    )
+                except Exception as e:
+                    stats["errors"] += 1
+                    logger.error(f"[GoogleSheetAuto] DB storage failed for {phone}: {e}")
+            else:
                 stats["errors"] += 1
-                logger.error(f"[GoogleSheetAuto] DB storage failed for {phone}: {e}")
-        else:
-            stats["errors"] += 1
-            error_detail = ""
-            if job and job.get("results"):
-                error_detail = job["results"][0].get("error", "unknown")
-            logger.error(f"[GoogleSheetAuto] Send failed for {phone}: {error_detail}")
+                error_detail = ""
+                if job and job.get("results"):
+                    error_detail = job["results"][0].get("error", "unknown")
+                logger.error(f"[GoogleSheetAuto] Send failed for {phone}: {error_detail}")
+
+    tasks = [asyncio.create_task(_send_one(recipient)) for recipient in eligible]
+    await asyncio.gather(*tasks)
 
     logger.info(
         f"[GoogleSheetAuto] Flow {flow_id} complete: "

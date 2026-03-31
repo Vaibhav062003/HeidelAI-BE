@@ -188,7 +188,7 @@ def _ensure_indexes() -> None:
         )
 
         # Per-org row storage indexes
-        active_orgs = db.google_connections.distinct("org_id")
+        active_orgs = db.google_sheets_connections.distinct("org_id")
         for org_id in active_orgs:
             col = db[f"google_sheet_rows_{org_id}"]
             col.create_index([("sheet_id", 1), ("row_number", 1)], unique=True)

@@ -1,7 +1,7 @@
 # Built-in modules
 import httpx
 import asyncio
-import json, requests
+import json
 import uuid
 import io
 import cloudinary.uploader
@@ -432,7 +432,8 @@ async def send_whatsapp_message(
             }
             
             
-            response = requests.post(url, headers=headers, json=data)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=data)
             
             if response.status_code != 200:
                 logger.error(f"WhatsApp API error: {response.text}")
@@ -673,7 +674,8 @@ async def send_wa_media_message(
             }
             
             
-            response = requests.post(url, headers=headers, json=data)
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(url, headers=headers, json=data)
             
             if response.status_code != 200:
                 logger.error(f"WhatsApp API error: {response.text}")

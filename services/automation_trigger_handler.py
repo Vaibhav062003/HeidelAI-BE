@@ -102,7 +102,7 @@ async def _find_matching_triggers(
         query["platform"] = platform
     
     # Find all potential triggers
-    triggers = list(triggers_collection.find(query))
+    triggers = await asyncio.to_thread(lambda: list(triggers_collection.find(query)))
     
     # Filter triggers based on additional criteria
     matching_triggers = []
