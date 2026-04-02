@@ -4,6 +4,7 @@ import asyncio
 import json
 import uuid
 import io
+import requests
 import cloudinary.uploader
 from typing import Optional
 from datetime import datetime, timezone, timedelta
