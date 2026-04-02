@@ -20,7 +20,7 @@ from database import get_mongo_db, get_mongo_client
 from core.services import services
 from services.scheduler_service import abort_scheduled_message
 from services.conversation_utils import reopen_conversation
-from services.automation_trigger_handler import check_and_trigger_automations
+
 from config.settings import (
     IG_ID, 
     IG_ACCESS_TOKEN, 
@@ -1520,7 +1520,7 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
         
         #  Add tasks to background_tasks to trigger automation system
         if background_tasks:
-            
+            from services.automation_trigger_handler import check_and_trigger_automations
             
             background_tasks.add_task(
                 check_and_trigger_automations,

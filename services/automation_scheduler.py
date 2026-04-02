@@ -52,8 +52,8 @@ async def startup_scheduler() -> None:
     """
     global _polling_task
 
-    _ensure_indexes()
-    _recover_stuck_jobs()
+    await asyncio.to_thread(_ensure_indexes)
+    await asyncio.to_thread(_recover_stuck_jobs)
 
     _polling_task = asyncio.create_task(_polling_loop())
     logger.success("WhatsApp follow-up scheduler started (poll interval = 30s).")
@@ -297,13 +297,15 @@ async def _process_due_jobs() -> None:
     now = datetime.now(timezone.utc)
 
     # Find due pending jobs (read phase — we'll atomically claim each one)
-    due_jobs = list(
-        db[COLLECTION]
-        .find(
-            {"status": "pending", "fire_at": {"$lte": now}},
-            {"_id": 0}
+    due_jobs = await asyncio.to_thread(
+        lambda: list(
+            db[COLLECTION]
+            .find(
+                {"status": "pending", "fire_at": {"$lte": now}},
+                {"_id": 0}
+            )
+            .limit(MAX_BATCH_SIZE)
         )
-        .limit(MAX_BATCH_SIZE)
     )
 
     if not due_jobs:
@@ -314,18 +316,20 @@ async def _process_due_jobs() -> None:
     # Atomically claim each job (prevents double execution)
     claimed_jobs = []
     for job in due_jobs:
-        claimed = db[COLLECTION].find_one_and_update(
-            {
-                "schedule_id": job["schedule_id"],
-                "status": "pending",  # Guard: only claim if still pending
-            },
-            {
-                "$set": {
-                    "status": "executing",
-                    "executed_at": now,
-                }
-            },
-            return_document=True,
+        claimed = await asyncio.to_thread(
+            lambda: db[COLLECTION].find_one_and_update(
+                {
+                    "schedule_id": job["schedule_id"],
+                    "status": "pending",  # Guard: only claim if still pending
+                },
+                {
+                    "$set": {
+                        "status": "executing",
+                        "executed_at": now,
+                    }
+                },
+                return_document=True,
+            )
         )
         if claimed:
             claimed_jobs.append(claimed)
@@ -358,22 +362,22 @@ async def _execute_job(job: dict) -> None:
     try:
         # Step 1: Validate conversation still exists and is open
         conv_collection = db[f"conversations_{org_id}"]
-        conversation = conv_collection.find_one({"conversation_id": conversation_id})
+        conversation = await asyncio.to_thread(lambda: conv_collection.find_one({"conversation_id": conversation_id}))
 
         if not conversation:
             logger.warning(f"[{schedule_id}] Conversation {conversation_id} not found — marking completed (no-op).")
-            _mark_completed(schedule_id)
+            await asyncio.to_thread(_mark_completed, schedule_id)
             return
 
         if conversation.get("status") == "closed":
             logger.info(f"[{schedule_id}] Conversation {conversation_id} is closed — skipping follow-up.")
-            _mark_completed(schedule_id)
+            await asyncio.to_thread(_mark_completed, schedule_id)
             return
 
         customer_name = conversation.get("customer_name", "")
 
         # Step 2: Get wa_id from organizations collection
-        org = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1})
+        org = await asyncio.to_thread(lambda: db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}))
         if not org or not org.get("wa_id"):
             raise Exception(f"No wa_id found for org {org_id}")
 
@@ -400,7 +404,7 @@ async def _execute_job(job: dict) -> None:
             f"[{schedule_id}] Follow-up sent to {conversation_id}. message_id={result.get('message_id')}"
         )
 
-        _mark_completed(schedule_id)
+        await asyncio.to_thread(_mark_completed, schedule_id)
 
     except Exception as e:
         error_msg = str(e)
@@ -409,30 +413,34 @@ async def _execute_job(job: dict) -> None:
         if retry_count < max_retries:
             # Retry in 5 minutes
             retry_fire_at = datetime.now(timezone.utc) + timedelta(minutes=5)
-            db[COLLECTION].update_one(
-                {"schedule_id": schedule_id},
-                {
-                    "$set": {
-                        "status": "pending",
-                        "fire_at": retry_fire_at,
-                        "error": error_msg,
+            await asyncio.to_thread(
+                lambda: db[COLLECTION].update_one(
+                    {"schedule_id": schedule_id},
+                    {
+                        "$set": {
+                            "status": "pending",
+                            "fire_at": retry_fire_at,
+                            "error": error_msg,
+                        },
+                        "$inc": {"retry_count": 1},
                     },
-                    "$inc": {"retry_count": 1},
-                },
+                )
             )
             logger.info(
                 f"[{schedule_id}] Scheduled retry {retry_count + 1}/{max_retries} at {retry_fire_at.isoformat()}"
             )
         else:
-            db[COLLECTION].update_one(
-                {"schedule_id": schedule_id},
-                {
-                    "$set": {
-                        "status": "failed",
-                        "error": error_msg,
-                        "completed_at": datetime.now(timezone.utc),
-                    }
-                },
+            await asyncio.to_thread(
+                lambda: db[COLLECTION].update_one(
+                    {"schedule_id": schedule_id},
+                    {
+                        "$set": {
+                            "status": "failed",
+                            "error": error_msg,
+                            "completed_at": datetime.now(timezone.utc),
+                        }
+                    },
+                )
             )
             logger.error(f"[{schedule_id}] Exhausted retries — marked as failed.")
 

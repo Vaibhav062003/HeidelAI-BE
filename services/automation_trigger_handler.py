@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 # === Internal Modules ===
 from database import get_mongo_db
-from services.automation_execution import execute_automation_flow
+
 from loguru import logger
 
 db = get_mongo_db()
@@ -47,6 +47,8 @@ async def check_and_trigger_automations(
             return
         
         logger.info(f"Found {len(triggers)} matching triggers for {platform} {event_type} in org {org_id}")
+        
+        from services.automation_execution import execute_automation_flow
         
         # Execute each matching flow
         for trigger in triggers:
@@ -208,7 +210,7 @@ async def trigger_tag_automation(org_id: str, conversation_id: str, tag: str, ac
     try:
         # Get conversation details
         conversations_collection = _conversations_collection(org_id)
-        conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+        conversation = await asyncio.to_thread(lambda: conversations_collection.find_one({"conversation_id": conversation_id}))
         
         if not conversation:
             logger.warning(f"Conversation {conversation_id} not found")
