@@ -39,22 +39,11 @@ async def process_google_sheet_trigger(
     flow_id: str,
     trigger_config: dict,
     message_text: str,
+    rows_data: Optional[List[dict]] = None,
 ) -> dict:
     """
-    Called on flow publish and by the scheduler when new rows are detected.
-
-    Reads rows from the sheet, builds the deduplicated recipient list, then
-    hands off to run_bulk_send_job (plain-text mode) for actual delivery.
-    After bulk send, creates WhatsApp conversations + stores messages in DB.
-
-    Args:
-        org_id:         Organization ID
-        flow_id:        Automation flow ID
-        trigger_config: {sheet_id, column_name, sheet_name?, row_start?, row_end?}
-        message_text:   WhatsApp message body (may contain {{variables}})
-
-    Returns:
-        {"sent": int, "skipped": int, "errors": int}
+    Core engine for Google Sheet automations.
+    Can be called with raw rows_data (list of dicts) or will fetch from API if None.
     """
     sheet_id = trigger_config.get("sheet_id")
     column_name = trigger_config.get("column_name")
@@ -69,38 +58,7 @@ async def process_google_sheet_trigger(
         logger.error(f"[GoogleSheetAuto] Empty message_text for flow {flow_id} — aborting")
         return {"sent": 0, "skipped": 0, "errors": 1}
 
-    # 1. Get Google access token
-    try:
-        from api.google_sheets_routes import refresh_google_token
-        access_token = await refresh_google_token(org_id)
-    except Exception as e:
-        logger.error(f"[GoogleSheetAuto] Failed to get Google access token for org {org_id}: {e}")
-        return {"sent": 0, "skipped": 0, "errors": 1}
-
-    # 2. Fetch headers (row 1) to find the column index
-  
-    sheet_doc = await asyncio.to_thread(
-        db.google_sheets_connections.find_one, {"org_id": org_id, "sheet_id": sheet_id}
-    )
-    tab_name = sheet_doc.get("tab_name", "Sheet1") if sheet_doc else "Sheet1"
-
-    headers = await _fetch_headers(sheet_id, tab_name, access_token)
-    if not headers:
-        logger.error(f"[GoogleSheetAuto] Could not fetch headers for sheet {sheet_id}")
-        return {"sent": 0, "skipped": 0, "errors": 1}
-
-    try:
-        col_index = headers.index(column_name)
-    except ValueError:
-        logger.error(
-            f"[GoogleSheetAuto] Column '{column_name}' not found in headers: {headers}"
-        )
-        return {"sent": 0, "skipped": 0, "errors": 1}
-
-    # 3. Fetch data rows within range
-    rows_with_data = await _fetch_rows(sheet_id, tab_name, access_token, row_start, row_end)
-
-    # 4. Get WhatsApp connection for this org
+    # 1. Get WhatsApp connection early
     wa_connection = await asyncio.to_thread(_get_wa_connection, org_id)
     if not wa_connection:
         logger.error(f"[GoogleSheetAuto] No WhatsApp connection found for org {org_id}")
@@ -111,154 +69,110 @@ async def process_google_sheet_trigger(
     wa_access_token = wa_connection.get("access_token")
 
     if not all([wa_id, phone_id, wa_access_token]):
-        logger.error(
-            f"[GoogleSheetAuto] Incomplete WA connection for org {org_id} "
-            f"(wa_id={wa_id}, phone_id={phone_id})"
-        )
+        logger.error(f"[GoogleSheetAuto] Incomplete WA connection for org {org_id}")
         return {"sent": 0, "skipped": 0, "errors": 1}
 
-    # 5. Ensure deduplication index exists
+    # 2. Prepare data source (API vs provided rows)
+    headers = []
+    rows_to_process = []
+    
+    if rows_data is not None:
+        # Source is MongoDB (list of dicts)
+        rows_to_process = rows_data
+    else:
+        # Source is Google Sheets API (list of lists)
+        try:
+            from api.google_sheets_routes import refresh_google_token
+            access_token = await refresh_google_token(org_id)
+        except Exception as e:
+            logger.error(f"[GoogleSheetAuto] Failed to get Google access token: {e}")
+            return {"sent": 0, "skipped": 0, "errors": 1}
+
+        sheet_doc = await asyncio.to_thread(db.google_sheets_connections.find_one, {"org_id": org_id, "sheet_id": sheet_id})
+        tab_name = sheet_doc.get("tab_name", "Sheet1") if sheet_doc else "Sheet1"
+
+        headers = await _fetch_headers(sheet_id, tab_name, access_token)
+        if not headers:
+            logger.error(f"[GoogleSheetAuto] Could not fetch headers for sheet {sheet_id}")
+            return {"sent": 0, "skipped": 0, "errors": 1}
+
+        try:
+            col_index = headers.index(column_name)
+        except ValueError:
+            logger.error(f"[GoogleSheetAuto] Column '{column_name}' not found")
+            return {"sent": 0, "skipped": 0, "errors": 1}
+
+        raw_rows = await _fetch_rows(sheet_id, tab_name, access_token, row_start, row_end)
+        for rv in raw_rows:
+            if col_index < len(rv):
+                row_dict = { (headers[i] if i < len(headers) else f"col_{i+1}"): (rv[i] if i < len(rv) else "") for i in range(len(headers)) }
+                rows_to_process.append(row_dict)
+
+    # 3. Ensure deduplication index exists
     await asyncio.to_thread(_ensure_sent_index)
 
-    # 6. Build eligible recipient list with pre-resolved text per recipient
+    # 4. Build eligible recipients
     stats = {"sent": 0, "skipped": 0, "errors": 0}
-    # Each entry: {"phone_number": str, "resolved_text": str}
     eligible: list = []
 
-    for row_values in rows_with_data:
-        if col_index >= len(row_values):
-            continue
-
-        phone_raw = str(row_values[col_index]).strip()
+    for row_dict in rows_to_process:
+        phone_raw = str(row_dict.get(column_name, "")).strip()
         if not phone_raw:
             continue
 
-        phone = phone_raw
-        if not phone:
-            logger.warning(f"[GoogleSheetAuto] Invalid phone '{phone_raw}' — skipping")
+        if not await _try_claim_send(org_id, flow_id, phone_raw):
             stats["skipped"] += 1
             continue
-
-        # Atomic deduplication check:
-        # Tries to insert a record for this (org, flow, phone).
-        # Proceed only if it's the first time this combination is being processed.
-        if not await _try_claim_send(org_id, flow_id, phone):
-            stats["skipped"] += 1
-            continue
-
-        row_context = {
-            (headers[i] if i < len(headers) else f"col_{i + 1}"): (
-                row_values[i] if i < len(row_values) else ""
-            )
-            for i in range(len(headers))
-        }
 
         resolved_text = _resolve_variables(message_text, {
-            "phone_number": phone,
-            "customer_name": row_context.get("Name", row_context.get("name", phone)),
-            "row": row_context,
+            "phone_number": phone_raw,
+            "customer_name": row_dict.get("Name", row_dict.get("name", phone_raw)),
+            "row": row_dict,
         })
-
-        eligible.append({"phone_number": phone, "resolved_text": resolved_text})
+        eligible.append({"phone_number": phone_raw, "resolved_text": resolved_text})
 
     if not eligible:
-        logger.info(
-            f"[GoogleSheetAuto] Flow {flow_id}: no new recipients "
-            f"(skipped={stats['skipped']})"
-        )
         return stats
 
-    logger.info(
-        f"[GoogleSheetAuto] Flow {flow_id}: {len(eligible)} eligible recipient(s) "
-        f"(skipped={stats['skipped']})"
-    )
-
-    # 7. Send via run_bulk_send_job.
-    #    Each recipient gets its own job so the per-recipient resolved_text is used.
-    #    run_bulk_send_job uses message_text param (plain-text mode) when provided.
+    # 5. Send bulk via existing logic
     from services.wa_service import create_bulk_job, run_bulk_send_job, get_bulk_job
-
-    # Use bounded concurrency to process multiple recipients in parallel
-    concurrency_limit = 10 
-    sem = asyncio.Semaphore(concurrency_limit)
+    sem = asyncio.Semaphore(10)
     
     async def _send_one(recipient):
         async with sem:
             phone = recipient["phone_number"]
             resolved_text = recipient["resolved_text"]
-
             job_id = _uuid.uuid4().hex
-            await asyncio.to_thread(
-                create_bulk_job,
-                org_id=org_id,
-                job_id=job_id,
-                template_name="",
-                language_code="",
-                total=1,
-            )
-
+            
+            await asyncio.to_thread(create_bulk_job, org_id=org_id, job_id=job_id, template_name="", language_code="", total=1)
             await run_bulk_send_job(
-                job_id=job_id,
-                org_id=org_id,
-                phone_id=phone_id,
-                access_token=wa_access_token,
-                template_name="",
-                language_code="",
-                recipients=[Recipient(phone_number=phone)],
-                components=None,
-                delay_seconds=1.0,
-                message_text=resolved_text,   # plain-text mode
+                job_id=job_id, org_id=org_id, phone_id=phone_id, access_token=wa_access_token,
+                template_name="", language_code="", recipients=[Recipient(phone_number=phone)],
+                delay_seconds=1.0, message_text=resolved_text
             )
 
-            # Read result from in-memory job store
             job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
-            send_succeeded = job and job.get("sent", 0) > 0
-
-            if send_succeeded:
-                message_id = ""
-                results = job.get("results", [])
-                if results:
-                    message_id = results[0].get("message_id", "")
-
+            if job and job.get("sent", 0) > 0:
+                msg_id = ""
+                if job.get("results"): msg_id = job["results"][0].get("message_id", "")
                 try:
-                    await _store_sent_message(
-                        org_id=org_id,
-                        wa_id=wa_id,
-                        phone=phone,
-                        message_text=resolved_text,
-                        message_id=message_id,
-                    )
+                    await _store_sent_message(org_id=org_id, wa_id=wa_id, phone=phone, message_text=resolved_text, message_id=msg_id)
                     stats["sent"] += 1
                     await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id)
-                    logger.success(
-                        f"[GoogleSheetAuto] ✅ Sent to {phone} | flow={flow_id} "
-                        f"| msg_id={message_id}"
-                    )
                 except Exception as e:
                     stats["errors"] += 1
                     logger.error(f"[GoogleSheetAuto] DB storage failed for {phone}: {e}")
             else:
                 stats["errors"] += 1
-                error_detail = ""
-                if job and job.get("results"):
-                    error_detail = job["results"][0].get("error", "unknown")
-                logger.error(f"[GoogleSheetAuto] Send failed for {phone}: {error_detail}")
 
-    tasks = [asyncio.create_task(_send_one(recipient)) for recipient in eligible]
-    await asyncio.gather(*tasks)
-
-    logger.info(
-        f"[GoogleSheetAuto] Flow {flow_id} complete: "
-        f"sent={stats['sent']}, skipped={stats['skipped']}, errors={stats['errors']}"
-    )
+    await asyncio.gather(*[asyncio.create_task(_send_one(r)) for r in eligible])
     return stats
 
 
 async def process_new_sheet_rows(org_id: str, sheet_id: str):
     """
-    Called by the Google Sheets scheduler after new rows are synced.
-    Finds all published google_sheet flows that reference this sheet
-    and sends messages to any new phone numbers.
+    Optimized: Reads from MongoDB instead of hits Google Sheets API.
+    Called by the scheduler after new rows are synced.
     """
     triggers = list(db.automation_triggers.find({
         "org_id": org_id,
@@ -270,10 +184,18 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
     if not triggers:
         return
 
-    logger.info(
-        f"[GoogleSheetAuto] {len(triggers)} active flow(s) to check for "
-        f"new rows in sheet {sheet_id}"
-    )
+    # Fetch recently synced rows from MongoDB
+    # We fetch all rows for this sheet - deduplication handles the rest.
+    rows_collection = db[f"google_sheet_rows_{org_id}"]
+    rows_docs = await asyncio.to_thread(lambda: list(rows_collection.find({"sheet_id": sheet_id})))
+    
+    if not rows_docs:
+        return
+
+    # Extract the row_data dict from each document
+    rows_data = [doc.get("row_data", {}) for doc in rows_docs]
+
+    logger.info(f"[GoogleSheetAuto] Processing {len(rows_data)} rows from DB for {len(triggers)} triggers on sheet {sheet_id}")
 
     for trigger in triggers:
         flow_id = trigger.get("flow_id")
@@ -289,9 +211,6 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
             )
 
         if not message_text:
-            logger.warning(
-                f"[GoogleSheetAuto] No message text found for flow {flow_id} — skipping"
-            )
             continue
 
         await process_google_sheet_trigger(
@@ -299,6 +218,7 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
             flow_id=flow_id,
             trigger_config=trigger_config,
             message_text=message_text,
+            rows_data=rows_data,  # Pass the pre-fetched data
         )
 
 

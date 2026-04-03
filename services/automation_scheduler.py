@@ -24,6 +24,7 @@ from typing import Optional, List, Dict
 
 from database import get_mongo_db
 from services.utils import serialize_mongo
+from pymongo import ReturnDocument
 from loguru import logger
 
 
@@ -328,7 +329,7 @@ async def _process_due_jobs() -> None:
                         "executed_at": now,
                     }
                 },
-                return_document=True,
+                return_document=ReturnDocument.AFTER,
             )
         )
         if claimed:

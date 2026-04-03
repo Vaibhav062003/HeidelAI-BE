@@ -50,17 +50,20 @@ async def check_and_trigger_automations(
         
         from services.automation_execution import execute_automation_flow
         
+        # Map event_type to trigger_type for execution consistency
+        trigger_type = _event_to_trigger_type(event_type, platform)
+        
         # Execute each matching flow
         for trigger in triggers:
             flow_id = trigger.get("flow_id")
             
             try:
-                # Execute flow asynchronously (in production, use Celery)
+                # Execute flow asynchronously
                 asyncio.create_task(
                     execute_automation_flow(
                         org_id=org_id,
                         flow_id=flow_id,
-                        trigger_type=event_type,
+                        trigger_type=trigger_type,
                         trigger_data=trigger_data
                     )
                 )

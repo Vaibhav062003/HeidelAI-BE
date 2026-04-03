@@ -314,7 +314,7 @@ async def toggle_sheet_polling(sheet_id: str, user: CurrentUser):
         new_state = not sheet_doc.get("polling_enabled", True)
         db.google_sheets_connections.update_one(
             {"org_id": org_id, "sheet_id": sheet_id},
-            {"$set": {"polling_enabled": new_state, "updated_at": datetime.now(timezone.utc).isoformat()}}
+            {"$set": {"polling_enabled": new_state, "updated_at": datetime.now(timezone.utc)}}
         )
         return {"sheet_id": sheet_id, "polling_enabled": new_state}
 
@@ -375,7 +375,7 @@ async def refresh_google_token(org_id: str) -> str:
             await asyncio.to_thread(
                 db.google_connections.update_one,
                 {"org_id": org_id},
-                {"$set": {"status": "inactive", "updated_at": datetime.now(timezone.utc).isoformat()}}
+                {"$set": {"status": "inactive", "updated_at": datetime.now(timezone.utc)}}
             )
         raise HTTPException(status_code=401, detail=f"Token refresh failed: {error_info.get('error_description', '')}")
 
@@ -389,7 +389,7 @@ async def refresh_google_token(org_id: str) -> str:
         {"$set": {
             "credentials.access_token": new_access_token,
             "credentials.token_expiry": new_expiry.isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc),
         }}
     )
     return new_access_token
@@ -400,7 +400,7 @@ async def _force_token_refresh(org_id: str) -> str:
     await asyncio.to_thread(
         db.google_connections.update_one,
         {"org_id": org_id},
-        {"$set": {"credentials.token_expiry": "2000-01-01T00:00:00+00:00"}}
+        {"$set": {"credentials.token_expiry": "2000-01-01T00:00:00+00:00", "updated_at": datetime.now(timezone.utc)}}
     )
     return await refresh_google_token(org_id)
 
@@ -493,7 +493,7 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             {"$set": {
                 "last_synced_at": now, "last_sync_rows": rows_processed,
                 "last_processed_row_number": new_last_row,
-                "updated_at": now.isoformat(),
+                "updated_at": now,
             }}
         )
 

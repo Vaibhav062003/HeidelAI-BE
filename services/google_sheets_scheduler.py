@@ -22,7 +22,7 @@ async def startup_google_scheduler() -> None:
     """
     global _polling_task
 
-    _ensure_indexes()
+    await _ensure_indexes()
 
     _polling_task = asyncio.create_task(_polling_loop())
     logger.success(f"Google Sheets scheduler started (poll interval = {POLL_INTERVAL_SECONDS}s).")
@@ -64,22 +64,26 @@ async def _poll_all_sheets() -> None:
     """
     active_org_ids = [
         doc["org_id"]
-        for doc in db.google_connections.find(
-            {"status": "active"},
-            {"org_id": 1, "_id": 0}
+        for doc in await asyncio.to_thread(
+            lambda: list(db.google_connections.find(
+                {"status": "active"},
+                {"org_id": 1, "_id": 0}
+            ))
         )
     ]
 
     if not active_org_ids:
         return
 
-    sheets = list(db.google_sheets_connections.find(
-        {
-            "org_id": {"$in": active_org_ids},
-            "polling_enabled": True,
-        },
-        {"org_id": 1, "sheet_id": 1, "_id": 0}
-    ))
+    sheets = await asyncio.to_thread(
+        lambda: list(db.google_sheets_connections.find(
+            {
+                "org_id": {"$in": active_org_ids},
+                "polling_enabled": True,
+            },
+            {"org_id": 1, "sheet_id": 1, "_id": 0}
+        ))
+    )
 
     if not sheets:
         return
@@ -105,7 +109,8 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
     try:
         # Atomic lease acquisition: 
         # Succeeds if no lease exists OR if the existing lease has expired.
-        lease_result = db.scheduler_leases.find_one_and_update(
+        lease_result = await asyncio.to_thread(
+            db.scheduler_leases.find_one_and_update,
             {
                 "_id": lease_key, 
                 "$or": [
@@ -132,12 +137,13 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
             await _trigger_google_sheet_automations(org_id, sheet_id)
 
         # Release lease upon successful completion
-        db.scheduler_leases.delete_one({"_id": lease_key})
+        await asyncio.to_thread(db.scheduler_leases.delete_one, {"_id": lease_key})
 
     except Exception as e:
         logger.error(f"[Scheduler] Failed to sync sheet {sheet_id} for org {org_id}: {str(e)}")
         try:
-            db.google_sheets_connections.update_one(
+            await asyncio.to_thread(
+                db.google_sheets_connections.update_one,
                 {"org_id": org_id, "sheet_id": sheet_id},
                 {"$set": {
                     "last_sync_error": str(e),
@@ -162,40 +168,40 @@ async def _trigger_google_sheet_automations(org_id: str, sheet_id: str) -> None:
 
 # ─── MongoDB Indexes ──────────────────────────────────────────────────────────
 
-def _ensure_indexes() -> None:
+async def _ensure_indexes() -> None:
     """Create indexes for efficient querying and deduplication."""
     try:
         # google_connections indexes
-        db.google_connections.create_index([("org_id", 1)], unique=True)
-        db.google_connections.create_index([("status", 1)])
+        await asyncio.to_thread(lambda: db.google_connections.create_index([("org_id", 1)], unique=True))
+        await asyncio.to_thread(lambda: db.google_connections.create_index([("status", 1)]))
 
         # google_sheets_connections indexes
-        db.google_sheets_connections.create_index([("org_id", 1), ("sheet_id", 1)], unique=True)
-        db.google_sheets_connections.create_index([("org_id", 1), ("polling_enabled", 1)])
+        await asyncio.to_thread(lambda: db.google_sheets_connections.create_index([("org_id", 1), ("sheet_id", 1)], unique=True))
+        await asyncio.to_thread(lambda: db.google_sheets_connections.create_index([("org_id", 1), ("polling_enabled", 1)]))
 
         # automation_triggers index for google_sheet lookups
-        db.automation_triggers.create_index(
+        await asyncio.to_thread(lambda: db.automation_triggers.create_index(
             [("org_id", 1), ("trigger_type", 1), ("status", 1), ("filters.sheet_id", 1)],
             name="google_sheet_trigger_idx",
             sparse=True,
-        )
+        ))
 
         # google_sheet_sent_numbers deduplication index
-        db.google_sheet_sent_numbers.create_index(
+        await asyncio.to_thread(lambda: db.google_sheet_sent_numbers.create_index(
             [("org_id", 1), ("flow_id", 1), ("phone", 1)],
             unique=True,
             name="dedup_sent_idx",
-        )
+        ))
 
         # Per-org row storage indexes
-        active_orgs = db.google_sheets_connections.distinct("org_id")
+        active_orgs = await asyncio.to_thread(lambda: db.google_sheets_connections.distinct("org_id"))
         for org_id in active_orgs:
             col = db[f"google_sheet_rows_{org_id}"]
-            col.create_index([("sheet_id", 1), ("row_number", 1)], unique=True)
-            col.create_index([("sheet_id", 1), ("synced_at", -1)])
+            await asyncio.to_thread(lambda c=col: c.create_index([("sheet_id", 1), ("row_number", 1)], unique=True))
+            await asyncio.to_thread(lambda c=col: c.create_index([("sheet_id", 1), ("synced_at", -1)]))
 
         # Scheduler leases TTL index
-        db.scheduler_leases.create_index("expires_at", expireAfterSeconds=0)
+        await asyncio.to_thread(lambda: db.scheduler_leases.create_index("expires_at", expireAfterSeconds=0))
 
         logger.info("Google Sheets MongoDB indexes ensured.")
     except Exception as e:

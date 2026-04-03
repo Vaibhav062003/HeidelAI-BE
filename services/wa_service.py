@@ -4,7 +4,6 @@ import asyncio
 import json
 import uuid
 import io
-import requests
 import cloudinary.uploader
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -924,7 +923,8 @@ async def revoke_whatsapp_access(org_id: str, wa_id: str):
                 # Call Facebook's token revocation endpoint
                 revoke_url = "https://graph.facebook.com/v17.0/me/permissions"
                 params = {"access_token": access_token}
-                requests.delete(revoke_url, params=params)
+                async with httpx.AsyncClient() as client:
+                    await client.delete(revoke_url, params=params)
             except Exception as e:
                 logger.error(f"Error revoking token: {e}")
 
@@ -1045,7 +1045,8 @@ async def send_whatsapp_reaction(org_id, message_id, emoji):
             "fields": "profile_picture_url"
         }
         
-        response = requests.get(url, params=params)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params)
         
         if response.status_code != 200:
             logger.error(f"WhatsApp API Error: {response.text}")
@@ -1172,7 +1173,8 @@ async def send_message_reaction(message_id: str, phone_id: str, access_token: st
             }
         }
 
-        response = requests.post(url, headers=headers, json=body)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=body)
         if response.status_code != 200:
             logger.error(f"Error sending message reaction: {response.text}")
             return "error"
@@ -1492,7 +1494,8 @@ async def send_interactive_whatsapp_message(
             "Content-Type": "application/json",
         } 
         
-        response = requests.post(url, headers=headers, json=data)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=data)
         
         if response.status_code != 200:
             logger.error(f"WhatsApp API error: {response.text}")
