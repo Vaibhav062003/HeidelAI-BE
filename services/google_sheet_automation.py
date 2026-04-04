@@ -174,12 +174,14 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
     Optimized: Reads from MongoDB instead of hits Google Sheets API.
     Called by the scheduler after new rows are synced.
     """
-    triggers = list(db.automation_triggers.find({
-        "org_id": org_id,
-        "trigger_type": "google_sheet",
-        "status": "active",
-        "filters.sheet_id": sheet_id,
-    }))
+    triggers = await asyncio.to_thread(
+        lambda: list(db.automation_triggers.find({
+            "org_id": org_id,
+            "trigger_type": "google_sheet",
+            "status": "active",
+            "filters.sheet_id": sheet_id,
+        }))
+    )
 
     if not triggers:
         return
