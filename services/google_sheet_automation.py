@@ -15,7 +15,7 @@ import re
 import uuid as _uuid
 import httpx
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, List
 
 from database import get_mongo_db
 from loguru import logger

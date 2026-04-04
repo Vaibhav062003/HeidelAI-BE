@@ -751,8 +751,11 @@ async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str)
                 logger.success(f"✅ Comment reply sent: {result.get('id')}")
                 return True
             else:
-                error_data = response.json()
-                logger.error(f"❌ Failed to reply to comment: {error_data}")
+                try:
+                    error_data = response.json()
+                except Exception:
+                    error_data = response.text
+                logger.error(f"❌ Failed to reply to comment (status {response.status_code}): {error_data}")
                 return False
     
     except Exception as e:
@@ -864,8 +867,11 @@ async def send_private_reply(
                 logger.success(f"✅ DM sent: {result.get('message_id')}")
                 return True
             else:
-                error_data = dm_response.json()
-                logger.error(f"❌ Failed to send DM: {error_data}")
+                try:
+                    error_data = dm_response.json()
+                except Exception:
+                    error_data = dm_response.text
+                logger.error(f"❌ Failed to send DM (status {dm_response.status_code}): {error_data}")
                 return False
     
     except Exception as e:

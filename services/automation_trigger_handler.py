@@ -143,22 +143,8 @@ def _trigger_matches_criteria(trigger: Dict, trigger_data: Dict) -> bool:
     filters = trigger.get("filters", {})
     
     # Check keyword filter (supports pipe-separated keywords: "price|info|help")
-    keyword_filter = filters.get("keyword", "")
-    if keyword_filter:
-        message_text = trigger_data.get("message_text", "").lower()
-        
-        # Split by pipe and check if ANY keyword matches
-        keywords = [k.strip().lower() for k in keyword_filter.split("|") if k.strip()]
-        
-        if keywords:
-            # Check if ANY keyword is in the message
-            keyword_found = any(keyword in message_text for keyword in keywords)
-            
-            if not keyword_found:
-                logger.debug(f"❌ Keyword match failed. Looking for: {keywords}, Got: '{message_text}'")
-                return False
-            else:
-                logger.success(f"✅ Keyword matched! Found one of {keywords} in '{message_text}'")
+    if not _check_keyword_match(filters, trigger_data):
+        return False
     
     # Check post_id filter (CRITICAL for Instagram comments)
     post_id = filters.get("post_id")

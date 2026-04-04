@@ -193,6 +193,9 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
         # Cancel any old pending follow-up jobs before creating new ones (re-publish safety)
         cancel_flow_followups(org_id, flow_id, reason="republished")
 
+        # Deactivate registered triggers (instagram / tag-based / google_sheet triggers)
+        await _deactivate_flow_triggers(org_id, flow_id)
+
         # ------------------------------------------------------------------
         # Process each trigger
         # ------------------------------------------------------------------
