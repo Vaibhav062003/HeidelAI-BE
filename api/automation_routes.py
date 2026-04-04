@@ -1,8 +1,9 @@
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Request
 
 # Internal Modules
+from core.limiter import limiter
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
 from services.automation_service import (
@@ -42,7 +43,8 @@ class CreateFlowRequest(BaseModel):
 
 # CREATE FLOW ENDPOINT
 @router.post("")
-async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
+@limiter.limit("10/minute")
+async def create_flow(request: Request, payload: CreateFlowRequest, user: CurrentUser):
     """
     Create a new automation flow
     
@@ -73,9 +75,10 @@ async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
     except Exception as e:
         logger.error(f"Error creating automation flow: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create automation flow: {str(e)}")
-    
+
 @router.get("")
-async def list_flows(user: CurrentUser, status: Optional[str] = None):
+@limiter.limit("100/minute")
+async def list_flows(request: Request, user: CurrentUser, status: Optional[str] = None):
     """
     List all automation flows for the organization
     
