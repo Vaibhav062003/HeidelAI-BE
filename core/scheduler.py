@@ -4,6 +4,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # === Internal Modules ===
 from database import get_mongo_db
+from core.services import services
 from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
@@ -116,6 +117,11 @@ async def process_scheduled_messages():
             logger.error(f"Error updating message statuses: {e}")
 
 async def process_inactivity_for_org(org_id: str):
+    
+    if org_id in services.NO_AUTO_CLOSE_ORGS:
+        logger.info(f"[ORG ...{org_id[-5:-1]}] Skipping inactivity processing (opted out)")
+        return
+
     conv_col = db[f"conversations_{org_id}"]
     now = datetime.now(timezone.utc)
 

@@ -1,7 +1,7 @@
 # Built-in Modules
 import time, json, hmac, hashlib
 from fastapi import APIRouter, HTTPException
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from fastapi import Request, Header, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from pymongo import ReturnDocument
@@ -12,7 +12,6 @@ import httpx
 from core.managers import manager
 from services.automation_service import execute_whatsapp_flow
 from services.pma_chatbot import process_onboarding_if_needed, send_to_pma_chatbot
-from services.utils import generate_message_id
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
@@ -26,11 +25,10 @@ from database import get_mongo_db
 from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, CGSV_ORG_WA_ID
 from core.services import services
 from loguru import logger
+from services.webhook_service import calculate_whatsapp_reply_window
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
-
-logger.info(f"DEV_WEBHOOK_URL repr: {repr(DEV_WEBHOOK_URL)}")
 
 async def forward_webhook_to_dev(body: bytes, headers: dict):
     """
@@ -365,6 +363,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             context_type = None
                             context = None
 
+                            try:
+                                reply_window_info = calculate_whatsapp_reply_window(message)
+                                reply_window_expiry_time_utc = reply_window_info["expiry_time_utc"]
+                                is_ad_referral = reply_window_info["is_ad_referral"]
+                            except ValueError as exc:
+                                logger.warning(
+                                    f"Failed to calculate WhatsApp reply window due to invalid/missing timestamp; "
+                                    f"using default 24h window. Error: {exc}"
+                                )
+                                reply_window_expiry_time_utc = datetime.now(timezone.utc) + timedelta(hours=24)
+                                is_ad_referral = False
+
                             if message_context:
                                 replied_message_id = message_context.get("id")
 
@@ -418,6 +428,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_name=sender_name2,
                                         last_message=content,
                                         last_sender="customer",
+                                        reply_window_expiry=reply_window_expiry_time_utc,
+                                        is_ad_referral=is_ad_referral,
                                         mode="reply"
                                     )
                                     
@@ -451,55 +463,60 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 }
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
-                                if whatsapp_flow and ai_enabled and is_production:
-                                    automation_response = await execute_whatsapp_flow(
-                                        flow=whatsapp_flow,
-                                        org_id=org_id,
+                                #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
+                                if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
+                                    
+                                    # Execute the WhatsApp Automation Flow first (if it exists)
+                                    if whatsapp_flow:
+                                        automation_response = await execute_whatsapp_flow(
+                                            flow=whatsapp_flow,
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            stage=stage,
+                                            trigger_event="message_received",
+                                            trigger_messages=whatsapp_flow.get("trigger_messages"),
+                                            message_content=content,
+                                            customer_name=sender_name2,
+                                            whatsapp_business_id=whatsapp_business_id,
+                                            message_type=message_type,
+                                        )
+
+                                        # If the flow handled the message successfully, exit early.
+                                        if automation_response:
+                                            return {"status": "ok"}
+
+                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
+                                    chatbot_response = await send_to_agent(
                                         conversation_id=conversation_id,
-                                        stage=stage,
-                                        trigger_event="message_received",
-                                        trigger_messages=whatsapp_flow.get("trigger_messages"),
-                                        message_content=content,
+                                        user_input=content,
+                                        persona=convo_doc.get("persona", "fallback"),
+                                        location=convo_doc.get("location", "india"),
                                         customer_name=sender_name2,
-                                        whatsapp_business_id=whatsapp_business_id,
-                                        message_type=message_type,
+                                        org_id=org_id,
+                                        source="webhook",
                                     )
 
-                                    if automation_response:
-                                        return {"status": "ok"}
-                                    else:
-                                        chatbot_response = await send_to_agent(
-                                            conversation_id=conversation_id,
-                                            user_input=content,
-                                            persona=convo_doc.get("persona", "fallback"),
-                                            location=convo_doc.get("location", "india"),
-                                            customer_name=sender_name2,
-                                            org_id=org_id,
-                                            source="webhook",
-                                        )
+                                    final_response = chatbot_response["final_response"]
 
-                                        final_response = chatbot_response["final_response"]
+                                    # Update the database with the agent's response
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=final_response,
+                                        last_sender="ai",
+                                        mode="ai",
+                                    )
 
-                                        # Storing chatbot response in the DB
-                                        # Create or update conversation
-                                        conversation_id = await create_or_update_whatsapp_conversation(
-                                            org_id=org_id,
-                                            recipient_id=whatsapp_business_id,
-                                            customer_phone_no=customer_phone_no,
-                                            customer_name=sender_name2,
-                                            last_message=final_response,
-                                            last_sender="ai",
-                                            mode="ai",
-                                        )
+                                    # Send the WhatsApp message
+                                    res = await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": final_response,
+                                        "sender_id": whatsapp_business_id,
+                                    }, org_id, "ai")
 
-                                        # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
-                                        res = await send_whatsapp_message({
-                                            "conversation_id": conversation_id,
-                                            "content": final_response,
-                                            "sender_id": whatsapp_business_id,
-                                            }, org_id, "ai")
-
-                                    return {"status":"ok"}
+                                    return {"status": "ok"}
 
                                 # Handling messages received on HeidelAI's whatsapp number
                                 if is_heidelai and ai_enabled and is_production:
@@ -605,6 +622,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     sender_name2=sender_name2,
                                     message_id=message_id,
                                     conversation_id=conversation_id,
+                                    reply_window_expiry_time_utc=reply_window_expiry_time_utc,
+                                    is_ad_referral=is_ad_referral,
                                     media_name=media_name,
                                     caption=media_data.get("caption", None)
                                 )
@@ -667,6 +686,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_name=sender_name2,
                                         last_message=content,
                                         last_sender="customer",
+                                        reply_window_expiry=reply_window_expiry_time_utc,
+                                        is_ad_referral=is_ad_referral,
                                         mode="reply"
                                     )
                                     
@@ -880,7 +901,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                                 "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1773070610/WhatsApp_Image_2026-03-09_at_3.02.13_PM_tcdpby.jpg"
                                                             }
                                                         },
-                                                        body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n\n💥 Special Early Bird Offer\n\n🎯 Register before 15th March\n💰 Only Rs. 2750/-\n\n⏳ After 15th March\n💰 Fees: Rs. 3500/-\n\n⚡ Limited Seats Available – Book Now!\n\n✨ Let’s Make Maths Your Child’s Best Friend this Summer....!!!🥳",
+                                                        body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n🕰️ Eve 4 to 5.30 PM\n\n💥 Special Early Bird Offer\n🎯Register before 15th March\n💰 Only Rs. 2750/-\n\n⏳ After 15th March\n💰 Fees: Rs. 3500/-\n\n⚡ Limited Seats Available – Book Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 8055579965\n\n✨ Let’s Make Maths Your Child’s Best Friend!",
                                                         button_text="Register Now",
                                                         url="https://forms.gle/hPMw7inpe7H1E4gF9"
                                                     )
@@ -924,7 +945,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 return {"status":"ok"}
                                 
                             elif message_type == "unsupported":
-                                continue  # Skip unsupported messages
+                                content = "[Unsupported message type]"
                             elif message_type == "reaction":
                                 continue  # Handled above
                             else:
@@ -940,7 +961,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 customer_name=sender_name2,
                                 last_message=content,
                                 last_sender="customer",
-                                mode="reply"
+                                reply_window_expiry=reply_window_expiry_time_utc,
+                                is_ad_referral=is_ad_referral,
+                                mode="reply",
                             )
                             
                             # Store in WhatsApp-specific collections

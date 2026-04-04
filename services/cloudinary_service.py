@@ -184,6 +184,8 @@ async def upload_and_send_whatsapp_media_background(
     message_id: str,
     conversation_id: str,
     media_name: str,
+    reply_window_expiry_time_utc: datetime,
+    is_ad_referral: bool,
     caption: Optional[str] = None
 ) -> Optional[str]:
     """
@@ -287,6 +289,8 @@ async def upload_and_send_whatsapp_media_background(
             customer_phone_no=customer_phone_no,
             customer_name=sender_name2,
             last_message=content,
+            reply_window_expiry=reply_window_expiry_time_utc,
+            is_ad_referral=is_ad_referral,
             last_sender="customer"
         )
         
