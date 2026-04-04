@@ -1227,6 +1227,7 @@ async def bulk_send_whatsapp_message(
         # Enqueue the heavy work as a background task
         background_tasks.add_task(
             run_bulk_send_job,
+            wa_id=wa_id,
             job_id=job_id,
             org_id=org_id,
             phone_id=phone_id,
