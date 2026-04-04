@@ -1646,7 +1646,13 @@ def create_bulk_job(
         "updated_at": now,
         "completed_at": None,
     }
-    db.bulk_jobs.insert_one(job_data)
+    try:
+        db.bulk_jobs.insert_one(job_data)
+    except Exception as e:
+        logger.error(f"Bulk WA | job={job_id} | org={org_id} | Failed to create bulk job record: {e}")
+        # Optionally re-raise or handle as needed. 
+        # In this context, the caller expects the job to be created.
+        raise
 
 
 def get_bulk_job(
@@ -1708,7 +1714,7 @@ async def run_bulk_send_job(
     job_id: str,
     org_id: str,
     phone_id: str,
-    access_token: str,
+        access_token: str,
     template_name: str,
     language_code: str,
     recipients: list,
@@ -1721,6 +1727,13 @@ async def run_bulk_send_job(
     offloading sync DB updates to threads to avoid blocking the event loop.
     All successful sends are saved to the messages and conversations collections in bulk.
     """
+    total_recipients = len(recipients)
+    if total_recipients > 2000:
+        logger.warning(
+            f"Bulk WA | job={job_id} | Large broadcast detected: {total_recipients} recipients. "
+            f"Estimated completion time: ~{(total_recipients / max_concurrent * (delay_seconds + 1)) / 60:.1f} minutes."
+        )
+    
     url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -1817,7 +1830,10 @@ async def run_bulk_send_job(
             # Process in chunks of max_concurrent
             for i in range(0, len(recipients), max_concurrent):
                 chunk = recipients[i : i + max_concurrent]
-                logger.info(f"Bulk WA | job={job_id} | processing batch {i//max_concurrent + 1} | size={len(chunk)}")
+                current_batch = (i // max_concurrent) + 1
+                total_batches = (total_recipients + max_concurrent - 1) // max_concurrent
+                
+                logger.info(f"Bulk WA | job={job_id} | processing batch {current_batch}/{total_batches} | size={len(chunk)}")
                 
                 tasks = [send_to_recipient(i + idx, r, client) for idx, r in enumerate(chunk)]
                 batch_results = await asyncio.gather(*tasks)
@@ -1910,7 +1926,12 @@ async def run_bulk_send_job(
                 if convo_updates:
                     db_tasks.append(asyncio.to_thread(db[conversations_collection_name].bulk_write, convo_updates, ordered=False))
 
-                await asyncio.gather(*db_tasks)
+                try:
+                    await asyncio.gather(*db_tasks)
+                except Exception as db_err:
+                    logger.error(f"Bulk WA | job={job_id} | database error during batch tracking: {db_err}")
+                    # We don't raise here to allow subsequent batches to try, 
+                    # but the job results might be incomplete in DB.
 
                 # Delay between batches if there are more messages left
                 if i + max_concurrent < len(recipients) and delay_seconds > 0:
