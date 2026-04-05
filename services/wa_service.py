@@ -1869,8 +1869,8 @@ async def run_bulk_send_job(
                                 "components": components
                             },
                             "sender_id": phone_number, # Matching existing convention for agent messages
-                            "sender_name": "Agent",
-                            "role": MessageRole.AGENT,
+                            "sender_name": "AI",
+                            "role": MessageRole.AI,
                             "timestamp": now,
                             "status": "sent",
                             "mode": "reply",
@@ -1887,9 +1887,9 @@ async def run_bulk_send_job(
                                     "platform": "whatsapp",
                                     "whatsapp_id": wa_id,
                                     "customer_id": phone_number,
-                                    "last_message": f"You: Shared a template {template_name}",
+                                    "last_message": f"AI: Shared a template {template_name}",
                                     "last_message_timestamp": now,
-                                    "last_sender": "agent",
+                                    "last_sender": "ai",
                                     "status": "open",
                                     "reminder_stage": 0,
                                     "next_action_at": now + timedelta(hours=6),
