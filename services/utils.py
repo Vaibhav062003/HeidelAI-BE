@@ -1,7 +1,7 @@
 from zoneinfo import ZoneInfo
 
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 import base64
 import time
@@ -11,7 +11,10 @@ def serialize_mongo(obj):
         return str(obj)
 
     if isinstance(obj, datetime):
-        return obj.isoformat()
+        # Ensure timezone info is always present so JS parses as UTC
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=timezone.utc)
+        return obj.isoformat().replace('+00:00', 'Z')
 
     if isinstance(obj, list):
         return [serialize_mongo(i) for i in obj]
