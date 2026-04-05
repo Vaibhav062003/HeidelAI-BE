@@ -484,18 +484,23 @@ async def _execute_delay_node(context, node_id: str, config: Dict):
     amount = config.get("amount", 1)
     unit = config.get("unit", "seconds")
     
+    try:
+        delay_amount = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid delay amount: {amount}")
+    
+    if delay_amount < 0:
+        raise ValueError(f"Delay amount must be non-negative: {delay_amount}")
+    
     # Convert to seconds
     if unit == "minutes":
-        delay_seconds = amount * 60
+        delay_seconds = delay_amount * 60
     elif unit == "hours":
-        delay_seconds = amount * 3600
+        delay_seconds = delay_amount * 3600
     elif unit == "days":
-        delay_seconds = amount * 86400
+        delay_seconds = delay_amount * 86400
     else:
-        delay_seconds = amount
-    
-    # Cap delay at 5 minutes for safety
-    delay_seconds = min(delay_seconds, 300)
+        delay_seconds = delay_amount
     
     context.log(node_id, "delay", "executing", f"Delaying {delay_seconds}s", success=True)
     
