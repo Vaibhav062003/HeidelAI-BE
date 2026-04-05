@@ -3,6 +3,7 @@ from typing import Dict, Set, List
 from collections import OrderedDict, defaultdict
 from fastapi import WebSocket
 from langgraph.graph.state import CompiledStateGraph
+from config.settings import EGENIE_ORG_ID
 
 class Services:
 
@@ -42,5 +43,6 @@ class Services:
         # === Agents ===
         self.prompt_cache = {}
         self.agents: Dict[str, CompiledStateGraph] = {}
+        self.NO_AUTO_CLOSE_ORGS = [EGENIE_ORG_ID]
 
 services = Services()
