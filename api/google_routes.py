@@ -1,6 +1,6 @@
 import httpx
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -99,9 +99,7 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
 
         # ── Step 3: Store connection in MongoDB ───────────────────────────────
         now = datetime.now(timezone.utc)
-        token_expiry = datetime.fromtimestamp(
-            now.timestamp() + expires_in, tz=timezone.utc
-        )
+        token_expiry = now + timedelta(seconds=expires_in)
 
         google_id = f"goog_{uuid.uuid4().hex}"
         connection_doc = {
@@ -115,10 +113,10 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
             "credentials": {
                 "access_token": access_token,
                 "refresh_token": refresh_token,   # May be None if already had one
-                "token_expiry": token_expiry.isoformat(),
+                "token_expiry": token_expiry,
             },
-            "connected_at": now.isoformat(),
-            "updated_at": now.isoformat(),
+            "connected_at": now,
+            "updated_at": now,
         }
 
         # Upsert - update if org already has a connection, insert if new
@@ -239,7 +237,7 @@ async def google_disconnect(user: CurrentUser):
         now = datetime.now(timezone.utc)
         db.google_connections.update_one(
             {"org_id": org_id},
-            {"$set": {"status": "inactive", "disconnected_at": now.isoformat(), "updated_at": now.isoformat()}}
+            {"$set": {"status": "inactive", "disconnected_at": now, "updated_at": now}}
         )
 
         # Update organization document to clear google_id
@@ -251,7 +249,7 @@ async def google_disconnect(user: CurrentUser):
         # ── Step 3: Disable polling on all sheets ─────────────────────────────
         result = db.google_sheets_connections.update_many(
             {"org_id": org_id},
-            {"$set": {"polling_enabled": False, "updated_at": now.isoformat()}}
+            {"$set": {"polling_enabled": False, "updated_at": now}}
         )
         logger.info(f"Disabled polling on {result.modified_count} sheets for org {org_id}")
 

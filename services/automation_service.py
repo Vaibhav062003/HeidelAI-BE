@@ -199,6 +199,8 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
         # ------------------------------------------------------------------
         # Process each trigger
         # ------------------------------------------------------------------
+        deferred_tasks = []
+
         for idx, trigger_config in enumerate(triggers):
             trigger_type = trigger_config.get("type")
             config = trigger_config.get("config", {})
@@ -208,9 +210,10 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
                 logger.warning(f"Trigger {idx} missing start_node_id — skipping.")
                 continue
 
-            # ---- Google Sheet trigger: register + immediately process rows ----
+            # ---- Google Sheet trigger: register --------------------------
             if trigger_type == "google_sheet":
-                await _handle_google_sheet_trigger(
+                # Returns a dict of params for process_google_sheet_trigger if valid
+                task_params = await _handle_google_sheet_trigger(
                     org_id=org_id,
                     flow_id=flow_id,
                     idx=idx,
@@ -219,6 +222,8 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
                     nodes=nodes,
                     connections=connections,
                 )
+                if task_params:
+                    deferred_tasks.append(task_params)
 
             # ---- WhatsApp Follow-Up: schedule a timed job -----------------
             elif trigger_type == "whatsapp_followup":
@@ -265,6 +270,12 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
         )
 
         if updated_flow:
+            # Start deferred background tasks after flow is successfully published
+            from services.google_sheet_automation import process_google_sheet_trigger
+            for params in deferred_tasks:
+                asyncio.create_task(process_google_sheet_trigger(**params))
+                logger.success(f"Started deferred immediate processing for google_sheet flow {flow_id}")
+
             return serialize_mongo(updated_flow)
         return None
 
@@ -433,12 +444,12 @@ async def _handle_google_sheet_trigger(
     start_node_id: str,
     nodes: dict,
     connections: list,
-):
+) -> Optional[dict]:
     """
     Handle a google_sheet trigger on publish:
     1. Register in automation_triggers for future scheduler runs
     2. Extract the message text from the connected node
-    3. Immediately process all existing sheet rows
+    3. Return params for immediate processing (to be run after publish success)
     """
     sheet_id = config.get("sheet_id")
     column_name = config.get("column_name")
@@ -447,13 +458,13 @@ async def _handle_google_sheet_trigger(
         logger.warning(
             f"google_sheet trigger for flow {flow_id} missing sheet_id or column_name — skipping."
         )
-        return
+        return None
 
     # Get message text from the flow's message node
     message_text = _extract_message_from_start(start_node_id, nodes, connections)
     if not message_text:
         logger.warning(f"No message text found for google_sheet flow {flow_id} — skipping.")
-        return
+        return None
 
     # Register the trigger (with message_text stored for scheduler use)
     triggers_collection = _automation_triggers_collection()
@@ -484,19 +495,13 @@ async def _handle_google_sheet_trigger(
     )
     logger.info(f"Registered google_sheet trigger for flow {flow_id}, sheet {sheet_id}")
 
-    # Immediately process all existing rows (don't await — run in background)
-    import asyncio
-    from services.google_sheet_automation import process_google_sheet_trigger
-
-    asyncio.create_task(
-        process_google_sheet_trigger(
-            org_id=org_id,
-            flow_id=flow_id,
-            trigger_config=config,
-            message_text=message_text,
-        )
-    )
-    logger.success(f"Started immediate processing for google_sheet flow {flow_id}")
+    # Return params for immediate processing (deferred until finish successfully)
+    return {
+        "org_id": org_id,
+        "flow_id": flow_id,
+        "trigger_config": config,
+        "message_text": message_text,
+    }
 
 
 async def _register_single_trigger(

@@ -348,7 +348,7 @@ async def store_instagram_message(
         "sender_name": sender_name,
         "sender_username": sender_username,
         "role": role,
-        "timestamp": datetime.now(),
+        "timestamp": datetime.now(timezone.utc),
         "status": "sent",
         "mode": mode
     }
@@ -1156,7 +1156,7 @@ async def send_instagram_reaction(org_id, message_id, emoji):
                     "username": owner_details.get("username"),
                     "full_name": owner_details.get("name"),
                     "profile_picture_url": owner_details.get("profile_picture_url"),
-                    "timestamp": datetime.now()
+                    "timestamp": datetime.now(timezone.utc)
                 }
             }}, 
             return_document=ReturnDocument.AFTER

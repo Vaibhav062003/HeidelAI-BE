@@ -172,6 +172,7 @@ async def process_google_sheet_trigger(
 async def process_new_sheet_rows(org_id: str, sheet_id: str):
     """
     Optimized: Reads from MongoDB instead of hits Google Sheets API.
+    Only processes rows synced within the last 15 minutes by default.
     Called by the scheduler after new rows are synced.
     """
     triggers = list(db.automation_triggers.find({
@@ -184,10 +185,16 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
     if not triggers:
         return
 
-    # Fetch recently synced rows from MongoDB
-    # We fetch all rows for this sheet - deduplication handles the rest.
+    # Fetch recently synced rows from MongoDB (last 15 minutes)
+    # This avoids loading the entire sheet history into memory on every poll.
+    min_synced_at = datetime.now(timezone.utc) - timedelta(minutes=15)
     rows_collection = db[f"google_sheet_rows_{org_id}"]
-    rows_docs = await asyncio.to_thread(lambda: list(rows_collection.find({"sheet_id": sheet_id})))
+    rows_docs = await asyncio.to_thread(
+        lambda: list(rows_collection.find({
+            "sheet_id": sheet_id,
+            "synced_at": {"$gte": min_synced_at}
+        }))
+    )
     
     if not rows_docs:
         return
@@ -224,8 +231,9 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
 
 def cancel_flow_sent_records(org_id: str, flow_id: str):
     """
-    Remove sent number tracking when a flow is unpublished,
-    so re-publishing starts fresh.
+    Remove sent number tracking for a specific flow.
+    Can be used to reset tracking so re-publishing starts fresh.
+    (Not automatically called on unpublish to prevent re-messaging).
     """
     result = db[SENT_COLLECTION].delete_many({"org_id": org_id, "flow_id": flow_id})
     logger.info(
@@ -412,10 +420,11 @@ def _mark_sent(org_id: str, flow_id: str, phone: str, sheet_id: str):
 def _ensure_sent_index():
     """Create indexes for deduplication collection."""
     try:
+        # Align with google_sheets_scheduler._ensure_indexes()
         db[SENT_COLLECTION].create_index(
             [("org_id", 1), ("flow_id", 1), ("phone", 1)],
             unique=True,
-            name="dedup_idx",
+            name="dedup_sent_idx",
         )
     except Exception:
         pass  # Index already exists

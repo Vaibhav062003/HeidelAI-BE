@@ -923,10 +923,18 @@ async def revoke_whatsapp_access(org_id: str, wa_id: str):
                 # Call Facebook's token revocation endpoint
                 revoke_url = "https://graph.facebook.com/v17.0/me/permissions"
                 params = {"access_token": access_token}
-                async with httpx.AsyncClient() as client:
-                    await client.delete(revoke_url, params=params)
+                timeout = httpx.Timeout(10.0)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.delete(revoke_url, params=params)
+                    if not response.is_success:
+                        logger.error(
+                            f"Token revocation returned status {response.status_code} for org {org_id} "
+                            f"and wa_id {wa_id}: {response.text}"
+                        )
+            except httpx.HTTPError as e:
+                logger.error(f"HTTP error revoking token for org {org_id}: {e}")
             except Exception as e:
-                logger.error(f"Error revoking token: {e}")
+                logger.error(f"Unexpected error revoking token: {e}")
 
         return {"message": "WhatsApp connection removed successfully"}
         
