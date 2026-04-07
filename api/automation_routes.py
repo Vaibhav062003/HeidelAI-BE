@@ -1,9 +1,10 @@
+import asyncio
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
 # Internal Modules
-from database import get_mongo_db
+from database import get_mongo_db, get_async_mongo_db
 from auth.dependencies import CurrentUser
 from services.automation_service import (
     create_automation_flow,
@@ -18,6 +19,7 @@ from services.automation_service import (
 from loguru import logger
 
 db = get_mongo_db()
+async_db = get_async_mongo_db()
 
 router = APIRouter(prefix="/api/automation_flows", tags=["Automation Flows"])
 
@@ -49,7 +51,6 @@ class UpdateFlowRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=3, max_length=255)
     description: Optional[str] = Field(None, max_length=500)
     flow_data: Optional[FlowDocument] = None
-    status: Optional[str] = None
 
 
 # =============================================================================
@@ -117,8 +118,8 @@ async def get_pending_followups(user: CurrentUser):
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         from services.automation_scheduler import list_followups_for_org
-        pending = list_followups_for_org(org_id, status="pending", limit=100)
-        executing = list_followups_for_org(org_id, status="executing", limit=100)
+        pending = await asyncio.to_thread(list_followups_for_org, org_id, status="pending", limit=100)
+        executing = await asyncio.to_thread(list_followups_for_org, org_id, status="executing", limit=100)
 
         return {
             "pending": pending,
@@ -141,16 +142,16 @@ async def get_pending_followups(user: CurrentUser):
 async def get_available_triggers(user: CurrentUser):
     """Get list of available trigger types"""
     try:
-        triggers_collection = db["automation_trigger_types"]
+        triggers_collection = async_db["automation_trigger_types"]
 
-        triggers = list(
-            triggers_collection.find(
-                {}, {"_id": 0}
-            )
-        )
+        triggers = await triggers_collection.find(
+            {}, {"_id": 0}
+        ).to_list(length=None)
 
         return {"triggers": triggers}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching triggers: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch triggers")
@@ -160,16 +161,16 @@ async def get_available_triggers(user: CurrentUser):
 async def get_available_actions(user: CurrentUser):
     """Get list of available action types"""
     try:
-        actions_collection = db["automation_action_types"]
+        actions_collection = async_db["automation_action_types"]
 
-        actions = list(
-            actions_collection.find(
-                {}, {"_id": 0}
-            )
-        )
+        actions = await actions_collection.find(
+            {}, {"_id": 0}
+        ).to_list(length=None)
 
         return {"actions": actions}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching actions: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch actions")
@@ -217,8 +218,6 @@ async def update_flow(flow_id: str, payload: UpdateFlowRequest, user: CurrentUse
             update_data["description"] = payload.description
         if payload.flow_data is not None:
             update_data["flow_data"] = payload.flow_data.model_dump()
-        if payload.status is not None:
-            update_data["status"] = payload.status
 
         flow = await update_automation_flow(
             org_id=org_id,
@@ -327,14 +326,13 @@ async def get_flow_executions(
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
-        executions_collection = db["automation_executions"]
+        executions_collection = async_db["automation_executions"]
 
-        executions = list(
-            executions_collection.find({"flow_id": flow_id, "org_id": org_id})
-            .sort("created_at", -1)
-            .skip(skip)
-            .limit(limit)
-        )
+        executions = await executions_collection.find({"flow_id": flow_id, "org_id": org_id}) \
+            .sort("created_at", -1) \
+            .skip(skip) \
+            .limit(limit) \
+            .to_list(length=limit)
 
         for exec in executions:
             exec["_id"] = str(exec["_id"])
@@ -345,10 +343,12 @@ async def get_flow_executions(
             if exec.get("error") and exec["error"].get("timestamp"):
                 exec["error"]["timestamp"] = exec["error"]["timestamp"].isoformat()
 
-        total_count = executions_collection.count_documents({"flow_id": flow_id, "org_id": org_id})
+        total_count = await executions_collection.count_documents({"flow_id": flow_id, "org_id": org_id})
 
         return {"executions": executions, "total": total_count}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching executions: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -369,16 +369,15 @@ async def get_google_sheet_flow_stats(flow_id: str, user: CurrentUser):
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
-        sent_count = db["google_sheet_sent_numbers"].count_documents(
+        sent_count = await async_db["google_sheet_sent_numbers"].count_documents(
             {"org_id": org_id, "flow_id": flow_id}
         )
 
-        recent_sent = list(
-            db["google_sheet_sent_numbers"]
-            .find({"org_id": org_id, "flow_id": flow_id}, {"_id": 0, "phone": 1, "sent_at": 1})
-            .sort("sent_at", -1)
-            .limit(20)
-        )
+        recent_sent = await async_db["google_sheet_sent_numbers"] \
+            .find({"org_id": org_id, "flow_id": flow_id}, {"_id": 0, "phone": 1, "sent_at": 1}) \
+            .sort("sent_at", -1) \
+            .limit(20) \
+            .to_list(length=20)
 
         for record in recent_sent:
             if record.get("sent_at") and hasattr(record["sent_at"], "isoformat"):
@@ -415,9 +414,9 @@ async def get_flow_followups(
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         from services.automation_scheduler import list_followups_for_flow
-        followups = list_followups_for_flow(org_id, flow_id, status=status, limit=limit)
+        followups = await asyncio.to_thread(list_followups_for_flow, org_id, flow_id, status=status, limit=limit)
 
-        total_count = db["automation_scheduled_followups"].count_documents(
+        total_count = await async_db["automation_scheduled_followups"].count_documents(
             {"org_id": org_id, "flow_id": flow_id} if not status else {"org_id": org_id, "flow_id": flow_id, "status": status}
         )
 
@@ -439,7 +438,7 @@ async def cancel_flow_followup(flow_id: str, schedule_id: str, user: CurrentUser
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         from services.automation_scheduler import cancel_followup
-        cancelled = cancel_followup(schedule_id=schedule_id, org_id=org_id)
+        cancelled = await asyncio.to_thread(cancel_followup, schedule_id=schedule_id, org_id=org_id)
 
         if not cancelled:
             raise HTTPException(
@@ -469,7 +468,7 @@ async def get_followup_stats(flow_id: str, user: CurrentUser):
             {"$group": {"_id": "$status", "count": {"$sum": 1}}},
         ]
 
-        raw = list(db["automation_scheduled_followups"].aggregate(pipeline))
+        raw = await async_db["automation_scheduled_followups"].aggregate(pipeline).to_list(length=None)
         stats = {item["_id"]: item["count"] for item in raw}
 
         for s in ["pending", "executing", "completed", "failed", "cancelled"]:
@@ -478,6 +477,8 @@ async def get_followup_stats(flow_id: str, user: CurrentUser):
         stats["total"] = sum(stats.values())
         return {"flow_id": flow_id, "stats": stats}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching followup stats for flow {flow_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
