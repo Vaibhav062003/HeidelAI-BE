@@ -19,6 +19,7 @@ from services.team_service import (
     fetch_team_escalations,
     update_team_conversation_status
 )
+from typing import List, Dict, Literal
 from fastapi import APIRouter, HTTPException, Body
 from pydantic import BaseModel
 from loguru import logger
@@ -97,7 +98,7 @@ async def get_team_escalations(user: CurrentUser):
 
 
 class StatusUpdate(BaseModel):
-    status: str
+    status: Literal["pending_human_review", "reviewed"]
 
 
 @router.patch("/conversations/{conversation_id}/status")
@@ -118,7 +119,8 @@ async def update_conversation_status(
         success = await update_team_conversation_status(
             org_id=org_id,
             conversation_id=conversation_id,
-            status=update.status
+            status=update.status,
+            current_user_id=user.user_id
         )
         if not success:
             raise HTTPException(status_code=404, detail="Conversation not found")

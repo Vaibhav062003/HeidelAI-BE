@@ -135,7 +135,8 @@ async def fetch_team_escalations(org_id: str) -> List[Dict]:
 async def update_team_conversation_status(
     org_id: str,
     conversation_id: str,
-    status: str
+    status: str,
+    current_user_id: str
 ) -> bool:
     """
     Update the status of a team conversation (e.g., from pending to reviewed).
@@ -144,7 +145,7 @@ async def update_team_conversation_status(
     collection = async_db[f"team_conversations_{org_id}"]
 
     result = await collection.update_one(
-        {"conversation_id": conversation_id},
+        {"conversation_id": conversation_id, "participants": current_user_id},
         {"$set": {
             "status": status,
             "updated_at": datetime.now(timezone.utc)
@@ -174,24 +175,33 @@ async def fetch_team_messages(
     Resets unread in: team_conversations_{org_id}
     """
     try:
-        team_messages_col = db[f"team_messages_{org_id}"]
-        team_convos_col = db[f"team_conversations_{org_id}"]
+        async_db = get_async_mongo_db()
+        team_messages_col = async_db[f"team_messages_{org_id}"]
+        team_convos_col = async_db[f"team_conversations_{org_id}"]
 
-        # Reset unread count for this agent
-        team_convos_col.update_one(
-            {"conversation_id": conversation_id},
+        # 1. Authorization & Reset unread count for this agent
+        # We combine this into one update_one to verify participation
+        result = await team_convos_col.update_one(
+            {"conversation_id": conversation_id, "participants": agent_id},
             {"$set": {f"unread.{agent_id}": 0}}
         )
 
-        messages: List[Dict] = []
+        if result.matched_count == 0:
+            # Check if conversation exists but user is not a participant
+            exists = await team_convos_col.find_one({"conversation_id": conversation_id}, {"_id": 1})
+            if exists:
+                logger.warning(f"[team_service] Unauthorized message access: user {agent_id} in conv {conversation_id}")
+                raise HTTPException(status_code=403, detail="Access denied: You are not a participant in this conversation")
+            else:
+                raise HTTPException(status_code=404, detail="Conversation not found")
 
-        collection_names = db.list_collection_names()
-        if f"team_messages_{org_id}" in collection_names:
-            messages = list(
-                team_messages_col
-                .find({"conversation_id": conversation_id}, {"_id": 0})
-                .sort("timestamp", 1)
-            )
+        # 2. Fetch messages
+        cursor = team_messages_col.find(
+            {"conversation_id": conversation_id},
+            {"_id": 0}
+        ).sort("timestamp", 1)
+        
+        messages = await cursor.to_list(length=None)
 
         # Normalize timestamps to ISO strings
         for msg in messages:
@@ -205,9 +215,12 @@ async def fetch_team_messages(
         )
         return {"messages": messages}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[team_service] fetch_team_messages error: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch team messages: {str(e)}"
+            detail="Failed to fetch team messages"
         )
+
