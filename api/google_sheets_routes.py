@@ -338,15 +338,21 @@ async def refresh_google_token(org_id: str) -> str:
     credentials = connection.get("credentials", {})
     access_token = credentials.get("access_token")
     refresh_token = credentials.get("refresh_token")
-    token_expiry_str = credentials.get("token_expiry")
+    token_expiry_value = credentials.get("token_expiry")
 
-    if token_expiry_str and access_token:
+    if token_expiry_value and access_token:
         try:
-            token_expiry = datetime.fromisoformat(token_expiry_str)
-            if token_expiry.tzinfo is None:
-                token_expiry = token_expiry.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) + timedelta(minutes=5) < token_expiry:
-                return access_token
+            token_expiry = None
+            if isinstance(token_expiry_value, datetime):
+                token_expiry = token_expiry_value
+            elif isinstance(token_expiry_value, str):
+                token_expiry = datetime.fromisoformat(token_expiry_value.replace("Z", "+00:00"))
+
+            if token_expiry is not None:
+                if token_expiry.tzinfo is None:
+                    token_expiry = token_expiry.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) + timedelta(minutes=5) < token_expiry:
+                    return access_token
         except Exception:
             pass
 

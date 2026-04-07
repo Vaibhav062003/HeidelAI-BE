@@ -143,7 +143,7 @@ async def process_google_sheet_trigger(
             phone = recipient["phone_number"]
             resolved_text = recipient["resolved_text"]
             job_id = _uuid.uuid4().hex
-            
+
             await asyncio.to_thread(create_bulk_job, org_id=org_id, job_id=job_id, template_name="", language_code="", total=1)
             await run_bulk_send_job(
                 job_id=job_id, org_id=org_id, phone_id=phone_id, access_token=wa_access_token,
@@ -157,15 +157,19 @@ async def process_google_sheet_trigger(
                 if job.get("results"): msg_id = job["results"][0].get("message_id", "")
                 try:
                     await _store_sent_message(org_id=org_id, wa_id=wa_id, phone=phone, message_text=resolved_text, message_id=msg_id)
-                    stats["sent"] += 1
                     await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id)
+                    return {"sent": 1, "errors": 0}
                 except Exception as e:
-                    stats["errors"] += 1
                     logger.error(f"[GoogleSheetAuto] DB storage failed for {phone}: {e}")
+                    return {"sent": 0, "errors": 1}
             else:
-                stats["errors"] += 1
+                return {"sent": 0, "errors": 1}
 
-    await asyncio.gather(*[asyncio.create_task(_send_one(r)) for r in eligible])
+    results = await asyncio.gather(*[asyncio.create_task(_send_one(r)) for r in eligible])
+    for res in results:
+        if res:
+            stats["sent"] += res.get("sent", 0)
+            stats["errors"] += res.get("errors", 0)
     return stats
 
 
