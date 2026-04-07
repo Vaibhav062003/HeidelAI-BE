@@ -318,9 +318,9 @@ async def _process_due_jobs() -> None:
     claimed_jobs = []
     for job in due_jobs:
         claimed = await asyncio.to_thread(
-            lambda: db[COLLECTION].find_one_and_update(
+            lambda j=job: db[COLLECTION].find_one_and_update(
                 {
-                    "schedule_id": job["schedule_id"],
+                    "schedule_id": j["schedule_id"],
                     "status": "pending",  # Guard: only claim if still pending
                 },
                 {

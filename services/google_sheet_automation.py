@@ -153,15 +153,25 @@ async def process_google_sheet_trigger(
 
             job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
             if job and job.get("sent", 0) > 0:
+                # 1. MARK SENT in deduplication collection IMMEDIATELY (highest priority)
+                try:
+                    await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id)
+                except Exception as e:
+                    logger.error(f"[GoogleSheetAuto] CRITICAL: Failed to mark {phone} as sent in dedup table: {e}")
+                    # Even if this fails, we proceed so we can try to store the message, 
+                    # but the risk of re-send exists if the app crashes right now.
+
+                # 2. Store in conversation history (lower priority bookkeeping)
                 msg_id = ""
-                if job.get("results"): msg_id = job["results"][0].get("message_id", "")
+                if job.get("results"): 
+                    msg_id = job["results"][0].get("message_id", "")
+                
                 try:
                     await _store_sent_message(org_id=org_id, wa_id=wa_id, phone=phone, message_text=resolved_text, message_id=msg_id)
-                    await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id)
-                    return {"sent": 1, "errors": 0}
                 except Exception as e:
-                    logger.error(f"[GoogleSheetAuto] DB storage failed for {phone}: {e}")
-                    return {"sent": 0, "errors": 1}
+                    logger.error(f"[GoogleSheetAuto] Conversation storage failed for {phone}: {e}")
+                
+                return {"sent": 1, "errors": 0}
             else:
                 return {"sent": 0, "errors": 1}
 

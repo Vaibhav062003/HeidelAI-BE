@@ -1,5 +1,8 @@
 # === Third-party Modules ===
 from typing import Dict, Any
+import asyncio
+import httpx
+import json as json_lib
 
 # === Internal Modules ===
 from database import get_mongo_db
@@ -425,7 +428,7 @@ async def execute_http_request(context, node_id: str, config: Dict, trigger_data
     # Replace variables in URL and body
     url = replace_variables(url, context.variables)
     body_str = replace_variables(body_str, context.variables)
-    
+
     # Parse body
     try:
         body = json_lib.loads(body_str) if body_str else {}

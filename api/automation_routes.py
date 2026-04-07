@@ -104,6 +104,78 @@ async def list_flows(user: CurrentUser, status: Optional[str] = None):
         raise HTTPException(status_code=500, detail=f"Failed to list automation flows: {str(e)}")
 
 
+# =============================================================================
+# FOLLOW-UP MANAGEMENT ENDPOINTS (WhatsApp Scheduler)
+# =============================================================================
+
+@router.get("/followups/pending")
+async def get_pending_followups(user: CurrentUser):
+    """List all pending and executing follow-up jobs for the organization."""
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        from services.automation_scheduler import list_followups_for_org
+        pending = list_followups_for_org(org_id, status="pending", limit=100)
+        executing = list_followups_for_org(org_id, status="executing", limit=100)
+
+        return {
+            "pending": pending,
+            "executing": executing,
+            "total_active": len(pending) + len(executing),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching pending followups: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# AVAILABLE TRIGGERS & ACTIONS (discovery endpoints)
+# =============================================================================
+
+@router.get("/triggers/available")
+async def get_available_triggers(user: CurrentUser):
+    """Get list of available trigger types"""
+    try:
+        triggers_collection = db["automation_trigger_types"]
+
+        triggers = list(
+            triggers_collection.find(
+                {}, {"_id": 0}
+            )
+        )
+
+        return {"triggers": triggers}
+
+    except Exception as e:
+        logger.error(f"Error fetching triggers: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch triggers")
+
+
+@router.get("/actions/available")
+async def get_available_actions(user: CurrentUser):
+    """Get list of available action types"""
+    try:
+        actions_collection = db["automation_action_types"]
+
+        actions = list(
+            actions_collection.find(
+                {}, {"_id": 0}
+            )
+        )
+
+        return {"actions": actions}
+
+    except Exception as e:
+        logger.error(f"Error fetching actions: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch actions")
+
+
+
 @router.get("/{flow_id}")
 async def get_flow(flow_id: str, user: CurrentUser):
     """Get a specific automation flow by ID"""
@@ -378,31 +450,6 @@ async def cancel_flow_followup(flow_id: str, schedule_id: str, user: CurrentUser
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/followups/pending")
-async def get_pending_followups(user: CurrentUser):
-    """List all pending and executing follow-up jobs for the organization."""
-    try:
-        org_id = user.org_id
-        if not org_id:
-            raise HTTPException(status_code=400, detail="Organization ID not found")
-
-        from services.automation_scheduler import list_followups_for_org
-        pending = list_followups_for_org(org_id, status="pending", limit=100)
-        executing = list_followups_for_org(org_id, status="executing", limit=100)
-
-        return {
-            "pending": pending,
-            "executing": executing,
-            "total_active": len(pending) + len(executing),
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error fetching pending followups: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.get("/{flow_id}/followups/stats")
 async def get_followup_stats(flow_id: str, user: CurrentUser):
     """Aggregated statistics for follow-up jobs of a specific flow."""
@@ -428,45 +475,3 @@ async def get_followup_stats(flow_id: str, user: CurrentUser):
     except Exception as e:
         logger.error(f"Error fetching followup stats for flow {flow_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# =============================================================================
-# AVAILABLE TRIGGERS & ACTIONS (discovery endpoints)
-# =============================================================================
-
-@router.get("/triggers/available")
-async def get_available_triggers(user: CurrentUser):
-    """Get list of available trigger types"""
-    try:
-        triggers_collection = db["automation_trigger_types"]
-
-        triggers = list(
-            triggers_collection.find(
-                {}, {"_id": 0}
-            )
-        )
-
-        return {"triggers": triggers}
-
-    except Exception as e:
-        logger.error(f"Error fetching triggers: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to fetch triggers")
-
-
-@router.get("/actions/available")
-async def get_available_actions(user: CurrentUser):
-    """Get list of available action types"""
-    try:
-        actions_collection = db["automation_action_types"]
-
-        actions = list(
-            actions_collection.find(
-                {}, {"_id": 0}
-            )
-        )
-
-        return {"actions": actions}
-
-    except Exception as e:
-        logger.error(f"Error fetching actions: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to fetch actions")
