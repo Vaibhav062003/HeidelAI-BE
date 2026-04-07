@@ -13,9 +13,14 @@ Message sending continues to use the existing shared endpoint:
 WebSocket events (new_team_message) are also unchanged.
 """
 
-from services.team_service import fetch_team_messages
-from services.team_service import fetch_team_conversations
-from fastapi import APIRouter, HTTPException
+from services.team_service import (
+    fetch_team_messages,
+    fetch_team_conversations,
+    fetch_team_escalations,
+    update_team_conversation_status
+)
+from fastapi import APIRouter, HTTPException, Body
+from pydantic import BaseModel
 from loguru import logger
 
 from auth.dependencies import CurrentUser
@@ -73,3 +78,54 @@ async def get_team_messages(conversation_id: str, user: CurrentUser):
             f"get_team_messages error for conv={conversation_id} org={org_id}: {e}"
         )
         raise HTTPException(status_code=500, detail="Failed to fetch team messages")
+@router.get("/escalations")
+async def get_team_escalations(user: CurrentUser):
+    """
+    List all team conversations that are pending human review.
+    Discovery endpoint for agents to find new escalations in their org.
+    """
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    try:
+        escalations = await fetch_team_escalations(org_id=org_id)
+        return escalations
+    except Exception as e:
+        logger.error(f"get_team_escalations error for org={org_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch escalations")
+
+
+class StatusUpdate(BaseModel):
+    status: str
+
+
+@router.patch("/conversations/{conversation_id}/status")
+async def update_conversation_status(
+    conversation_id: str,
+    update: StatusUpdate,
+    user: CurrentUser
+):
+    """
+    Update the status of a specific team conversation.
+    Example: Change from 'pending_human_review' to 'reviewed'.
+    """
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    try:
+        success = await update_team_conversation_status(
+            org_id=org_id,
+            conversation_id=conversation_id,
+            status=update.status
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        return {"status": "success", "new_status": update.status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"update_conversation_status error for conv={conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update status")
