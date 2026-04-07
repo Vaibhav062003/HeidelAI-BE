@@ -442,8 +442,8 @@ def _ensure_sent_index():
             unique=True,
             name="dedup_sent_idx",
         )
-    except Exception:
-        pass  # Index already exists
+    except Exception as e:
+        logger.error(f"[GoogleSheetAuto] Failed to ensure sent index: {e}")
 
 
 def _get_flow_message_text(

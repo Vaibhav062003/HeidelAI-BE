@@ -456,7 +456,7 @@ async def execute_http_request(context, node_id: str, config: Dict, trigger_data
             
             try:
                 context.set_variable("http_response", response.json())
-            except:
+            except (json_lib.JSONDecodeError, ValueError):
                 context.set_variable("http_response", response.text)
             
             if 200 <= response.status_code < 300:

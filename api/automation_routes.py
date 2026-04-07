@@ -345,7 +345,9 @@ async def get_flow_executions(
             if exec.get("error") and exec["error"].get("timestamp"):
                 exec["error"]["timestamp"] = exec["error"]["timestamp"].isoformat()
 
-        return {"executions": executions, "total": len(executions)}
+        total_count = executions_collection.count_documents({"flow_id": flow_id, "org_id": org_id})
+
+        return {"executions": executions, "total": total_count}
 
     except Exception as e:
         logger.error(f"Error fetching executions: {str(e)}")
@@ -415,7 +417,11 @@ async def get_flow_followups(
         from services.automation_scheduler import list_followups_for_flow
         followups = list_followups_for_flow(org_id, flow_id, status=status, limit=limit)
 
-        return {"followups": followups, "total": len(followups)}
+        total_count = db["automation_scheduled_followups"].count_documents(
+            {"org_id": org_id, "flow_id": flow_id} if not status else {"org_id": org_id, "flow_id": flow_id, "status": status}
+        )
+
+        return {"followups": followups, "total": total_count}
 
     except HTTPException:
         raise
