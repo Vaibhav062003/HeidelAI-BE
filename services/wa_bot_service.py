@@ -1,4 +1,4 @@
-""""
+"""
   # ── Webhook-runtime fields (read by webhook_routes.py and execute_whatsapp_flow) ──
   # The webhook does:
   #   flow_collection.find_one({
@@ -28,11 +28,11 @@ import uuid
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timezone
 
-from database import get_mongo_db
+from database import get_async_mongo_db
 from services.utils import serialize_mongo
 from loguru import logger
 
-db = get_mongo_db()
+db = get_async_mongo_db()
 
 # ─── Internal helper ──────────────────────────────────────────────────────────
 
@@ -62,6 +62,7 @@ async def create_wa_bot_flow(
             "flow_id":    flow_id,
             "org_id":     org_id,
             "name":       payload.get("name", name),
+            "status":     payload.get("status", "draft"),  # always present; never None
             "flow_type":  "wabot",
             "created_at": now,
             "updated_at": now,
@@ -72,7 +73,7 @@ async def create_wa_bot_flow(
             "last_run":   None,
         }
 
-        col.insert_one(doc)
+        await col.insert_one(doc)
         logger.info(f"Created wa_bot_flow {flow_id} for org {org_id}")
         return serialize_mongo(doc)
 
@@ -96,7 +97,7 @@ async def list_wa_bot_flows(
         if status:
             query["status"] = status
 
-        flows = list(col.find(query).sort("created_at", -1))
+        flows = await col.find(query).sort("created_at", -1).to_list(length=None)
         logger.info(f"Listed {len(flows)} wa_bot_flows for org {org_id}")
         return [serialize_mongo(f) for f in flows]
 
@@ -123,7 +124,7 @@ async def get_wa_bot_flow(org_id: str, flow_id: str) -> Optional[Dict]:
     """
     try:
         col = _col(org_id)
-        doc = col.find_one({"flow_id": flow_id, "org_id": org_id})
+        doc = await col.find_one({"flow_id": flow_id, "org_id": org_id})
         if not doc:
             return None
         return serialize_mongo(doc)
@@ -166,7 +167,7 @@ async def update_wa_bot_flow(
         if payload.get("status") == "active":
             set_fields["published_at"] = now
 
-        result = col.find_one_and_update(
+        result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
             {"$set": set_fields},
             return_document=True,
@@ -188,7 +189,7 @@ async def update_wa_bot_flow(
 async def delete_wa_bot_flow(org_id: str, flow_id: str) -> bool:
     try:
         col = _col(org_id)
-        result = col.delete_one({"flow_id": flow_id, "org_id": org_id})
+        result = await col.delete_one({"flow_id": flow_id, "org_id": org_id})
         deleted = result.deleted_count > 0
         if deleted:
             logger.info(f"Deleted wa_bot_flow {flow_id} for org {org_id}")
@@ -223,7 +224,7 @@ async def publish_wa_bot_flow(
         col = _col(org_id)
         now = datetime.now(timezone.utc)
 
-        result = col.find_one_and_update(
+        result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
             {"$set": {
                 "status":       "active",
@@ -259,7 +260,7 @@ async def unpublish_wa_bot_flow(
         col = _col(org_id)
         now = datetime.now(timezone.utc)
 
-        result = col.find_one_and_update(
+        result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
             {"$set": {
                 "status":     "draft",
