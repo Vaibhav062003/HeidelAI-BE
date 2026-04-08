@@ -87,65 +87,56 @@ async def fetch_team_conversations(
 # Fetch AI Escalations
 # ---------------------------------------------------------------------------
 
-async def fetch_team_escalations(org_id: str) -> List[Dict]:
+async def fetch_ai_escalations(org_id: str) -> List[Dict]:
     """
-    Return all team conversations that are pending human review.
-    Discovery endpoint for agents to find new escalations.
+    Return all AI escalations that are pending human review.
+    Discovery endpoint for agents to find new escalations in their org.
+    Reads from: escalations_{   org_id} (without org_ prefix)
     """
     async_db = get_async_mongo_db()
-    collection = async_db[f"team_conversations_{org_id}"]
+    collection = async_db[f"escalations_{org_id}"]
 
-    # Only fetch conversations pending human review
+    # Only fetch escalations pending human review
     query = {"status": "pending_human_review"}
     projection = {"_id": 0}
 
     cursor = (
         collection
         .find(query, projection)
-        .sort("last_message_timestamp", -1)
+        .sort("timestamp", -1)
     )
 
     raw_docs = await cursor.to_list(length=100)
 
-    result = []
     for doc in raw_docs:
-        lmt = doc.get("last_message_timestamp")
-        timestamp = lmt.isoformat() if isinstance(lmt, datetime) else None
+        # Format timestamps to ISO strings
+        for field in ["timestamp", "created_at"]:
+            val = doc.get(field)
+            if isinstance(val, datetime):
+                doc[field] = val.isoformat()
 
-        result.append({
-            "id": doc.get("conversation_id"),
-            "customer_name": doc.get("customer_name") or f"Escalation: {doc.get('conversation_id')}",
-            "last_message": doc.get("last_message", ""),
-            "timestamp": timestamp,
-            "status": doc.get("status"),
-            "inferred_intent": doc.get("inferred_intent"),
-            "platform": "internal",
-            "type": "team",
-            "participants": doc.get("participants", []),
-        })
-
-    logger.info(f"[team_service] Fetched {len(result)} escalations for org {org_id}")
-    return result
+    logger.info(f"[team_service] Fetched {len(raw_docs)} AI escalations for org {org_id}")
+    return raw_docs
 
 
 # ---------------------------------------------------------------------------
-# Update Conversation Status
+# Update Escalation Status
 # ---------------------------------------------------------------------------
 
-async def update_team_conversation_status(
+async def update_escalation_status(
     org_id: str,
-    conversation_id: str,
-    status: str,
-    current_user_id: str
+    escalation_id: str,
+    status: str
 ) -> bool:
     """
-    Update the status of a team conversation (e.g., from pending to reviewed).
+    Update the status of an AI escalation (e.g., from pending to reviewed).
+    Targets the new collection: escalations_{org_id}
     """
     async_db = get_async_mongo_db()
-    collection = async_db[f"team_conversations_{org_id}"]
+    collection = async_db[f"escalations_{org_id}"]
 
     result = await collection.update_one(
-        {"conversation_id": conversation_id, "participants": current_user_id},
+        {"id": escalation_id},
         {"$set": {
             "status": status,
             "updated_at": datetime.now(timezone.utc)
@@ -153,10 +144,10 @@ async def update_team_conversation_status(
     )
 
     if result.matched_count == 0:
-        logger.warning(f"[team_service] No conversation found to update status: {conversation_id}")
+        logger.warning(f"[team_service] No escalation found to update status: {escalation_id}")
         return False
 
-    logger.info(f"[team_service] Updated status to '{status}' for conv {conversation_id} in org {org_id}")
+    logger.info(f"[team_service] Updated escalation status to '{status}' for {escalation_id} in org {org_id}")
     return True
 
 
@@ -187,13 +178,8 @@ async def fetch_team_messages(
         )
 
         if result.matched_count == 0:
-            # Check if conversation exists but user is not a participant
-            exists = await team_convos_col.find_one({"conversation_id": conversation_id}, {"_id": 1})
-            if exists:
-                logger.warning(f"[team_service] Unauthorized message access: user {agent_id} in conv {conversation_id}")
-                raise HTTPException(status_code=403, detail="Access denied: You are not a participant in this conversation")
-            else:
-                raise HTTPException(status_code=404, detail="Conversation not found")
+            logger.info(f"[team_service] Conversation {conversation_id} not found or user {agent_id} not a participant. Returning empty list.")
+            return {"messages": []}
 
         # 2. Fetch messages
         cursor = team_messages_col.find(

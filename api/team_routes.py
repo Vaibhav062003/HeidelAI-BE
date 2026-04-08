@@ -16,8 +16,8 @@ WebSocket events (new_team_message) are also unchanged.
 from services.team_service import (
     fetch_team_messages,
     fetch_team_conversations,
-    fetch_team_escalations,
-    update_team_conversation_status
+    fetch_ai_escalations,
+    update_escalation_status
 )
 from typing import List, Dict, Literal
 from fastapi import APIRouter, HTTPException, Body
@@ -82,7 +82,7 @@ async def get_team_messages(conversation_id: str, user: CurrentUser):
 @router.get("/escalations")
 async def get_team_escalations(user: CurrentUser):
     """
-    List all team conversations that are pending human review.
+    List all AI escalations that are pending human review.
     Discovery endpoint for agents to find new escalations in their org.
     """
     org_id = user.org_id
@@ -90,7 +90,7 @@ async def get_team_escalations(user: CurrentUser):
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
     try:
-        escalations = await fetch_team_escalations(org_id=org_id)
+        escalations = await fetch_ai_escalations(org_id=org_id)
         return escalations
     except Exception as e:
         logger.error(f"get_team_escalations error for org={org_id}: {e}")
@@ -101,14 +101,14 @@ class StatusUpdate(BaseModel):
     status: Literal["pending_human_review", "reviewed"]
 
 
-@router.patch("/conversations/{conversation_id}/status")
-async def update_conversation_status(
-    conversation_id: str,
+@router.patch("/escalations/{id}/status")
+async def update_escalation_status_route(
+    id: str,
     update: StatusUpdate,
     user: CurrentUser
 ):
     """
-    Update the status of a specific team conversation.
+    Update the status of a specific AI escalation.
     Example: Change from 'pending_human_review' to 'reviewed'.
     """
     org_id = user.org_id
@@ -116,18 +116,17 @@ async def update_conversation_status(
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
     try:
-        success = await update_team_conversation_status(
+        success = await update_escalation_status(
             org_id=org_id,
-            conversation_id=conversation_id,
-            status=update.status,
-            current_user_id=user.user_id
+            escalation_id=id,
+            status=update.status
         )
         if not success:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+            raise HTTPException(status_code=404, detail="Escalation not found")
         
         return {"status": "success", "new_status": update.status}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"update_conversation_status error for conv={conversation_id}: {e}")
+        logger.error(f"update_escalation_status error for id={id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update status")
