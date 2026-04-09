@@ -152,6 +152,51 @@ async def update_escalation_status(
 
 
 # ---------------------------------------------------------------------------
+# Create AI Escalation (Programmatic/API)
+# ---------------------------------------------------------------------------
+
+async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
+    """
+    Save a new AI escalation to MongoDB and broadcast to online agents.
+    Used by the internal API and AI tools.
+    """
+    from services.websocket_service import broadcast_ai_escalation
+    import uuid
+
+    async_db = get_async_mongo_db()
+    collection = async_db[f"escalations_{org_id}"]
+
+    # Prepare document
+    escalation_doc = {
+        "id": data.get("id") or str(uuid.uuid4()),
+        "user_id": data.get("user_id"),
+        "customer_text": data.get("customer_text"),
+        "inferred_intent": data.get("inferred_intent"),
+        "status": data.get("status", "pending_human_review"),
+        "timestamp": datetime.now(timezone.utc),
+        "created_at": datetime.now(timezone.utc),
+        "role": data.get("role", "ai_agent"),
+        "sender_name": data.get("sender_name", "AI Assistant"),
+        "is_ai_escalation": True,
+        "metadata": data.get("metadata", {})
+    }
+
+    # Save to MongoDB
+    await collection.insert_one(escalation_doc.copy())
+    logger.success(f"[team_service] Created new AI escalation: {escalation_doc['id']} for org {org_id}")
+
+    # Broadcast via WebSocket
+    # Prepare broadcast payload (format timestamps as ISO string)
+    broadcast_payload = escalation_doc.copy()
+    broadcast_payload["timestamp"] = broadcast_payload["timestamp"].isoformat()
+    broadcast_payload["created_at"] = broadcast_payload["created_at"].isoformat()
+    
+    await broadcast_ai_escalation(org_id, broadcast_payload)
+
+    return escalation_doc
+
+
+# ---------------------------------------------------------------------------
 # Fetch team messages for a specific conversation
 # ---------------------------------------------------------------------------
 

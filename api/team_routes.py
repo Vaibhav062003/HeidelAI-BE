@@ -17,8 +17,12 @@ from services.team_service import (
     fetch_team_messages,
     fetch_team_conversations,
     fetch_ai_escalations,
-    update_escalation_status
+    update_escalation_status,
+    create_ai_escalation
 )
+from fastapi import APIRouter, HTTPException, Body, Header, Depends
+from auth.dependencies import CurrentUser
+from config import settings
 from typing import List, Dict, Literal
 from fastapi import APIRouter, HTTPException, Body
 from pydantic import BaseModel
@@ -130,3 +134,33 @@ async def update_escalation_status_route(
     except Exception as e:
         logger.error(f"update_escalation_status error for id={id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update status")
+
+
+# ---------------------------------------------------------------------------
+# Internal Endpoint: Create AI Escalation
+# ---------------------------------------------------------------------------
+
+@router.post("/escalations/internal")
+async def internal_create_escalation(
+    payload: dict,
+    x_internal_secret: str = Header(None, alias="X-Internal-Secret")
+):
+    """
+    Internal endpoint for AI tools to push new escalations.
+    Broadcasts a live notification to connected agents.
+    """
+    if not settings.X_INTERNAL_SECRET or x_internal_secret != settings.X_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized internal access")
+
+    org_id = payload.get("org_id")
+    data = payload.get("data")
+
+    if not org_id or not data:
+        raise HTTPException(status_code=400, detail="Missing org_id or escalation data")
+
+    try:
+        new_esc = await create_ai_escalation(org_id, data)
+        return {"status": "success", "escalation_id": new_esc["id"]}
+    except Exception as e:
+        logger.error(f"Error in internal_create_escalation: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create escalation")

@@ -179,8 +179,12 @@ async def main_ws(websocket: WebSocket, client_id: str):
     services.client_metadata[client_id] = {
         "ig_id": ig_id,
         "wa_id": wa_id,
-        "user_id": user.user_id
+        "user_id": user.user_id,
+        "org_id": user.org_id
     }
+    
+    # Register under organization for wide broadcasts
+    services.org_clients[user.org_id].add(client_id)
 
     if user.user_id:
         services.agent_clients[user.user_id].add(client_id)
