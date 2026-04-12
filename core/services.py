@@ -3,6 +3,7 @@ from typing import Dict, Set, List
 from collections import OrderedDict, defaultdict
 from fastapi import WebSocket
 from langgraph.graph.state import CompiledStateGraph
+from config.settings import EGENIE_ORG_ID
 
 class Services:
 
@@ -15,6 +16,7 @@ class Services:
         self.address_details = []
         self.responded_users_by_media = {}
         self.processed_message_ids = OrderedDict()
+        self.processed_comment_ids = OrderedDict()
         self.processed_message_reaction_ids = OrderedDict()
         self.active_connections: List[WebSocket] = []
         self.whatsapp_connections_map: Dict[str, Set[str]] = {}
@@ -42,5 +44,6 @@ class Services:
         # === Agents ===
         self.prompt_cache = {}
         self.agents: Dict[str, CompiledStateGraph] = {}
+        self.NO_AUTO_CLOSE_ORGS = [EGENIE_ORG_ID]
 
 services = Services()

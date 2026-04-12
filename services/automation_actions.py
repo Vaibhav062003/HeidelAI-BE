@@ -1,13 +1,15 @@
 # === Third-party Modules ===
 from typing import Dict, Any
+import asyncio
+import httpx
+import json as json_lib
 
 # === Internal Modules ===
 from database import get_mongo_db
 from services.ig_service import send_ig_message, send_ig_media_message
 from services.wa_service import send_whatsapp_message
-from core.logger import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 
@@ -426,7 +428,7 @@ async def execute_http_request(context, node_id: str, config: Dict, trigger_data
     # Replace variables in URL and body
     url = replace_variables(url, context.variables)
     body_str = replace_variables(body_str, context.variables)
-    
+
     # Parse body
     try:
         body = json_lib.loads(body_str) if body_str else {}
@@ -454,7 +456,7 @@ async def execute_http_request(context, node_id: str, config: Dict, trigger_data
             
             try:
                 context.set_variable("http_response", response.json())
-            except:
+            except (json_lib.JSONDecodeError, ValueError):
                 context.set_variable("http_response", response.text)
             
             if 200 <= response.status_code < 300:
@@ -485,18 +487,23 @@ async def _execute_delay_node(context, node_id: str, config: Dict):
     amount = config.get("amount", 1)
     unit = config.get("unit", "seconds")
     
+    try:
+        delay_amount = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid delay amount: {amount}")
+    
+    if delay_amount < 0:
+        raise ValueError(f"Delay amount must be non-negative: {delay_amount}")
+    
     # Convert to seconds
     if unit == "minutes":
-        delay_seconds = amount * 60
+        delay_seconds = delay_amount * 60
     elif unit == "hours":
-        delay_seconds = amount * 3600
+        delay_seconds = delay_amount * 3600
     elif unit == "days":
-        delay_seconds = amount * 86400
+        delay_seconds = delay_amount * 86400
     else:
-        delay_seconds = amount
-    
-    # Cap delay at 5 minutes for safety
-    delay_seconds = min(delay_seconds, 300)
+        delay_seconds = delay_amount
     
     context.log(node_id, "delay", "executing", f"Delaying {delay_seconds}s", success=True)
     

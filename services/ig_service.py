@@ -1,6 +1,6 @@
 # Built-in modules
 import uuid
-import requests
+import httpx
 import json
 from typing import Optional
 from datetime import datetime, timezone, timedelta
@@ -20,6 +20,7 @@ from database import get_mongo_db, get_mongo_client
 from core.services import services
 from services.scheduler_service import abort_scheduled_message
 from services.conversation_utils import reopen_conversation
+
 from config.settings import (
     IG_ID, 
     IG_ACCESS_TOKEN, 
@@ -99,11 +100,12 @@ async def send_ig_message(id, message_text, instagram_id, mode, org_id) -> dict:
             }
 
             # Send the message
-            response = requests.post(url, headers=headers, json=data)
-            logger.info(f"Instagram message response: {response.status_code}, {response.json()}")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=data)
+                
+            logger.info(f"Instagram message response: {response.status_code}, {response.text}")
             
             # Return the response for further processing
-            sent_message_id = response.json().get("message_id")
             return response.json()
         else:
             message_id = f"privatenote_{uuid.uuid4()}"
@@ -199,8 +201,10 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
             }
 
             # Send the media message
-            response = requests.post(url, headers=headers, json=data)
-            logger.info(f"Instagram media message response: {response.status_code}, {response.json()}")
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(url, headers=headers, json=data)
+            
+            logger.info(f"Instagram media message response: {response.status_code}, {response.text}")
             
             # Return the response for further processing
             return response.json()
@@ -344,7 +348,7 @@ async def store_instagram_message(
         "sender_name": sender_name,
         "sender_username": sender_username,
         "role": role,
-        "timestamp": datetime.now(),
+        "timestamp": datetime.now(timezone.utc),
         "status": "sent",
         "mode": mode
     }
@@ -622,10 +626,11 @@ async def get_ig_username(sender_id, page_access_token):
         "access_token" : page_access_token
     }
 
-    response = requests.get(url, headers=headers, params=params)
-    logger.info(f"Response: {response.status_code}, {response.json()}")
-    response = response.json()
-    return response
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, headers=headers, params=params)
+        
+    logger.info(f"Response: {response.status_code}, {response.text}")
+    return response.json()
 
 async def get_ig_media_owner(media_id, page_access_token):
     url = f"https://graph.instagram.com/{media_id}"
@@ -637,7 +642,8 @@ async def get_ig_media_owner(media_id, page_access_token):
         "access_token" : page_access_token
     }
 
-    response = requests.get(url, headers=headers, params=params)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, headers=headers, params=params)
     response = response.json()
     if 'username' in response:
         owner_username = response['username']
@@ -663,7 +669,8 @@ async def get_ig_profile_picture(user_id, page_access_token):
         "access_token" : page_access_token
     }
 
-    response = requests.get(url, headers=headers, params=params)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(url, headers=headers, params=params)
     response = response.json()
     if 'profile_picture_url' in response:
         return response['profile_picture_url']
@@ -696,12 +703,6 @@ media_data = fetch_media_data()
 # INSTAGRAM COMMENT AUTOMATION FUNCTIONS
 # ============================================================================
 
-import httpx
-from database import get_mongo_db
-from core.logger import get_logger
-
-db = get_mongo_db()
-logger = get_logger(__name__)
 
 
 async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str) -> bool:
@@ -719,7 +720,9 @@ async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str)
     try:
         # Get page access token
         connection = db.instagram_connections.find_one(
-            {"instagram_id": ig_account_id, "is_active": True}
+            {"instagram_id": ig_account_id, "is_active": True},
+            {"page_access_token": 1},
+            sort=[("last_updated", -1)]
         )
         
         if not connection:
@@ -748,8 +751,11 @@ async def reply_to_comment(comment_id: str, reply_text: str, ig_account_id: str)
                 logger.success(f"✅ Comment reply sent: {result.get('id')}")
                 return True
             else:
-                error_data = response.json()
-                logger.error(f"❌ Failed to reply to comment: {error_data}")
+                try:
+                    error_data = response.json()
+                except Exception:
+                    error_data = response.text
+                logger.error(f"❌ Failed to reply to comment (status {response.status_code}): {error_data}")
                 return False
     
     except Exception as e:
@@ -780,7 +786,9 @@ async def send_private_reply(
     try:
         # Get page access token
         connection = db.instagram_connections.find_one(
-            {"instagram_id": ig_account_id, "is_active": True}
+            {"instagram_id": ig_account_id, "is_active": True},
+            {"page_access_token": 1},
+            sort=[("last_updated", -1)]
         )
         
         if not connection:
@@ -859,79 +867,17 @@ async def send_private_reply(
                 logger.success(f"✅ DM sent: {result.get('message_id')}")
                 return True
             else:
-                error_data = dm_response.json()
-                logger.error(f"❌ Failed to send DM: {error_data}")
+                try:
+                    error_data = dm_response.json()
+                except Exception:
+                    error_data = dm_response.text
+                logger.error(f"❌ Failed to send DM (status {dm_response.status_code}): {error_data}")
                 return False
     
     except Exception as e:
         logger.error(f"❌ Error sending DM: {str(e)}")
         return False
 
-async def process_comments_events(value, ig_account_id): 
-    comment_id = value.get('id')
-    text = value.get('text', '').lower()
-    from_user = value.get('from', {}).get('username', 'unknown_user')
-    media_id = value.get('media', {}).get('id')
-    user_id = value.get('from', {}).get('id')
-
-    logger.info(f"new comment by @{from_user}: {text} on media_id {media_id}")
-
-    if not media_id or not user_id:
-        logger.error("Missing media_id or user_id.")
-        return
-
-    # ADD THIS: Get org_id and trigger automation
-    from services.automation_trigger_handler import check_and_trigger_automations
-    
-    org_data = db.organizations.find_one({"ig_id": ig_account_id})
-    if org_data:
-        org_id = org_data.get("org_id")
-        
-        # Trigger automation check BEFORE existing keyword logic
-        await check_and_trigger_automations(
-            org_id=org_id,
-            platform="instagram",
-            event_type="post_comment",
-            trigger_data={
-                "platform": "instagram",
-                "platform_id": ig_account_id,
-                "comment_id": comment_id,
-                "comment_text": text,
-                "commenter_username": from_user,
-                "commenter_id": user_id,
-                "post_id": media_id,
-                "message_text": text  # For keyword matching
-            }
-        )
-
-    media_info = media_data.get(str(media_id))
-
-    if media_info and media_info['keyword'].lower() in text:
-        # Initialize the set if media_id not seen before
-        if str(media_id) not in services.responded_users_by_media:
-            services.responded_users_by_media[str(media_id)] = set()
-
-        if user_id not in services.responded_users_by_media[str(media_id)]:
-            logger.success(f"Keyword match found: '{media_info['keyword']}' in comment text. First time responding.")
-            reply_message = media_info['reply']
-            link_url = media_info.get('link')
-            button_title = media_info.get('button_title', 'View Offer')
-
-            await reply_to_comment(comment_id,reply_message, ig_account_id)
-
-            await send_private_reply(
-                comment_id=comment_id,
-                ig_account_id=ig_account_id,
-                message_text=reply_message,
-                link_url=link_url,
-                button_title=button_title
-            )
-
-            services.responded_users_by_media[str(media_id)].add(user_id)
-        else:
-            logger.info(f"Already responded to user_id {user_id} for media_id {media_id}. Skipping.")
-    else:
-        logger.warning("No matching keyword or media not tracked.")
 
 # === Disconnect and Archive helpers for Instagram ===
 
@@ -952,10 +898,11 @@ async def revoke_instagram_access(org_id: str, user_id: str):
         access_token = connection.get("page_access_token")
         if access_token:
             try:
-                response = requests.delete(
-                    f"https://graph.instagram.com/{user_id}/permissions",
-                    params={"access_token": access_token}
-                )
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    response = await client.delete(
+                        f"https://graph.instagram.com/{user_id}/permissions",
+                        params={"access_token": access_token}
+                    )
                 logger.info(f"Token revocation response: {response.status_code} - {response.text}")
             except Exception as revoke_error:
                 logger.error(f"Error revoking Instagram token: {revoke_error}")
@@ -1145,7 +1092,8 @@ async def send_instagram_reaction(org_id, message_id, emoji):
             "fields": "name,profile_picture_url,username"
         }
         
-        response = requests.get(url, params=params)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, params=params)
         
         if response.status_code != 200:
             logger.error(f"Instagram API Error: {response.text}")
@@ -1208,7 +1156,7 @@ async def send_instagram_reaction(org_id, message_id, emoji):
                     "username": owner_details.get("username"),
                     "full_name": owner_details.get("name"),
                     "profile_picture_url": owner_details.get("profile_picture_url"),
-                    "timestamp": datetime.now()
+                    "timestamp": datetime.now(timezone.utc)
                 }
             }}, 
             return_document=ReturnDocument.AFTER
@@ -1264,7 +1212,8 @@ async def send_message_reaction(message_id: str, instagram_id: str, page_access_
             }
         }
 
-        response = requests.post(url, headers=headers, json=body)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(url, headers=headers, json=body)
         if response.status_code != 200:
             logger.error(f"Error sending message reaction: {response.text}")
             return "error"
@@ -1492,7 +1441,7 @@ async def get_comment_details(comment_id: str, ig_account_id: str) -> dict:
 
 
 
-async def process_comments_events(value: dict, ig_account_id: str, background_tasks: BackgroundTasks):
+async def process_comments_events(value: dict, ig_account_id: str, background_tasks: Optional[BackgroundTasks] = None):
     """
     Process Instagram comment events from webhook
     """
@@ -1513,9 +1462,26 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
             logger.warning("Missing comment_id or post_id in webhook payload")
             return
         
-        if comment_id in services.processed_message_ids:
+        if comment_id in services.processed_comment_ids:
             logger.info(f"Duplicate comment ID {comment_id}, skipping processing.")
             return
+        
+        # Record this comment ID to prevent duplicate processing on webhook retries
+        current_time = datetime.now(timezone.utc).timestamp()
+        services.processed_comment_ids[comment_id] = current_time
+
+        # Cleanup expired processed comment IDs to keep the map from growing indefinitely
+        expiry_seconds = 60 * 60  # 1 hour TTL
+        expired_ids = [
+            msg_id for msg_id, ts in list(services.processed_comment_ids.items())
+            if current_time - ts > expiry_seconds
+        ]
+        for msg_id in expired_ids:
+            try:
+                del services.processed_comment_ids[msg_id]
+            except KeyError:
+                # Entry may have been removed concurrently; safe to ignore
+                pass
         
         logger.info(f" Instagram Comment Received: @{commenter_username} on post {post_id}: '{comment_text}'")
         
@@ -1558,19 +1524,52 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
-        # Trigger automation system with correct event_type
-        from services.automation_trigger_handler import check_and_trigger_automations
+        #  Add tasks to background_tasks to trigger automation system
+        if background_tasks:
+            from services.automation_trigger_handler import check_and_trigger_automations
+            
+            background_tasks.add_task(
+                check_and_trigger_automations,
+                org_id=org_id,
+                platform="instagram",
+                event_type="post_comment",  # Maps to "instagram_comment" trigger
+                trigger_data=trigger_data
+            )
+        else:
+            logger.warning("No background_tasks provided, skipping automation trigger.")
+
+        #  Legacy keyword matching logic (Supabase)
+        media_info = media_data.get(str(post_id))
+        if media_info and media_info['keyword'].lower() in comment_text.lower():
+            # Initialize responded users for this media if needed
+            if str(post_id) not in services.responded_users_by_media:
+                services.responded_users_by_media[str(post_id)] = set()
+
+            if str(commenter_id) not in services.responded_users_by_media[str(post_id)]:
+                logger.success(f"✅ Keyword match found: '{media_info['keyword']}' for commenter {commenter_id}")
+                reply_message = media_info['reply']
+                link_url = media_info.get('link')
+                button_title = media_info.get('button_title', 'View Offer')
+
+                # Public Reply 
+                await reply_to_comment(comment_id, reply_message, ig_account_id)
+
+                # Private DM
+                await send_private_reply(
+                    comment_id=comment_id,
+                    ig_account_id=ig_account_id,
+                    message_text=reply_message,
+                    link_url=link_url,
+                    button_title=button_title
+                )
+
+                # Record that we responded to this user on this media
+                services.responded_users_by_media[str(post_id)].add(str(commenter_id))
+            else:
+                logger.info(f"⏭ Already responded to user_id {commenter_id} for post {post_id}. Skipping keyword reply.")
         
-        background_tasks.add_task(
-            check_and_trigger_automations,
-            org_id=org_id,
-            platform="instagram",
-            event_type="post_comment",  # Maps to "instagram_comment" trigger
-            trigger_data=trigger_data
-        )
-        
-        logger.success(f" Processed Instagram comment automation for comment {comment_id}")
+        logger.success(f"✅ Processed Instagram comment {comment_id} successfully.")
         
     except Exception as e:
-        logger.error(f"Error processing Instagram comment event: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error processing Instagram comment event: {str(e)}", exc_info=True)
 

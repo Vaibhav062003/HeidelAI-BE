@@ -26,6 +26,7 @@ from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WE
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
+from services.automation_trigger_handler import check_and_trigger_automations
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -901,7 +902,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                                 "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1773070610/WhatsApp_Image_2026-03-09_at_3.02.13_PM_tcdpby.jpg"
                                                             }
                                                         },
-                                                        body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n🕰️ Eve 4 to 5.30 PM\n\n💥 Special Early Bird Offer\n🎯Register before 15th March\n💰 Only Rs. 2750/-\n\n⏳ After 15th March\n💰 Fees: Rs. 3500/-\n\n⚡ Limited Seats Available – Book Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 8055579965\n\n✨ Let’s Make Maths Your Child’s Best Friend!",
+                                                        body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n🕰️ Eve 4 to 5.30 PM\n\n⚡ Limited Seats Available – Book Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 8055579965\n\n✨ Let’s Make Maths Your Child’s Best Friend!",
                                                         button_text="Register Now",
                                                         url="https://forms.gle/hPMw7inpe7H1E4gF9"
                                                     )
@@ -1459,24 +1460,26 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     )
                     
                     if not message_echo:
-                        from services.automation_trigger_handler import check_and_trigger_automations
-
-                        await check_and_trigger_automations(
-                            org_id=org_id,
-                            platform="instagram",
-                            event_type="message_received",
-                            trigger_data={
-                                "platform": "instagram",    
-                                "platform_id": recipient_id,
-                                "conversation_id": conversation_id,
-                                "customer_id": sender_id,
-                                "customer_name": name,
-                                "customer_username": username,
-                                "message_text": message_text,
-                                "message_type": attachment_type,
-                                "message_id": ig_message_id
-                            }
-                        )
+                        if background_tasks:
+                            background_tasks.add_task(
+                                check_and_trigger_automations,
+                                org_id=org_id,
+                                platform="instagram",
+                                event_type="message_received",
+                                trigger_data={
+                                    "platform": "instagram",    
+                                    "platform_id": recipient_id,
+                                    "conversation_id": conversation_id,
+                                    "customer_id": sender_id,
+                                    "customer_name": name,
+                                    "customer_username": username,
+                                    "message_text": message_text,
+                                    "message_type": attachment_type,
+                                    "message_id": ig_message_id
+                                }
+                            )
+                        else:
+                            logger.warning("No background_tasks provided, skipping automation trigger for message_received.")
 
                     # Check if conversation exists
                     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})

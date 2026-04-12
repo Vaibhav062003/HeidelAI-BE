@@ -1,14 +1,13 @@
-import requests
-from datetime import datetime, timezone
+import httpx
+import uuid
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
 from config.settings import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
-from core.logger import get_logger
-
-logger = get_logger(__name__)
+from loguru import logger
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/google", tags=["Google"])
@@ -53,7 +52,8 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
             "redirect_uri": redirect_uri,
         }
 
-        token_response = requests.post(token_url, data=token_data, timeout=10)
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(token_url, data=token_data, timeout=10)
 
         if token_response.status_code != 200:
             logger.error(f"Google token exchange failed: {token_response.text}")
@@ -75,11 +75,12 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
 
         # ── Step 2: Fetch user profile ─────────────────────────────────────────
         profile_url = "https://www.googleapis.com/oauth2/v2/userinfo"
-        profile_response = requests.get(
-            profile_url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10
-        )
+        async with httpx.AsyncClient() as client:
+            profile_response = await client.get(
+                profile_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10
+            )
 
         if profile_response.status_code != 200:
             logger.error(f"Google profile fetch failed: {profile_response.text}")
@@ -98,11 +99,11 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
 
         # ── Step 3: Store connection in MongoDB ───────────────────────────────
         now = datetime.now(timezone.utc)
-        token_expiry = datetime.fromtimestamp(
-            now.timestamp() + expires_in, tz=timezone.utc
-        )
+        token_expiry = now + timedelta(seconds=expires_in)
 
+        google_id = f"goog_{uuid.uuid4().hex}"
         connection_doc = {
+            "id": google_id,
             "org_id": org_id,
             "status": "active",
             "email": email,
@@ -112,12 +113,10 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
             "credentials": {
                 "access_token": access_token,
                 "refresh_token": refresh_token,   # May be None if already had one
-                "token_expiry": token_expiry.isoformat(),
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
+                "token_expiry": token_expiry,
             },
-            "connected_at": now.isoformat(),
-            "updated_at": now.isoformat(),
+            "connected_at": now,
+            "updated_at": now,
         }
 
         # Upsert - update if org already has a connection, insert if new
@@ -136,7 +135,13 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
             upsert=True
         )
 
-        logger.info(f"Google connection stored for org {org_id} ({email})")
+        # Update organization document with google_id
+        db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"google_id": google_id}}
+        )
+
+        logger.info(f"Google connection stored and linked for org {org_id} ({email})")
 
         # ── Step 4: Return sanitized profile to frontend ──────────────────────
         return {
@@ -212,12 +217,13 @@ async def google_disconnect(user: CurrentUser):
         token_to_revoke = refresh_token or access_token
         if token_to_revoke:
             try:
-                revoke_response = requests.post(
-                    "https://oauth2.googleapis.com/revoke",
-                    params={"token": token_to_revoke},
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=5
-                )
+                async with httpx.AsyncClient() as client:
+                    revoke_response = await client.post(
+                        "https://oauth2.googleapis.com/revoke",
+                        params={"token": token_to_revoke},
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        timeout=5
+                    )
                 if revoke_response.status_code == 200:
                     logger.info(f"Google token revoked for org {org_id}")
                 else:
@@ -231,17 +237,23 @@ async def google_disconnect(user: CurrentUser):
         now = datetime.now(timezone.utc)
         db.google_connections.update_one(
             {"org_id": org_id},
-            {"$set": {"status": "inactive", "disconnected_at": now.isoformat(), "updated_at": now.isoformat()}}
+            {"$set": {"status": "inactive", "disconnected_at": now, "updated_at": now}}
+        )
+
+        # Update organization document to clear google_id
+        db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"google_id": None}}
         )
 
         # ── Step 3: Disable polling on all sheets ─────────────────────────────
         result = db.google_sheets_connections.update_many(
             {"org_id": org_id},
-            {"$set": {"polling_enabled": False, "updated_at": now.isoformat()}}
+            {"$set": {"polling_enabled": False, "updated_at": now}}
         )
         logger.info(f"Disabled polling on {result.modified_count} sheets for org {org_id}")
 
-        logger.info(f"Google account disconnected for org {org_id}")
+        logger.info(f"Google account disconnected and unlinked for org {org_id}")
 
         return {"message": "Google account disconnected successfully"}
 

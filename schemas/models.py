@@ -263,11 +263,15 @@ WhatsAppInteractiveMessage = Annotated[
 
 
 class BulkRecipient(BaseModel):
-    phone_number: str  # E.164 format without '+', e.g. "919876543210"
+    phone_number: str = Field(..., pattern=r"^\d{7,15}$")  # E.164 digits only, 7-15 chars
 
 class BulkMessageRequest(BaseModel):
-    template_name: str                               # Must be an APPROVED WhatsApp template
-    language_code: str                               # e.g. "en", "en_US", "hi"
-    recipients: List[BulkRecipient]                  # At least one recipient required
+    template_name: str = Field(..., min_length=1)       # Must be an APPROVED WhatsApp template
+    language_code: str = Field(                         # e.g. "en", "en_US", "hi"
+        ...,
+        min_length=1,
+        pattern=r"^[a-z]{2}(?:_[A-Z]{2})?$",
+    )
+    recipients: List[BulkRecipient] = Field(..., min_length=1)  # At least one recipient required
     components: Optional[List[Dict[str, Any]]] = None  # Same for all recipients (header, body, etc.)
-    delay_seconds: float = 4.0                       # Seconds to wait between each send
+    delay_seconds: float = Field(default=8.0, ge=8.0)  # Seconds to wait between each batch of sends (applied per batch, not per recipient)

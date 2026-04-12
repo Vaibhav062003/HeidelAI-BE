@@ -7,11 +7,9 @@ from datetime import datetime, timezone
 
 # === Internal Modules ===
 from database import get_mongo_db
-from services.utils import serialize_mongo
-from core.logger import get_logger
 from services.automation_actions import execute_action_node
+from loguru import logger
 
-logger = get_logger(__name__)
 db = get_mongo_db()
 
 
@@ -249,11 +247,18 @@ async def execute_automation_flow(
         )
     
     finally:
-        await _save_execution_record(context)
+        # Ensure that failures in saving or incrementing do not crash background tasks
+        try:
+            await _save_execution_record(context)
+        except Exception as e:
+            logger.error(f"Failed to save automation execution record: {e}")
         
         if context.status == "success":
             from services.automation_service import increment_execution_count
-            await increment_execution_count(org_id, flow_id)
+            try:
+                await increment_execution_count(org_id, flow_id)
+            except Exception as e:
+                logger.error(f"Failed to increment automation execution count: {e}")
     
     return context.to_dict()
 

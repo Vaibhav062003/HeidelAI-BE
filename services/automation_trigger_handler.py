@@ -5,10 +5,9 @@ from datetime import datetime, timezone
 
 # === Internal Modules ===
 from database import get_mongo_db
-from core.logger import get_logger
-from services.automation_execution import execute_automation_flow
 
-logger = get_logger(__name__)
+from loguru import logger
+
 db = get_mongo_db()
 
 
@@ -49,17 +48,22 @@ async def check_and_trigger_automations(
         
         logger.info(f"Found {len(triggers)} matching triggers for {platform} {event_type} in org {org_id}")
         
+        from services.automation_execution import execute_automation_flow
+        
+        # Map event_type to trigger_type for execution consistency
+        trigger_type = _event_to_trigger_type(event_type, platform)
+        
         # Execute each matching flow
         for trigger in triggers:
             flow_id = trigger.get("flow_id")
             
             try:
-                # Execute flow asynchronously (in production, use Celery)
+                # Execute flow asynchronously
                 asyncio.create_task(
                     execute_automation_flow(
                         org_id=org_id,
                         flow_id=flow_id,
-                        trigger_type=event_type,
+                        trigger_type=trigger_type,
                         trigger_data=trigger_data
                     )
                 )
@@ -103,7 +107,7 @@ async def _find_matching_triggers(
         query["platform"] = platform
     
     # Find all potential triggers
-    triggers = list(triggers_collection.find(query))
+    triggers = await asyncio.to_thread(lambda: list(triggers_collection.find(query)))
     
     # Filter triggers based on additional criteria
     matching_triggers = []
@@ -139,22 +143,8 @@ def _trigger_matches_criteria(trigger: Dict, trigger_data: Dict) -> bool:
     filters = trigger.get("filters", {})
     
     # Check keyword filter (supports pipe-separated keywords: "price|info|help")
-    keyword_filter = filters.get("keyword", "")
-    if keyword_filter:
-        message_text = trigger_data.get("message_text", "").lower()
-        
-        # Split by pipe and check if ANY keyword matches
-        keywords = [k.strip().lower() for k in keyword_filter.split("|") if k.strip()]
-        
-        if keywords:
-            # Check if ANY keyword is in the message
-            keyword_found = any(keyword in message_text for keyword in keywords)
-            
-            if not keyword_found:
-                logger.debug(f"❌ Keyword match failed. Looking for: {keywords}, Got: '{message_text}'")
-                return False
-            else:
-                logger.success(f"✅ Keyword matched! Found one of {keywords} in '{message_text}'")
+    if not _check_keyword_match(filters, trigger_data):
+        return False
     
     # Check post_id filter (CRITICAL for Instagram comments)
     post_id = filters.get("post_id")
@@ -187,10 +177,11 @@ def _trigger_matches_criteria(trigger: Dict, trigger_data: Dict) -> bool:
 async def _update_trigger_timestamp(trigger_id: str):
     """Update last_triggered_at timestamp for a trigger"""
     triggers_collection = _automation_triggers_collection()
-    
-    triggers_collection.update_one(
+
+    await asyncio.to_thread(
+        triggers_collection.update_one,
         {"trigger_id": trigger_id},
-        {"$set": {"last_triggered_at": datetime.now(timezone.utc)}}
+        {"$set": {"last_triggered_at": datetime.now(timezone.utc)}},
     )
 
 
@@ -208,7 +199,7 @@ async def trigger_tag_automation(org_id: str, conversation_id: str, tag: str, ac
     try:
         # Get conversation details
         conversations_collection = _conversations_collection(org_id)
-        conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+        conversation = await asyncio.to_thread(lambda: conversations_collection.find_one({"conversation_id": conversation_id}))
         
         if not conversation:
             logger.warning(f"Conversation {conversation_id} not found")
