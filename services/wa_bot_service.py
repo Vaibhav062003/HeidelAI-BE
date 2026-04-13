@@ -167,9 +167,12 @@ async def update_wa_bot_flow(
         }
 
         # If publishing, stamp published_at
-        if payload.get("status") == "active":
-            set_fields["published_at"] = now
-
+        if "status" in payload:
+            if payload["status"] == "active":
+                set_fields["published_at"] = now
+            else:
+                set_fields["published_at"] = None
+                
         result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
             {"$set": set_fields},
@@ -266,9 +269,10 @@ async def unpublish_wa_bot_flow(
         result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
             {"$set": {
-                "status":     "draft",
-                "updated_at": now,
-                "updated_by": updated_by,
+                "status":       "draft",
+                "published_at": None,
+                "updated_at":   now,
+                "updated_by":   updated_by,
             }},
             return_document=True,
         )
