@@ -26,6 +26,7 @@ from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
 
 
+
 db = get_mongo_db()
 mongo_client = get_mongo_client()
 
@@ -1760,20 +1761,31 @@ async def run_bulk_send_job(
         phone_number = recipient.phone_number
         masked_phone = mask_phone(phone_number)
         
-        template_payload = {
-            "name": template_name,
-            "language": {"code": language_code},
-        }
-        if components:
-            template_payload["components"] = components
+        if message_text:
+            # Plain-text mode (used by Google Sheet automations)
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": phone_number,
+                "type": "text",
+                "text": {"body": message_text},
+            }
+        else:
+            # Standard template mode
+            template_payload = {
+                "name": template_name,
+                "language": {"code": language_code},
+            }
+            if components:
+                template_payload["components"] = components
 
-        payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": phone_number,
-            "type": "template",
-            "template": template_payload,
-        }
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": phone_number,
+                "type": "template",
+                "template": template_payload,
+            }
 
         try:
             logger.debug(f"Bulk WA | job={job_id} | [{index + 1}] sending to {masked_phone}")
