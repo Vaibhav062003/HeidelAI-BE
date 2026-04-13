@@ -41,7 +41,7 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
             messages = (
                 list(
                     messages_collection.find({"conversation_id": conversation_id})
-                    .sort("timestamp", 1)
+                    .sort("timestamp", -1)
                     .limit(40)
                 )
             )
@@ -52,7 +52,8 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
             return result_data
 
         # Combine message content into a single string
-        conversation_text = "\n".join([msg["content"] for msg in messages])
+        messages.reverse()
+        conversation_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
 
         # Fetch existing tags and labels from org metadata
         available_tags = await contacts_service.get_tags_from_org_metadata(org_id)
