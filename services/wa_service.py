@@ -1,7 +1,7 @@
 # Built-in modules
 import httpx
 import asyncio
-import json, requests
+import json
 import uuid
 import io
 import cloudinary.uploader
@@ -431,7 +431,8 @@ async def send_whatsapp_message(
             }
             
             
-            response = requests.post(url, headers=headers, json=data)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=data)
             
             if response.status_code != 200:
                 logger.error(f"WhatsApp API error: {response.text}")
@@ -672,7 +673,8 @@ async def send_wa_media_message(
             }
             
             
-            response = requests.post(url, headers=headers, json=data)
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(url, headers=headers, json=data)
             
             if response.status_code != 200:
                 logger.error(f"WhatsApp API error: {response.text}")
@@ -920,9 +922,18 @@ async def revoke_whatsapp_access(org_id: str, wa_id: str):
                 # Call Facebook's token revocation endpoint
                 revoke_url = "https://graph.facebook.com/v17.0/me/permissions"
                 params = {"access_token": access_token}
-                requests.delete(revoke_url, params=params)
+                timeout = httpx.Timeout(10.0)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.delete(revoke_url, params=params)
+                    if not response.is_success:
+                        logger.error(
+                            f"Token revocation returned status {response.status_code} for org {org_id} "
+                            f"and wa_id {wa_id}: {response.text}"
+                        )
+            except httpx.HTTPError as e:
+                logger.error(f"HTTP error revoking token for org {org_id}: {e}")
             except Exception as e:
-                logger.error(f"Error revoking token: {e}")
+                logger.error(f"Unexpected error revoking token: {e}")
 
         return {"message": "WhatsApp connection removed successfully"}
         
@@ -1041,7 +1052,8 @@ async def send_whatsapp_reaction(org_id, message_id, emoji):
             "fields": "profile_picture_url"
         }
         
-        response = requests.get(url, params=params)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params)
         
         if response.status_code != 200:
             logger.error(f"WhatsApp API Error: {response.text}")
@@ -1168,7 +1180,8 @@ async def send_message_reaction(message_id: str, phone_id: str, access_token: st
             }
         }
 
-        response = requests.post(url, headers=headers, json=body)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=body)
         if response.status_code != 200:
             logger.error(f"Error sending message reaction: {response.text}")
             return "error"
@@ -1488,7 +1501,8 @@ async def send_interactive_whatsapp_message(
             "Content-Type": "application/json",
         } 
         
-        response = requests.post(url, headers=headers, json=data)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=data)
         
         if response.status_code != 200:
             logger.error(f"WhatsApp API error: {response.text}")
@@ -1714,6 +1728,7 @@ async def run_bulk_send_job(
     components: Optional[list] = None,
     delay_seconds: float = 8.0,
     max_concurrent: int = 50,
+    message_text: Optional[str] = None,
 ) -> None:
     """
     Background worker: sends WhatsApp templates using a bounded worker queue,

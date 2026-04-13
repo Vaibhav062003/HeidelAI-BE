@@ -57,12 +57,15 @@ async def create_wa_bot_flow(
         payload.pop("_id", None)
         payload.pop("flow_id", None)
 
+        raw_status = payload.get("status")
+        status = raw_status if raw_status in { "draft", "active" } else "draft"
+
         doc = {
             **payload,                     # all flat WaBot fields from frontend
             "flow_id":    flow_id,
             "org_id":     org_id,
             "name":       payload.get("name", name),
-            "status":     payload.get("status", "draft"),  # always present; never None
+            "status":     status,
             "flow_type":  "wabot",
             "created_at": now,
             "updated_at": now,
