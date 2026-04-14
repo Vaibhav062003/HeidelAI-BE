@@ -1261,62 +1261,36 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             response = await client.post(url, headers=headers, json=data)
-
-        try:
-            response_body_for_log = response.json()
-        except Exception:
-            response_body_for_log = response.text
-
-        logger.info(
-            f"WhatsApp API response | org_id={org_id} wa_id={wa_id} template={template_name} "
-            f"status={response.status_code} response={response_body_for_log}"
-        )
-        if response.status_code != 200:
-            try:
-                error_payload = response.json()
-            except Exception:
-                error_payload = {"error": {"message": response.text}}
-
-            logger.error(
-                f"WhatsApp API error | org_id={org_id} wa_id={wa_id} template={template_name} "
-                f"status={response.status_code} response={error_payload}"
-            )
-
-            # Extract the most descriptive error message
-            error_msg = "Failed to create WhatsApp message template"
-            if isinstance(error_payload, dict):
-                error_body = error_payload.get("error", {})
-                # Prioritize error_user_msg as it is often more descriptive
-                error_msg = error_body.get("error_user_msg") or error_body.get("message") or str(error_payload)
-
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=error_msg
-            )
-        logger.info(
-            f"WhatsApp template created | org_id={org_id} wa_id={wa_id} "
-            f"template={template_name}"
-        )
-
-        return response.json()
-
     except httpx.RequestError as e:
-        logger.error(
-            f"WhatsApp API request failed | org_id={org_id} wa_id={wa_id} error={str(e)}"
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Unable to reach WhatsApp API"
-        )
-
+        logger.error(f"WhatsApp API request failed | org_id={org_id} wa_id={wa_id} error={str(e)}")
+        raise HTTPException(status_code=502, detail="Unable to reach WhatsApp API")
     except Exception as e:
-        logger.exception(
-            f"Unexpected error creating WhatsApp template | org_id={org_id} | error={str(e)}"
+        logger.exception(f"Unexpected error calling WhatsApp API | org_id={org_id} | error={str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    # Process response outside of the network error catch-all
+    try:
+        response_json = response.json()
+    except Exception:
+        response_json = {"error": {"message": response.text}}
+
+    logger.info(
+        f"WhatsApp API response | org_id={org_id} wa_id={wa_id} template={template_name} "
+        f"status={response.status_code} response={response_json}"
+    )
+
+    if response.status_code != 200:
+        error_body = response_json.get("error", {})
+        error_msg = error_body.get("error_user_msg") or error_body.get("message") or str(response_json)
+        
+        logger.error(
+            f"WhatsApp API error | org_id={org_id} wa_id={wa_id} template={template_name} "
+            f"status={response.status_code} response={response_json}"
         )
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error while creating WhatsApp template"
-        )
+        raise HTTPException(status_code=response.status_code, detail=error_msg)
+
+    logger.success(f"WhatsApp template created | org_id={org_id} wa_id={wa_id} template={template_name}")
+    return response_json
 
 # WhatsApp Interactive Messages (Free to send)
 
