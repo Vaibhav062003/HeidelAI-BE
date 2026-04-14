@@ -1263,15 +1263,15 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
             response = await client.post(url, headers=headers, json=data)
     except httpx.RequestError as e:
         logger.error(f"WhatsApp API request failed | org_id={org_id} wa_id={wa_id} error={str(e)}")
-        raise HTTPException(status_code=502, detail="Unable to reach WhatsApp API")
+        raise HTTPException(status_code=502, detail="Unable to reach WhatsApp API") from e
     except Exception as e:
         logger.exception(f"Unexpected error calling WhatsApp API | org_id={org_id} | error={str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail="Internal WhatsApp server error") from e
 
     # Process response outside of the network error catch-all
     try:
         response_json = response.json()
-    except Exception:
+    except json.JSONDecodeError:
         response_json = {"error": {"message": response.text}}
 
     logger.info(
