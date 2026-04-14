@@ -1280,9 +1280,14 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
     )
 
     if response.status_code != 200:
-        error_body = response_json.get("error", {})
-        error_msg = error_body.get("error_user_msg") or error_body.get("message") or str(response_json)
-        
+        error_body = response_json.get("error", {}) if isinstance(response_json, dict) else {}
+        if not isinstance(error_body, dict):
+            error_body = {}
+        error_msg = (
+            error_body.get("error_user_msg")
+            or error_body.get("message")
+            or str(response_json)
+        )
         logger.error(
             f"WhatsApp API error | org_id={org_id} wa_id={wa_id} template={template_name} "
             f"status={response.status_code} response={response_json}"
