@@ -78,7 +78,8 @@ async def get_conversations(
     active_tab: str = Query("all"),
     unread_only: bool = Query(False),
     platform: Optional[str] = None,
-    priority: Optional[str] = None
+    priority: Optional[str] = None,
+    labels: Optional[str] = None
 ):
     """
     Get conversations for the current user's organization
@@ -97,7 +98,8 @@ async def get_conversations(
             active_tab=active_tab,
             unread_only=unread_only,
             platform=platform,
-            priority=priority
+            priority=priority,
+            labels=labels
         )
 
     except HTTPException:
