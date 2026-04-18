@@ -32,7 +32,8 @@ async def fetch_conversations_new(
     active_tab: str = "all",
     unread_only: bool = False,
     platform: Optional[str] = None,
-    priority: Optional[str] = None
+    priority: Optional[str] = None,
+    labels: Optional[str] = None
 ) -> List[Dict]:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -65,6 +66,23 @@ async def fetch_conversations_new(
             ]
         }
     ]
+
+    # Labels filter
+    if labels:
+        labels_list = [l.strip() for l in labels.split(",") if l.strip()]
+        if labels_list:
+            contact_col = async_db[f"contacts_{org_id}"]
+            
+            # Optimization: Use regex for case-insensitive exact matching
+            regex_labels = [re.compile(f"^{re.escape(l)}$", re.IGNORECASE) for l in labels_list]
+            
+            # Fetch unique conversation_ids from contacts who have any of these labels
+            matching_ids = await contact_col.distinct("conversation_id", {"labels": {"$in": regex_labels}})
+            
+            if not matching_ids:
+                return [] # Early exit to save resources
+            
+            base_conditions.append({"conversation_id": {"$in": matching_ids}})
 
     # Tab filters
     if active_tab == "open":
