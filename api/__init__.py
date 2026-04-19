@@ -16,6 +16,7 @@ from . import dashboard_routes
 from . import automation_routes
 from . import google_routes
 from . import google_sheets_routes
+from . import wa_bot_routes
 
 router = APIRouter()
 
@@ -35,3 +36,4 @@ router.include_router(automation_routes.router)
 router.include_router(google_routes.router)
 router.include_router(google_sheets_routes.router)
 router.include_router(dashboard_routes.router)
+router.include_router(wa_bot_routes.router)
