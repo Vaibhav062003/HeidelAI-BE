@@ -121,8 +121,14 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
         if not db.google_connections.find_one({"org_id": org_id, "status": "active"}):
             raise HTTPException(status_code=404, detail="No active Google connection found.")
 
-        if db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": request.sheet_id}):
-            return {"sheet_id": request.sheet_id, "sheet_name": request.sheet_name, "message": "Already connected."}
+        existing_connection = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": request.sheet_id})
+        if existing_connection:
+            return {
+                "sheet_id": existing_connection.get("sheet_id", request.sheet_id),
+                "sheet_name": existing_connection.get("sheet_name", request.sheet_name),
+                "tab_name": existing_connection.get("tab_name", request.tab_name),
+                "message": "Already connected."
+            }
 
         # Auto-detect the first tab if none was provided
         tab_name = request.tab_name
@@ -294,16 +300,17 @@ async def get_sheet_columns(
         columns: List[str] = []
         used_tab = tabs_to_try[0]
 
-        for try_tab in tabs_to_try:
-            try:
-                fetched = await _fetch_columns_from_tab(sheet_id, try_tab, access_token, org_id)
-                if fetched:
-                    columns = fetched
-                    used_tab = try_tab
-                    break
-            except Exception as e:
-                logger.debug(f"Tab '{try_tab}' failed for sheet {sheet_id}: {e}")
-                continue
+        async with httpx.AsyncClient() as client:
+            for try_tab in tabs_to_try:
+                try:
+                    fetched = await _fetch_columns_from_tab(sheet_id, try_tab, access_token, org_id, client)
+                    if fetched:
+                        columns = fetched
+                        used_tab = try_tab
+                        break
+                except Exception as e:
+                    logger.debug(f"Tab '{try_tab}' failed for sheet {sheet_id}: {e}")
+                    continue
 
         # If we found columns on a different tab than stored, update the stored tab (only if opted-in)
         if columns and used_tab != stored_tab and update_stored_tab:
@@ -413,7 +420,16 @@ async def _fetch_sheet_tabs(sheet_id: str, access_token: str, org_id: str) -> Li
             )
 
     if resp.status_code != 200:
-        error_msg = resp.json().get("error", {}).get("message", "Unknown error")
+        try:
+            error_msg = resp.json().get("error", {}).get("message", "Unknown error")
+        except Exception:
+            error_msg = resp.text or "Unknown error"
+        if resp.status_code == 401:
+            raise HTTPException(status_code=401, detail=f"Google Sheets API error: {error_msg}")
+        if resp.status_code == 403:
+            raise HTTPException(status_code=403, detail=f"Google Sheets API error: {error_msg}")
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Google Sheets API error: {error_msg}")
         raise HTTPException(status_code=502, detail=f"Google Sheets API error: {error_msg}")
 
     sheets_data = resp.json().get("sheets", [])
@@ -426,13 +442,12 @@ async def _fetch_sheet_tabs(sheet_id: str, access_token: str, org_id: str) -> Li
 
 
 async def _fetch_columns_from_tab(
-    sheet_id: str, tab_name: str, access_token: str, org_id: str
+    sheet_id: str, tab_name: str, access_token: str, org_id: str, client: Optional[httpx.AsyncClient] = None
 ) -> List[str]:
     """
     Fetch column headers (row 1) from a specific tab of a Google Sheet.
     Returns a list of non-empty header strings.
     """
-    # URL-encode the tab name to handle special characters and spaces
     import urllib.parse
     encoded_tab = urllib.parse.quote(tab_name, safe="")
     url = (
@@ -440,26 +455,37 @@ async def _fetch_columns_from_tab(
         f"/values/{encoded_tab}!A1:ZZ1"
     )
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=15,
-        )
-        if resp.status_code == 401:
+    async def _do_request(c):
+        nonlocal access_token
+        r = await c.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        if r.status_code == 401:
             access_token = await _force_token_refresh(org_id)
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=15,
-            )
+            r = await c.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        return r
+
+    if client:
+        resp = await _do_request(client)
+    else:
+        async with httpx.AsyncClient() as _client:
+            resp = await _do_request(_client)
 
     if resp.status_code != 200:
-        return []
+        try:
+            error_payload = resp.json()
+        except Exception:
+            error_payload = {}
+        error_message = error_payload.get("error", {}).get("message") or resp.text or "Google Sheets API request failed"
+        
+        if resp.status_code == 403:
+            raise HTTPException(status_code=403, detail=f"Access to the Google Sheet or tab was denied: {error_message}")
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Google Sheet or tab not found: {error_message}")
+        if resp.status_code == 400:
+            raise HTTPException(status_code=400, detail=f"Bad request, possibly invalid tab name: {error_message}")
+        raise HTTPException(status_code=502, detail=f"Google Sheets API request failed with status {resp.status_code}: {error_message}")
 
     values = resp.json().get("values", [[]])
     row = values[0] if values else []
-    # Filter out empty column names
     return [col for col in row if col and str(col).strip()]
 
 
@@ -558,11 +584,14 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     last_row = sheet_doc.get("last_processed_row_number", 1)
     sheet_name = sheet_doc.get("sheet_name", "Sheet1")
     tab_name = sheet_doc.get("tab_name", "Sheet1")
+    
+    import urllib.parse
+    encoded_tab = urllib.parse.quote(tab_name, safe="")
     access_token = await refresh_google_token(org_id)
 
     start_row = last_row + 1
     end_row = start_row + 999
-    sheets_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab_name}!A{start_row}:ZZ{end_row}"
+    sheets_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A{start_row}:ZZ{end_row}"
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
@@ -589,7 +618,7 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
 
     async with httpx.AsyncClient() as client:
         headers_resp = await client.get(
-            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{tab_name}!A1:ZZ1",
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A1:ZZ1",
             headers={"Authorization": f"Bearer {access_token}"}, 
             timeout=10
         )

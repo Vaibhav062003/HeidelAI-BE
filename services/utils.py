@@ -14,6 +14,8 @@ def serialize_mongo(obj):
         # Ensure timezone info is always present so JS parses as UTC
         if obj.tzinfo is None:
             obj = obj.replace(tzinfo=timezone.utc)
+        else:
+            obj = obj.astimezone(timezone.utc)
         return obj.isoformat().replace('+00:00', 'Z')
 
     if isinstance(obj, list):
