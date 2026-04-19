@@ -126,7 +126,7 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             return {
                 "sheet_id": existing_connection.get("sheet_id", request.sheet_id),
                 "sheet_name": existing_connection.get("sheet_name", request.sheet_name),
-                "tab_name": existing_connection.get("tab_name", request.tab_name),
+                "tab_name": existing_connection.get("tab_name") or request.tab_name or "Sheet1",
                 "message": "Already connected."
             }
 
