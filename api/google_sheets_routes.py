@@ -241,6 +241,7 @@ async def get_sheet_columns(
     user: CurrentUser,
     sheet_id: str = Query(..., description="Google Sheet ID to fetch columns for"),
     tab_name: Optional[str] = Query(None, description="Worksheet tab name (auto-detects if omitted)"),
+    update_stored_tab: bool = Query(False, description="Whether to update the stored tab if a different one is used"),
 ):
     """
     Fetch the column headers (first row) from a connected Google Sheet.
@@ -304,8 +305,8 @@ async def get_sheet_columns(
                 logger.debug(f"Tab '{try_tab}' failed for sheet {sheet_id}: {e}")
                 continue
 
-        # If we found columns on a different tab than stored, update the stored tab
-        if columns and used_tab != stored_tab:
+        # If we found columns on a different tab than stored, update the stored tab (only if opted-in)
+        if columns and used_tab != stored_tab and update_stored_tab:
             try:
                 db.google_sheets_connections.update_one(
                     {"org_id": org_id, "sheet_id": sheet_id},
