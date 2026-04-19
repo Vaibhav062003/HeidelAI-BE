@@ -305,9 +305,11 @@ async def _store_sent_message(
 
 async def _fetch_headers(sheet_id: str, tab_name: str, access_token: str) -> list:
     """Fetch the first row (headers) from the Google Sheet."""
+    import urllib.parse
+    encoded_tab = urllib.parse.quote(tab_name, safe="")
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-        f"/values/{tab_name}!A1:ZZ1"
+        f"/values/{encoded_tab}!A1:ZZ1"
     )
     async with httpx.AsyncClient() as client:
         resp = await client.get(
@@ -333,9 +335,11 @@ async def _fetch_rows(
     sheet_start = (row_start + 1) if row_start else 2
     sheet_end = (row_end + 1) if row_end else 10001
 
+    import urllib.parse
+    encoded_tab = urllib.parse.quote(tab_name, safe="")
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-        f"/values/{tab_name}!A{sheet_start}:ZZ{sheet_end}"
+        f"/values/{encoded_tab}!A{sheet_start}:ZZ{sheet_end}"
     )
     async with httpx.AsyncClient() as client:
         resp = await client.get(
