@@ -285,16 +285,17 @@ async def get_sheet_columns(
         # Build ordered list of tabs to try
         tabs_to_try: List[str] = []
         if explicit_tab:
-            tabs_to_try.append(explicit_tab)
-        if stored_tab and stored_tab not in tabs_to_try:
-            tabs_to_try.append(stored_tab)
-        # Add all available tabs that we haven't tried yet
-        for t in available_tabs:
-            if t not in tabs_to_try:
-                tabs_to_try.append(t)
-        # Last resort fallback
-        if not tabs_to_try:
-            tabs_to_try = ["Sheet1"]
+            tabs_to_try = [explicit_tab]
+        else:
+            if stored_tab:
+                tabs_to_try.append(stored_tab)
+            # Add all available tabs that we haven't tried yet
+            for t in available_tabs:
+                if t not in tabs_to_try:
+                    tabs_to_try.append(t)
+            # Last resort fallback
+            if not tabs_to_try:
+                tabs_to_try = ["Sheet1"]
 
         # Try each tab until we get columns
         columns: List[str] = []
@@ -308,8 +309,15 @@ async def get_sheet_columns(
                         columns = fetched
                         used_tab = try_tab
                         break
+                except HTTPException as he:
+                    if explicit_tab or he.status_code in [401, 403]:
+                        raise
+                    logger.debug(f"Tab '{try_tab}' failed during auto-detection: {he.detail}")
+                    continue
                 except Exception as e:
                     logger.debug(f"Tab '{try_tab}' failed for sheet {sheet_id}: {e}")
+                    if explicit_tab:
+                        raise HTTPException(status_code=500, detail=str(e))
                     continue
 
         # If we found columns on a different tab than stored, update the stored tab (only if opted-in)
