@@ -38,6 +38,15 @@ class FlowDocument(BaseModel):
     nodes: dict = Field(default_factory=dict)
     connections: list = Field(default_factory=list)
     triggers: list = Field(default_factory=list)
+    ui_config: Optional[dict] = None
+    trigger_event: Optional[str] = None
+    trigger_from: Optional[str] = None
+    trigger_messages: Optional[str] = None
+    welcome_message: Optional[dict] = None
+
+    model_config = {
+        "extra": "allow"
+    }
 
 
 class CreateFlowRequest(BaseModel):
