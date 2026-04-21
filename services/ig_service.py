@@ -1572,4 +1572,3 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
         
     except Exception as e:
         logger.error(f"❌ Error processing Instagram comment event: {str(e)}", exc_info=True)
-

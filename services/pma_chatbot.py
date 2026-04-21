@@ -217,12 +217,12 @@ async def process_onboarding_if_needed(user_input: str, conversation_id: str, or
                 header={
                     "type": "image",
                     "image": {
-                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1773070610/WhatsApp_Image_2026-03-09_at_3.02.13_PM_tcdpby.jpg"
+                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1776172882/WhatsApp_Image_2026-04-14_at_12.40.23_PM_hfyc4z.jpg"
                     }
                 },
-                body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n🕰️ Eve 4 to 5.30 PM\n\n⚡ Limited Seats Available – Book Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 8055579965\n\n✨ Let’s Make Maths Your Child’s Best Friend!",                
+                body_text="🚀 This Summer, Give Your Child a Learning Advantage!\n✨ Parijat Academy presents\n🎯 VEDIC MATHS + AI BASICS SUMMER CAMP 2026\n\nBuild super-fast calculation skills, sharp logical thinking & future-ready AI awareness in your child!\n\n📚 In this Power Camp, students will develop:\n✅ Super-Fast Calculation Skills\n✅ Sharp Logical Thinking\n✅ Confidence in Academics\n✅ Future-Ready AI Awareness\n\n📍 Offline Camp @ BVB Paranjape Vidya Mandir, Kothrud, Pune\n\n📅 Camp Dates:\n1st May – 15th May 2026\n⏰ Morning 10:00 AM to 12:30 PM\n\n🎁 Combo Offer Discount worth ₹999/-\n📖 Free Study Material worth ₹499/-\n⚠️ Limited Seats Available – Reserve Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 7030617881\n\n🌐 www.paarijatacademy.in\n🌐 www.aijunior.in\n\n🚀 Let's Build Your Child's Future — One Calculation at a Time!",                
                 button_text="Register Now",
-                url="https://forms.gle/hPMw7inpe7H1E4gF9"
+                url="https://forms.gle/6ZoiPxw1op4PsByb9"
             )
         )
 
