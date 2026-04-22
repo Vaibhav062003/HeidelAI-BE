@@ -466,39 +466,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 }
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
-                                if ai_enabled and is_dev and is_lee_dealer_wa:
-                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
-                                    chatbot_response = await send_to_agent(
-                                        conversation_id=conversation_id,
-                                        user_input=content,
-                                        persona=convo_doc.get("persona", "dealers"),
-                                        location=convo_doc.get("location", "india"),
-                                        customer_name=sender_name2,
-                                        org_id=org_id,
-                                        source="webhook",
-                                    )
 
-                                    final_response = chatbot_response["final_response"]
-
-                                    # Update the database with the agent's response
-                                    conversation_id = await create_or_update_whatsapp_conversation(
-                                        org_id=org_id,
-                                        recipient_id=whatsapp_business_id,
-                                        customer_phone_no=customer_phone_no,
-                                        customer_name=sender_name2,
-                                        last_message=final_response,
-                                        last_sender="ai",
-                                        mode="ai",
-                                    )
-
-                                    # Send the WhatsApp message
-                                    res = await send_whatsapp_message({
-                                        "conversation_id": conversation_id,
-                                        "content": final_response,
-                                        "sender_id": whatsapp_business_id,
-                                    }, org_id, "ai")
-
-                                    return {"status": "ok"}
 
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
                                 if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
@@ -629,6 +597,40 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
                                         }, org_id, "ai")
 
+                                elif ai_enabled and is_dev and is_lee_dealer_wa:
+                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
+                                    chatbot_response = await send_to_agent(
+                                        conversation_id=conversation_id,
+                                        user_input=content,
+                                        persona=convo_doc.get("persona", "dealers"),
+                                        location=convo_doc.get("location", "india"),
+                                        customer_name=sender_name2,
+                                        org_id=org_id,
+                                        source="webhook",
+                                    )
+
+                                    final_response = chatbot_response["final_response"]
+
+                                    # Update the database with the agent's response
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=final_response,
+                                        last_sender="ai",
+                                        mode="ai",
+                                    )
+
+                                    # Send the WhatsApp message
+                                    res = await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": final_response,
+                                        "sender_id": whatsapp_business_id,
+                                    }, org_id, "ai")
+
+                                    return {"status": "ok"}
+                                
                                 return {"status": "ok"}
 
                             elif message_type in ["image", "video", "document"]:
