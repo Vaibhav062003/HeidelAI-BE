@@ -328,7 +328,7 @@ async def process_onboarding_if_needed(user_input: str, conversation_id: str, or
                 return reply
 
             case "ai_intro" | "vedic_ai_intro":
-                reply = get_step_two_message(sender_name)
+                reply = get_step_two_message()
 
                 location = "india"
                 persona = "fallback"
