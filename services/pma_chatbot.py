@@ -260,7 +260,7 @@ def get_step_two_message():
     )
 
 def get_step_three_ai_message():
-    return InteractiveReplyButtonMessage(
+    return InteractiveUrlButtonMessage(
         type="button",
         body_text=(
             "Here are the details 😊\n\n💰 Course Fee: ₹3000 AI\n🎁Today's Special Offer:\n✅Free study material worth ₹499\n\nVisit our website - https://paarijatacademy.in/"
@@ -270,7 +270,7 @@ def get_step_three_ai_message():
     )
 
 def get_step_three_vedic_ai_message():
-    return InteractiveReplyButtonMessage(
+    return InteractiveUrlButtonMessage(
         type="button",
         body_text=(
             "Here are the details 😊\n\n💰 Course Fee: ₹3000 VM + ₹3000 AI\n🎁Today's Special Offer:\n✅Combo Discount ₹999\n✅Just to pay Rs.5000/- with combo offer\n✅Free study material worth ₹499\n\nVisit our website - https://paarijatacademy.in/"
