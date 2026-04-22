@@ -11,7 +11,7 @@ import httpx
 # Internal Modules 
 from core.managers import manager
 from services.automation_service import execute_whatsapp_flow
-from services.pma_chatbot import process_onboarding_if_needed, send_to_pma_chatbot
+from services.pma_chatbot import get_step_three_ai_message, get_step_three_vedic_ai_message, process_onboarding_if_needed, send_to_pma_chatbot
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
@@ -548,7 +548,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_production:
+                                elif is_pma_wa and ai_enabled and is_dev:
 
                                     flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                         
@@ -727,7 +727,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     if automation_response:
                                         return {"status": "ok"}
                                 
-                                if is_pma_wa and ai_enabled and is_production:
+                                if is_pma_wa and ai_enabled and is_dev:
                                     step_two_content = convo_doc.get("step_two_content", "vedic_ai_intro") if convo_doc else "vedic_ai_intro"
                                     if selection_id:
                                         match selection_id:
