@@ -728,10 +728,40 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         return {"status": "ok"}
                                 
                                 if is_pma_wa and ai_enabled and is_production:
+                                    step_two_content = convo_doc.get("step_two_content", "vedic_ai_intro") if convo_doc else "vedic_ai_intro"
                                     if selection_id:
                                         match selection_id:
+                                            case "step_two_yes":
+                                                if step_two_content == "vedic_ai_intro":
+                                                    await send_interactive_whatsapp_message(
+                                                        org_id=org_id,
+                                                        conversation_id=conversation_id,
+                                                        sender_id=whatsapp_business_id,
+                                                        interactive_message=get_step_three_vedic_ai_message()
+                                                    )
+                                                    return {"status": "ok"}
+                                                else:
+                                                    await send_interactive_whatsapp_message(
+                                                        org_id=org_id,
+                                                        conversation_id=conversation_id,
+                                                        sender_id=whatsapp_business_id,
+                                                        interactive_message=get_step_three_ai_message()
+                                                    )
+                                                    return {"status": "ok"}
+
                                             case "india" | "abroad":
                                                 flow_response = await process_onboarding_if_needed(user_input=selection_id, conversation_id=conversation_id, org_id=org_id, stage="awaiting_location", whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
+                                                if flow_response:
+                                                    await send_interactive_whatsapp_message(
+                                                        org_id=org_id,
+                                                        conversation_id=conversation_id,
+                                                        sender_id=whatsapp_business_id,
+                                                        interactive_message=flow_response
+                                                    )
+                                                    return {"status": "ok"}
+
+                                            case "vedic_maths_intro" | "ai_intro" | "vedic_ai_intro":
+                                                flow_response = await process_onboarding_if_needed(user_input=selection_id, conversation_id=conversation_id, org_id=org_id, stage="awaiting_introduction", whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                                 if flow_response:
                                                     await send_interactive_whatsapp_message(
                                                         org_id=org_id,
