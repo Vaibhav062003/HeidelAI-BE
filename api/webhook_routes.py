@@ -215,7 +215,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     access_token = connection.get("access_token")
 
                     # Get organization's automation flow collection
-                    flow_collection_name = f"automation_flows_{org_id}"
+                    flow_collection_name = f"wa_bot_flows_{org_id}"
                     flow_collection = db[flow_collection_name]
 
                     # Get sender name from contacts if available
@@ -397,7 +397,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             
                             is_heidelai = whatsapp_business_id == HEIDELAI_ORG_WA_ID
                             is_pma_wa = whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID
-                            is_cgsv_wa = whatsapp_business_id == CGSV_ORG_WA_ID
                             is_lee_dealer_wa = whatsapp_business_id == LEE_DEALER_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
@@ -406,7 +405,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             logger.info(f"is_heidelai: {is_heidelai}")
                             logger.info(f"is_pma_wa: {is_pma_wa}")
-                            logger.info(f"is_cgsv_wa: {is_cgsv_wa}")
                             logger.info(f"is_lee_dealer_wa: {is_lee_dealer_wa}")
                             logger.info(f"is_production: {is_production}")
                             logger.info(f"is_dev: {is_dev}")
@@ -469,8 +467,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
 
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
-                                if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
-                                    
+                                if ai_enabled and is_dev and not is_heidelai and not is_pma_wa:
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     if whatsapp_flow:
                                         automation_response = await execute_whatsapp_flow(
