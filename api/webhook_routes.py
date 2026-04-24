@@ -596,6 +596,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 elif ai_enabled and is_dev and is_lee_dealer_wa:
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
+
+                                    print("*" * 80 )
+                                    print("Calling agent for Lee Dealer WhatsApp")
                                     chatbot_response = await send_to_agent(
                                         conversation_id=conversation_id,
                                         user_input=content,
