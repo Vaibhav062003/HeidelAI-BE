@@ -15,7 +15,7 @@ import re
 import uuid as _uuid
 import httpx
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from database import get_mongo_db
 from loguru import logger
@@ -238,20 +238,15 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
     #   - Previous automation run failed midway
     #   - Re-publish after adding new rows
     rows_collection = db[f"google_sheet_rows_{org_id}"]
-    rows_docs = await asyncio.to_thread(
-        lambda: list(rows_collection.find(
-            {"sheet_id": sheet_id},
-            {"row_data": 1, "_id": 0}
-        ).sort("row_number", 1))
-    )
     
-    if not rows_docs:
+    # Determine total rows to process in batches
+    total_rows = await asyncio.to_thread(
+        lambda: rows_collection.count_documents({"sheet_id": sheet_id})
+    )
+    if total_rows == 0:
         return
 
-    # Extract the row_data dict from each document
-    rows_data = [doc.get("row_data", {}) for doc in rows_docs if doc.get("row_data")]
-
-    logger.info(f"[GoogleSheetAuto] Processing {len(rows_data)} rows from DB for {len(triggers)} triggers on sheet {sheet_id}")
+    logger.info(f"[GoogleSheetAuto] Processing {total_rows} rows from DB for {len(triggers)} triggers on sheet {sheet_id}")
 
     for trigger in triggers:
         flow_id = trigger.get("flow_id")
@@ -290,13 +285,27 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
         if not message_text:
             continue
 
-        await process_google_sheet_trigger(
-            org_id=org_id,
-            flow_id=flow_id,
-            trigger_config=trigger_config,
-            message_text=message_text,
-            rows_data=rows_data,  # Pass ALL synced data — dedup handles the rest
-        )
+        # Process rows in batches to avoid materializing the entire list
+        batch_size = 1000
+        for skip in range(0, total_rows, batch_size):
+            batch_docs = await asyncio.to_thread(
+                lambda s=skip, b=batch_size: list(rows_collection.find(
+                    {"sheet_id": sheet_id},
+                    {"row_data": 1, "_id": 0}
+                ).sort("row_number", 1).skip(s).limit(b))
+            )
+            
+            batch_data = [doc.get("row_data", {}) for doc in batch_docs if doc.get("row_data")]
+            if not batch_data:
+                break
+                
+            await process_google_sheet_trigger(
+                org_id=org_id,
+                flow_id=flow_id,
+                trigger_config=trigger_config,
+                message_text=message_text,
+                rows_data=batch_data,
+            )
 
 
 def cancel_flow_sent_records(org_id: str, flow_id: str):
@@ -411,7 +420,7 @@ async def _store_sent_message(
         logger.warning(f"[GoogleSheetAuto] Failed to upsert contact for {phone}: {e}")
 
 
-async def _fetch_headers(sheet_id: str, tab_name: str, access_token: str) -> tuple:
+async def _fetch_headers(sheet_id: str, tab_name: str, access_token: str) -> Tuple[List[str], int, int]:
     """
     Smart header detection: scans the first 20 rows to find the actual header row.
     Returns (headers_list, header_row_number, col_offset) where:
@@ -642,13 +651,13 @@ async def update_sheet_sent_status(org_id: str, message_id: str, status: str):
     Only updates if the message_id exists in the collection (i.e., it was
     sent by a Google Sheet automation).
     """
-    if not message_id or status not in ("delivered", "read", "failed"):
+    if not org_id or not message_id or status not in ("delivered", "read", "failed"):
         return
 
     def _sync_update():
         try:
             result = db[SENT_COLLECTION].update_one(
-                {"message_id": message_id},
+                {"org_id": org_id, "message_id": message_id},
                 {
                     "$set": {
                         "delivery_status": status,
