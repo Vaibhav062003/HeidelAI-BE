@@ -199,6 +199,86 @@ def get_location_message(sender_name: str):
         ],
     )
 
+def get_introduction_message(sender_name: str):
+    # Safely get the first name, default to "there" if sender_name is empty/None
+    first_name = get_first_name(sender_name)
+
+    return InteractiveReplyButtonMessage(
+        type="button",
+        header={
+            "type": "text",
+            "text": "Welcome to Parijat Academy"
+        },
+        body_text=(
+            f"Hello {first_name}👋🏻\n\n"
+            "Give your child a power-packed learning advantage this summer! 🚀\n\nAt Parijat Academy, we combine Vedic Maths + AI Basics to build:\n✅ Super-fast calculation skills\n✅ Sharp logical thinking\n✅ Confidence in academics\n✅ Future-ready AI awareness\n\n📍 Offline Summer Camp @ BVB Paranjape Vidya Mandir, Kothrud Pune\n📅 1st May to 15th May\n⏰ Morning 10 AM to 12.30pm\n\n⚠️ Limited Seats | Combo Offer Discount worth Rs 999/- \n📚 Free Study Material worth Rs. 499/-\n\n👉 Fill this form to reserve your child’s seat today!\n🔗   https://forms.gle/6ZoiPxw1op4PsByb9\n\n📲📞 Call/WhatsApp Now: 9503498556/7030617881\n🌐 www.paarijatacademy.in/ 🌐 www.aijunior.in"
+        ),
+        buttons=[
+            ActionButton(
+                type="reply",
+                reply=ReplyButton(
+                    id="vedic_maths_intro", 
+                    title="Vedic Maths"
+                )
+            ),
+            ActionButton(
+                type="reply",
+                reply=ReplyButton(
+                    id="ai_intro", 
+                    title="AI"
+                )
+            ),
+            ActionButton(
+                type="reply",
+                reply=ReplyButton(
+                    id="vedic_ai_intro", 
+                    title="Vedic + AI"
+                )
+            ),
+        ],
+    )
+
+def get_step_two_message():
+    return InteractiveReplyButtonMessage(
+        type="button",
+        header={
+            "type": "document",
+            "document": {"link":"https://res.cloudinary.com/djpc5zfgz/image/upload/v1776864318/AI_Junior_Summer_Camp_10042026_260410_155346_m1acpr.pdf"}
+        },
+        body_text=(
+            "Great Choice! 😊\n\n✨ In this Offline Summer Camp your child will learn:\n✅Vedic Maths - super fast calculation tricks\n✅Improve speed, accuracy & confidence\n✅AI Junior - Future ready learning (Document attached)\n\n📅2nd May - 16th May\n⏰10:00AM - 12:30PM\n📍@BVB Paranjpe Vidya Mandir, Kothrud, Pune\n\nWould you like to know fees and offers?\n\nPlease tap the button below👇🏻"
+        ),
+        buttons=[
+            ActionButton(
+                type="reply",
+                reply=ReplyButton(
+                    id="step_two_yes", 
+                    title="Yes"
+                )
+            ),
+        ],
+    )
+
+def get_step_three_ai_message():
+    return InteractiveUrlButtonMessage(
+        type="cta_url",
+        body_text=(
+            "Here are the details 😊\n\n💰 Course Fee: ₹3000 AI\n🎁Today's Special Offer:\n✅Free study material worth ₹499\n\nVisit our website - https://paarijatacademy.in/"
+        ),
+        button_text="Register now",
+        url="https://forms.gle/6ZoiPxw1op4PsByb9"
+    )
+
+def get_step_three_vedic_ai_message():
+    return InteractiveUrlButtonMessage(
+        type="cta_url",
+        body_text=(
+            "Here are the details 😊\n\n💰 Course Fee: ₹3000 VM + ₹3000 AI\n🎁Today's Special Offer:\n✅Combo Discount ₹999\n✅Just to pay Rs.5000/- with combo offer\n✅Free study material worth ₹499\n\nVisit our website - https://paarijatacademy.in/"
+        ),
+        button_text="Register now",
+        url="https://forms.gle/6ZoiPxw1op4PsByb9"
+    )
+
 async def process_onboarding_if_needed(user_input: str, conversation_id: str, org_id: str, stage: str, whatsapp_business_id: str, sender_name: str):
     logger.info(f"Processing onboarding for conversation_id={conversation_id} at stage={stage} with user_input={user_input}")
     user_input = user_input.strip().lower()
@@ -207,31 +287,13 @@ async def process_onboarding_if_needed(user_input: str, conversation_id: str, or
     # STAGE 1: Welcome
     # ───────────────────────────────────
     if stage == "welcome" or stage is None:
-        # First message to be sent would always be current campaign text
-        await send_interactive_whatsapp_message(
-            org_id=org_id,
-            conversation_id=conversation_id,
-            sender_id=whatsapp_business_id,
-            interactive_message=InteractiveUrlButtonMessage(
-                type="cta_url",
-                header={
-                    "type": "image",
-                    "image": {
-                        "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1776172882/WhatsApp_Image_2026-04-14_at_12.40.23_PM_hfyc4z.jpg"
-                    }
-                },
-                body_text="🚀 This Summer, Give Your Child a Learning Advantage!\n✨ Parijat Academy presents\n🎯 VEDIC MATHS + AI BASICS SUMMER CAMP 2026\n\nBuild super-fast calculation skills, sharp logical thinking & future-ready AI awareness in your child!\n\n📚 In this Power Camp, students will develop:\n✅ Super-Fast Calculation Skills\n✅ Sharp Logical Thinking\n✅ Confidence in Academics\n✅ Future-Ready AI Awareness\n\n📍 Offline Camp @ BVB Paranjape Vidya Mandir, Kothrud, Pune\n\n📅 Camp Dates:\n1st May – 15th May 2026\n⏰ Morning 10:00 AM to 12:30 PM\n\n🎁 Combo Offer Discount worth ₹999/-\n📖 Free Study Material worth ₹499/-\n⚠️ Limited Seats Available – Reserve Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 7030617881\n\n🌐 www.paarijatacademy.in\n🌐 www.aijunior.in\n\n🚀 Let's Build Your Child's Future — One Calculation at a Time!",                
-                button_text="Register Now",
-                url="https://forms.gle/6ZoiPxw1op4PsByb9"
-            )
-        )
 
-        reply = get_location_message(sender_name)
+        reply = get_introduction_message(sender_name)
 
         await conversations_col().update_one(
             {"conversation_id": conversation_id},
             {"$set": {
-                "onboarding_stage": "awaiting_location",
+                "onboarding_stage": "awaiting_introduction",
                 "is_ai_enabled": True
             }}
         )
@@ -243,9 +305,62 @@ async def process_onboarding_if_needed(user_input: str, conversation_id: str, or
     # ───────────────────────────────────
     
     if user_input in ["hi", "hello", "hey"]:
-        reply = get_welcome_message(sender_name)
+        reply = get_introduction_message(sender_name)
 
         return reply
+
+    # ───────────────────────────────────
+    # STAGE 2: Awaiting Introduction Response
+    # ───────────────────────────────────
+    if stage == "awaiting_introduction":
+        match user_input:
+            case "vedic_maths_intro":
+                reply = get_location_message(sender_name)
+
+                await conversations_col().update_one(
+                    {"conversation_id": conversation_id},
+                    {"$set": {
+                        "onboarding_stage": "awaiting_location",
+                        "is_ai_enabled": True
+                    }}
+                )
+                
+                return reply
+
+            case "ai_intro" | "vedic_ai_intro":
+                reply = get_step_two_message()
+
+                location = "india"
+                persona = "fallback"
+
+                agent = "agent_fallback"
+
+                await conversations_col().update_one(
+                    {"conversation_id": conversation_id},
+                    {"$set": {
+                        "step_two_content": user_input,
+                        "onboarding_stage": "completed",
+                        "location": location,
+                        "persona": persona,
+                        "assigned_bot": agent,
+                        "is_ai_enabled": True,
+                    }}
+                )
+                
+                return reply
+
+            case _:
+                reply = get_location_message(sender_name)
+
+                await conversations_col().update_one(
+                    {"conversation_id": conversation_id},
+                    {"$set": {
+                        "onboarding_stage": "awaiting_location",
+                        "is_ai_enabled": True
+                    }}
+                )
+                
+                return reply
 
     # ───────────────────────────────────
     # STAGE 2: Awaiting Location
