@@ -464,7 +464,13 @@ async def _fetch_headers(sheet_id: str, tab_name: str, access_token: str) -> Tup
     for row_idx, row in enumerate(all_rows):
         non_empty = [cell for cell in row if cell and str(cell).strip()]
         if non_empty:
-            return (non_empty, row_idx + 1, 0)
+            col_offset = 0
+            for cell in row:
+                if cell and str(cell).strip():
+                    break
+                col_offset += 1
+            headers = [str(cell).strip() if cell else "" for cell in row[col_offset:]]
+            return (headers, row_idx + 1, col_offset)
 
     return ([], 1, 0)
 
