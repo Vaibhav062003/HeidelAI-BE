@@ -457,7 +457,7 @@ async def _fetch_headers(sheet_id: str, tab_name: str, access_token: str) -> Tup
                 if cell and str(cell).strip():
                     break
                 col_offset += 1
-            headers = [str(cell).strip() for cell in row[col_offset:] if cell and str(cell).strip()]
+            headers = [str(cell).strip() if cell else "" for cell in row[col_offset:]]
             return (headers, row_idx + 1, col_offset)
 
     # Fallback: first row with any data
@@ -509,7 +509,7 @@ async def _fetch_rows(
 
     # Strip leading columns to align data with headers
     if col_offset > 0:
-        return [row[col_offset:] if col_offset < len(row) else row for row in raw_rows]
+        return [row[col_offset:] if col_offset < len(row) else [] for row in raw_rows]
     return raw_rows
 
 
