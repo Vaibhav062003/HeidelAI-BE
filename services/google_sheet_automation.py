@@ -171,12 +171,14 @@ async def process_google_sheet_trigger(
             )
 
             job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
-            if job and job.get("sent", 0) > 0:
-                # 1. Extract message_id from bulk job results
-                msg_id = ""
-                if job.get("results"):
-                    msg_id = job["results"][0].get("message_id", "")
+            
+            # 1. Extract message_id to ensure we have a tracking ID for webhooks
+            msg_id = ""
+            if job and job.get("results"):
+                msg_id = job["results"][0].get("message_id", "")
 
+            # Only consider the send completely successful if we have a tracking ID
+            if job and job.get("sent", 0) > 0 and msg_id:
                 # 2. MARK SENT in deduplication collection IMMEDIATELY (highest priority)
                 try:
                     await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id, msg_id)
