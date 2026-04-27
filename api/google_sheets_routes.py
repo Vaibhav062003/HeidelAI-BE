@@ -189,6 +189,7 @@ async def disconnect_sheet(
             active_triggers = list(db.automation_triggers.find(
                 {
                     "org_id": org_id,
+                    "trigger_type": "google_sheet",
                     "filters.sheet_id": sheet_id,
                     "status": "active",
                 },
