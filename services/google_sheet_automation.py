@@ -172,32 +172,51 @@ async def process_google_sheet_trigger(
 
             job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
             
-            # 1. Extract message_id to ensure we have a tracking ID for webhooks
+            # 1. Extract message_id for tracking webhook statuses
             msg_id = ""
             if job and job.get("results"):
                 msg_id = job["results"][0].get("message_id", "")
 
-            # Only consider the send completely successful if we have a tracking ID
-            if job and job.get("sent", 0) > 0 and msg_id:
-                # 2. MARK SENT in deduplication collection IMMEDIATELY (highest priority)
-                try:
-                    await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id, msg_id)
-                except Exception as e:
-                    logger.error(f"[GoogleSheetAuto] CRITICAL: Failed to mark {phone} as sent in dedup table: {e}")
+            # If WhatsApp confirms the message was sent, consider it a success 
+            # even if the tracking msg_id is missing ("sent but untracked").
+            if job and job.get("sent", 0) > 0:
+                # 2. MARK SENT in deduplication collection IMMEDIATELY
+                dedup_success = False
+                for attempt in range(3):
+                    try:
+                        await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id, msg_id)
+                        dedup_success = True
+                        break
+                    except Exception as e:
+                        logger.error(f"[GoogleSheetAuto] Dedup mark_sent failed ({attempt+1}/3) for {phone}: {e}")
+                        await asyncio.sleep(0.5)
 
-                # 3. Store in conversation history (uses same collection as inbox)
-                try:
-                    await _store_sent_message(
-                        org_id=org_id, wa_id=wa_id, phone=phone,
-                        message_text=resolved_text, message_id=msg_id,
-                        customer_name=customer_name,
-                    )
-                except Exception as e:
-                    logger.error(f"[GoogleSheetAuto] Conversation storage failed for {phone}: {e}")
+                if not dedup_success:
+                    logger.error(f"[GoogleSheetAuto] CRITICAL: Dedup write permanently failed for {phone}")
+                    return {"sent": 0, "errors": 1}
+
+                # 3. Store in conversation history and link contact
+                convo_success = False
+                for attempt in range(3):
+                    try:
+                        await _store_sent_message(
+                            org_id=org_id, wa_id=wa_id, phone=phone,
+                            message_text=resolved_text, message_id=msg_id,
+                            customer_name=customer_name,
+                        )
+                        convo_success = True
+                        break
+                    except Exception as e:
+                        logger.error(f"[GoogleSheetAuto] Conversation storage failed ({attempt+1}/3) for {phone}: {e}")
+                        await asyncio.sleep(0.5)
+
+                if not convo_success:
+                    logger.error(f"[GoogleSheetAuto] CRITICAL: Conversation/Contact sync permanently failed for {phone}")
+                    return {"sent": 0, "errors": 1}
 
                 return {"sent": 1, "errors": 0}
             else:
-                # Mark as failed so it doesn't stay as stale "pending" forever
+                # Send failed at the WhatsApp API level. Move to a retryable failure state.
                 try:
                     await asyncio.to_thread(_mark_failed, org_id, flow_id, phone, sheet_id)
                 except Exception as e:
