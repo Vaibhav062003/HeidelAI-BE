@@ -193,6 +193,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # status_timestamp=status.get("timestamp")
                         )
 
+                        # Propagate delivery status to Google Sheet automation tracking
+                        # (no-op if message_id doesn't exist in the sheet sent collection)
+                        try:
+                            from services.google_sheet_automation import update_sheet_sent_status
+                            await update_sheet_sent_status(
+                                org_id=connection.get("org_id"),
+                                message_id=message_id,
+                                status=status_type,
+                            )
+                        except Exception as e:
+                            logger.debug(f"Sheet status propagation skipped for {message_id}: {e}")
+
                         if not broadcast_message:
                             logger.warning(f"No message found with ID {message_id} to update status.")
                             continue
