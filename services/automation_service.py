@@ -151,13 +151,49 @@ async def update_automation_flow(
 # =============================================================================
 
 async def delete_automation_flow(org_id: str, flow_id: str) -> bool:
+    """
+    Delete an automation flow AND all related data:
+      - The flow document itself
+      - All automation_triggers for this flow (prevents scheduler from firing)
+      - All google_sheet_sent_numbers dedup records for this flow
+      - Any scheduled follow-up jobs
+    """
     try:
         collection = _automation_flows_collection(org_id)
         result = collection.delete_one({"flow_id": flow_id, "org_id": org_id})
-        if result.deleted_count > 0:
-            logger.info(f"Deleted automation flow: {flow_id} for org: {org_id}")
-            return True
-        return False
+        if result.deleted_count == 0:
+            return False
+
+        logger.info(f"Deleted automation flow: {flow_id} for org: {org_id}")
+
+        # 1. Delete all automation triggers for this flow
+        try:
+            triggers_result = _automation_triggers_collection().delete_many(
+                {"flow_id": flow_id, "org_id": org_id}
+            )
+            if triggers_result.deleted_count > 0:
+                logger.info(f"Cleaned up {triggers_result.deleted_count} trigger(s) for deleted flow {flow_id}")
+        except Exception as e:
+            logger.error(f"Failed to clean up triggers for flow {flow_id}: {e}")
+
+        # 2. Delete all dedup (sent numbers) records for this flow
+        try:
+            dedup_result = db.google_sheet_sent_numbers.delete_many(
+                {"flow_id": flow_id, "org_id": org_id}
+            )
+            if dedup_result.deleted_count > 0:
+                logger.info(f"Cleaned up {dedup_result.deleted_count} dedup record(s) for deleted flow {flow_id}")
+        except Exception as e:
+            logger.error(f"Failed to clean up dedup records for flow {flow_id}: {e}")
+
+        # 3. Cancel any scheduled follow-up jobs
+        try:
+            from services.automation_scheduler import cancel_flow_followups
+            cancel_flow_followups(org_id, flow_id, reason="flow_deleted")
+        except Exception as e:
+            logger.error(f"Failed to cancel follow-ups for flow {flow_id}: {e}")
+
+        return True
     except Exception as e:
         logger.error(f"Error deleting automation flow: {str(e)}")
         raise
