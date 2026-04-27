@@ -150,7 +150,9 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             "last_synced_at": None,
             "last_sync_rows": 0,
             "polling_enabled": True,
-            "last_processed_row_number": 1,
+            "last_processed_row_number": 0,  # 0 = never synced; first sync will auto-detect start row
+            "header_row": None,  # Cached header row number (auto-detected on first sync)
+            "col_offset": None,  # Cached column offset (auto-detected on first sync)
             "connected_at": now,
             "updated_at": now,
         })
@@ -453,14 +455,21 @@ async def _fetch_columns_from_tab(
     sheet_id: str, tab_name: str, access_token: str, org_id: str, client: Optional[httpx.AsyncClient] = None
 ) -> List[str]:
     """
-    Fetch column headers (row 1) from a specific tab of a Google Sheet.
-    Returns a list of non-empty header strings.
+    Smart column header detection: reads the first 20 rows and finds the first
+    row containing 2+ non-empty cells. This handles:
+      - Standard sheets where headers are in row 1
+      - Google Sheets "Table" objects where headers start at row 2, 3, etc.
+      - Tables that don't start at column A (leading empty cells are stripped)
+      - Sheets with a title/label row above the actual header row
+
+    Returns a list of non-empty header strings from the detected header row.
     """
     import urllib.parse
     encoded_tab = urllib.parse.quote(tab_name, safe="")
+    # Fetch the first 20 rows to scan for headers
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-        f"/values/{encoded_tab}!A1:ZZ1"
+        f"/values/{encoded_tab}!A1:ZZ20"
     )
 
     async def _do_request(c):
@@ -492,9 +501,77 @@ async def _fetch_columns_from_tab(
             raise HTTPException(status_code=400, detail=f"Bad request, possibly invalid tab name: {error_message}")
         raise HTTPException(status_code=502, detail=f"Google Sheets API request failed with status {resp.status_code}: {error_message}")
 
-    values = resp.json().get("values", [[]])
-    row = values[0] if values else []
-    return [col for col in row if col and str(col).strip()]
+    all_rows = resp.json().get("values", [])
+    if not all_rows:
+        return []
+
+    # Find the header row: first row with 2+ non-empty cells
+    for row in all_rows:
+        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        if len(non_empty) >= 2:
+            return non_empty
+
+    # Fallback: if no row has 2+ values, return the first non-empty row
+    for row in all_rows:
+        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        if non_empty:
+            return non_empty
+
+    return []
+
+
+async def _detect_header_row(
+    sheet_id: str, tab_name: str, access_token: str, org_id: str
+) -> tuple:
+    """
+    Detect the header row in a Google Sheet tab by scanning the first 20 rows.
+    Returns (header_list, header_row_number_1_indexed, col_offset).
+
+    - header_list: list of non-empty header strings
+    - header_row_number: 1-indexed row number in the sheet (e.g., 3 means row 3)
+    - col_offset: 0-indexed column where headers start (e.g., 1 means columns start at B)
+
+    Used internally by _fetch_headers and _fetch_rows to support tables that
+    don't start at A1.
+    """
+    import urllib.parse
+    encoded_tab = urllib.parse.quote(tab_name, safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
+        f"/values/{encoded_tab}!A1:ZZ20"
+    )
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
+        )
+        if resp.status_code != 200:
+            return ([], 1, 0)
+
+    all_rows = resp.json().get("values", [])
+    if not all_rows:
+        return ([], 1, 0)
+
+    # Find header row: first row with 2+ non-empty cells
+    for row_idx, row in enumerate(all_rows):
+        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        if len(non_empty) >= 2:
+            # Determine column offset (skip leading empty cells)
+            col_offset = 0
+            for cell in row:
+                if cell and str(cell).strip():
+                    break
+                col_offset += 1
+            headers = [str(cell).strip() for cell in row[col_offset:] if cell and str(cell).strip()]
+            return (headers, row_idx + 1, col_offset)
+
+    # Fallback: first row with any data
+    for row_idx, row in enumerate(all_rows):
+        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        if non_empty:
+            return (non_empty, row_idx + 1, 0)
+
+    return ([], 1, 0)
+
 
 
 async def refresh_google_token(org_id: str) -> str:
