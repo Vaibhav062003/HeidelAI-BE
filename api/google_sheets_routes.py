@@ -327,7 +327,7 @@ async def get_sheet_columns(
             try:
                 db.google_sheets_connections.update_one(
                     {"org_id": org_id, "sheet_id": sheet_id},
-                    {"$set": {"tab_name": used_tab, "updated_at": datetime.now(timezone.utc)}}
+                    {"$set": {"tab_name": used_tab, "updated_at": datetime.now(timezone.utc), "header_row": None, "col_offset": None}}
                 )
                 logger.info(f"Updated stored tab_name to '{used_tab}' for sheet {sheet_id} org {org_id}")
             except Exception as e:
@@ -507,13 +507,13 @@ async def _fetch_columns_from_tab(
 
     # Find the header row: first row with 2+ non-empty cells
     for row in all_rows:
-        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        non_empty = [str(cell).strip() for cell in row if cell and str(cell).strip()]
         if len(non_empty) >= 2:
             return non_empty
 
     # Fallback: if no row has 2+ values, return the first non-empty row
     for row in all_rows:
-        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        non_empty = [str(cell).strip() for cell in row if cell and str(cell).strip()]
         if non_empty:
             return non_empty
 
@@ -758,7 +758,7 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
         actual_row = start_row + idx
         
         # Account for column offset
-        data_cells = row_values[col_offset:] if col_offset < len(row_values) else row_values
+        data_cells = row_values[col_offset:] if col_offset < len(row_values) else []
         row_data = {
             (headers[i] if i < len(headers) else f"col_{i+1}"): v
             for i, v in enumerate(data_cells)
