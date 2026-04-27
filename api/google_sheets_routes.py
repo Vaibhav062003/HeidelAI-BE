@@ -568,7 +568,13 @@ async def _detect_header_row(
     for row_idx, row in enumerate(all_rows):
         non_empty = [cell for cell in row if cell and str(cell).strip()]
         if non_empty:
-            return (non_empty, row_idx + 1, 0)
+            col_offset = 0
+            for cell in row:
+                if cell and str(cell).strip():
+                    break
+                col_offset += 1
+            headers = [str(cell).strip() for cell in row[col_offset:] if cell and str(cell).strip()]
+            return (headers, row_idx + 1, col_offset)
 
     return ([], 1, 0)
 
@@ -666,7 +672,7 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     if not sheet_doc:
         raise HTTPException(status_code=404, detail=f"Sheet {sheet_id} not found for org {org_id}")
 
-    last_row = sheet_doc.get("last_processed_row_number", 1)
+    last_row = sheet_doc.get("last_processed_row_number", 0)
     sheet_name = sheet_doc.get("sheet_name", "Sheet1")
     tab_name = sheet_doc.get("tab_name", "Sheet1")
     
@@ -674,7 +680,49 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     encoded_tab = urllib.parse.quote(tab_name, safe="")
     access_token = await refresh_google_token(org_id)
 
-    start_row = last_row + 1
+    # --- Header detection (cached after first detection) ---
+    cached_header_row = sheet_doc.get("header_row")
+    cached_col_offset = sheet_doc.get("col_offset")
+
+    if cached_header_row is not None and cached_col_offset is not None:
+        header_row = cached_header_row
+        col_offset = cached_col_offset
+        # Fetch just the header row to extract column names
+        header_url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
+            f"/values/{encoded_tab}!A{header_row}:ZZ{header_row}"
+        )
+        async with httpx.AsyncClient() as client:
+            h_resp = await client.get(
+                header_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
+            )
+        if h_resp.status_code == 200:
+            h_vals = h_resp.json().get("values", [[]])
+            h_row = h_vals[0] if h_vals else []
+            headers = [str(c).strip() for c in h_row[col_offset:] if c and str(c).strip()]
+        else:
+            headers = []
+    else:
+        # First sync or cache missing — detect headers (scans first 20 rows)
+        headers, header_row, col_offset = await _detect_header_row(
+            sheet_id, tab_name, access_token, org_id
+        )
+        if headers:
+            try:
+                await asyncio.to_thread(
+                    db.google_sheets_connections.update_one,
+                    {"org_id": org_id, "sheet_id": sheet_id},
+                    {"$set": {"header_row": header_row, "col_offset": col_offset}}
+                )
+            except Exception as e:
+                logger.warning(f"[SyncSheet] Failed to cache header info: {e}")
+
+    if not headers:
+        logger.warning(f"[SyncSheet] No headers found for sheet {sheet_id} org {org_id} — skipping sync")
+        return {"rows_processed": 0}
+
+    # Data starts after header row
+    start_row = max(last_row, header_row) + 1
     end_row = start_row + 999
     sheets_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A{start_row}:ZZ{end_row}"
 
@@ -701,17 +749,6 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     if not values:
         return {"rows_processed": 0}
 
-    async with httpx.AsyncClient() as client:
-        headers_resp = await client.get(
-            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A1:ZZ1",
-            headers={"Authorization": f"Bearer {access_token}"}, 
-            timeout=10
-        )
-    headers = []
-    if headers_resp.status_code == 200:
-        hv = headers_resp.json().get("values", [[]])
-        headers = hv[0] if hv else []
-
     rows_processed = 0
     now = datetime.now(timezone.utc)
     new_last_row = last_row
@@ -719,10 +756,14 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
 
     for idx, row_values in enumerate(values):
         actual_row = start_row + idx
+        
+        # Account for column offset
+        data_cells = row_values[col_offset:] if col_offset < len(row_values) else row_values
         row_data = {
             (headers[i] if i < len(headers) else f"col_{i+1}"): v
-            for i, v in enumerate(row_values)
+            for i, v in enumerate(data_cells)
         }
+        
         result = await asyncio.to_thread(
             collection.update_one,
             {"sheet_id": sheet_id, "row_number": actual_row},
