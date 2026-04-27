@@ -150,7 +150,9 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             "last_synced_at": None,
             "last_sync_rows": 0,
             "polling_enabled": True,
-            "last_processed_row_number": 1,
+            "last_processed_row_number": 0,  # 0 = never synced; first sync will auto-detect start row
+            "header_row": None,  # Cached header row number (auto-detected on first sync)
+            "col_offset": None,  # Cached column offset (auto-detected on first sync)
             "connected_at": now,
             "updated_at": now,
         })
@@ -453,14 +455,21 @@ async def _fetch_columns_from_tab(
     sheet_id: str, tab_name: str, access_token: str, org_id: str, client: Optional[httpx.AsyncClient] = None
 ) -> List[str]:
     """
-    Fetch column headers (row 1) from a specific tab of a Google Sheet.
-    Returns a list of non-empty header strings.
+    Smart column header detection: reads the first 20 rows and finds the first
+    row containing 2+ non-empty cells. This handles:
+      - Standard sheets where headers are in row 1
+      - Google Sheets "Table" objects where headers start at row 2, 3, etc.
+      - Tables that don't start at column A (leading empty cells are stripped)
+      - Sheets with a title/label row above the actual header row
+
+    Returns a list of non-empty header strings from the detected header row.
     """
     import urllib.parse
     encoded_tab = urllib.parse.quote(tab_name, safe="")
+    # Fetch the first 20 rows to scan for headers
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-        f"/values/{encoded_tab}!A1:ZZ1"
+        f"/values/{encoded_tab}!A1:ZZ20"
     )
 
     async def _do_request(c):
@@ -492,9 +501,77 @@ async def _fetch_columns_from_tab(
             raise HTTPException(status_code=400, detail=f"Bad request, possibly invalid tab name: {error_message}")
         raise HTTPException(status_code=502, detail=f"Google Sheets API request failed with status {resp.status_code}: {error_message}")
 
-    values = resp.json().get("values", [[]])
-    row = values[0] if values else []
-    return [col for col in row if col and str(col).strip()]
+    all_rows = resp.json().get("values", [])
+    if not all_rows:
+        return []
+
+    # Find the header row: first row with 2+ non-empty cells
+    for row in all_rows:
+        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        if len(non_empty) >= 2:
+            return non_empty
+
+    # Fallback: if no row has 2+ values, return the first non-empty row
+    for row in all_rows:
+        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        if non_empty:
+            return non_empty
+
+    return []
+
+
+async def _detect_header_row(
+    sheet_id: str, tab_name: str, access_token: str, org_id: str
+) -> tuple:
+    """
+    Detect the header row in a Google Sheet tab by scanning the first 20 rows.
+    Returns (header_list, header_row_number_1_indexed, col_offset).
+
+    - header_list: list of non-empty header strings
+    - header_row_number: 1-indexed row number in the sheet (e.g., 3 means row 3)
+    - col_offset: 0-indexed column where headers start (e.g., 1 means columns start at B)
+
+    Used internally by _fetch_headers and _fetch_rows to support tables that
+    don't start at A1.
+    """
+    import urllib.parse
+    encoded_tab = urllib.parse.quote(tab_name, safe="")
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
+        f"/values/{encoded_tab}!A1:ZZ20"
+    )
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
+        )
+        if resp.status_code != 200:
+            return ([], 1, 0)
+
+    all_rows = resp.json().get("values", [])
+    if not all_rows:
+        return ([], 1, 0)
+
+    # Find header row: first row with 2+ non-empty cells
+    for row_idx, row in enumerate(all_rows):
+        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        if len(non_empty) >= 2:
+            # Determine column offset (skip leading empty cells)
+            col_offset = 0
+            for cell in row:
+                if cell and str(cell).strip():
+                    break
+                col_offset += 1
+            headers = [str(cell).strip() for cell in row[col_offset:] if cell and str(cell).strip()]
+            return (headers, row_idx + 1, col_offset)
+
+    # Fallback: first row with any data
+    for row_idx, row in enumerate(all_rows):
+        non_empty = [cell for cell in row if cell and str(cell).strip()]
+        if non_empty:
+            return (non_empty, row_idx + 1, 0)
+
+    return ([], 1, 0)
+
 
 
 async def refresh_google_token(org_id: str) -> str:
@@ -582,14 +659,25 @@ async def _force_token_refresh(org_id: str) -> str:
 
 
 async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
+    """
+    Full reconciliation sync: reads the ENTIRE data range from Google Sheets
+    and replaces the MongoDB row cache to match exactly what's in the sheet.
 
+    This handles:
+      - New rows added to the sheet
+      - Rows deleted from the sheet (removed from MongoDB)
+      - Rows modified in the sheet (updated in MongoDB)
+      - Rows reordered in the sheet
+
+    The automation dedup system (google_sheet_sent_numbers) is separate and
+    unaffected — it only tracks what has been SENT, not what exists in the sheet.
+    """
     sheet_doc = await asyncio.to_thread(
         db.google_sheets_connections.find_one, {"org_id": org_id, "sheet_id": sheet_id}
     )
     if not sheet_doc:
         raise HTTPException(status_code=404, detail=f"Sheet {sheet_id} not found for org {org_id}")
 
-    last_row = sheet_doc.get("last_processed_row_number", 1)
     sheet_name = sheet_doc.get("sheet_name", "Sheet1")
     tab_name = sheet_doc.get("tab_name", "Sheet1")
     
@@ -597,9 +685,60 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     encoded_tab = urllib.parse.quote(tab_name, safe="")
     access_token = await refresh_google_token(org_id)
 
-    start_row = last_row + 1
-    end_row = start_row + 999
-    sheets_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A{start_row}:ZZ{end_row}"
+    # --- Header detection (cached after first detection) ---
+    cached_header_row = sheet_doc.get("header_row")
+    cached_col_offset = sheet_doc.get("col_offset")
+
+    if cached_header_row is not None and cached_col_offset is not None:
+        header_row = cached_header_row
+        col_offset = cached_col_offset
+        # Fetch just the header row for column name mapping
+        header_url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
+            f"/values/{encoded_tab}!A{header_row}:ZZ{header_row}"
+        )
+        async with httpx.AsyncClient() as client:
+            h_resp = await client.get(
+                header_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
+            )
+        if h_resp.status_code == 200:
+            h_vals = h_resp.json().get("values", [[]])
+            h_row = h_vals[0] if h_vals else []
+            headers = [str(c).strip() for c in h_row[col_offset:] if c and str(c).strip()]
+        else:
+            headers = []
+    else:
+        # First sync or cache missing — detect headers (scans first 20 rows)
+        headers, header_row, col_offset = await _detect_header_row(
+            sheet_id, tab_name, access_token, org_id
+        )
+        # Cache for future polls
+        if headers:
+            try:
+                await asyncio.to_thread(
+                    db.google_sheets_connections.update_one,
+                    {"org_id": org_id, "sheet_id": sheet_id},
+                    {"$set": {"header_row": header_row, "col_offset": col_offset}}
+                )
+                logger.info(f"[SyncSheet] Cached header_row={header_row}, col_offset={col_offset} for sheet {sheet_id}")
+            except Exception as e:
+                logger.warning(f"[SyncSheet] Failed to cache header info: {e}")
+
+    if not headers:
+        logger.warning(f"[SyncSheet] No headers found for sheet {sheet_id} org {org_id} — skipping sync")
+        return {"rows_processed": 0}
+
+    # --- Fetch ALL data rows from the sheet (full read, not incremental) ---
+    data_start_row = header_row + 1
+    sheets_url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
+        f"/values/{encoded_tab}!A{data_start_row}:ZZ10001"
+    )
+
+    logger.debug(
+        f"[SyncSheet] FULL sync sheet={sheet_id} org={org_id} | "
+        f"header_row={header_row} col_offset={col_offset} data_start={data_start_row} headers={headers}"
+    )
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
@@ -621,59 +760,102 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
         raise HTTPException(status_code=502, detail=f"Google Sheets API error: {response.json().get('error', {}).get('message', 'Unknown')}")
 
     values = response.json().get("values", [])
-    if not values:
-        return {"rows_processed": 0}
-
-    async with httpx.AsyncClient() as client:
-        headers_resp = await client.get(
-            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A1:ZZ1",
-            headers={"Authorization": f"Bearer {access_token}"}, 
-            timeout=10
-        )
-    headers = []
-    if headers_resp.status_code == 200:
-        hv = headers_resp.json().get("values", [[]])
-        headers = hv[0] if hv else []
-
-    rows_processed = 0
     now = datetime.now(timezone.utc)
-    new_last_row = last_row
     collection = db[f"google_sheet_rows_{org_id}"]
 
+    # --- Build the current set of row documents from the live sheet ---
+    current_rows = []
+    current_row_numbers = set()
+
     for idx, row_values in enumerate(values):
-        actual_row = start_row + idx
+        actual_row = data_start_row + idx
+
+        # Map row values to headers, accounting for column offset
+        data_cells = row_values[col_offset:] if col_offset < len(row_values) else row_values
         row_data = {
             (headers[i] if i < len(headers) else f"col_{i+1}"): v
-            for i, v in enumerate(row_values)
+            for i, v in enumerate(data_cells)
         }
+
+        # Skip completely empty rows
+        if not any(v and str(v).strip() for v in data_cells):
+            continue
+
+        current_row_numbers.add(actual_row)
+        current_rows.append({
+            "org_id": org_id,
+            "sheet_id": sheet_id,
+            "sheet_name": sheet_name,
+            "row_number": actual_row,
+            "row_data": row_data,
+            "synced_at": now,
+        })
+
+    # --- Reconcile MongoDB with the live sheet ---
+    # Step 1: Delete all rows for this sheet that are NOT in the current data
+    #         (handles rows removed from the sheet)
+    if current_row_numbers:
+        delete_result = await asyncio.to_thread(
+            collection.delete_many,
+            {
+                "sheet_id": sheet_id,
+                "row_number": {"$nin": list(current_row_numbers)},
+            }
+        )
+        if delete_result.deleted_count > 0:
+            logger.info(
+                f"[SyncSheet] Removed {delete_result.deleted_count} stale row(s) from MongoDB "
+                f"for sheet {sheet_id} (no longer in sheet)"
+            )
+    else:
+        # Sheet is empty — remove all cached rows
+        delete_result = await asyncio.to_thread(
+            collection.delete_many, {"sheet_id": sheet_id}
+        )
+        if delete_result.deleted_count > 0:
+            logger.info(f"[SyncSheet] Sheet {sheet_id} is empty — cleared {delete_result.deleted_count} cached row(s)")
+
+    # Step 2: Upsert current rows (add new, update modified)
+    rows_added = 0
+    rows_updated = 0
+    for row_doc in current_rows:
         result = await asyncio.to_thread(
             collection.update_one,
-            {"sheet_id": sheet_id, "row_number": actual_row},
-            {
-                "$setOnInsert": {
-                    "org_id": org_id,
-                    "sheet_id": sheet_id,
-                    "sheet_name": sheet_name,
-                    "row_number": actual_row,
-                    "row_data": row_data,
-                    "synced_at": now,
-                }
-            },
+            {"sheet_id": sheet_id, "row_number": row_doc["row_number"]},
+            {"$set": {
+                "row_data": row_doc["row_data"],
+                "synced_at": now,
+                "org_id": org_id,
+                "sheet_name": sheet_name,
+            }},
             upsert=True,
         )
         if result.upserted_id is not None:
-            rows_processed += 1
-            new_last_row = actual_row
+            rows_added += 1
+        elif result.modified_count > 0:
+            rows_updated += 1
 
-    if rows_processed > 0:
-        await asyncio.to_thread(
-            db.google_sheets_connections.update_one,
-            {"org_id": org_id, "sheet_id": sheet_id},
-            {"$set": {
-                "last_synced_at": now, "last_sync_rows": rows_processed,
-                "last_processed_row_number": new_last_row,
-                "updated_at": now,
-            }}
+    # Update connection metadata
+    max_row = max(current_row_numbers) if current_row_numbers else header_row
+    await asyncio.to_thread(
+        db.google_sheets_connections.update_one,
+        {"org_id": org_id, "sheet_id": sheet_id},
+        {"$set": {
+            "last_synced_at": now,
+            "last_sync_rows": len(current_rows),
+            "last_processed_row_number": max_row,
+            "updated_at": now,
+        }}
+    )
+
+    total_changes = rows_added + rows_updated
+    deleted_count = delete_result.deleted_count if delete_result else 0
+    if total_changes > 0 or deleted_count > 0:
+        logger.info(
+            f"[SyncSheet] Reconciled sheet {sheet_id} org {org_id}: "
+            f"{rows_added} new, {rows_updated} updated, "
+            f"{deleted_count} removed | "
+            f"{len(current_rows)} total rows now cached"
         )
 
-    return {"rows_processed": rows_processed}
+    return {"rows_processed": rows_added}
