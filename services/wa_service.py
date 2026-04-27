@@ -1640,7 +1640,13 @@ def create_bulk_job(
         "updated_at": now,
         "completed_at": None,
     }
-    db.bulk_jobs.insert_one(job_data)
+    try:
+        db.bulk_jobs.insert_one(job_data)
+    except Exception as e:
+        logger.error(f"Bulk WA | job={job_id} | org={org_id} | Failed to create bulk job record: {e}")
+        # Optionally re-raise or handle as needed. 
+        # In this context, the caller expects the job to be created.
+        raise
 
 
 def get_bulk_job(
@@ -1698,10 +1704,11 @@ def get_bulk_job(
 
 
 async def run_bulk_send_job(
+    wa_id: str,
     job_id: str,
     org_id: str,
     phone_id: str,
-    access_token: str,
+        access_token: str,
     template_name: str,
     language_code: str,
     recipients: list,
@@ -1713,7 +1720,15 @@ async def run_bulk_send_job(
     """
     Background worker: sends WhatsApp templates using a bounded worker queue,
     offloading sync DB updates to threads to avoid blocking the event loop.
+    All successful sends are saved to the messages and conversations collections in bulk.
     """
+    total_recipients = len(recipients)
+    if total_recipients > 2000:
+        logger.warning(
+            f"Bulk WA | job={job_id} | Large broadcast detected: {total_recipients} recipients. "
+            f"Estimated completion time: ~{(total_recipients / max_concurrent * (delay_seconds + 1)) / 60:.1f} minutes."
+        )
+    
     url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -1814,11 +1829,17 @@ async def run_bulk_send_job(
         return result_entry, update_fields
 
     try:
+        messages_collection_name = f"messages_{org_id}"
+        conversations_collection_name = f"conversations_{org_id}"
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Process in chunks of max_concurrent
             for i in range(0, len(recipients), max_concurrent):
                 chunk = recipients[i : i + max_concurrent]
-                logger.info(f"Bulk WA | job={job_id} | processing batch {i//max_concurrent + 1} | size={len(chunk)}")
+                current_batch = (i // max_concurrent) + 1
+                total_batches = (total_recipients + max_concurrent - 1) // max_concurrent
+                
+                logger.info(f"Bulk WA | job={job_id} | processing batch {current_batch}/{total_batches} | size={len(chunk)}")
                 
                 tasks = [send_to_recipient(i + idx, r, client) for idx, r in enumerate(chunk)]
                 batch_results = await asyncio.gather(*tasks)
@@ -1829,7 +1850,70 @@ async def run_bulk_send_job(
                 total_sent = sum(res[1]["$inc"].get("sent", 0) for res in batch_results)
                 total_failed = sum(res[1]["$inc"].get("failed", 0) for res in batch_results)
                 
-                # Combine atomic updates
+                # Prepare message and conversation bulk operations for successful sends
+                message_docs = []
+                convo_updates = []
+                now = datetime.now(timezone.utc)
+                
+                for entry, _ in batch_results:
+                    if entry["status"] == "sent":
+                        phone_number = entry["phone_number"]
+                        msg_id = entry["message_id"]
+                        convo_id = f"whatsapp_{phone_number}"
+                        
+                        # Prepare individual message doc
+                        message_doc = {
+                            "id": msg_id,
+                            "message_id": msg_id,
+                            "platform": "whatsapp",
+                            "conversation_id": convo_id,
+                            "content": f"Shared a template {template_name}",
+                            "type": "template",
+                            "payload": {
+                                "name": template_name,
+                                "language": {"code": language_code},
+                                "components": components
+                            },
+                            "sender_id": phone_number, # Matching existing convention for agent messages
+                            "sender_name": "AI",
+                            "role": MessageRole.AI,
+                            "timestamp": now,
+                            "status": "sent",
+                            "mode": "reply",
+                            "context": None,
+                            "context_type": None
+                        }
+                        message_docs.append(message_doc)
+                        
+                        # Prepare individual conversation update (upsert if session doesn't exist)
+                        convo_updates.append(UpdateOne(
+                            {"conversation_id": convo_id},
+                            {
+                                "$set": {
+                                    "platform": "whatsapp",
+                                    "whatsapp_id": wa_id,
+                                    "customer_id": phone_number,
+                                    "last_message": f"AI: Shared a template {template_name}",
+                                    "last_message_timestamp": now,
+                                    "last_sender": "ai",
+                                    "status": "open",
+                                    "reminder_stage": 0,
+                                    "next_action_at": now + timedelta(hours=6),
+                                    "last_message_is_private_note": False
+                                },
+                                "$setOnInsert": {
+                                    "is_ai_enabled": True,
+                                    "started_at": now,
+                                    "created_at": now,
+                                    "unread_count": 0,
+                                    "closed_at": None,
+                                    "message_counter": 0
+                                }
+                            },
+                            upsert=True
+                        ))
+
+                # Combine atomic updates for bulk_jobs
                 combined_update = {
                     "$inc": {},
                     "$set": {"updated_at": datetime.now(timezone.utc)}
@@ -1837,10 +1921,23 @@ async def run_bulk_send_job(
                 if total_sent > 0: combined_update["$inc"]["sent"] = total_sent
                 if total_failed > 0: combined_update["$inc"]["failed"] = total_failed
 
-                await asyncio.gather(
+                db_tasks = [
                     asyncio.to_thread(db.bulk_job_results.insert_many, entries),
                     asyncio.to_thread(db.bulk_jobs.update_one, {"job_id": job_id, "org_id": org_id}, combined_update)
-                )
+                ]
+                
+                # Execute bulk writes for messages and conversations if there are successes
+                if message_docs:
+                    db_tasks.append(asyncio.to_thread(db[messages_collection_name].insert_many, message_docs, ordered=False))
+                if convo_updates:
+                    db_tasks.append(asyncio.to_thread(db[conversations_collection_name].bulk_write, convo_updates, ordered=False))
+
+                try:
+                    await asyncio.gather(*db_tasks)
+                except Exception as db_err:
+                    logger.error(f"Bulk WA | job={job_id} | database error during batch tracking: {db_err}")
+                    # We don't raise here to allow subsequent batches to try, 
+                    # but the job results might be incomplete in DB.
 
                 # Delay between batches if there are more messages left
                 if i + max_concurrent < len(recipients) and delay_seconds > 0:
