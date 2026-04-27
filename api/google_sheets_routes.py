@@ -763,7 +763,6 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             (headers[i] if i < len(headers) else f"col_{i+1}"): v
             for i, v in enumerate(data_cells)
         }
-        
         result = await asyncio.to_thread(
             collection.update_one,
             {"sheet_id": sheet_id, "row_number": actual_row},
