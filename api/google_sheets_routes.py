@@ -545,7 +545,7 @@ async def _detect_header_row(
             url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
         )
         if resp.status_code != 200:
-            return ([], 1, 0)
+            raise HTTPException(status_code=502, detail=f"Google Sheets API error: {resp.json().get('error', {}).get('message', 'Unknown')}")
 
     all_rows = resp.json().get("values", [])
     if not all_rows:
@@ -706,7 +706,7 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             h_row = h_vals[0] if h_vals else []
             headers = [str(c).strip() for c in h_row[col_offset:] if c and str(c).strip()]
         else:
-            headers = []
+            raise HTTPException(status_code=502, detail=f"Google Sheets API error: {h_resp.json().get('error', {}).get('message', 'Unknown')}")
     else:
         # First sync or cache missing — detect headers (scans first 20 rows)
         headers, header_row, col_offset = await _detect_header_row(
@@ -858,4 +858,4 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             f"{len(current_rows)} total rows now cached"
         )
 
-    return {"rows_processed": rows_added}
+    return {"rows_processed": total_changes}
