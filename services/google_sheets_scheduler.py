@@ -141,17 +141,8 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
         rows = result.get("rows_processed", 0)
 
         if rows > 0:
-            logger.info(f"[Scheduler] Synced {rows} new row(s) from sheet {sheet_id} for org {org_id} — triggering automations")
-        
-        # ALWAYS trigger automations after a successful sync.
-        # Even if rows_processed == 0, we trigger automations because:
-        #   - Rows may have been synced on a PREVIOUS poll but the automation
-        #     wasn't published yet at that time.
-        #   - The automation's own dedup system (google_sheet_sent_numbers)
-        #     ensures the same phone number is never messaged twice.
-        #   - This makes the system self-healing: if any step failed on a
-        #     previous run, it will be retried on the next poll.
-        await _trigger_google_sheet_automations(org_id, sheet_id)
+            logger.info(f"[Scheduler] Synced {rows} new row(s) from sheet {sheet_id} for org {org_id}")
+            await _trigger_google_sheet_automations(org_id, sheet_id)
 
     except Exception as e:
         logger.error(f"[Scheduler] Failed to sync sheet {sheet_id} for org {org_id}: {str(e)}")
