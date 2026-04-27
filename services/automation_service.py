@@ -167,22 +167,31 @@ async def delete_automation_flow(org_id: str, flow_id: str) -> bool:
             return False
 
         # 1. Cancel any scheduled follow-up jobs
-        from services.automation_scheduler import cancel_flow_followups
-        cancel_flow_followups(org_id, flow_id, reason="flow_deleted")
+        try:
+            from services.automation_scheduler import cancel_flow_followups
+            cancel_flow_followups(org_id, flow_id, reason="flow_deleted")
+        except Exception as e:
+            logger.error(f"Failed to cancel follow-ups for flow {flow_id}: {e}")
 
         # 2. Delete all automation triggers for this flow
-        triggers_result = _automation_triggers_collection().delete_many(
-            {"flow_id": flow_id, "org_id": org_id}
-        )
-        if triggers_result.deleted_count > 0:
-            logger.info(f"Cleaned up {triggers_result.deleted_count} trigger(s) for deleted flow {flow_id}")
+        try:
+            triggers_result = _automation_triggers_collection().delete_many(
+                {"flow_id": flow_id, "org_id": org_id}
+            )
+            if triggers_result.deleted_count > 0:
+                logger.info(f"Cleaned up {triggers_result.deleted_count} trigger(s) for deleted flow {flow_id}")
+        except Exception as e:
+            logger.error(f"Failed to clean up triggers for flow {flow_id}: {e}")
 
         # 3. Delete all dedup (sent numbers) records for this flow
-        dedup_result = db.google_sheet_sent_numbers.delete_many(
-            {"flow_id": flow_id, "org_id": org_id}
-        )
-        if dedup_result.deleted_count > 0:
-            logger.info(f"Cleaned up {dedup_result.deleted_count} dedup record(s) for deleted flow {flow_id}")
+        try:
+            dedup_result = db.google_sheet_sent_numbers.delete_many(
+                {"flow_id": flow_id, "org_id": org_id}
+            )
+            if dedup_result.deleted_count > 0:
+                logger.info(f"Cleaned up {dedup_result.deleted_count} dedup record(s) for deleted flow {flow_id}")
+        except Exception as e:
+            logger.error(f"Failed to clean up dedup records for flow {flow_id}: {e}")
 
         # 4. Finally delete the flow document
         result = collection.delete_one({"flow_id": flow_id, "org_id": org_id})

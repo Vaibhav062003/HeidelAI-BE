@@ -768,7 +768,7 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     current_row_numbers = set()
 
     for idx, row_values in enumerate(values):
-        actual_row = start_row + idx
+        actual_row = data_start_row + idx
         
         # Account for column offset
         data_cells = row_values[col_offset:] if col_offset < len(row_values) else []
