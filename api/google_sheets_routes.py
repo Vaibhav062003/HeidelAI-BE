@@ -170,10 +170,53 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
 # ─── NEW: Disconnect (remove) a sheet ─────────────────────────────────────────
 
 @router.delete("/connections/{sheet_id}")
-async def disconnect_sheet(sheet_id: str, user: CurrentUser):
+async def disconnect_sheet(
+    sheet_id: str,
+    user: CurrentUser,
+    force: bool = Query(False, description="Force disconnect even if sheet is used in active automations"),
+):
     """Remove a sheet from google_sheets_connections — stops all syncing for it."""
     try:
         org_id = user.org_id
+
+        # Check if the sheet exists
+        sheet_doc = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": sheet_id})
+        if not sheet_doc:
+            raise HTTPException(status_code=404, detail="Sheet not found.")
+
+        # Check for active automations using this sheet (unless force=true)
+        if not force:
+            active_triggers = list(db.automation_triggers.find(
+                {
+                    "org_id": org_id,
+                    "trigger_type": "google_sheet",
+                    "filters.sheet_id": sheet_id,
+                    "status": "active",
+                },
+                {"flow_id": 1, "trigger_id": 1, "_id": 0}
+            ))
+            if active_triggers:
+                flow_ids = list(set(t["flow_id"] for t in active_triggers))
+                # Try to get flow names for a better message
+                flow_names = []
+                for fid in flow_ids:
+                    flow = db[f"automation_flows_{org_id}"].find_one(
+                        {"flow_id": fid}, {"name": 1, "_id": 0}
+                    )
+                    if flow:
+                        flow_names.append(flow.get("name", fid))
+                    else:
+                        flow_names.append(fid)
+
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": f"This sheet is used by {len(flow_ids)} active automation(s). Disconnecting will break them.",
+                        "automations": flow_names,
+                        "hint": "Unpublish the automation(s) first, or force disconnect.",
+                    }
+                )
+
         result = db.google_sheets_connections.delete_one({"org_id": org_id, "sheet_id": sheet_id})
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Sheet not found.")
@@ -360,9 +403,13 @@ async def manual_sync_sheet(request: ManualSyncRequest, user: CurrentUser):
             raise HTTPException(status_code=404, detail="Sheet not found or not connected")
 
         result = await _sync_sheet(org_id, request.sheet_id)
-        rows_processed = result.get("rows_processed", 0)
-        if rows_processed == 0:
-            return {"status": "no_new_data", "rows_processed": 0}
+        rows_added = result.get("rows_added", 0)
+        rows_updated = result.get("rows_updated", 0)
+        rows_removed = result.get("rows_removed", 0)
+        total_changes = rows_added + rows_updated + rows_removed
+
+        if total_changes == 0:
+            return {"status": "no_new_data", "rows_added": 0, "rows_updated": 0, "rows_removed": 0}
 
         # Trigger google_sheet automations for this sheet (Manual Sync)
         try:
@@ -372,7 +419,12 @@ async def manual_sync_sheet(request: ManualSyncRequest, user: CurrentUser):
         except Exception as e:
             logger.warning(f"Could not trigger google_sheet automations after manual sync: {e}")
 
-        return {"status": "synced", "rows_processed": rows_processed}
+        return {
+            "status": "synced",
+            "rows_added": rows_added,
+            "rows_updated": rows_updated,
+            "rows_removed": rows_removed,
+        }
 
     except HTTPException:
         raise
@@ -858,4 +910,4 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             f"{len(current_rows)} total rows now cached"
         )
 
-    return {"rows_processed": total_changes}
+    return {"rows_added": rows_added, "rows_updated": rows_updated, "rows_removed": deleted_count}
