@@ -157,6 +157,12 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             "updated_at": now,
         })
 
+        # Ensure indexes dynamically so large sheets don't OOM crash on initial sync/publish
+        await asyncio.to_thread(lambda: db.google_sheets_connections.create_index([("org_id", 1), ("sheet_id", 1)], unique=True))
+        rows_col = db[f"google_sheet_rows_{org_id}"]
+        await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("row_number", 1)], unique=True))
+        await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("synced_at", -1)]))
+
         logger.info(f"Sheet {request.sheet_id} connected for org {org_id} (tab: {tab_name})")
         return {"sheet_id": request.sheet_id, "sheet_name": request.sheet_name, "tab_name": tab_name, "message": "Sheet connected successfully."}
 
@@ -408,16 +414,18 @@ async def manual_sync_sheet(request: ManualSyncRequest, user: CurrentUser):
         rows_removed = result.get("rows_removed", 0)
         total_changes = rows_added + rows_updated + rows_removed
 
-        if total_changes == 0:
-            return {"status": "no_new_data", "rows_added": 0, "rows_updated": 0, "rows_removed": 0}
-
-        # Trigger google_sheet automations for this sheet (Manual Sync)
+        # ALWAYS trigger automations after sync, even if 0 changes.
+        # Rows may have been synced on a previous poll before the automation was published.
+        # The automation's dedup system (google_sheet_sent_numbers) prevents double-sends.
         try:
             from services.google_sheet_automation import process_new_sheet_rows
            
             asyncio.create_task(process_new_sheet_rows(org_id, request.sheet_id))
         except Exception as e:
             logger.warning(f"Could not trigger google_sheet automations after manual sync: {e}")
+
+        if total_changes == 0:
+            return {"status": "no_new_data", "rows_added": 0, "rows_updated": 0, "rows_removed": 0}
 
         return {
             "status": "synced",
@@ -814,6 +822,10 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
     values = response.json().get("values", [])
     now = datetime.now(timezone.utc)
     collection = db[f"google_sheet_rows_{org_id}"]
+
+    # Ensure indexes dynamically so large sheets don't OOM crash on sort during processing
+    await asyncio.to_thread(lambda c=collection: c.create_index([("sheet_id", 1), ("row_number", 1)], unique=True))
+    await asyncio.to_thread(lambda c=collection: c.create_index([("sheet_id", 1), ("synced_at", -1)]))
 
     # --- Build the current set of row documents from the live sheet ---
     current_rows = []

@@ -4,14 +4,15 @@ google_sheet_automation.py
 Handles Google Sheet → WhatsApp automation flows.
 
 Key behaviors:
-  - On publish: read all rows in range, send WhatsApp message to each phone number ONCE
+  - On publish: sync sheet to MongoDB, then process all rows via the scheduler path
   - On new rows (via scheduler): send message to newly added numbers only
   - Deduplication: tracks sent numbers per (org_id, flow_id) in google_sheet_sent_numbers
   - Variables: {{phone_number}}, {{row.ColumnName}}, {{customer_name}} supported in message text
-  - Uses run_bulk_send_job (plain-text mode via message_text param) for sending
+  - Uses DIRECT WhatsApp Cloud API calls (no bulk job overhead) for maximum speed
 """
 
 import re
+import json
 import uuid as _uuid
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -21,13 +22,16 @@ from database import get_mongo_db
 from loguru import logger
 import asyncio
 from pymongo.errors import DuplicateKeyError
-from collections import namedtuple
 
 db = get_mongo_db()
 
-Recipient = namedtuple("Recipient", ["phone_number"])
-
 SENT_COLLECTION = "google_sheet_sent_numbers"
+
+# Meta WhatsApp Cloud API version (shared with wa_service)
+try:
+    from services.wa_service import IG_VERSION
+except ImportError:
+    IG_VERSION = "v24.0"
 
 
 # =============================================================================
@@ -120,6 +124,12 @@ async def process_google_sheet_trigger(
 
     for row_dict in rows_to_process:
         phone_raw = str(row_dict.get(column_name, "")).strip()
+        
+        # Robust sanitization: keep only digits and + (e.g. +1 (555) 123-4567 -> 15551234567)
+        phone_raw = re.sub(r'[^\d+]', '', phone_raw)
+        if phone_raw.startswith('+'):
+            phone_raw = phone_raw[1:]
+            
         if not phone_raw:
             continue
 
@@ -152,35 +162,49 @@ async def process_google_sheet_trigger(
     if not eligible:
         return stats
 
-    # 5. Send bulk via existing logic
-    from services.wa_service import create_bulk_job, run_bulk_send_job, get_bulk_job
-    sem = asyncio.Semaphore(10)
-    
-    async def _send_one(recipient):
+    # 5. Send directly via WhatsApp Cloud API (no bulk job overhead)
+    sem = asyncio.Semaphore(20)  # 20 concurrent sends for high throughput
+    wa_api_url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
+    wa_headers = {
+        "Authorization": f"Bearer {wa_access_token}",
+        "Content-Type": "application/json",
+    }
+
+    async def _send_one(recipient, client: httpx.AsyncClient):
         async with sem:
             phone = recipient["phone_number"]
             resolved_text = recipient["resolved_text"]
             customer_name = recipient.get("customer_name", phone)
-            job_id = _uuid.uuid4().hex
 
-            await asyncio.to_thread(create_bulk_job, org_id=org_id, job_id=job_id, template_name="", language_code="", total=1)
-            await run_bulk_send_job(
-                job_id=job_id, org_id=org_id, phone_id=phone_id, access_token=wa_access_token,
-                template_name="", language_code="", recipients=[Recipient(phone_number=phone)],
-                delay_seconds=1.0, message_text=resolved_text
-            )
+            # Direct WhatsApp API call (no bulk job, no sleep, no extra DB ops)
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": phone,
+                "type": "text",
+                "text": {"body": resolved_text},
+            }
 
-            job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
-            
-            # 1. Extract message_id for tracking webhook statuses
             msg_id = ""
-            if job and job.get("results"):
-                msg_id = job["results"][0].get("message_id", "")
+            send_ok = False
+            try:
+                resp = await client.post(wa_api_url, headers=wa_headers, json=payload)
+                if resp.status_code == 200:
+                    resp_data = resp.json()
+                    messages = resp_data.get("messages") or [{}]
+                    msg_id = messages[0].get("id", "")
+                    send_ok = True
+                else:
+                    try:
+                        error_detail = resp.json().get("error", {}).get("message", resp.text)
+                    except Exception:
+                        error_detail = resp.text
+                    logger.error(f"[GoogleSheetAuto] WA API error for {phone}: {resp.status_code} — {error_detail}")
+            except Exception as e:
+                logger.error(f"[GoogleSheetAuto] WA API request failed for {phone}: {e}")
 
-            # If WhatsApp confirms the message was sent, consider it a success 
-            # even if the tracking msg_id is missing ("sent but untracked").
-            if job and job.get("sent", 0) > 0:
-                # 2. MARK SENT in deduplication collection IMMEDIATELY
+            if send_ok:
+                # MARK SENT in deduplication collection IMMEDIATELY
                 dedup_success = False
                 for attempt in range(3):
                     try:
@@ -189,13 +213,18 @@ async def process_google_sheet_trigger(
                         break
                     except Exception as e:
                         logger.error(f"[GoogleSheetAuto] Dedup mark_sent failed ({attempt+1}/3) for {phone}: {e}")
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)
 
                 if not dedup_success:
-                    logger.error(f"[GoogleSheetAuto] CRITICAL: Dedup write permanently failed for {phone}")
+                    # FIX: Mark as failed so next poll retries instead of leaving permanently stuck as 'pending'
+                    logger.error(f"[GoogleSheetAuto] CRITICAL: Dedup write permanently failed for {phone} — marking failed for retry")
+                    try:
+                        await asyncio.to_thread(_mark_failed, org_id, flow_id, phone, sheet_id)
+                    except Exception:
+                        pass
                     return {"sent": 0, "errors": 1}
 
-                # 3. Store in conversation history and link contact
+                # Store in conversation history and link contact
                 convo_success = False
                 for attempt in range(3):
                     try:
@@ -208,11 +237,12 @@ async def process_google_sheet_trigger(
                         break
                     except Exception as e:
                         logger.error(f"[GoogleSheetAuto] Conversation storage failed ({attempt+1}/3) for {phone}: {e}")
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)
 
                 if not convo_success:
-                    logger.error(f"[GoogleSheetAuto] CRITICAL: Conversation/Contact sync permanently failed for {phone}")
-                    return {"sent": 0, "errors": 1}
+                    # Message was sent but conversation record failed — log but count as sent
+                    # (dedup already marked as 'sent', so no duplicate risk)
+                    logger.error(f"[GoogleSheetAuto] CRITICAL: Conversation/Contact sync permanently failed for {phone} — message was delivered")
 
                 return {"sent": 1, "errors": 0}
             else:
@@ -223,11 +253,22 @@ async def process_google_sheet_trigger(
                     logger.error(f"[GoogleSheetAuto] Failed to mark {phone} as failed: {e}")
                 return {"sent": 0, "errors": 1}
 
-    results = await asyncio.gather(*[asyncio.create_task(_send_one(r)) for r in eligible])
+    # Use a SHARED httpx client for all sends (connection pooling)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        results = await asyncio.gather(
+            *[asyncio.create_task(_send_one(r, client)) for r in eligible],
+            return_exceptions=True,
+        )
+
     for res in results:
-        if res:
+        if isinstance(res, Exception):
+            logger.error(f"[GoogleSheetAuto] Unexpected error in _send_one: {res}")
+            stats["errors"] += 1
+        elif res:
             stats["sent"] += res.get("sent", 0)
             stats["errors"] += res.get("errors", 0)
+
+    logger.info(f"[GoogleSheetAuto] Flow {flow_id}: sent={stats['sent']}, skipped={stats['skipped']}, errors={stats['errors']}")
     return stats
 
 

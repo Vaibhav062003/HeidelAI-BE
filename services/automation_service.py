@@ -314,11 +314,16 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
         )
 
         if updated_flow:
-            # Start deferred background tasks after flow is successfully published
-            from services.google_sheet_automation import process_google_sheet_trigger
+            # Process existing sheet rows IMMEDIATELY after publish.
+            # Strategy: sync sheet → process via the MongoDB path (same as scheduler).
+            # This avoids a redundant direct Google API fetch and ensures consistency.
             for params in deferred_tasks:
-                asyncio.create_task(process_google_sheet_trigger(**params))
-                logger.success(f"Started deferred immediate processing for google_sheet flow {flow_id}")
+                sheet_id = params.get("trigger_config", {}).get("sheet_id")
+                if sheet_id:
+                    asyncio.create_task(
+                        _safe_immediate_sheet_processing(org_id, flow_id, sheet_id)
+                    )
+                    logger.success(f"Started immediate sheet processing for google_sheet flow {flow_id}, sheet {sheet_id}")
 
             return serialize_mongo(updated_flow)
         return None
@@ -326,6 +331,38 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"Error publishing automation flow: {str(e)}")
         raise
+
+
+async def _safe_immediate_sheet_processing(org_id: str, flow_id: str, sheet_id: str):
+    """
+    Immediately sync and process sheet rows on publish.
+    Wrapped in try/except so fire-and-forget asyncio.create_task doesn't silently swallow errors.
+
+    Steps:
+      1. Sync the sheet (ensures MongoDB has the latest data from Google Sheets)
+      2. Trigger automation processing via process_new_sheet_rows (the same reliable path the scheduler uses)
+    """
+    try:
+        # Step 1: Sync the sheet to ensure MongoDB has the latest data
+        from api.google_sheets_routes import _sync_sheet
+        try:
+            sync_result = await _sync_sheet(org_id, sheet_id)
+            logger.info(
+                f"[PublishSync] Synced sheet {sheet_id} for flow {flow_id}: "
+                f"+{sync_result.get('rows_added', 0)} ~{sync_result.get('rows_updated', 0)} -{sync_result.get('rows_removed', 0)}"
+            )
+        except Exception as e:
+            # Sync may fail if sheet was just connected — log but continue
+            # (process_new_sheet_rows will still try with whatever data is in MongoDB)
+            logger.warning(f"[PublishSync] Sheet sync failed for {sheet_id}, continuing with cached data: {e}")
+
+        # Step 2: Process all rows via the MongoDB path (dedup ensures no double-sends)
+        from services.google_sheet_automation import process_new_sheet_rows
+        await process_new_sheet_rows(org_id, sheet_id)
+        logger.success(f"[PublishSync] Completed immediate processing for flow {flow_id}, sheet {sheet_id}")
+
+    except Exception as e:
+        logger.error(f"[PublishSync] FAILED immediate processing for flow {flow_id}, sheet {sheet_id}: {e}")
 
 
 # =============================================================================
