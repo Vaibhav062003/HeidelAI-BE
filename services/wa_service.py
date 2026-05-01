@@ -364,7 +364,8 @@ async def send_whatsapp_message(
         temp_id: Optional[str] = None, 
         context_type: Optional[str] = None, 
         context: Optional[dict] = None,
-        bot_context: Optional[dict] = None
+        bot_context: Optional[dict] = None,
+        raise_on_partial_failure: bool = False
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -376,6 +377,7 @@ async def send_whatsapp_message(
             "content": str,
             "sender_id": str,
         }
+        raise_on_partial_failure: If True, raises HTTPException if any message in a multi-message payload fails.
     """
     whatsapp_id = message.get("sender_id")
 
@@ -526,17 +528,22 @@ async def send_whatsapp_message(
                 })
         
         success_count = sum(1 for r in results if r["status"] == "success")
-        if success_count == 0 and len(content_list) > 0:
-            # All failed
+        
+        # Only return the success payload when all items succeeded
+        if success_count < len(content_list) and len(content_list) > 0:
+            # If any failed, we raise an exception to maintain the all-or-nothing contract
             first_error = next((r.get("error") for r in results if r["status"] == "error"), "Unknown error")
-            raise HTTPException(status_code=500, detail=f"Failed to send any messages: {first_error}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to send all messages ({success_count}/{len(content_list)} succeeded). First error: {first_error}"
+            )
 
         return {
             "message": "Message(s) processed", 
             "message_id": last_mid, 
             "results": results,
             "success_count": success_count,
-            "failure_count": len(content_list) - success_count
+            "failure_count": 0
         }
 
     
