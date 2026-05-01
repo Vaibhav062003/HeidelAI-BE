@@ -163,15 +163,16 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
             "access_token": access_token
         }
         phone_register_url = f"https://graph.facebook.com/v22.0/{phone_id}/register"
-        phone_register_response = requests.post(phone_register_url, json=phone_register_params)
-        logger.info(f"Phone register response: {phone_register_response.json()}")
 
-        if phone_register_response.status_code != 200:
-            logger.error(f"Register phone number error: {phone_register_response.text}")
-            raise HTTPException(
-                status_code=400, 
-                detail="Failed to register phone number. Please ensure the phone number is valid/verified and try again."
-            )
+        try:
+            phone_register_response = requests.post(phone_register_url, json=phone_register_params)
+            logger.info(f"Phone register response: {phone_register_response.json()}")
+
+            if phone_register_response.status_code != 200:
+                logger.error(f"Phone registration failed (non-fatal): {phone_register_response.text}")
+            
+        except Exception as e:
+            logger.error(f"Phone registration request failed (non-fatal): {str(e)}")
         
         # Generate a unique user_id for this WhatsApp connection
         user_id = str(uuid.uuid4())
@@ -1227,6 +1228,7 @@ async def bulk_send_whatsapp_message(
         # Enqueue the heavy work as a background task
         background_tasks.add_task(
             run_bulk_send_job,
+            wa_id=wa_id,
             job_id=job_id,
             org_id=org_id,
             phone_id=phone_id,

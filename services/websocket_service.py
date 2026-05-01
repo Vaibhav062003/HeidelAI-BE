@@ -39,6 +39,12 @@ async def cleanup_client(client_id: str):
         if not services.agent_clients[user_id]:
             del services.agent_clients[user_id]
 
+    org_id = meta.get("org_id")
+    if org_id and client_id in services.org_clients.get(org_id, set()):
+        services.org_clients[org_id].remove(client_id)
+        if not services.org_clients[org_id]:
+            del services.org_clients[org_id]
+
     if ig_id and client_id in services.instagram_clients[ig_id]:
         services.instagram_clients[ig_id].remove(client_id)
         if not services.instagram_clients[ig_id]:
@@ -330,3 +336,30 @@ async def broadcast_team_message(org_id: str, conversation_id: str, participants
                     logger.warning(f"WebSocket not found for active client {client_id}")
         else:
             pass
+
+async def broadcast_ai_escalation(org_id: str, payload: dict):
+    """
+    Broadcast a new AI escalation to all online agents in an organization.
+    """
+    logger.info(f"📡 Broadcasting AI escalation to organization: {org_id}")
+    
+    client_ids = services.org_clients.get(org_id, [])
+    if not client_ids:
+        logger.warning(f"⚠️ No active clients found for organization {org_id}")
+        return
+
+    safe_payload = jsonable_encoder(payload)
+    
+    for client_id in list(client_ids):
+        ws = services.active_clients.get(client_id)
+        if ws:
+            try:
+                await ws.send_json({
+                    "type": "new_ai_escalation",
+                    "data": safe_payload
+                })
+                logger.success(f"Sent escalation alert to terminal {client_id}")
+            except Exception as e:
+                logger.error(f"Failed to send escalation to {client_id}: {e}")
+        else:
+            logger.warning(f"WebSocket not found for active client {client_id}")

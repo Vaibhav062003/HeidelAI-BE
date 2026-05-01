@@ -7,7 +7,7 @@ from loguru import logger
 
 db = get_mongo_db()
 
-POLL_INTERVAL_SECONDS = 60
+POLL_INTERVAL_SECONDS = 15
 _polling_task: Optional[asyncio.Task] = None
 
 
@@ -138,11 +138,23 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
     try:
         from api.google_sheets_routes import _sync_sheet
         result = await _sync_sheet(org_id, sheet_id)
-        rows = result.get("rows_processed", 0)
+        rows_added = result.get("rows_added", 0)
+        rows_updated = result.get("rows_updated", 0)
+        rows_removed = result.get("rows_removed", 0)
+        total = rows_added + rows_updated + rows_removed
 
-        if rows > 0:
-            logger.info(f"[Scheduler] Synced {rows} new row(s) from sheet {sheet_id} for org {org_id}")
-            await _trigger_google_sheet_automations(org_id, sheet_id)
+        if total > 0:
+            logger.info(f"[Scheduler] Synced sheet {sheet_id} for org {org_id}: +{rows_added} ~{rows_updated} -{rows_removed}")
+        
+        # ALWAYS trigger automations after a successful sync.
+        # Even if rows_processed == 0, we trigger automations because:
+        #   - Rows may have been synced on a PREVIOUS poll but the automation
+        #     wasn't published yet at that time.
+        #   - The automation's own dedup system (google_sheet_sent_numbers)
+        #     ensures the same phone number is never messaged twice.
+        #   - This makes the system self-healing: if any step failed on a
+        #     previous run, it will be retried on the next poll.
+        await _trigger_google_sheet_automations(org_id, sheet_id)
 
     except Exception as e:
         logger.error(f"[Scheduler] Failed to sync sheet {sheet_id} for org {org_id}: {str(e)}")
