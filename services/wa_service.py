@@ -473,42 +473,45 @@ async def send_whatsapp_message(
                     "last_message_is_private_note": mode == "private"
                 }
 
-                conversation = db[f"conversations_{org_id}"].find_one_and_update(
-                    {"conversation_id": conversation_id},
-                    {"$set": wa_conversation},
-                    return_document=ReturnDocument.AFTER  
+                # Execute storage (bubble) and conversation update (sidebar) concurrently
+                mid, conversation = await asyncio.gather(
+                    store_whatsapp_message(
+                        org_id=org_id,
+                        content=single_content,
+                        conversation_id=conversation_id,
+                        customer_phone_no=recipient_id,
+                        type="text",
+                        payload=None,
+                        sender_name="AI" if mode == "ai" else "Agent",
+                        recipient_id=whatsapp_business_id,
+                        role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
+                        mode=mode,
+                        message_id=message_id,
+                        raw_data=response_data,
+                        status="delivered" if mode == "private" else "sending",
+                        temp_id=temp_id,
+                        context=context,
+                        context_type=context_type,
+                        bot_context=bot_context
+                    ),
+                    db[f"conversations_{org_id}"].find_one_and_update(
+                        {"conversation_id": conversation_id},
+                        {"$set": wa_conversation},
+                        return_document=ReturnDocument.AFTER  
+                    )
                 )
 
-                if conversation and "_id" in conversation:
-                    conversation["_id"] = str(conversation["_id"])
+                if conversation:
+                    if "_id" in conversation:
+                        conversation["_id"] = str(conversation["_id"])
 
-                await broadcast_main_ws(
-                    platform_id=connection.get("wa_id"),
-                    platform_type="whatsapp",
-                    event_type="conversation_updated",
-                    payload={"conversation": conversation}
-                )
+                    await broadcast_main_ws(
+                        platform_id=connection.get("wa_id"),
+                        platform_type="whatsapp",
+                        event_type="conversation_updated",
+                        payload={"conversation": conversation}
+                    )
 
-                # Store message in WhatsApp-specific collection
-                mid = await store_whatsapp_message(
-                    org_id=org_id,
-                    content=single_content,
-                    conversation_id=conversation_id,
-                    customer_phone_no=recipient_id,
-                    type="text",
-                    payload=None,
-                    sender_name="AI" if mode == "ai" else "Agent",
-                    recipient_id=whatsapp_business_id,
-                    role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
-                    mode=mode,
-                    message_id=message_id,
-                    raw_data=response_data,
-                    status="delivered" if mode == "private" else "sending",
-                    temp_id=temp_id,
-                    context=context,
-                    context_type=context_type,
-                    bot_context=bot_context
-                )
                 
                 results.append({
                     "status": "success",
