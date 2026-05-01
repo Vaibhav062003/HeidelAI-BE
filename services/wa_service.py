@@ -530,7 +530,7 @@ async def send_whatsapp_message(
         success_count = sum(1 for r in results if r["status"] == "success")
         
         # Only return the success payload when all items succeeded
-        if success_count < len(content_list) and len(content_list) > 0:
+        if success_count < len(content_list) and len(content_list) > 0 and raise_on_partial_failure:
             # If any failed, we raise an exception to maintain the all-or-nothing contract
             first_error = next((r.get("error") for r in results if r["status"] == "error"), "Unknown error")
             raise HTTPException(
@@ -543,7 +543,7 @@ async def send_whatsapp_message(
             "message_id": last_mid, 
             "results": results,
             "success_count": success_count,
-            "failure_count": 0
+             "failure_count": len(content_list) - success_count
         }
 
     
