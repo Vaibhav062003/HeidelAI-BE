@@ -374,7 +374,7 @@ async def send_whatsapp_message(
         Sender wa_id: The recipient's WhatsApp user ID
         message: {
             "conversation_id": str,
-            "content": str,
+            "content": str | list[str],
             "sender_id": str,
         }
         raise_on_partial_failure: If True, raises HTTPException if any message in a multi-message payload fails.
