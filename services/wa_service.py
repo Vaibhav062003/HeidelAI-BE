@@ -366,7 +366,8 @@ async def send_whatsapp_message(
         temp_id: Optional[str] = None, 
         context_type: Optional[str] = None, 
         context: Optional[dict] = None,
-        bot_context: Optional[dict] = None
+        bot_context: Optional[dict] = None,
+        raise_on_partial_failure: bool = False
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -375,9 +376,10 @@ async def send_whatsapp_message(
         Sender wa_id: The recipient's WhatsApp user ID
         message: {
             "conversation_id": str,
-            "content": str,
+            "content": str | list[str],
             "sender_id": str,
         }
+        raise_on_partial_failure: If True, raises HTTPException if any message in a multi-message payload fails.
     """
     whatsapp_id = message.get("sender_id")
 
