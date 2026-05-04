@@ -25,6 +25,8 @@ from services.websocket_service import broadcast_main_ws
 from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
 
+MSG_SPLIT = "|MSG_SPLIT|"
+
 
 
 db = get_mongo_db()
@@ -399,7 +401,7 @@ async def send_whatsapp_message(
     
     try:
         conversation_id = message["conversation_id"]
-        content = message["content"]
+        original_content = message["content"]
         
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
@@ -410,100 +412,129 @@ async def send_whatsapp_message(
         # Extract the recipient phone number from conversation ID
         recipient_id = conversation_id.replace("whatsapp_", "")
 
-        data = {
-            "messaging_product": "whatsapp",
-            "to": recipient_id,
-            "type": "text",
-            "text": {"body": content}
-        }
-
-        if context_type and context:
-            data["context"] = {
-                "message_id": context.get("mid")
-            }
-        
-        if mode == "reply" or mode == "ai":
-            
-            # Send message via WhatsApp Cloud API
-            url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
-            headers = {
-                "Authorization": f"Bearer {connection['access_token']}",
-                "Content-Type": "application/json",
-            }
-            
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, headers=headers, json=data)
-            
-            if response.status_code != 200:
-                logger.error(f"WhatsApp API error: {response.text}")
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail="Failed to send WhatsApp message"
-                )
-            
-            response_data = response.json()
-            message_id = response_data.get("messages", [{}])[0].get("id")
-        else: 
-            message_id = f"privatenote_{uuid.uuid4()}"
-            response_data = {"status": "Private note created, no API call made"}
-        
-        now = datetime.now(timezone.utc)
-
-        if mode == "private":
-            last_message = f"Private Note: {content}"
-        elif mode == "ai":
-            last_message= f"AI: {content}"
+        # Handle multi-part messages (e.g. lists returned by the agent or strings with MSG_SPLIT)
+        if isinstance(original_content, list):
+            contents = original_content
+        elif isinstance(original_content, str) and MSG_SPLIT in original_content:
+            contents = [m.strip() for m in original_content.split(MSG_SPLIT) if m.strip()]
         else:
-            last_message = f"You: {content}"
+            contents = [str(original_content)]
 
-        wa_conversation = {
-            "last_message": last_message,
-            "last_message_timestamp": now,
-            "last_sender": "ai" if mode == "ai" else "agent" ,
-            "reminder_stage": 0,
-            "next_action_at": now + timedelta(hours=6),
-            "last_message_is_private_note": mode == "private"
-        }
+        if not contents:
+            logger.warning(f"Empty content provided for WhatsApp message to {recipient_id}")
+            return {"message": "No content to send"}
 
-        conversation = db[f"conversations_{org_id}"].find_one_and_update(
-            {"conversation_id": conversation_id},
-            {"$set": wa_conversation},
-            return_document=ReturnDocument.AFTER  
-        )
+        last_stored_id = None
+        all_message_ids = []
 
-        if "_id" in conversation:
-            conversation["_id"] = str(conversation["_id"])
+        # Send each content part as a separate bubble
+        for i, content_item in enumerate(contents):
+            data = {
+                "messaging_product": "whatsapp",
+                "to": recipient_id,
+                "type": "text",
+                "text": {"body": content_item}
+            }
 
-        await broadcast_main_ws(
-            platform_id=connection.get("wa_id"),
-            platform_type="whatsapp",
-            event_type="conversation_updated",
-            payload={"conversation": conversation}
-        )
+            if context_type and context:
+                data["context"] = {
+                    "message_id": context.get("mid")
+                }
+            
+            if mode == "reply" or mode == "ai":
+                # Send message via WhatsApp Cloud API
+                url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
+                headers = {
+                    "Authorization": f"Bearer {connection['access_token']}",
+                    "Content-Type": "application/json",
+                }
+                
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(url, headers=headers, json=data)
+                
+                if response.status_code != 200:
+                    logger.error(f"WhatsApp API error: {response.text}")
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Failed to send WhatsApp message part {i+1}"
+                    )
+                
+                response_data = response.json()
+                message_id = response_data.get("messages", [{}])[0].get("id")
+            else: 
+                message_id = f"privatenote_{uuid.uuid4()}"
+                response_data = {"status": "Private note created, no API call made"}
+            
+            all_message_ids.append(message_id)
+            now = datetime.now(timezone.utc)
 
-        # Store message in WhatsApp-specific collection
-        mid = await store_whatsapp_message(
-            org_id=org_id,
-            content=content,
-            conversation_id=conversation_id,
-            customer_phone_no=recipient_id,
-            type="text",
-            payload=None,
-            sender_name="AI" if mode == "ai" else "Agent",
-            recipient_id=whatsapp_business_id,
-            role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
-            mode=mode,
-            message_id=message_id,
-            raw_data=response_data,
-            status="delivered" if mode == "private" else "sending",
-            temp_id=temp_id,
-            context=context,
-            context_type=context_type,
-            bot_context=bot_context
-        )
-        
-        return {"message": "Message sent", "message_id": mid}
+            if mode == "private":
+                last_message = f"Private Note: {content_item}"
+            elif mode == "ai":
+                last_message= f"AI: {content_item}"
+            else:
+                last_message = f"You: {content_item}"
+
+            wa_conversation = {
+                "last_message": last_message,
+                "last_message_timestamp": now,
+                "last_sender": "ai" if mode == "ai" else "agent" ,
+                "reminder_stage": 0,
+                "next_action_at": now + timedelta(hours=6),
+                "last_message_is_private_note": mode == "private"
+            }
+
+            # Update conversation for each part (last one will reflect the final state)
+            db[f"conversations_{org_id}"].find_one_and_update(
+                {"conversation_id": conversation_id},
+                {"$set": wa_conversation},
+                return_document=ReturnDocument.AFTER  
+            )
+
+            # Store message in WhatsApp-specific collection
+            last_stored_id = await store_whatsapp_message(
+                org_id=org_id,
+                content=content_item,
+                conversation_id=conversation_id,
+                customer_phone_no=recipient_id,
+                type="text",
+                payload=None,
+                sender_name="AI" if mode == "ai" else "Agent",
+                recipient_id=whatsapp_business_id,
+                role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
+                mode=mode,
+                message_id=message_id,
+                raw_data=response_data,
+                status="delivered" if mode == "private" else "sending",
+                temp_id=temp_id,
+                context=context,
+                context_type=context_type,
+                bot_context=bot_context
+            )
+
+            # Small delay between bubbles to ensure delivery order
+            if len(contents) > 1 and i < len(contents) - 1:
+                await asyncio.sleep(0.5)
+
+        # Broadcast the final conversation state once after all bubbles are sent
+        final_conversation = db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+        if final_conversation:
+            if "_id" in final_conversation:
+                final_conversation["_id"] = str(final_conversation["_id"])
+            
+            # Convert datetimes for JSON
+            for key in ["last_message_timestamp", "next_action_at", "started_at", "created_at", "reply_window_ends_at"]:
+                if final_conversation.get(key) and isinstance(final_conversation[key], datetime):
+                    final_conversation[key] = final_conversation[key].isoformat()
+
+            await broadcast_main_ws(
+                platform_id=connection.get("wa_id"),
+                platform_type="whatsapp",
+                event_type="conversation_updated",
+                payload={"conversation": final_conversation}
+            )
+
+        return {"message": "Messages sent", "message_ids": all_message_ids, "message_id": last_stored_id}
     
     except HTTPException as e:
         raise e
