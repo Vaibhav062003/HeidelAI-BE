@@ -267,7 +267,7 @@ async def store_whatsapp_message(
     logger.success(f"Whatsapp conversation updated: {conversation_id}")
     
     if status == "sending":
-        return
+        return message_id
     
     # Format message for WebSocket broadcast
     broadcast_message = {
@@ -416,7 +416,7 @@ async def send_whatsapp_message(
 
         # Handle multi-part messages (e.g. lists returned by the agent or strings with MSG_SPLIT)
         if isinstance(original_content, list):
-            contents = original_content
+            contents = [str(m).strip() for m in original_content if str(m).strip()]
         elif isinstance(original_content, str) and MSG_SPLIT in original_content:
             contents = [m.strip() for m in original_content.split(MSG_SPLIT) if m.strip()]
         else:
