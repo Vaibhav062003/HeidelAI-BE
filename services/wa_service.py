@@ -364,7 +364,8 @@ async def send_whatsapp_message(
         temp_id: Optional[str] = None, 
         context_type: Optional[str] = None, 
         context: Optional[dict] = None,
-        bot_context: Optional[dict] = None
+        bot_context: Optional[dict] = None,
+        raise_on_partial_failure: bool = False
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -373,9 +374,10 @@ async def send_whatsapp_message(
         Sender wa_id: The recipient's WhatsApp user ID
         message: {
             "conversation_id": str,
-            "content": str,
+            "content": str | list[str],
             "sender_id": str,
         }
+        raise_on_partial_failure: If True, raises HTTPException if any message in a multi-message payload fails.
     """
     whatsapp_id = message.get("sender_id")
 
@@ -401,6 +403,8 @@ async def send_whatsapp_message(
         conversation_id = message["conversation_id"]
         content = message["content"]
         
+        content_list = content if isinstance(content, list) else [content]
+        
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
         
@@ -410,100 +414,138 @@ async def send_whatsapp_message(
         # Extract the recipient phone number from conversation ID
         recipient_id = conversation_id.replace("whatsapp_", "")
 
-        data = {
-            "messaging_product": "whatsapp",
-            "to": recipient_id,
-            "type": "text",
-            "text": {"body": content}
-        }
-
-        if context_type and context:
-            data["context"] = {
-                "message_id": context.get("mid")
-            }
+        last_mid = None
+        results = []
         
-        if mode == "reply" or mode == "ai":
-            
-            # Send message via WhatsApp Cloud API
-            url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
-            headers = {
-                "Authorization": f"Bearer {connection['access_token']}",
-                "Content-Type": "application/json",
-            }
-            
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, headers=headers, json=data)
-            
-            if response.status_code != 200:
-                logger.error(f"WhatsApp API error: {response.text}")
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail="Failed to send WhatsApp message"
+        for idx, single_content in enumerate(content_list):
+            try:
+                data = {
+                    "messaging_product": "whatsapp",
+                    "to": recipient_id,
+                    "type": "text",
+                    "text": {"body": single_content}
+                }
+
+                if context_type and context:
+                    data["context"] = {
+                        "message_id": context.get("mid")
+                    }
+                
+                if mode == "reply" or mode == "ai":
+                    # Send message via WhatsApp Cloud API
+                    url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
+                    headers = {
+                        "Authorization": f"Bearer {connection['access_token']}",
+                        "Content-Type": "application/json",
+                    }
+                    
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        response = await client.post(url, headers=headers, json=data)
+                    
+                    if response.status_code != 200:
+                        logger.error(f"WhatsApp API error for message {idx}: {response.text}")
+                        results.append({
+                            "status": "error",
+                            "error": response.text,
+                            "index": idx
+                        })
+                        continue
+                    
+                    response_data = response.json()
+                    message_id = response_data.get("messages", [{}])[0].get("id")
+                else: 
+                    message_id = f"privatenote_{uuid.uuid4()}"
+                    response_data = {"status": "Private note created, no API call made"}
+                
+                now = datetime.now(timezone.utc)
+
+                if mode == "private":
+                    last_message = f"Private Note: {single_content}"
+                elif mode == "ai":
+                    last_message= f"AI: {single_content}"
+                else:
+                    last_message = f"You: {single_content}"
+
+                wa_conversation = {
+                    "last_message": last_message,
+                    "last_message_timestamp": now,
+                    "last_sender": "ai" if mode == "ai" else "agent" ,
+                    "reminder_stage": 0,
+                    "next_action_at": now + timedelta(hours=6),
+                    "last_message_is_private_note": mode == "private"
+                }
+
+                conversation = db[f"conversations_{org_id}"].find_one_and_update(
+                    {"conversation_id": conversation_id},
+                    {"$set": wa_conversation},
+                    return_document=ReturnDocument.AFTER  
                 )
-            
-            response_data = response.json()
-            message_id = response_data.get("messages", [{}])[0].get("id")
-        else: 
-            message_id = f"privatenote_{uuid.uuid4()}"
-            response_data = {"status": "Private note created, no API call made"}
+
+                if conversation and "_id" in conversation:
+                    conversation["_id"] = str(conversation["_id"])
+
+                if conversation:
+                    await broadcast_main_ws(
+                        platform_id=connection.get("wa_id"),
+                        platform_type="whatsapp",
+                        event_type="conversation_updated",
+                        payload={"conversation": conversation}
+                    )
+                # Store message in WhatsApp-specific collection
+                mid = await store_whatsapp_message(
+                    org_id=org_id,
+                    content=single_content,
+                    conversation_id=conversation_id,
+                    customer_phone_no=recipient_id,
+                    type="text",
+                    payload=None,
+                    sender_name="AI" if mode == "ai" else "Agent",
+                    recipient_id=whatsapp_business_id,
+                    role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
+                    mode=mode,
+                    message_id=message_id,
+                    raw_data=response_data,
+                    status="delivered" if mode == "private" else "sending",
+                    temp_id=temp_id,
+                    context=context,
+                    context_type=context_type,
+                    bot_context=bot_context
+                )
+                
+                results.append({
+                    "status": "success",
+                    "message_id": mid,
+                    "index": idx
+                })
+                last_mid = mid
+
+            except Exception as e:
+                logger.error(f"Error processing WhatsApp message {idx}: {e}")
+                results.append({
+                    "status": "error",
+                    "error": str(e),
+                    "index": idx
+                })
         
-        now = datetime.now(timezone.utc)
+        success_count = sum(1 for r in results if r["status"] == "success")
+        
+        # Only return the success payload when all items succeeded
+        if success_count < len(content_list) and len(content_list) > 0 and raise_on_partial_failure:
+            # If any failed, we raise an exception to maintain the all-or-nothing contract
+            first_error = next((r.get("error") for r in results if r["status"] == "error"), "Unknown error")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to send all messages ({success_count}/{len(content_list)} succeeded). First error: {first_error}"
+            )
 
-        if mode == "private":
-            last_message = f"Private Note: {content}"
-        elif mode == "ai":
-            last_message= f"AI: {content}"
-        else:
-            last_message = f"You: {content}"
-
-        wa_conversation = {
-            "last_message": last_message,
-            "last_message_timestamp": now,
-            "last_sender": "ai" if mode == "ai" else "agent" ,
-            "reminder_stage": 0,
-            "next_action_at": now + timedelta(hours=6),
-            "last_message_is_private_note": mode == "private"
+        return {
+            "message": "Message(s) processed", 
+            "message_id": last_mid, 
+            "results": results,
+            "success_count": success_count,
+             "failure_count": len(content_list) - success_count
         }
 
-        conversation = db[f"conversations_{org_id}"].find_one_and_update(
-            {"conversation_id": conversation_id},
-            {"$set": wa_conversation},
-            return_document=ReturnDocument.AFTER  
-        )
-
-        if "_id" in conversation:
-            conversation["_id"] = str(conversation["_id"])
-
-        await broadcast_main_ws(
-            platform_id=connection.get("wa_id"),
-            platform_type="whatsapp",
-            event_type="conversation_updated",
-            payload={"conversation": conversation}
-        )
-
-        # Store message in WhatsApp-specific collection
-        mid = await store_whatsapp_message(
-            org_id=org_id,
-            content=content,
-            conversation_id=conversation_id,
-            customer_phone_no=recipient_id,
-            type="text",
-            payload=None,
-            sender_name="AI" if mode == "ai" else "Agent",
-            recipient_id=whatsapp_business_id,
-            role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
-            mode=mode,
-            message_id=message_id,
-            raw_data=response_data,
-            status="delivered" if mode == "private" else "sending",
-            temp_id=temp_id,
-            context=context,
-            context_type=context_type,
-            bot_context=bot_context
-        )
-        
-        return {"message": "Message sent", "message_id": mid}
     
     except HTTPException as e:
         raise e

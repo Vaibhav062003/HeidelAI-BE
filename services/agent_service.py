@@ -14,8 +14,9 @@ async def send_to_agent(
     customer_name: str,
     org_id: str,
     source: str = "webhook",
-    timeout: int = 10
+    timeout: int = 20
 ) -> Dict:
+
     """
     Send a message to the chatbot service and return the chatbot's response.
     Args:
