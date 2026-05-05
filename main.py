@@ -36,7 +36,7 @@ else:
     alowed_origins = [
         "https://www.heidelai.com", 
         "https://heidelai.com",
-        "https://www.deveopment.heidelai.com", 
+        "https://www.development.heidelai.com", 
         "https://development.heidelai.com",
         "https://www.testing.heidelai.com", 
         "https://testing.heidelai.com",
