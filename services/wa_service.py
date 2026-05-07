@@ -1605,8 +1605,14 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
 
         if mode == "platform":
             message_doc = db[messages_collection].find_one(
-                {},
-                {"message_id": 1, "_id": 0},
+                {
+                    "role": MessageRole.CUSTOMER, 
+                    "status": {"$ne": "read"}
+                },
+                {
+                    "message_id": 1, 
+                    "_id": 0
+                },
                 sort=[("timestamp", -1)]
             )
             message_id = message_doc.get("message_id") if message_doc else None
