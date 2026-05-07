@@ -15,7 +15,7 @@ from pymongo import ReturnDocument, UpdateOne
 from core.managers import manager
 from database import get_mongo_db, get_mongo_client
 from core.services import services
-from config.settings import IG_VERSION, VERSION, APP_ID
+from config.settings import IG_VERSION, VERSION, WA_VERSION, APP_ID
 from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
@@ -1630,7 +1630,7 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
             logger.warning(f"Trying to process webhook for unregistered WhatsApp ID: {whatsapp_id}")
             return
 
-        url = f"https://graph.facebook.com/{VERSION}/{connection['phone_id']}/messages"
+        url = f"https://graph.facebook.com/{WA_VERSION}/{connection['phone_id']}/messages"
         headers = {
             "Authorization": f"Bearer {connection['access_token']}",
             "Content-Type": "application/json",
