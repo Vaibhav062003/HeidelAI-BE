@@ -480,7 +480,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
 
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
-                                if ai_enabled and is_dev and not is_heidelai and not is_pma_wa:
+                                if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
                                     await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
                                     # Execute the WhatsApp Automation Flow first (if it exists)
@@ -763,7 +763,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context=context
                                     )
 
-                                if whatsapp_flow and ai_enabled and is_dev:
+                                if whatsapp_flow and ai_enabled and is_production:
                                     automation_response = await execute_whatsapp_flow(
                                         flow=whatsapp_flow,
                                         org_id=org_id,
