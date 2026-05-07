@@ -89,17 +89,18 @@ async def handle_typing_event(client_id: str, data: dict):
 
     # Broadcast to WhatsApp
     elif platform == "whatsapp" and wa_id:
-        from services.wa_service import read_message_and_typing_indicator
-        await read_message_and_typing_indicator(
-            mode="platform",
-            whatsapp_id=wa_id,
-        )
         await broadcast_main_ws(
             platform_id=wa_id,
             platform_type="whatsapp",
             event_type="typing_indicator",
             payload=data,
             exclude_client_id=client_id 
+        )
+        
+        from services.wa_service import read_message_and_typing_indicator
+        await read_message_and_typing_indicator(
+            mode="platform",
+            whatsapp_id=wa_id,
         )
 
 async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: str, payload: dict, exclude_client_id: str = None):
