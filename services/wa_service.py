@@ -1,7 +1,7 @@
 # Built-in modules
 import httpx
 import asyncio
-import json, requests
+import json
 import uuid
 import io
 import cloudinary.uploader
@@ -24,6 +24,9 @@ from services.websocket_service import broadcast_main_ws
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
+
+MSG_SPLIT = "|MSG_SPLIT|"
+
 
 
 db = get_mongo_db()
@@ -264,7 +267,7 @@ async def store_whatsapp_message(
     logger.success(f"Whatsapp conversation updated: {conversation_id}")
     
     if status == "sending":
-        return
+        return message_id
     
     # Format message for WebSocket broadcast
     broadcast_message = {
@@ -363,7 +366,8 @@ async def send_whatsapp_message(
         temp_id: Optional[str] = None, 
         context_type: Optional[str] = None, 
         context: Optional[dict] = None,
-        bot_context: Optional[dict] = None
+        bot_context: Optional[dict] = None,
+        raise_on_partial_failure: bool = False
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -372,9 +376,10 @@ async def send_whatsapp_message(
         Sender wa_id: The recipient's WhatsApp user ID
         message: {
             "conversation_id": str,
-            "content": str,
+            "content": str | list[str],
             "sender_id": str,
         }
+        raise_on_partial_failure: If True, raises HTTPException if any message in a multi-message payload fails.
     """
     whatsapp_id = message.get("sender_id")
 
@@ -398,7 +403,7 @@ async def send_whatsapp_message(
     
     try:
         conversation_id = message["conversation_id"]
-        content = message["content"]
+        original_content = message["content"]
         
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
@@ -409,99 +414,129 @@ async def send_whatsapp_message(
         # Extract the recipient phone number from conversation ID
         recipient_id = conversation_id.replace("whatsapp_", "")
 
-        data = {
-            "messaging_product": "whatsapp",
-            "to": recipient_id,
-            "type": "text",
-            "text": {"body": content}
-        }
-
-        if context_type and context:
-            data["context"] = {
-                "message_id": context.get("mid")
-            }
-        
-        if mode == "reply" or mode == "ai":
-            
-            # Send message via WhatsApp Cloud API
-            url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
-            headers = {
-                "Authorization": f"Bearer {connection['access_token']}",
-                "Content-Type": "application/json",
-            }
-            
-            
-            response = requests.post(url, headers=headers, json=data)
-            
-            if response.status_code != 200:
-                logger.error(f"WhatsApp API error: {response.text}")
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail="Failed to send WhatsApp message"
-                )
-            
-            response_data = response.json()
-            message_id = response_data.get("messages", [{}])[0].get("id")
-        else: 
-            message_id = f"privatenote_{uuid.uuid4()}"
-            response_data = {"status": "Private note created, no API call made"}
-        
-        now = datetime.now(timezone.utc)
-
-        if mode == "private":
-            last_message = f"Private Note: {content}"
-        elif mode == "ai":
-            last_message= f"AI: {content}"
+        # Handle multi-part messages (e.g. lists returned by the agent or strings with MSG_SPLIT)
+        if isinstance(original_content, list):
+            contents = [str(m).strip() for m in original_content if str(m).strip()]
+        elif isinstance(original_content, str) and MSG_SPLIT in original_content:
+            contents = [m.strip() for m in original_content.split(MSG_SPLIT) if m.strip()]
         else:
-            last_message = f"You: {content}"
+            contents = [str(original_content)]
 
-        wa_conversation = {
-            "last_message": last_message,
-            "last_message_timestamp": now,
-            "last_sender": "ai" if mode == "ai" else "agent" ,
-            "reminder_stage": 0,
-            "next_action_at": now + timedelta(hours=6),
-            "last_message_is_private_note": mode == "private"
-        }
+        if not contents:
+            logger.warning(f"Empty content provided for WhatsApp message to {recipient_id}")
+            return {"message": "No content to send"}
 
-        conversation = db[f"conversations_{org_id}"].find_one_and_update(
-            {"conversation_id": conversation_id},
-            {"$set": wa_conversation},
-            return_document=ReturnDocument.AFTER  
-        )
+        last_stored_id = None
+        all_message_ids = []
 
-        if "_id" in conversation:
-            conversation["_id"] = str(conversation["_id"])
+        # Send each content part as a separate bubble
+        for i, content_item in enumerate(contents):
+            data = {
+                "messaging_product": "whatsapp",
+                "to": recipient_id,
+                "type": "text",
+                "text": {"body": content_item}
+            }
 
-        await broadcast_main_ws(
-            platform_id=connection.get("wa_id"),
-            platform_type="whatsapp",
-            event_type="conversation_updated",
-            payload={"conversation": conversation}
-        )
+            if context_type and context:
+                data["context"] = {
+                    "message_id": context.get("mid")
+                }
+            
+            if mode == "reply" or mode == "ai":
+                # Send message via WhatsApp Cloud API
+                url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
+                headers = {
+                    "Authorization": f"Bearer {connection['access_token']}",
+                    "Content-Type": "application/json",
+                }
+                
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(url, headers=headers, json=data)
+                
+                if response.status_code != 200:
+                    logger.error(f"WhatsApp API error: {response.text}")
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Failed to send WhatsApp message part {i+1}"
+                    )
+                
+                response_data = response.json()
+                message_id = response_data.get("messages", [{}])[0].get("id")
+            else: 
+                message_id = f"privatenote_{uuid.uuid4()}"
+                response_data = {"status": "Private note created, no API call made"}
+            
+            all_message_ids.append(message_id)
+            now = datetime.now(timezone.utc)
 
-        # Store message in WhatsApp-specific collection
-        mid = await store_whatsapp_message(
-            org_id=org_id,
-            content=content,
-            conversation_id=conversation_id,
-            customer_phone_no=recipient_id,
-            type="text",
-            payload=None,
-            sender_name="AI" if mode == "ai" else "Agent",
-            recipient_id=whatsapp_business_id,
-            role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
-            mode=mode,
-            message_id=message_id,
-            raw_data=response_data,
-            status="delivered" if mode == "private" else "sending",
-            temp_id=temp_id,
-            context=context,
-            context_type=context_type,
-            bot_context=bot_context
-        )
-        
-        return {"message": "Message sent", "message_id": mid}
+            if mode == "private":
+                last_message = f"Private Note: {content_item}"
+            elif mode == "ai":
+                last_message= f"AI: {content_item}"
+            else:
+                last_message = f"You: {content_item}"
+
+            wa_conversation = {
+                "last_message": last_message,
+                "last_message_timestamp": now,
+                "last_sender": "ai" if mode == "ai" else "agent" ,
+                "reminder_stage": 0,
+                "next_action_at": now + timedelta(hours=6),
+                "last_message_is_private_note": mode == "private"
+            }
+
+            # Update conversation for each part (last one will reflect the final state)
+            db[f"conversations_{org_id}"].find_one_and_update(
+                {"conversation_id": conversation_id},
+                {"$set": wa_conversation},
+                return_document=ReturnDocument.AFTER  
+            )
+
+            # Store message in WhatsApp-specific collection
+            last_stored_id = await store_whatsapp_message(
+                org_id=org_id,
+                content=content_item,
+                conversation_id=conversation_id,
+                customer_phone_no=recipient_id,
+                type="text",
+                payload=None,
+                sender_name="AI" if mode == "ai" else "Agent",
+                recipient_id=whatsapp_business_id,
+                role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
+                mode=mode,
+                message_id=message_id,
+                raw_data=response_data,
+                status="delivered" if mode == "private" else "sending",
+                temp_id=temp_id,
+                context=context,
+                context_type=context_type,
+                bot_context=bot_context
+            )
+
+            # Small delay between bubbles to ensure delivery order
+            if len(contents) > 1 and i < len(contents) - 1:
+                await asyncio.sleep(0.5)
+
+        # Broadcast the final conversation state once after all bubbles are sent
+        final_conversation = db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+        if final_conversation:
+            if "_id" in final_conversation:
+                final_conversation["_id"] = str(final_conversation["_id"])
+            
+            # Convert datetimes for JSON
+            for key in ["last_message_timestamp", "next_action_at", "started_at", "created_at", "reply_window_ends_at"]:
+                if final_conversation.get(key) and isinstance(final_conversation[key], datetime):
+                    final_conversation[key] = final_conversation[key].isoformat()
+
+            await broadcast_main_ws(
+                platform_id=connection.get("wa_id"),
+                platform_type="whatsapp",
+                event_type="conversation_updated",
+                payload={"conversation": final_conversation}
+            )
+
+        return {"message": "Messages sent", "message_ids": all_message_ids, "message_id": last_stored_id}
     
     except HTTPException as e:
         raise e
@@ -672,7 +707,8 @@ async def send_wa_media_message(
             }
             
             
-            response = requests.post(url, headers=headers, json=data)
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(url, headers=headers, json=data)
             
             if response.status_code != 200:
                 logger.error(f"WhatsApp API error: {response.text}")
@@ -920,9 +956,18 @@ async def revoke_whatsapp_access(org_id: str, wa_id: str):
                 # Call Facebook's token revocation endpoint
                 revoke_url = "https://graph.facebook.com/v17.0/me/permissions"
                 params = {"access_token": access_token}
-                requests.delete(revoke_url, params=params)
+                timeout = httpx.Timeout(10.0)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.delete(revoke_url, params=params)
+                    if not response.is_success:
+                        logger.error(
+                            f"Token revocation returned status {response.status_code} for org {org_id} "
+                            f"and wa_id {wa_id}: {response.text}"
+                        )
+            except httpx.HTTPError as e:
+                logger.error(f"HTTP error revoking token for org {org_id}: {e}")
             except Exception as e:
-                logger.error(f"Error revoking token: {e}")
+                logger.error(f"Unexpected error revoking token: {e}")
 
         return {"message": "WhatsApp connection removed successfully"}
         
@@ -1041,7 +1086,8 @@ async def send_whatsapp_reaction(org_id, message_id, emoji):
             "fields": "profile_picture_url"
         }
         
-        response = requests.get(url, params=params)
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params)
         
         if response.status_code != 200:
             logger.error(f"WhatsApp API Error: {response.text}")
@@ -1168,7 +1214,8 @@ async def send_message_reaction(message_id: str, phone_id: str, access_token: st
             }
         }
 
-        response = requests.post(url, headers=headers, json=body)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=body)
         if response.status_code != 200:
             logger.error(f"Error sending message reaction: {response.text}")
             return "error"
@@ -1247,62 +1294,41 @@ async def create_templates(org_id:str, wa_id:str, access_token:str, template_nam
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             response = await client.post(url, headers=headers, json=data)
-
-        try:
-            response_body_for_log = response.json()
-        except Exception:
-            response_body_for_log = response.text
-
-        logger.info(
-            f"WhatsApp API response | org_id={org_id} wa_id={wa_id} template={template_name} "
-            f"status={response.status_code} response={response_body_for_log}"
-        )
-        if response.status_code != 200:
-            try:
-                error_payload = response.json()
-            except Exception:
-                error_payload = {"error": {"message": response.text}}
-
-            logger.error(
-                f"WhatsApp API error | org_id={org_id} wa_id={wa_id} template={template_name} "
-                f"status={response.status_code} response={error_payload}"
-            )
-
-            # Extract the most descriptive error message
-            error_msg = "Failed to create WhatsApp message template"
-            if isinstance(error_payload, dict):
-                error_body = error_payload.get("error", {})
-                # Prioritize error_user_msg as it is often more descriptive
-                error_msg = error_body.get("error_user_msg") or error_body.get("message") or str(error_payload)
-
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=error_msg
-            )
-        logger.info(
-            f"WhatsApp template created | org_id={org_id} wa_id={wa_id} "
-            f"template={template_name}"
-        )
-
-        return response.json()
-
     except httpx.RequestError as e:
-        logger.error(
-            f"WhatsApp API request failed | org_id={org_id} wa_id={wa_id} error={str(e)}"
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Unable to reach WhatsApp API"
-        )
-
+        logger.error(f"WhatsApp API request failed | org_id={org_id} wa_id={wa_id} error={str(e)}")
+        raise HTTPException(status_code=502, detail="Unable to reach WhatsApp API") from e
     except Exception as e:
-        logger.exception(
-            f"Unexpected error creating WhatsApp template | org_id={org_id} | error={str(e)}"
+        logger.exception(f"Unexpected error calling WhatsApp API | org_id={org_id} | error={str(e)}")
+        raise HTTPException(status_code=500, detail="Internal WhatsApp server error") from e
+
+    # Process response outside of the network error catch-all
+    try:
+        response_json = response.json()
+    except json.JSONDecodeError:
+        response_json = {"error": {"message": response.text}}
+
+    logger.info(
+        f"WhatsApp API response | org_id={org_id} wa_id={wa_id} template={template_name} "
+        f"status={response.status_code} response={response_json}"
+    )
+
+    if response.status_code != 200:
+        error_body = response_json.get("error", {}) if isinstance(response_json, dict) else {}
+        if not isinstance(error_body, dict):
+            error_body = {}
+        error_msg = (
+            error_body.get("error_user_msg")
+            or error_body.get("message")
+            or str(response_json)
         )
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error while creating WhatsApp template"
+        logger.error(
+            f"WhatsApp API error | org_id={org_id} wa_id={wa_id} template={template_name} "
+            f"status={response.status_code} response={response_json}"
         )
+        raise HTTPException(status_code=response.status_code, detail=error_msg)
+
+    logger.success(f"WhatsApp template created | org_id={org_id} wa_id={wa_id} template={template_name}")
+    return response_json
 
 # WhatsApp Interactive Messages (Free to send)
 
@@ -1488,7 +1514,8 @@ async def send_interactive_whatsapp_message(
             "Content-Type": "application/json",
         } 
         
-        response = requests.post(url, headers=headers, json=data)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=data)
         
         if response.status_code != 200:
             logger.error(f"WhatsApp API error: {response.text}")
@@ -1646,7 +1673,13 @@ def create_bulk_job(
         "updated_at": now,
         "completed_at": None,
     }
-    db.bulk_jobs.insert_one(job_data)
+    try:
+        db.bulk_jobs.insert_one(job_data)
+    except Exception as e:
+        logger.error(f"Bulk WA | job={job_id} | org={org_id} | Failed to create bulk job record: {e}")
+        # Optionally re-raise or handle as needed. 
+        # In this context, the caller expects the job to be created.
+        raise
 
 
 def get_bulk_job(
@@ -1704,21 +1737,31 @@ def get_bulk_job(
 
 
 async def run_bulk_send_job(
+    wa_id: str,
     job_id: str,
     org_id: str,
     phone_id: str,
-    access_token: str,
+        access_token: str,
     template_name: str,
     language_code: str,
     recipients: list,
     components: Optional[list] = None,
     delay_seconds: float = 8.0,
     max_concurrent: int = 50,
+    message_text: Optional[str] = None,
 ) -> None:
     """
     Background worker: sends WhatsApp templates using a bounded worker queue,
     offloading sync DB updates to threads to avoid blocking the event loop.
+    All successful sends are saved to the messages and conversations collections in bulk.
     """
+    total_recipients = len(recipients)
+    if total_recipients > 2000:
+        logger.warning(
+            f"Bulk WA | job={job_id} | Large broadcast detected: {total_recipients} recipients. "
+            f"Estimated completion time: ~{(total_recipients / max_concurrent * (delay_seconds + 1)) / 60:.1f} minutes."
+        )
+    
     url = f"https://graph.facebook.com/{IG_VERSION}/{phone_id}/messages"
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -1745,20 +1788,31 @@ async def run_bulk_send_job(
         phone_number = recipient.phone_number
         masked_phone = mask_phone(phone_number)
         
-        template_payload = {
-            "name": template_name,
-            "language": {"code": language_code},
-        }
-        if components:
-            template_payload["components"] = components
+        if message_text:
+            # Plain-text mode (used by Google Sheet automations)
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": phone_number,
+                "type": "text",
+                "text": {"body": message_text},
+            }
+        else:
+            # Standard template mode
+            template_payload = {
+                "name": template_name,
+                "language": {"code": language_code},
+            }
+            if components:
+                template_payload["components"] = components
 
-        payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": phone_number,
-            "type": "template",
-            "template": template_payload,
-        }
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": phone_number,
+                "type": "template",
+                "template": template_payload,
+            }
 
         try:
             logger.debug(f"Bulk WA | job={job_id} | [{index + 1}] sending to {masked_phone}")
@@ -1808,11 +1862,17 @@ async def run_bulk_send_job(
         return result_entry, update_fields
 
     try:
+        messages_collection_name = f"messages_{org_id}"
+        conversations_collection_name = f"conversations_{org_id}"
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Process in chunks of max_concurrent
             for i in range(0, len(recipients), max_concurrent):
                 chunk = recipients[i : i + max_concurrent]
-                logger.info(f"Bulk WA | job={job_id} | processing batch {i//max_concurrent + 1} | size={len(chunk)}")
+                current_batch = (i // max_concurrent) + 1
+                total_batches = (total_recipients + max_concurrent - 1) // max_concurrent
+                
+                logger.info(f"Bulk WA | job={job_id} | processing batch {current_batch}/{total_batches} | size={len(chunk)}")
                 
                 tasks = [send_to_recipient(i + idx, r, client) for idx, r in enumerate(chunk)]
                 batch_results = await asyncio.gather(*tasks)
@@ -1823,7 +1883,70 @@ async def run_bulk_send_job(
                 total_sent = sum(res[1]["$inc"].get("sent", 0) for res in batch_results)
                 total_failed = sum(res[1]["$inc"].get("failed", 0) for res in batch_results)
                 
-                # Combine atomic updates
+                # Prepare message and conversation bulk operations for successful sends
+                message_docs = []
+                convo_updates = []
+                now = datetime.now(timezone.utc)
+                
+                for entry, _ in batch_results:
+                    if entry["status"] == "sent":
+                        phone_number = entry["phone_number"]
+                        msg_id = entry["message_id"]
+                        convo_id = f"whatsapp_{phone_number}"
+                        
+                        # Prepare individual message doc
+                        message_doc = {
+                            "id": msg_id,
+                            "message_id": msg_id,
+                            "platform": "whatsapp",
+                            "conversation_id": convo_id,
+                            "content": f"Shared a template {template_name}",
+                            "type": "template",
+                            "payload": {
+                                "name": template_name,
+                                "language": {"code": language_code},
+                                "components": components
+                            },
+                            "sender_id": phone_number, # Matching existing convention for agent messages
+                            "sender_name": "AI",
+                            "role": MessageRole.AI,
+                            "timestamp": now,
+                            "status": "sent",
+                            "mode": "reply",
+                            "context": None,
+                            "context_type": None
+                        }
+                        message_docs.append(message_doc)
+                        
+                        # Prepare individual conversation update (upsert if session doesn't exist)
+                        convo_updates.append(UpdateOne(
+                            {"conversation_id": convo_id},
+                            {
+                                "$set": {
+                                    "platform": "whatsapp",
+                                    "whatsapp_id": wa_id,
+                                    "customer_id": phone_number,
+                                    "last_message": f"AI: Shared a template {template_name}",
+                                    "last_message_timestamp": now,
+                                    "last_sender": "ai",
+                                    "status": "open",
+                                    "reminder_stage": 0,
+                                    "next_action_at": now + timedelta(hours=6),
+                                    "last_message_is_private_note": False
+                                },
+                                "$setOnInsert": {
+                                    "is_ai_enabled": True,
+                                    "started_at": now,
+                                    "created_at": now,
+                                    "unread_count": 0,
+                                    "closed_at": None,
+                                    "message_counter": 0
+                                }
+                            },
+                            upsert=True
+                        ))
+
+                # Combine atomic updates for bulk_jobs
                 combined_update = {
                     "$inc": {},
                     "$set": {"updated_at": datetime.now(timezone.utc)}
@@ -1831,10 +1954,23 @@ async def run_bulk_send_job(
                 if total_sent > 0: combined_update["$inc"]["sent"] = total_sent
                 if total_failed > 0: combined_update["$inc"]["failed"] = total_failed
 
-                await asyncio.gather(
+                db_tasks = [
                     asyncio.to_thread(db.bulk_job_results.insert_many, entries),
                     asyncio.to_thread(db.bulk_jobs.update_one, {"job_id": job_id, "org_id": org_id}, combined_update)
-                )
+                ]
+                
+                # Execute bulk writes for messages and conversations if there are successes
+                if message_docs:
+                    db_tasks.append(asyncio.to_thread(db[messages_collection_name].insert_many, message_docs, ordered=False))
+                if convo_updates:
+                    db_tasks.append(asyncio.to_thread(db[conversations_collection_name].bulk_write, convo_updates, ordered=False))
+
+                try:
+                    await asyncio.gather(*db_tasks)
+                except Exception as db_err:
+                    logger.error(f"Bulk WA | job={job_id} | database error during batch tracking: {db_err}")
+                    # We don't raise here to allow subsequent batches to try, 
+                    # but the job results might be incomplete in DB.
 
                 # Delay between batches if there are more messages left
                 if i + max_concurrent < len(recipients) and delay_seconds > 0:

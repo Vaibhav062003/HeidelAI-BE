@@ -16,6 +16,7 @@ class Services:
         self.address_details = []
         self.responded_users_by_media = {}
         self.processed_message_ids = OrderedDict()
+        self.processed_comment_ids = OrderedDict()
         self.processed_message_reaction_ids = OrderedDict()
         self.active_connections: List[WebSocket] = []
         self.whatsapp_connections_map: Dict[str, Set[str]] = {}
@@ -39,6 +40,7 @@ class Services:
         self.whatsapp_clients = defaultdict(set) # For WhatsApp event broadcasting -> { wa_id: { client_id1, client_id2 } }
         self.client_metadata = {}  # Reverse mapping (for cleanup) -> { client_id: { "ig_id": "...", "wa_id": "..." } }
         self.agent_clients = defaultdict(set) # Track agents by Clerk User ID -> { user_id: { client_id1, client_id2 } }
+        self.org_clients = defaultdict(set)   # Track agents by Org ID -> { org_id: { client_id1, client_id2 } }
 
         # === Agents ===
         self.prompt_cache = {}

@@ -32,7 +32,8 @@ async def fetch_conversations_new(
     active_tab: str = "all",
     unread_only: bool = False,
     platform: Optional[str] = None,
-    priority: Optional[str] = None
+    priority: Optional[str] = None,
+    labels: Optional[str] = None
 ) -> List[Dict]:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -50,21 +51,29 @@ async def fetch_conversations_new(
         "_id": 0,
     }
 
-    # Filtering logic for Team Chat
-    # 1. Customer conversations: type != "team"
-    # 2. Team conversations: type == "team" AND current_user_id in participants
-    # TODO: seperate out the team and non-team conversations filtering don't add both in one call
+    # Only customer conversations — team conversations are in their own
+    # dedicated collection (team_conversations_{org_id}) and fetched
+    # via GET /api/team/conversations
     base_conditions = [
-        {
-            "$or": [
-                {"type": {"$ne": "team"}},
-                {
-                    "type": "team",
-                    "participants": current_user_id
-                }
-            ]
-        }
+        {"type": {"$ne": "team"}}
     ]
+
+    # Labels filter
+    if labels:
+        labels_list = [l.strip() for l in labels.split(",") if l.strip()]
+        if labels_list:
+            contact_col = async_db[f"contacts_{org_id}"]
+            
+            # Optimization: Use regex for case-insensitive exact matching
+            regex_labels = [re.compile(f"^{re.escape(l)}$", re.IGNORECASE) for l in labels_list]
+            
+            # Fetch unique conversation_ids from contacts who have any of these labels
+            matching_ids = await contact_col.distinct("conversation_id", {"labels": {"$in": regex_labels}})
+            
+            if not matching_ids:
+                return [] # Early exit to save resources
+            
+            base_conditions.append({"conversation_id": {"$in": matching_ids}})
 
     # Tab filters
     if active_tab == "open":
@@ -123,65 +132,33 @@ async def fetch_conversations_new(
         conv_type = doc.get("type")
         platform = doc.get("platform")
         
-        if conv_type == "team":
-            # For Team chats, use participants but check online status
-            participants = doc.get("participants", [])
-            other_participants = [p for p in participants if p != current_user_id]
-            
-            # logic for "is_online": if ANY other participant is online
-            is_online = False
-            if other_participants:
-                for p_id in other_participants:
-                    if p_id in services.agent_clients and services.agent_clients[p_id]:
-                        is_online = True
-                        break
-            
-            unread_map = doc.get("unread", {})
-            user_unread = unread_map.get(current_user_id, 0) if current_user_id else 0
-            
-            conv_obj = {
-                "id": doc.get("conversation_id"),
-                "customer_name": doc.get("customer_name") or doc.get("conversation_id"),
-                "last_message": doc.get("last_message", ""),
-                "timestamp": (
-                    doc["last_message_timestamp"].isoformat()
-                    if isinstance(doc.get("last_message_timestamp"), datetime)
-                    else None
-                ),
-                "unread_count": user_unread,
-                "platform": platform or "internal",
-                "type": "team",
-                "participants": participants,
-                "is_online": is_online
-            }
-        else:
-            conv_obj = {
-                "id": doc.get("conversation_id"),
-                "platform": platform,
-                "type": conv_type,
-                "customer_id": doc.get("customer_username"),
-                "phone_number": doc.get("customer_id") if platform == "whatsapp" else None,
-                "customer_name": doc.get("customer_name") or "Unknown",
-                "last_message": doc.get("last_message") or "",
-                "last_message_is_private_note": doc.get("last_message_is_private_note", False),
-                "timestamp": (
-                    doc["last_message_timestamp"].isoformat()
-                    if isinstance(doc.get("last_message_timestamp"), datetime)
-                    else None
-                ),
-                "unread_count": doc.get("unread_count", 0),
-                "status": doc.get("status"),
-                "priority": doc.get("priority"),
-                "sentiment": doc.get("sentiment"),
-                "assigned_agent": doc.get("assigned_agent", {}),
-                "is_ai_enabled": doc.get("is_ai_enabled"),
-                "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
-                "assignment_history": doc.get("assignment_history", []),
-                "suggestions": doc.get("suggestions", []),
-                "summary": doc.get("summary", []),
-                "participants": doc.get("participants", []),
-                "unread": doc.get("unread", {})
-            }
+        conv_obj = {
+            "id": doc.get("conversation_id"),
+            "platform": platform,
+            "type": conv_type,
+            "customer_id": doc.get("customer_username"),
+            "phone_number": doc.get("customer_id") if platform == "whatsapp" else None,
+            "customer_name": doc.get("customer_name") or "Unknown",
+            "last_message": doc.get("last_message") or "",
+            "last_message_is_private_note": doc.get("last_message_is_private_note", False),
+            "timestamp": (
+                doc["last_message_timestamp"].isoformat()
+                if isinstance(doc.get("last_message_timestamp"), datetime)
+                else None
+            ),
+            "unread_count": doc.get("unread_count", 0),
+            "status": doc.get("status"),
+            "priority": doc.get("priority"),
+            "sentiment": doc.get("sentiment"),
+            "assigned_agent": doc.get("assigned_agent", {}),
+            "is_ai_enabled": doc.get("is_ai_enabled"),
+            "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
+            "assignment_history": doc.get("assignment_history", []),
+            "suggestions": doc.get("suggestions", []),
+            "summary": doc.get("summary", []),
+            "participants": doc.get("participants", []),
+            "unread": doc.get("unread", {})
+        }
             
         result.append(conv_obj)
 
@@ -290,24 +267,13 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
              )
              assigned_convo = current_convo
 
-        # Reset unread count
-        if assigned_convo and assigned_convo.get("type") == "team":
+        # For team conversations, unread is tracked per user (unread.{agent_id}),
+        # so we avoid resetting the aggregate unread_count here to prevent
+        # inconsistent unread state.
+        if not assigned_convo or assigned_convo.get("type") != "team":
             convo_collection.update_one(
                 {"conversation_id": conversation_id},
-                {
-                    "$set": {
-                        f"unread.{agent_id}": 0
-                    }
-                }
-            )
-        else:
-            convo_collection.update_one(
-                {"conversation_id": conversation_id},
-                {
-                    "$set": {
-                        "unread_count": 0
-                    }
-                }
+                {"$set": {"unread_count": 0}}
             )
 
         messages = []
@@ -648,7 +614,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             conversation_id = f"team_{sorted_ids[0]}_{sorted_ids[1]}"
         
         now = datetime.now(timezone.utc)
-        convo_collection = db[f"conversations_{org_id}"]
+        # Team conversations and messages live in their own dedicated collections
+        convo_collection = db[f"team_conversations_{org_id}"]
         
         convo = convo_collection.find_one({"conversation_id": conversation_id})
         
@@ -699,7 +666,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                     }
                 )
         
-        messages_collection = db[f"messages_{org_id}"]
+        messages_collection = db[f"team_messages_{org_id}"]
         sender_id = context.get("sender_id") if context else None
         sender_name = context.get("sender_name") if context else None
         

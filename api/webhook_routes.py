@@ -22,10 +22,11 @@ from services.ig_service import *
 from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButton, InteractiveReplyButtonMessage
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, CGSV_ORG_WA_ID, LEE_DEALER_ORG_WA_ID
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
+from services.automation_trigger_handler import check_and_trigger_automations
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -192,6 +193,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # status_timestamp=status.get("timestamp")
                         )
 
+                        # Propagate delivery status to Google Sheet automation tracking
+                        # (no-op if message_id doesn't exist in the sheet sent collection)
+                        try:
+                            from services.google_sheet_automation import update_sheet_sent_status
+                            await update_sheet_sent_status(
+                                org_id=connection.get("org_id"),
+                                message_id=message_id,
+                                status=status_type,
+                            )
+                        except Exception as e:
+                            logger.debug(f"Sheet status propagation skipped for {message_id}: {e}")
+
                         if not broadcast_message:
                             logger.warning(f"No message found with ID {message_id} to update status.")
                             continue
@@ -214,7 +227,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     access_token = connection.get("access_token")
 
                     # Get organization's automation flow collection
-                    flow_collection_name = f"automation_flows_{org_id}"
+                    flow_collection_name = f"wa_bot_flows_{org_id}"
                     flow_collection = db[flow_collection_name]
 
                     # Get sender name from contacts if available
@@ -397,7 +410,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_heidelai = whatsapp_business_id == HEIDELAI_ORG_WA_ID
                             is_pma_wa = whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID
                             is_lee_dealer_wa = whatsapp_business_id == LEE_DEALER_ORG_WA_ID
-                            is_cgsv_wa = whatsapp_business_id == CGSV_ORG_WA_ID
+                            is_karan_wa = whatsapp_business_id == KARAN_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
                             # fetch org + convo flags
@@ -464,9 +477,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 }
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
+
+
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
                                 if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
-                                    
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     if whatsapp_flow:
                                         automation_response = await execute_whatsapp_flow(
@@ -593,6 +607,43 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
                                         }, org_id, "ai")
 
+                                elif ai_enabled and is_dev and is_lee_dealer_wa:
+                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
+
+                                    print("*" * 80 )
+                                    print("Calling agent for Lee Dealer WhatsApp")
+                                    chatbot_response = await send_to_agent(
+                                        conversation_id=conversation_id,
+                                        user_input=content,
+                                        persona="dealers",
+                                        location=convo_doc.get("location", "india"),
+                                        customer_name=sender_name2,
+                                        org_id=org_id,
+                                        source="webhook",
+                                    )
+
+                                    final_response = chatbot_response["final_response"]
+
+                                    # Update the database with the agent's response
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=final_response,
+                                        last_sender="ai",
+                                        mode="ai",
+                                    )
+
+                                    # Send the WhatsApp message
+                                    res = await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": final_response,
+                                        "sender_id": whatsapp_business_id,
+                                    }, org_id, "ai")
+
+                                    return {"status": "ok"}
+                                
                                 return {"status": "ok"}
 
                             elif message_type in ["image", "video", "document"]:
@@ -1053,7 +1104,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             return {"status": "ok"}
     
-    if payload["object"] == "instagram": 
+    if payload["object"] == "instagram":
         if "entry" in payload and len(payload["entry"]) > 0:
             for entry in payload["entry"]:
                 ig_account_id = entry.get("id")
@@ -1065,8 +1116,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     value = changes.get('value')
 
                     if field == 'comments':
-                        await process_comments_events(value, ig_account_id)
-                    return {"status": "success"}
+                        await process_comments_events(value, ig_account_id, background_tasks)
                 
                 for message in entry.get("messaging", []):
                     # Check if this is a deletion event
@@ -1490,6 +1540,28 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         context=context,
                     )
                     
+                    if not message_echo:
+                        if background_tasks:
+                            background_tasks.add_task(
+                                check_and_trigger_automations,
+                                org_id=org_id,
+                                platform="instagram",
+                                event_type="message_received",
+                                trigger_data={
+                                    "platform": "instagram",    
+                                    "platform_id": recipient_id,
+                                    "conversation_id": conversation_id,
+                                    "customer_id": sender_id,
+                                    "customer_name": name,
+                                    "customer_username": username,
+                                    "message_text": message_text,
+                                    "message_type": attachment_type,
+                                    "message_id": ig_message_id
+                                }
+                            )
+                        else:
+                            logger.warning("No background_tasks provided, skipping automation trigger for message_received.")
+
                     # Check if conversation exists
                     existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
                     conversation = conversations_collection.find_one({"conversation_id": conversation_id})
@@ -1560,7 +1632,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     # })
 
     return {"status": "ok"}
-
+        
 @router.post("/cashfree")
 async def cashfree_webhook(request: Request):
 
@@ -1605,3 +1677,4 @@ async def cashfree_webhook(request: Request):
         logger.error(f"Webhook processing failed : {e}")
 
     return {"status": "processed"}
+
