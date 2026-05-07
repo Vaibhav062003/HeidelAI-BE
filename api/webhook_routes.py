@@ -22,7 +22,9 @@ from services.ig_service import *
 from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButton, InteractiveReplyButtonMessage
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID
+from config.settings import (
+    VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, TECHNET_ORG_WA_ID
+)
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
@@ -411,6 +413,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_pma_wa = whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID
                             is_lee_dealer_wa = whatsapp_business_id == LEE_DEALER_ORG_WA_ID
                             is_karan_wa = whatsapp_business_id == KARAN_ORG_WA_ID
+                            is_technet_wa = whatsapp_business_id == TECHNET_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
                             # fetch org + convo flags
@@ -419,6 +422,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info(f"is_heidelai: {is_heidelai}")
                             logger.info(f"is_pma_wa: {is_pma_wa}")
                             logger.info(f"is_lee_dealer_wa: {is_lee_dealer_wa}")
+                            logger.info(f"is_technet_wa: {is_technet_wa}")
                             logger.info(f"is_production: {is_production}")
                             logger.info(f"is_dev: {is_dev}")
                             logger.info(f"ai_enabled: {ai_enabled}") 
@@ -480,7 +484,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
 
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
-                                if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
+                                if ai_enabled and is_dev and not is_heidelai and not is_pma_wa:
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     if whatsapp_flow:
                                         automation_response = await execute_whatsapp_flow(
