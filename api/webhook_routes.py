@@ -504,6 +504,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         if automation_response:
                                             return {"status": "ok"}
 
+                                    if not convo_doc:
+                                        convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
                                     chatbot_response = await send_to_agent(
                                         conversation_id=conversation_id,
