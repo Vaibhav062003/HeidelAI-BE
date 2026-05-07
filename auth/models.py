@@ -5,6 +5,7 @@ class CurrentUserModel(BaseModel):
     user_id: str
     org_id: str
     role: str
+    full_name: str
 
 
 class Token(BaseModel):
