@@ -5,6 +5,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 from database import get_mongo_db, get_async_mongo_db
 from loguru import logger
 
+from services.wa_service import read_message_and_typing_indicator
+
 db = get_mongo_db()
 
 async def cleanup_client(client_id: str):
@@ -89,6 +91,10 @@ async def handle_typing_event(client_id: str, data: dict):
 
     # Broadcast to WhatsApp
     elif platform == "whatsapp" and wa_id:
+        await read_message_and_typing_indicator(
+            mode="platform",
+            whatsapp_id=wa_id,
+        )
         await broadcast_main_ws(
             platform_id=wa_id,
             platform_type="whatsapp",

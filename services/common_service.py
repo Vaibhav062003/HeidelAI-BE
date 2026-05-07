@@ -531,7 +531,7 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, user_full_name: str, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
@@ -576,7 +576,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                     "conversation_id": conversation_id,
                     "content": content,
                     "sender_id": wa_id,
-                }, org_id, mode, temp_id, context_type, context)
+                },user_full_name, org_id, mode, temp_id, context_type, context)
         return res
     
     elif platform == "instagram":

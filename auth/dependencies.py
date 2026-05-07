@@ -22,6 +22,7 @@ async def get_current_user(
             user_id=payload["sub"],
             org_id=payload["o"]["id"],
             role=payload["o"]["rol"],
+            full_name=payload.get("full_name")
         )
     except (JWTError, KeyError, TypeError):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
