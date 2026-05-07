@@ -1604,11 +1604,16 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
         messages_collection = "messages_" + org_id
 
         if mode == "platform":
-            message_id = db[messages_collection].find_one(
+            message_doc = db[messages_collection].find_one(
                 {},
-                {"message_id":1, "_id":0}, 
-                {"sort": [("timestamp", -1)]}
+                {"message_id": 1, "_id": 0},
+                sort=[("timestamp", -1)]
             )
+            message_id = message_doc.get("message_id") if message_doc else None
+
+        if not message_id:
+            logger.error(f"No message_id available when trying to send typing indicator for WhatsApp ID: {whatsapp_id}")
+            return
         
         # Query the database to validate the ID
         connection = db.whatsapp_connections.find_one(
