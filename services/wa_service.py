@@ -361,9 +361,9 @@ async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: 
 
 async def send_whatsapp_message(
         message: dict, 
-        user_full_name: str,
         org_id: str, 
         mode:str, 
+        user_full_name: Optional[str] = None,
         temp_id: Optional[str] = None, 
         context_type: Optional[str] = None, 
         context: Optional[dict] = None,
