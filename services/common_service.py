@@ -572,11 +572,19 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 else:
                     raise ValueError("Not a template")
             except (json.JSONDecodeError, ValueError, TypeError):
-                res = await send_whatsapp_message({
-                    "conversation_id": conversation_id,
-                    "content": content,
-                    "sender_id": wa_id,
-                },user_full_name, org_id, mode, temp_id, context_type, context)
+                res = await send_whatsapp_message(
+                    {
+                        "conversation_id": conversation_id,
+                        "content": content,
+                        "sender_id": wa_id,
+                    }, 
+                    org_id=org_id, 
+                    mode=mode, 
+                    temp_id=temp_id, 
+                    context_type=context_type, 
+                    context=context, 
+                    user_full_name=user_full_name
+                )
         return res
     
     elif platform == "instagram":

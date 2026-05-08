@@ -363,12 +363,12 @@ async def send_whatsapp_message(
         message: dict, 
         org_id: str, 
         mode:str, 
-        user_full_name: Optional[str] = None,
         temp_id: Optional[str] = None, 
         context_type: Optional[str] = None, 
         context: Optional[dict] = None,
         bot_context: Optional[dict] = None,
-        raise_on_partial_failure: bool = False
+        raise_on_partial_failure: bool = False,
+        user_full_name: Optional[str] = None,
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
