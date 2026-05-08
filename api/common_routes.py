@@ -154,6 +154,7 @@ async def send_message_endpoint(
     The body should contain the necessary fields for sending the message.
     """
     org_id = user.org_id
+    user_full_name = user.full_name or "You"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
@@ -170,10 +171,11 @@ async def send_message_endpoint(
         conversation_id, 
         content if content else None, 
         mode,
+        user_full_name,
         file if file else None, 
         temp_id if temp_id else None,
         context_type if context_type else None,
-        context_dict
+        context_dict,
     )
 
     return {"message": "Message sent", "details": res}

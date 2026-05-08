@@ -15,7 +15,7 @@ from pymongo import ReturnDocument, UpdateOne
 from core.managers import manager
 from database import get_mongo_db, get_mongo_client
 from core.services import services
-from config.settings import IG_VERSION, VERSION, APP_ID
+from config.settings import IG_VERSION, VERSION, WA_VERSION, APP_ID
 from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
@@ -367,7 +367,8 @@ async def send_whatsapp_message(
         context_type: Optional[str] = None, 
         context: Optional[dict] = None,
         bot_context: Optional[dict] = None,
-        raise_on_partial_failure: bool = False
+        raise_on_partial_failure: bool = False,
+        user_full_name: Optional[str] = None,
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -501,7 +502,7 @@ async def send_whatsapp_message(
                 customer_phone_no=recipient_id,
                 type="text",
                 payload=None,
-                sender_name="AI" if mode == "ai" else "Agent",
+                sender_name="AI" if mode == "ai" else (user_full_name or "Agent"),
                 recipient_id=whatsapp_business_id,
                 role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
                 mode=mode,
@@ -1582,7 +1583,103 @@ async def send_interactive_whatsapp_message(
             detail=f"Failed to send message: {str(e)}"
         )
 
+async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str] = None, message_id: Optional[str] = None, conversation_id: Optional[str] = None):
+    """
+    Marks a message as read and sends a typing indicator to the recipient.
+    """
+    try:
+        if not whatsapp_id:
+            logger.error("Missing 'whatsapp_id' when trying to send typing indicator")
+            return
+        
+        org_connection = db.organizations.find_one(
+            {"wa_id": whatsapp_id}
+        )
+        
+        if not org_connection:
+            return
 
+        org_id = org_connection.get("org_id")
+
+        messages_collection = "messages_" + org_id
+
+        if mode == "platform":
+            if not conversation_id:
+                logger.warning(
+                    f"Missing conversation_id for platform typing indicator on WhatsApp ID: {whatsapp_id}; skipping typing indicator"
+                )
+                return
+
+            query_filter = {
+                "role": MessageRole.CUSTOMER,
+                "status": {"$ne": "read"},
+                "platform": "whatsapp",
+                "conversation_id": conversation_id,
+            }
+
+            message_doc = db[messages_collection].find_one(
+                query_filter,
+                {
+                    "message_id": 1, 
+                    "_id": 0
+                },
+                sort=[("timestamp", -1)]
+            )
+            message_id = message_doc.get("message_id") if message_doc else None
+
+            if not message_id:
+                logger.debug(
+                    f"No unread customer message found for WhatsApp ID: {whatsapp_id}; skipping typing indicator"
+                )
+                return
+
+        if not message_id:
+            logger.error(f"No message_id available when trying to send typing indicator for WhatsApp ID: {whatsapp_id}")
+            return
+        
+        # Query the database to validate the ID
+        connection = db.whatsapp_connections.find_one(
+            {"wa_id": whatsapp_id}
+        )
+        
+        if not connection:
+            logger.warning(f"Trying to process webhook for unregistered WhatsApp ID: {whatsapp_id}")
+            return
+
+        url = f"https://graph.facebook.com/{WA_VERSION}/{connection['phone_id']}/messages"
+        headers = {
+            "Authorization": f"Bearer {connection['access_token']}",
+            "Content-Type": "application/json",
+        }
+        data={
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": message_id,
+            "typing_indicator": {
+                "type": "text"
+            }
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json=data)
+        
+        if response.status_code != 200:
+            logger.error(f"WhatsApp API error: {response.text}")
+            return
+        
+        message = db[messages_collection].find_one({"message_id": message_id})
+        if not message:
+            logger.error(f"Message with ID {message_id} not found for read receipt")
+            return
+
+        # Update the message status to "read"
+        db[messages_collection].update_one(
+            {"message_id": message_id},
+            {"$set": {"status": "read", "updated_at": datetime.now(timezone.utc)}}
+        )
+
+    except Exception as e:
+        logger.error(f"Error while sending typing indicator: {e}")
 
 # Bulk jobs are now stored in the "bulk_jobs" collection in MongoDB.
 # This ensures they survive restarts and work across multiple instances.
