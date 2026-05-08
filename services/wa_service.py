@@ -1583,7 +1583,7 @@ async def send_interactive_whatsapp_message(
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str] = None, message_id: Optional[str] = None):
+async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str] = None, message_id: Optional[str] = None, conversation_id: Optional[str] = None):
     """
     Marks a message as read and sends a typing indicator to the recipient.
     """
@@ -1604,11 +1604,16 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
         messages_collection = "messages_" + org_id
 
         if mode == "platform":
+            query_filter = {
+                "role": MessageRole.CUSTOMER,
+                "status": {"$ne": "read"},
+                "platform": "whatsapp",
+            }
+            if conversation_id:
+                query_filter["conversation_id"] = conversation_id
+
             message_doc = db[messages_collection].find_one(
-                {
-                    "role": MessageRole.CUSTOMER, 
-                    "status": {"$ne": "read"}
-                },
+                query_filter,
                 {
                     "message_id": 1, 
                     "_id": 0
