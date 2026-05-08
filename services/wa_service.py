@@ -1604,13 +1604,18 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
         messages_collection = "messages_" + org_id
 
         if mode == "platform":
+            if not conversation_id:
+                logger.warning(
+                    f"Missing conversation_id for platform typing indicator on WhatsApp ID: {whatsapp_id}; skipping typing indicator"
+                )
+                return
+
             query_filter = {
                 "role": MessageRole.CUSTOMER,
                 "status": {"$ne": "read"},
                 "platform": "whatsapp",
+                "conversation_id": conversation_id,
             }
-            if conversation_id:
-                query_filter["conversation_id"] = conversation_id
 
             message_doc = db[messages_collection].find_one(
                 query_filter,
