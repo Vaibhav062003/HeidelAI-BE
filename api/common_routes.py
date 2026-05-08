@@ -32,6 +32,7 @@ from services.contacts_service import (
     remove_label_from_org_metadata,
     get_tags_from_org_metadata,
     get_labels_from_org_metadata,
+    get_unread_counts_by_labels,
     process_bulk_wa_contact_upload
     )
 
@@ -453,6 +454,15 @@ async def get_labels(user: CurrentUser):
     result = await get_labels_from_org_metadata(user.org_id)
 
     return {"labels": result}
+
+@router.get("/api/org/metadata/labels-unread")
+async def get_labels_unread(user: CurrentUser):
+    """Get labels for the organization with unread counts."""
+
+    result = await get_unread_counts_by_labels(user.org_id)
+
+    return {"labels": result}
+
 
 
 @router.get("/api/agents-on-conversation")
