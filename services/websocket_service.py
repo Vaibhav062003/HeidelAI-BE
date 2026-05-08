@@ -98,11 +98,11 @@ async def handle_typing_event(client_id: str, data: dict):
         )
         
         from services.wa_service import read_message_and_typing_indicator
-        await read_message_and_typing_indicator(
+        asyncio.create_task(read_message_and_typing_indicator(
             mode="platform",
             whatsapp_id=wa_id,
             conversation_id=data.get("conversation_id"),
-        )
+        ))
 
 async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: str, payload: dict, exclude_client_id: str = None):
     """
