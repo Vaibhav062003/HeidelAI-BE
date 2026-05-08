@@ -502,7 +502,7 @@ async def send_whatsapp_message(
                 customer_phone_no=recipient_id,
                 type="text",
                 payload=None,
-                sender_name="AI" if mode == "ai" else user_full_name,
+                sender_name="AI" if mode == "ai" else (user_full_name or "Agent"),
                 recipient_id=whatsapp_business_id,
                 role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
                 mode=mode,
