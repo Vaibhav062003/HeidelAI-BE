@@ -910,15 +910,17 @@ def _get_flow_message_config(
 
 def _sanitize_phone(phone_raw: str) -> str:
     """
-    Robust sanitization: keep only digits and + (e.g. +1 (555) 123-4567 -> 15551234567)
-    Then strips leading + if present.
+    Robust sanitization: removes leading +, then strips ALL non-digits.
+    Ensures Meta API compatibility and consistent deduplication keys.
     """
     if not phone_raw:
         return ""
-    phone_clean = re.sub(r'[^\d+]', '', phone_raw.strip())
-    if phone_clean.startswith('+'):
+    # Strip whitespace and leading +
+    phone_clean = phone_raw.strip()
+    if phone_clean.startswith("+"):
         phone_clean = phone_clean[1:]
-    return phone_clean
+    # Remove all remaining non-digits (including any + in the middle)
+    return re.sub(r"[^\d]", "", phone_clean)
 
 
 def _resolve_recursive(data, variables):
