@@ -152,16 +152,16 @@ async def process_google_sheet_trigger(
         )
 
         if has_template:
-            # For templates, we store the full resolved components
-            components_str = json.dumps(message_config.get("components", []))
-            resolved_components_str = _resolve_variables(components_str, {
+            # Safely resolve variables inside the components structure recursively.
+            # This avoids JSON parsing errors if variables contain quotes/backslashes.
+            components = message_config.get("components", [])
+            resolved_components = _resolve_recursive(components, {
                 "phone_number": phone_raw,
                 "customer_name": customer_name,
                 "row": row_dict,
             })
-            resolved_components = json.loads(resolved_components_str)
-            resolved_text = message_config.get("template_name") # use template name as reference
-            
+            resolved_text = message_config.get("template_name")  # use template name as reference
+
             eligible.append({
                 "phone_number": phone_raw,
                 "resolved_text": resolved_text,
@@ -901,6 +901,19 @@ def _get_flow_message_config(
         )
 
     return {}
+
+
+def _resolve_recursive(data, variables):
+    """
+    Recursively traverse a dict or list and resolve variables in all string values.
+    """
+    if isinstance(data, str):
+        return _resolve_variables(data, variables)
+    elif isinstance(data, list):
+        return [_resolve_recursive(item, variables) for item in data]
+    elif isinstance(data, dict):
+        return {k: _resolve_recursive(v, variables) for k, v in data.items()}
+    return data
 
 
 def _resolve_variables(text: str, variables: dict) -> str:
