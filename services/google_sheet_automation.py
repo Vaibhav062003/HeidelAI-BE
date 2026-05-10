@@ -126,12 +126,7 @@ async def process_google_sheet_trigger(
     eligible: list = []
 
     for row_dict in rows_to_process:
-        phone_raw = str(row_dict.get(column_name, "")).strip()
-        
-        # Robust sanitization: keep only digits and + (e.g. +1 (555) 123-4567 -> 15551234567)
-        phone_raw = re.sub(r'[^\d+]', '', phone_raw)
-        if phone_raw.startswith('+'):
-            phone_raw = phone_raw[1:]
+        phone_raw = _sanitize_phone(str(row_dict.get(column_name, "")))
             
         if not phone_raw:
             continue
@@ -451,9 +446,7 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
             filtered_batch_data = []
             skipped_in_cache = 0
             for row in batch_data:
-                phone_raw = str(row.get(trigger_config.get("column_name", ""), "")).strip()
-                phone_clean = re.sub(r'[^\d]', '', phone_raw)
-                if phone_clean.startswith('+'): phone_clean = phone_clean[1:]
+                phone_clean = _sanitize_phone(str(row.get(trigger_config.get("column_name", ""), "")))
                 
                 if phone_clean in already_sent_set:
                     skipped_in_cache += 1
@@ -901,6 +894,19 @@ def _get_flow_message_config(
         )
 
     return {}
+
+
+def _sanitize_phone(phone_raw: str) -> str:
+    """
+    Robust sanitization: keep only digits and + (e.g. +1 (555) 123-4567 -> 15551234567)
+    Then strips leading + if present.
+    """
+    if not phone_raw:
+        return ""
+    phone_clean = re.sub(r'[^\d+]', '', phone_raw.strip())
+    if phone_clean.startswith('+'):
+        phone_clean = phone_clean[1:]
+    return phone_clean
 
 
 def _resolve_recursive(data, variables):
