@@ -358,16 +358,6 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
 
     # Fetch synced rows for this sheet from MongoDB.
     rows_collection = db[f"google_sheet_rows_{org_id}"]
-    row_filter = {"sheet_id": sheet_id}
-
-    # Determine total rows to process in batches
-    total_rows = await asyncio.to_thread(
-        lambda: rows_collection.count_documents(row_filter)
-    )
-    if total_rows == 0:
-        return
-
-    logger.info(f"[GoogleSheetAuto] Processing {total_rows} rows from DB for {len(triggers)} triggers on sheet {sheet_id}")
 
     for trigger in triggers:
         flow_id = trigger.get("flow_id")
@@ -375,6 +365,29 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
         message_config = trigger.get("message_config", {})
         message_text = trigger.get("message_text", "")
         
+        # Apply row range from trigger config (1-based row numbers)
+        row_start = trigger_config.get("row_start")
+        row_end = trigger_config.get("row_end")
+
+        # Build specific filter for this trigger's range
+        trigger_row_filter = {"sheet_id": sheet_id}
+        if row_start is not None or row_end is not None:
+            trigger_row_filter["row_number"] = {}
+            if row_start is not None:
+                trigger_row_filter["row_number"]["$gte"] = int(row_start)
+            if row_end is not None:
+                trigger_row_filter["row_number"]["$lte"] = int(row_end)
+
+        # Count rows for THIS trigger's specific range
+        trigger_total_rows = await asyncio.to_thread(
+            lambda f=trigger_row_filter: rows_collection.count_documents(f)
+        )
+        if trigger_total_rows == 0:
+            logger.debug(f"[GoogleSheetAuto] No rows found in range {row_start}-{row_end} for flow {flow_id}")
+            continue
+
+        logger.info(f"[GoogleSheetAuto] Processing {trigger_total_rows} rows from DB for flow {flow_id} (Range: {row_start}-{row_end})")
+
         # If the trigger only has legacy message_text, wrap it
         if not message_config and message_text:
             message_config = {"text": message_text}
@@ -413,7 +426,6 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
 
         # --- High-Performance Deduplication Optimization ---
         # Fetch all previously sent phone numbers for THIS flow in a single query.
-        # This replaces O(N) database lookups in the loop with a single O(1) set lookup.
         try:
             sent_records = await asyncio.to_thread(
                 lambda: list(db[SENT_COLLECTION].find(
@@ -429,10 +441,10 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
 
         # Process rows in batches to avoid materializing the entire list
         batch_size = 1000
-        for skip in range(0, total_rows, batch_size):
+        for skip in range(0, trigger_total_rows, batch_size):
             batch_docs = await asyncio.to_thread(
-                lambda s=skip, b=batch_size: list(rows_collection.find(
-                    row_filter,
+                lambda s=skip, b=batch_size, f=trigger_row_filter: list(rows_collection.find(
+                    f,
                     {"row_data": 1, "_id": 0}
                 ).sort("row_number", 1).skip(s).limit(b))
             )
