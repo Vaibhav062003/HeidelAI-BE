@@ -12,7 +12,6 @@ Key behaviors:
 """
 
 import re
-import json
 import uuid as _uuid
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -26,12 +25,6 @@ from pymongo.errors import DuplicateKeyError
 db = get_mongo_db()
 
 SENT_COLLECTION = "google_sheet_sent_numbers"
-
-# Meta WhatsApp Cloud API version (shared with wa_service)
-try:
-    from services.wa_service import IG_VERSION
-except ImportError:
-    IG_VERSION = "v24.0"
 
 
 # =============================================================================
@@ -424,21 +417,6 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
         if not message_config:
             continue
 
-        # --- High-Performance Deduplication Optimization ---
-        # Fetch all previously sent phone numbers for THIS flow in a single query.
-        try:
-            sent_records = await asyncio.to_thread(
-                lambda: list(db[SENT_COLLECTION].find(
-                    {"flow_id": flow_id, "org_id": org_id, "status": "sent"},
-                    {"phone": 1, "_id": 0}
-                ))
-            )
-            already_sent_set = {r["phone"] for r in sent_records if r.get("phone")}
-            logger.info(f"[GoogleSheetAuto] Loaded {len(already_sent_set)} sent records into cache for flow {flow_id}")
-        except Exception as e:
-            logger.error(f"[GoogleSheetAuto] Failed to load dedup cache for flow {flow_id}: {e}")
-            already_sent_set = set()
-
         # Process rows in batches to avoid materializing the entire list
         batch_size = 1000
         for skip in range(0, trigger_total_rows, batch_size):
@@ -452,21 +430,42 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
             batch_data = [doc.get("row_data", {}) for doc in batch_docs if doc.get("row_data")]
             if not batch_data:
                 break
-                
-            # Filter out rows that are ALREADY in our in-memory sent set.
-            # This is extremely fast and avoids redundant database 'claim' attempts.
-            filtered_batch_data = []
-            skipped_in_cache = 0
+
+            # --- High-Performance Batch Deduplication ---
+            # Instead of loading ALL sent records into memory (which causes OOM at scale),
+            # we query only for the phone numbers present in the current batch.
+            batch_phones = []
+            column_name = trigger_config.get("column_name", "")
             for row in batch_data:
-                phone_clean = _sanitize_phone(str(row.get(trigger_config.get("column_name", ""), "")))
+                p = _sanitize_phone(str(row.get(column_name, "")))
+                if p: batch_phones.append(p)
+            
+            already_sent_batch = set()
+            if batch_phones:
+                try:
+                    sent_records = await asyncio.to_thread(
+                        lambda: list(db[SENT_COLLECTION].find(
+                            {"flow_id": flow_id, "org_id": org_id, "status": "sent", "phone": {"$in": batch_phones}},
+                            {"phone": 1, "_id": 0}
+                        ))
+                    )
+                    already_sent_batch = {r["phone"] for r in sent_records if r.get("phone")}
+                except Exception as e:
+                    logger.error(f"[GoogleSheetAuto] Batch dedup fetch failed for flow {flow_id}: {e}")
                 
-                if phone_clean in already_sent_set:
-                    skipped_in_cache += 1
+            # Filter out rows that are ALREADY marked as sent in the DB.
+            filtered_batch_data = []
+            skipped_in_batch = 0
+            for row in batch_data:
+                phone_clean = _sanitize_phone(str(row.get(column_name, "")))
+                
+                if phone_clean in already_sent_batch:
+                    skipped_in_batch += 1
                 else:
                     filtered_batch_data.append(row)
             
-            if skipped_in_cache > 0:
-                logger.debug(f"[GoogleSheetAuto] Skipped {skipped_in_cache} rows already present in dedup cache")
+            if skipped_in_batch > 0:
+                logger.debug(f"[GoogleSheetAuto] Skipped {skipped_in_batch} rows already present in dedup records")
 
             if not filtered_batch_data:
                 continue

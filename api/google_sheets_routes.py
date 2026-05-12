@@ -2,7 +2,6 @@
 google_sheets_routes.py  — UPDATED
 
 Endpoints:
-  GET    /api/google-sheets/available                               - list sheets from Google Drive
   POST   /api/google-sheets/connect                                 - connect a selected sheet
   DELETE /api/google-sheets/connections/{sheet_id}                  - remove a sheet
   GET    /api/google-sheets/connections                             - list connected sheets
@@ -10,6 +9,9 @@ Endpoints:
   GET    /api/google-sheets/columns?sheet_id=<id>&tab_name=<tab>   - fetch column headers (auto-detect tab)
   POST   /api/google-sheets/manual-sync
   PATCH  /api/google-sheets/connections/{sheet_id}/toggle-polling
+
+Note: The /available endpoint was removed — users now select sheets via
+the Google Picker API on the frontend (drive.file scope).
 """
 
 import httpx
@@ -18,6 +20,7 @@ from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+from pymongo import UpdateOne
 
 from database import get_mongo_db
 from auth.dependencies import CurrentUser
@@ -41,73 +44,12 @@ class ConnectSheetRequest(BaseModel):
     tab_name: Optional[str] = None  # None = auto-detect first tab
 
 
-# ─── NEW: List available sheets from Google Drive ──────────────────────────────
 
-@router.get("/available")
-async def list_available_sheets(user: CurrentUser):
-    """
-    Fetch all Google Sheets the connected account can access via Drive API.
-    Also marks which ones are already connected to this org.
-    """
-    try:
-        org_id = user.org_id
-        access_token = await refresh_google_token(org_id)
-
-        async with httpx.AsyncClient() as client:
-            drive_response = await client.get(
-                "https://www.googleapis.com/drive/v3/files",
-                params={
-                    "q": "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
-                    "fields": "files(id,name,modifiedTime)",
-                    "orderBy": "modifiedTime desc",
-                    "pageSize": 100,
-                },
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=15
-            )
-
-            if drive_response.status_code == 401:
-                access_token = await _force_token_refresh(org_id)
-                drive_response = await client.get(
-                    "https://www.googleapis.com/drive/v3/files",
-                    params={
-                        "q": "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
-                        "fields": "files(id,name,modifiedTime)",
-                        "orderBy": "modifiedTime desc",
-                        "pageSize": 100,
-                    },
-                    headers={"Authorization": f"Bearer {access_token}"},
-                    timeout=15
-                )
-
-        if drive_response.status_code != 200:
-            error_msg = drive_response.json().get("error", {}).get("message", "Unknown error")
-            raise HTTPException(status_code=502, detail=f"Google Drive API error: {error_msg}")
-
-        files = drive_response.json().get("files", [])
-
-        connected_ids = set(
-            doc["sheet_id"]
-            for doc in db.google_sheets_connections.find({"org_id": org_id}, {"sheet_id": 1})
-        )
-
-        sheets = [
-            {
-                "sheet_id": f["id"],
-                "sheet_name": f["name"],
-                "modified_at": f.get("modifiedTime"),
-                "is_connected": f["id"] in connected_ids,
-            }
-            for f in files
-        ]
-
-        return {"sheets": sheets}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing available sheets for org {user.org_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to list sheets: {str(e)}")
+# ─── REMOVED: /available endpoint ──────────────────────────────────────────────
+# The list_available_sheets endpoint was removed as part of the migration to
+# the drive.file scope. With drive.file, the app can no longer list all files
+# in the user's Drive. Users now select sheets via the Google Picker API on the
+# frontend, which automatically grants per-file access.
 
 
 # ─── NEW: Connect a sheet ──────────────────────────────────────────────────────
@@ -142,6 +84,15 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
                 tab_name = "Sheet1"
 
         now = datetime.now(timezone.utc)
+        
+        # Ensure indexes dynamically BEFORE inserting the connection.
+        # This prevents "zombie" states where a connection exists but indexes are missing.
+        await asyncio.to_thread(lambda: db.google_sheets_connections.create_index([("org_id", 1), ("sheet_id", 1)], unique=True))
+        
+        rows_col = db[f"google_sheet_rows_{org_id}"]
+        await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("row_number", 1)], unique=True))
+        await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("synced_at", -1)]))
+
         db.google_sheets_connections.insert_one({
             "org_id": org_id,
             "sheet_id": request.sheet_id,
@@ -156,12 +107,6 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             "connected_at": now,
             "updated_at": now,
         })
-
-        # Ensure indexes dynamically so large sheets don't OOM crash on initial sync/publish
-        await asyncio.to_thread(lambda: db.google_sheets_connections.create_index([("org_id", 1), ("sheet_id", 1)], unique=True))
-        rows_col = db[f"google_sheet_rows_{org_id}"]
-        await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("row_number", 1)], unique=True))
-        await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("synced_at", -1)]))
 
         logger.info(f"Sheet {request.sheet_id} connected for org {org_id} (tab: {tab_name})")
         return {"sheet_id": request.sheet_id, "sheet_name": request.sheet_name, "tab_name": tab_name, "message": "Sheet connected successfully."}
@@ -718,7 +663,13 @@ async def _force_token_refresh(org_id: str) -> str:
     return await refresh_google_token(org_id)
 
 
-async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
+async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncClient] = None) -> dict:
+    """
+    Sync Google Sheet data with MongoDB cache (FULL read-and-reconcile).
+    client: Optional shared httpx.AsyncClient for performance.
+    """
+    now = datetime.now(timezone.utc)
+    start_time = datetime.now() # for timing
     """
     Full reconciliation sync: reads the ENTIRE data range from Google Sheets
     and replaces the MongoDB row cache to match exactly what's in the sheet.
@@ -757,8 +708,8 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
             f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
             f"/values/{encoded_tab}!A{header_row}:ZZ{header_row}"
         )
-        async with httpx.AsyncClient() as client:
-            h_resp = await client.get(
+        async with httpx.AsyncClient() as client_h:
+            h_resp = await client_h.get(
                 header_url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
             )
         if h_resp.status_code == 200:
@@ -790,6 +741,7 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
 
     # --- Fetch ALL data rows from the sheet (full read, not incremental) ---
     data_start_row = header_row + 1
+    import time
     sheets_url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
         f"/values/{encoded_tab}!A{data_start_row}:ZZ10001"
@@ -879,25 +831,39 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
         if delete_result.deleted_count > 0:
             logger.info(f"[SyncSheet] Sheet {sheet_id} is empty — cleared {delete_result.deleted_count} cached row(s)")
 
-    # Step 2: Upsert current rows (add new, update modified)
+    # Step 2: Upsert current rows (add new, update modified) in bulk for performance
     rows_added = 0
     rows_updated = 0
+    
+    bulk_ops = []
     for row_doc in current_rows:
-        result = await asyncio.to_thread(
-            collection.update_one,
-            {"sheet_id": sheet_id, "row_number": row_doc["row_number"]},
-            {"$set": {
-                "row_data": row_doc["row_data"],
-                "synced_at": now,
-                "org_id": org_id,
-                "sheet_name": sheet_name,
-            }},
-            upsert=True,
+        bulk_ops.append(
+            UpdateOne(
+                {"sheet_id": sheet_id, "row_number": row_doc["row_number"]},
+                {"$set": {
+                    "row_data": row_doc["row_data"],
+                    "synced_at": now,
+                    "org_id": org_id,
+                    "sheet_name": sheet_name,
+                }},
+                upsert=True
+            )
         )
-        if result.upserted_id is not None:
-            rows_added += 1
-        elif result.modified_count > 0:
-            rows_updated += 1
+    
+    if bulk_ops:
+        try:
+            result = await asyncio.to_thread(
+                collection.bulk_write, 
+                bulk_ops, 
+                ordered=False
+            )
+            rows_added = result.upserted_count
+            rows_updated = result.modified_count
+            logger.info(f"[SyncSheet] Bulk reconciled {len(bulk_ops)} rows for {sheet_id}: +{rows_added} ~{rows_updated}")
+        except Exception as e:
+            logger.error(f"[SyncSheet] Bulk write failed for {sheet_id}: {e}")
+            # Fallback stats if needed
+            rows_added = len(current_rows) 
 
     # Update connection metadata
     max_row = max(current_row_numbers) if current_row_numbers else header_row
@@ -914,12 +880,10 @@ async def _sync_sheet(org_id: str, sheet_id: str) -> dict:
 
     total_changes = rows_added + rows_updated
     deleted_count = delete_result.deleted_count if delete_result else 0
-    if total_changes > 0 or deleted_count > 0:
-        logger.info(
-            f"[SyncSheet] Reconciled sheet {sheet_id} org {org_id}: "
-            f"{rows_added} new, {rows_updated} updated, "
-            f"{deleted_count} removed | "
-            f"{len(current_rows)} total rows now cached"
-        )
+    total_time = (datetime.now() - start_time).total_seconds()
+    logger.info(
+        f"[SyncSheet] COMPLETED sheet {sheet_id} in {total_time:.2f}s "
+        f"(Fetch: {fetch_time:.2f}s). Total rows: {len(current_rows)}"
+    )
 
     return {"rows_added": rows_added, "rows_updated": rows_updated, "rows_removed": deleted_count}

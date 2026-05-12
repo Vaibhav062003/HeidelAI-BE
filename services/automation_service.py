@@ -10,6 +10,7 @@ from database import get_mongo_db
 from schemas.models import WhatsAppInteractiveMessage
 from services.utils import get_first_name, inject_variables, serialize_mongo
 from services.wa_service import send_interactive_whatsapp_message, send_whatsapp_message
+from core.services import services
 from loguru import logger
 
 db = get_mongo_db()
@@ -317,17 +318,16 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
             # Process existing sheet rows IMMEDIATELY after publish.
             # Strategy: sync sheet → process via the MongoDB path (same as scheduler).
             # This avoids a redundant direct Google API fetch and ensures consistency.
-            # NOTE: Task references are stored in a set to prevent garbage collection
+            # NOTE: Task references are stored in a global set to prevent garbage collection
             # from silently cancelling them (Python asyncio best practice).
-            _background_tasks = set()
             for params in deferred_tasks:
                 sheet_id = params.get("trigger_config", {}).get("sheet_id")
                 if sheet_id:
                     task = asyncio.create_task(
                         _safe_immediate_sheet_processing(org_id, flow_id, sheet_id)
                     )
-                    _background_tasks.add(task)
-                    task.add_done_callback(_background_tasks.discard)
+                    services.background_tasks.add(task)
+                    task.add_done_callback(services.background_tasks.discard)
                     logger.success(f"Started immediate sheet processing for google_sheet flow {flow_id}, sheet {sheet_id}")
 
 
@@ -556,10 +556,13 @@ async def _handle_google_sheet_trigger(
     # Get message config from the flow's message node
     message_config = _extract_message_from_start(start_node_id, nodes, connections)
     if not message_config:
-        logger.warning(f"No message config found for google_sheet flow {flow_id} — skipping.")
-        logger.warning(f"DEBUG: start_node_id={start_node_id}")
-        logger.warning(f"DEBUG: nodes={list(nodes.keys())}")
-        logger.warning(f"DEBUG: connections={connections}")
+        logger.debug(
+             "Message extraction debug for flow {}: start_node_id={}, node_count={}, connection_count={}",
+             flow_id,
+             start_node_id,
+             len(nodes),
+             len(connections),
+         )
         return None
 
     # Register the trigger (with message_text stored for scheduler use)

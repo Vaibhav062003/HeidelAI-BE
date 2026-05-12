@@ -265,7 +265,7 @@ async def store_whatsapp_message(
     logger.success(f"Whatsapp conversation updated: {conversation_id}")
     
     if status == "sending":
-        return
+        return message_id
     
     # Format message for WebSocket broadcast
     broadcast_message = {
@@ -293,11 +293,12 @@ async def store_whatsapp_message(
         payload={"message": broadcast_message}
     )
     
-    # Broadcast to WhatsApp-specific WebSocket connections
-    if recipient_id in services.whatsapp_connections_map:
-        await broadcast_whatsapp_message(recipient_id, "new_message", {
-            "message": broadcast_message
-        })
+    # Broadcast to WhatsApp-specific WebSocket connections (legacy)
+    # This was causing double-broadcasts to clients already listening on main-ws
+    # if recipient_id in services.whatsapp_connections_map:
+    #     await broadcast_whatsapp_message(recipient_id, "new_message", {
+    #         "message": broadcast_message
+    #     })
 
 
     # Check if counter >= 10 for conversational analytics
