@@ -19,6 +19,7 @@ from services.websocket_service import broadcast_team_message
 from database import get_mongo_db, get_async_mongo_db
 
 from loguru import logger
+from dateutil import parser
 
 
 db = get_mongo_db()
@@ -531,7 +532,7 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, user_full_name: Optional[str] = None, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, user_full_name: Optional[str] = None, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
@@ -621,7 +622,18 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             sorted_ids = sorted(participants)
             conversation_id = f"team_{sorted_ids[0]}_{sorted_ids[1]}"
         
-        now = datetime.now(timezone.utc)
+        if timestamp:
+            try:
+                now = parser.parse(timestamp)
+                if now.tzinfo is None:
+                    now = now.replace(tzinfo=timezone.utc)
+                else:
+                    now = now.astimezone(timezone.utc)
+            except Exception:
+                now = datetime.now(timezone.utc)
+        else:
+            now = datetime.now(timezone.utc)
+
         # Team conversations and messages live in their own dedicated collections
         convo_collection = db[f"team_conversations_{org_id}"]
         
@@ -682,6 +694,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         msg_doc = {
             "id": msg_id,
             "message_id": msg_id,
+            "temp_id": temp_id,
             "conversation_id": conversation_id,
             "platform": "internal",
             "type": "text",
@@ -718,9 +731,10 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             update_query
         )
 
-        broadcast_payload = {k: v for k, v in msg_doc.items() if k != "_id"}
+        from services.utils import serialize_mongo
+        broadcast_payload = serialize_mongo(msg_doc)
         await broadcast_team_message(org_id, conversation_id, participants, broadcast_payload)
         
-        return {"status": "sent", "conversation_id": conversation_id}
+        return {"status": "sent", "conversation_id": conversation_id, "message_id": msg_id}
     else:
         raise HTTPException(status_code=400, detail="Unsupported platform")

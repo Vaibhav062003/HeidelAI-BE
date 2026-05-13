@@ -145,6 +145,7 @@ async def send_message_endpoint(
     platform: str = Form(...),
     mode: str = Form(...),
     temp_id: Optional[str] = Form(None), 
+    timestamp: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     context_type: Optional[str] = Form(None),
     context: Optional[str] = Form(None)
@@ -176,6 +177,7 @@ async def send_message_endpoint(
         temp_id if temp_id else None,
         context_type if context_type else None,
         context_dict,
+        timestamp=timestamp
     )
 
     return {"message": "Message sent", "details": res}
