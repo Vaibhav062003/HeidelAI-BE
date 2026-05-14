@@ -119,7 +119,7 @@ async def process_google_sheet_trigger(
     eligible: list = []
 
     for row_dict in rows_to_process:
-        phone_raw = _sanitize_phone(str(row_dict.get(column_name, "")))
+        phone_raw = normalize_phone(str(row_dict.get(column_name, "")))
             
         if not phone_raw:
             continue
@@ -437,27 +437,43 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
             batch_phones = []
             column_name = trigger_config.get("column_name", "")
             for row in batch_data:
-                p = _sanitize_phone(str(row.get(column_name, "")))
+                p = normalize_phone(str(row.get(column_name, "")))
                 if p: batch_phones.append(p)
             
             already_sent_batch = set()
             if batch_phones:
                 try:
+                    # Batch dedup mirrors _try_claim_send's logic:
+                    #   - Always skip "sent" records (permanently done)
+                    #   - Skip "pending" records that are recent (< 5 min, in-flight)
+                    #   - Allow stale "pending" records through (crash recovery)
+                    #   - Allow "failed" records through (retry)
+                    pending_threshold = datetime.now(timezone.utc) - timedelta(minutes=5)
                     sent_records = await asyncio.to_thread(
                         lambda: list(db[SENT_COLLECTION].find(
-                            {"flow_id": flow_id, "org_id": org_id, "status": "sent", "phone": {"$in": batch_phones}},
+                            {
+                                "flow_id": flow_id,
+                                "org_id": org_id,
+                                "phone": {"$in": batch_phones},
+                                "$or": [
+                                    {"status": "sent"},
+                                    {"status": "pending", "updated_at": {"$gte": pending_threshold}},
+                                ],
+                            },
                             {"phone": 1, "_id": 0}
                         ))
                     )
                     already_sent_batch = {r["phone"] for r in sent_records if r.get("phone")}
                 except Exception as e:
                     logger.error(f"[GoogleSheetAuto] Batch dedup fetch failed for flow {flow_id}: {e}")
+
+
                 
             # Filter out rows that are ALREADY marked as sent in the DB.
             filtered_batch_data = []
             skipped_in_batch = 0
             for row in batch_data:
-                phone_clean = _sanitize_phone(str(row.get(column_name, "")))
+                phone_clean = normalize_phone(str(row.get(column_name, "")))
                 
                 if phone_clean in already_sent_batch:
                     skipped_in_batch += 1
@@ -534,6 +550,18 @@ async def _store_sent_message(
         # preserve it — don't overwrite "John Doe" with "919876543210"
         if stored_name and stored_name != phone:
             final_name = stored_name
+
+    # Check if contact exists in the contacts collection (might have been imported or interacted before)
+    if final_name == phone:
+        existing_contact = await asyncio.to_thread(
+            db[f"contacts_{org_id}"].find_one,
+            {"phone_number": phone},
+            {"full_name": 1},
+        )
+        if existing_contact:
+            contact_name = existing_contact.get("full_name", "")
+            if contact_name and contact_name != phone:
+                final_name = contact_name
 
     conversation_id = await create_or_update_whatsapp_conversation(
         org_id=org_id,
@@ -907,19 +935,7 @@ def _get_flow_message_config(
     return {}
 
 
-def _sanitize_phone(phone_raw: str) -> str:
-    """
-    Robust sanitization: removes leading +, then strips ALL non-digits.
-    Ensures Meta API compatibility and consistent deduplication keys.
-    """
-    if not phone_raw:
-        return ""
-    # Strip whitespace and leading +
-    phone_clean = phone_raw.strip()
-    if phone_clean.startswith("+"):
-        phone_clean = phone_clean[1:]
-    # Remove all remaining non-digits (including any + in the middle)
-    return re.sub(r"[^\d]", "", phone_clean)
+from services.utils import serialize_mongo, inject_variables, generate_message_id, get_first_name, normalize_phone
 
 
 def _resolve_recursive(data, variables):

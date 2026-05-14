@@ -752,19 +752,27 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
         f"header_row={header_row} col_offset={col_offset} data_start={data_start_row} headers={headers}"
     )
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
+    # Use the passed-in shared client if available, otherwise create a new one
+    fetch_start = time.time()
+    http_client = client or httpx.AsyncClient(timeout=15)
+    try:
+        response = await http_client.get(
             sheets_url, 
             headers={"Authorization": f"Bearer {access_token}"}, 
             timeout=15
         )
         if response.status_code == 401:
             access_token = await _force_token_refresh(org_id)
-            response = await client.get(
+            response = await http_client.get(
                 sheets_url, 
                 headers={"Authorization": f"Bearer {access_token}"}, 
                 timeout=15
             )
+    finally:
+        # Only close the client if we created it ourselves (not the shared one)
+        if client is None:
+            await http_client.aclose()
+    fetch_time = time.time() - fetch_start
 
     if response.status_code == 404:
         raise HTTPException(status_code=404, detail="Spreadsheet not found. It may have been deleted or access revoked.")

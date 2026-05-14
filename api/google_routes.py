@@ -191,6 +191,43 @@ async def google_profile(user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to fetch Google profile: {str(e)}")
 
 
+@router.get("/picker-token")
+async def get_picker_token(user: CurrentUser):
+    """
+    Return a short-lived OAuth access token for the Google Picker API.
+
+    The frontend needs a valid access token to open the Google Picker popup.
+    This endpoint refreshes the token if needed and returns it.
+    The access token is already scoped to drive.file — the Picker automatically
+    grants access to any file the user selects through it.
+    """
+    try:
+        org_id = user.org_id
+
+        connection = db.google_connections.find_one(
+            {"org_id": org_id, "status": "active"}
+        )
+        if not connection:
+            raise HTTPException(
+                status_code=404,
+                detail="No active Google connection. Please connect your Google account first.",
+            )
+
+        from api.google_sheets_routes import refresh_google_token
+
+        access_token = await refresh_google_token(org_id)
+        return {"access_token": access_token}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching picker token for org {user.org_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get picker token: {str(e)}",
+        )
+
+
 @router.post("/disconnect")
 async def google_disconnect(user: CurrentUser):
     """

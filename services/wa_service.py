@@ -21,6 +21,7 @@ from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
+from services.utils import normalize_phone
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
@@ -61,6 +62,9 @@ async def create_or_update_whatsapp_conversation(
     Returns:
         str: The conversation ID
     """
+    # Canonical normalization to prevent duplicate conversations
+    customer_phone_no = normalize_phone(customer_phone_no)
+    
     conversation_id = f"whatsapp_{customer_phone_no}"
     now = datetime.now(timezone.utc)
     

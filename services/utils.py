@@ -60,6 +60,39 @@ def inject_variables(data, variables: dict):
     # Return ints, bools, etc., as is
     return data
 
+def normalize_phone(phone_raw: str, default_country_code: str = "91") -> str:
+    """
+    Robust normalization to Meta's format (no symbols, includes country code).
+    Ensures that numbers with/without prefixes map to the same canonical ID.
+    
+    Example (India):
+    - '9133800607'   -> '919133800607'
+    - '919133800607' -> '919133800607'
+    - '+91 91338-00607' -> '919133800607'
+    """
+    if not phone_raw:
+        return ""
+    
+    import re
+    # Strip all non-digits
+    clean = re.sub(r"[^\d]", "", str(phone_raw))
+    
+    # Strip leading 0s (common in local formats)
+    clean = clean.lstrip("0")
+    
+    if not clean:
+        return ""
+
+    # Special logic for India (default_country_code="91")
+    # If it's a 10-digit number, prepend the country code.
+    if len(clean) == 10:
+        return f"{default_country_code}{clean}"
+        
+    # If it's already a 12-digit number starting with 91, it's likely already normalized.
+    # However, if someone provided an 8-digit or other length, we return the cleaned digits.
+    
+    return clean
+
 def get_first_name(full_name: str):
     if not full_name:
         return "there"

@@ -41,12 +41,32 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
         logger.warning(f"Unknown platform {platform} - skipping contact storage.")
         return
 
-    if contacts_collection.find_one(unique_filter):
-        logger.info(f"Contact already exists for {platform}: {unique_filter}")
-        return
-    
-    contacts_collection.insert_one(contact_data)
-    logger.success(f"Added new contact for {platform}: {unique_filter}")
+    # Use update_one with upsert=True to either update existing or create new
+    update_doc = {
+        "$set": {
+            "whatsapp_id": contact_data.get("whatsapp_id"),
+            "full_name": contact_data.get("full_name"),
+            "conversation_id": contact_data.get("conversation_id"),
+            "platform": platform,
+            "updated_at": now
+        },
+        "$setOnInsert": {
+            "created_at": now,
+            "categories": contact_data.get("categories", []),
+            "labels": contact_data.get("labels", []),
+            "email": contact_data.get("email"),
+            "country": contact_data.get("country"),
+            "profile_url": contact_data.get("profile_url"),
+        }
+    }
+
+    # Clean up $set to avoid overwriting with None if fields are missing in contact_data
+    for key in list(update_doc["$set"].keys()):
+        if update_doc["$set"][key] is None:
+            del update_doc["$set"][key]
+
+    contacts_collection.update_one(unique_filter, update_doc, upsert=True)
+    logger.success(f"Stored/Updated contact for {platform}: {unique_filter}")
     
 async def get_contacts_for_org(org_id: str):
     """

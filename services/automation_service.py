@@ -728,6 +728,17 @@ def validate_flow_structure(flow_data: Dict) -> tuple:
                 if row_end is not None and row_start is not None and row_end < row_start:
                     return False, "row_end must be >= row_start"
 
+            # Strict check for WhatsApp message received trigger (New System)
+            if trigger.get("type") == "whatsapp_message_received":
+                config = trigger.get("config", {})
+                if not config.get("keyword"):
+                    return False, "WhatsApp message trigger requires at least one keyword"
+
+        # Strict check for WhatsApp message received trigger (Legacy System)
+        if flow_data.get("trigger_from") == "webhook" and flow_data.get("trigger_event") == "message_received":
+            if not flow_data.get("trigger_messages"):
+                return False, "WhatsApp flow requires trigger keywords for message_received event"
+
         return True, None
 
     except Exception as e:

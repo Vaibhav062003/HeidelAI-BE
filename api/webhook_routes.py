@@ -19,6 +19,7 @@ from services.heidelai_bot import send_to_chatbot
 from services.agent_service import send_to_agent
 from services.wa_service import *
 from services.ig_service import *
+from services.utils import normalize_phone
 from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButton, InteractiveReplyButtonMessage
 from schemas.models import MessageRole
 from database import get_mongo_db
@@ -262,7 +263,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 services.processed_message_reaction_ids[key] = timestamp
 
                                 # Extract essential data
-                                customer_phone_no = message.get("from")
+                                customer_phone_no = normalize_phone(message.get("from"))
                                 customer_name = sender_name2
                                 message_type = message.get("type")
 
@@ -358,7 +359,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             services.processed_message_ids[message_id] = time.time()
                             
                             # Extract essential data
-                            customer_phone_no = message.get("from")
+                            customer_phone_no = normalize_phone(message.get("from"))
                             message_type = message.get("type")
                             message_context = message.get("context")
 
