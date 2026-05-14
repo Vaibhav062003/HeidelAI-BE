@@ -81,6 +81,7 @@ ENVIRONMENT = os.getenv("ENVIRONMENT")
 HEIDELAI_ORG_WA_ID = os.getenv("HEIDELAI_ORG_WA_ID")
 PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
 LEE_DEALER_ORG_WA_ID = os.getenv("LEE_DEALER_ORG_WA_ID")
+KARAN_ORG_WA_ID = os.getenv("KARAN_ORG_WA_ID")
 X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making & validating API calls between different koyeb instances
 
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
