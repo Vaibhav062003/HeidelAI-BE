@@ -4,11 +4,11 @@ google_sheet_automation.py
 Handles Google Sheet → WhatsApp automation flows.
 
 Key behaviors:
-  - On publish: read all rows in range, send WhatsApp message to each phone number ONCE
+  - On publish: sync sheet to MongoDB, then process all rows via the scheduler path
   - On new rows (via scheduler): send message to newly added numbers only
   - Deduplication: tracks sent numbers per (org_id, flow_id) in google_sheet_sent_numbers
   - Variables: {{phone_number}}, {{row.ColumnName}}, {{customer_name}} supported in message text
-  - Uses run_bulk_send_job (plain-text mode via message_text param) for sending
+  - Uses DIRECT WhatsApp Cloud API calls (no bulk job overhead) for maximum speed
 """
 
 import re
@@ -21,11 +21,8 @@ from database import get_mongo_db
 from loguru import logger
 import asyncio
 from pymongo.errors import DuplicateKeyError
-from collections import namedtuple
 
 db = get_mongo_db()
-
-Recipient = namedtuple("Recipient", ["phone_number"])
 
 SENT_COLLECTION = "google_sheet_sent_numbers"
 
@@ -38,7 +35,7 @@ async def process_google_sheet_trigger(
     org_id: str,
     flow_id: str,
     trigger_config: dict,
-    message_text: str,
+    message_config: dict,
     rows_data: Optional[List[dict]] = None,
 ) -> dict:
     """
@@ -54,8 +51,11 @@ async def process_google_sheet_trigger(
         logger.error(f"[GoogleSheetAuto] Missing sheet_id or column_name for flow {flow_id}")
         return {"sent": 0, "skipped": 0, "errors": 1}
 
-    if not message_text or not message_text.strip():
-        logger.error(f"[GoogleSheetAuto] Empty message_text for flow {flow_id} — aborting")
+    message_text = message_config.get("text", "")
+    has_template = bool(message_config.get("template_name"))
+    
+    if not has_template and (not message_text or not message_text.strip()):
+        logger.error(f"[GoogleSheetAuto] Empty message_text and no template for flow {flow_id} — aborting")
         return {"sent": 0, "skipped": 0, "errors": 1}
 
     # 1. Get WhatsApp connection early
@@ -119,7 +119,8 @@ async def process_google_sheet_trigger(
     eligible: list = []
 
     for row_dict in rows_to_process:
-        phone_raw = str(row_dict.get(column_name, "")).strip()
+        phone_raw = _sanitize_phone(str(row_dict.get(column_name, "")))
+            
         if not phone_raw:
             continue
 
@@ -138,49 +139,117 @@ async def process_google_sheet_trigger(
             or phone_raw
         )
 
-        resolved_text = _resolve_variables(message_text, {
-            "phone_number": phone_raw,
-            "customer_name": customer_name,
-            "row": row_dict,
-        })
-        eligible.append({
-            "phone_number": phone_raw,
-            "resolved_text": resolved_text,
-            "customer_name": customer_name,
-        })
+        if has_template:
+            # Safely resolve variables inside the components structure recursively.
+            # This avoids JSON parsing errors if variables contain quotes/backslashes.
+            components = message_config.get("components", [])
+            resolved_components = _resolve_recursive(components, {
+                "phone_number": phone_raw,
+                "customer_name": customer_name,
+                "row": row_dict,
+            })
+            resolved_text = message_config.get("template_name")  # use template name as reference
+
+            eligible.append({
+                "phone_number": phone_raw,
+                "resolved_text": resolved_text,
+                "customer_name": customer_name,
+                "is_template": True,
+                "template_name": message_config.get("template_name"),
+                "language_code": message_config.get("language_code", "en"),
+                "components": resolved_components,
+            })
+        else:
+            resolved_text = _resolve_variables(message_text, {
+                "phone_number": phone_raw,
+                "customer_name": customer_name,
+                "row": row_dict,
+            })
+            eligible.append({
+                "phone_number": phone_raw,
+                "resolved_text": resolved_text,
+                "customer_name": customer_name,
+                "is_template": False,
+            })
 
     if not eligible:
         return stats
 
-    # 5. Send bulk via existing logic
-    from services.wa_service import create_bulk_job, run_bulk_send_job, get_bulk_job
-    sem = asyncio.Semaphore(10)
-    
+    # 5. Send via centralized wa_service functions (handles API call + storage + WebSocket broadcast)
+    from services.wa_service import (
+        send_whatsapp_message,
+        send_whatsapp_template_message,
+        create_or_update_whatsapp_conversation,
+    )
+    sem = asyncio.Semaphore(20)  # 20 concurrent sends for high throughput
+
     async def _send_one(recipient):
         async with sem:
             phone = recipient["phone_number"]
             resolved_text = recipient["resolved_text"]
             customer_name = recipient.get("customer_name", phone)
-            job_id = _uuid.uuid4().hex
 
-            await asyncio.to_thread(create_bulk_job, org_id=org_id, job_id=job_id, template_name="", language_code="", total=1)
-            await run_bulk_send_job(
-                job_id=job_id, org_id=org_id, phone_id=phone_id, access_token=wa_access_token,
-                template_name="", language_code="", recipients=[Recipient(phone_number=phone)],
-                delay_seconds=1.0, message_text=resolved_text
-            )
+            # Ensure conversation exists before sending — the centralized send functions
+            # use find_one_and_update WITHOUT upsert, so new contacts from sheets would crash.
+            # create_or_update_whatsapp_conversation uses upsert=True and handles name resolution.
+            try:
+                await create_or_update_whatsapp_conversation(
+                    org_id=org_id,
+                    recipient_id=wa_id,
+                    customer_phone_no=phone,
+                    customer_name=customer_name or phone,
+                    last_message=resolved_text,
+                    last_sender="agent",
+                    mode="reply",
+                )
+            except Exception as e:
+                logger.warning(f"[GoogleSheetAuto] Conversation pre-create for {phone}: {e}")
 
-            job = await asyncio.to_thread(get_bulk_job, job_id=job_id, org_id=org_id)
-            
-            # 1. Extract message_id for tracking webhook statuses
             msg_id = ""
-            if job and job.get("results"):
-                msg_id = job["results"][0].get("message_id", "")
+            send_ok = False
+            try:
+                if recipient.get("is_template"):
+                    # Build template dict matching what send_whatsapp_template_message expects
+                    template_dict = {
+                        "name": recipient.get("template_name"),
+                        "language": {"code": recipient.get("language_code", "en")},
+                    }
+                    if recipient.get("components"):
+                        template_dict["components"] = recipient.get("components")
 
-            # If WhatsApp confirms the message was sent, consider it a success 
-            # even if the tracking msg_id is missing ("sent but untracked").
-            if job and job.get("sent", 0) > 0:
-                # 2. MARK SENT in deduplication collection IMMEDIATELY
+                    result = await send_whatsapp_template_message(
+                        recipient_id=phone,
+                        template=template_dict,
+                        wa_id=wa_id,
+                        org_id=org_id,
+                        temp_id=None,
+                        mode="reply",
+                        context_type=None,
+                        context=None,
+                    )
+                    msg_id = result.get("message_id", "")
+                    send_ok = True
+                else:
+                    # Build message dict matching what send_whatsapp_message expects
+                    message_dict = {
+                        "conversation_id": f"whatsapp_{phone}",
+                        "content": resolved_text,
+                        "sender_id": wa_id,
+                    }
+                    result = await send_whatsapp_message(
+                        message=message_dict,
+                        org_id=org_id,
+                        mode="reply",
+                    )
+                    msg_id = result.get("message_id", "")
+                    send_ok = True
+
+            except Exception as e:
+                logger.error(f"[GoogleSheetAuto] WA send failed for {phone}: {e}")
+
+
+            if send_ok:
+                # MARK SENT in deduplication collection IMMEDIATELY
                 dedup_success = False
                 for attempt in range(3):
                     try:
@@ -189,56 +258,81 @@ async def process_google_sheet_trigger(
                         break
                     except Exception as e:
                         logger.error(f"[GoogleSheetAuto] Dedup mark_sent failed ({attempt+1}/3) for {phone}: {e}")
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)
 
                 if not dedup_success:
-                    logger.error(f"[GoogleSheetAuto] CRITICAL: Dedup write permanently failed for {phone}")
-                    return {"sent": 0, "errors": 1}
-
-                # 3. Store in conversation history and link contact
-                convo_success = False
-                for attempt in range(3):
+                    logger.error(f"[GoogleSheetAuto] CRITICAL: Dedup write permanently failed for {phone} — marking failed for retry")
                     try:
-                        await _store_sent_message(
-                            org_id=org_id, wa_id=wa_id, phone=phone,
-                            message_text=resolved_text, message_id=msg_id,
-                            customer_name=customer_name,
-                        )
-                        convo_success = True
-                        break
-                    except Exception as e:
-                        logger.error(f"[GoogleSheetAuto] Conversation storage failed ({attempt+1}/3) for {phone}: {e}")
-                        await asyncio.sleep(0.5)
-
-                if not convo_success:
-                    logger.error(f"[GoogleSheetAuto] CRITICAL: Conversation/Contact sync permanently failed for {phone}")
+                        await asyncio.to_thread(_mark_failed, org_id, flow_id, phone, sheet_id)
+                    except Exception as mark_err:
+                        logger.error(f"[GoogleSheetAuto] Failed to mark {phone} as failed: {mark_err}")
                     return {"sent": 0, "errors": 1}
+
+                # Contact upsert — the wa_service functions handle conversation + message storage,
+                # but we still need to ensure the contact record exists
+                try:
+                    final_name = customer_name or phone
+                    conversation_id_key = f"whatsapp_{phone}"
+                    contacts_collection = db[f"contacts_{org_id}"]
+                    await asyncio.to_thread(
+                        contacts_collection.update_one,
+                        {"phone_number": phone},
+                        {
+                            "$setOnInsert": {
+                                "whatsapp_id": wa_id,
+                                "full_name": final_name,
+                                "phone_number": phone,
+                                "country": None,
+                                "profile_url": None,
+                                "conversation_id": conversation_id_key,
+                                "email": None,
+                                "categories": [],
+                                "labels": [],
+                                "platform": "whatsapp",
+                                "created_at": datetime.now(timezone.utc),
+                                "source": "google_sheet_automation",
+                            }
+                        },
+                        upsert=True,
+                    )
+                except Exception as e:
+                    logger.warning(f"[GoogleSheetAuto] Contact upsert failed for {phone}: {e}")
 
                 return {"sent": 1, "errors": 0}
             else:
-                # Send failed at the WhatsApp API level. Move to a retryable failure state.
+                # Send failed. Move to a retryable failure state.
                 try:
                     await asyncio.to_thread(_mark_failed, org_id, flow_id, phone, sheet_id)
                 except Exception as e:
                     logger.error(f"[GoogleSheetAuto] Failed to mark {phone} as failed: {e}")
                 return {"sent": 0, "errors": 1}
 
-    results = await asyncio.gather(*[asyncio.create_task(_send_one(r)) for r in eligible])
+    # Fire all sends concurrently
+    results = await asyncio.gather(
+        *[asyncio.create_task(_send_one(r)) for r in eligible],
+        return_exceptions=True,
+    )
+
     for res in results:
-        if res:
+        if isinstance(res, Exception):
+            logger.error(f"[GoogleSheetAuto] Unexpected error in _send_one: {res}")
+            stats["errors"] += 1
+        elif res:
             stats["sent"] += res.get("sent", 0)
             stats["errors"] += res.get("errors", 0)
+
+    logger.info(f"[GoogleSheetAuto] Flow {flow_id}: sent={stats['sent']}, skipped={stats['skipped']}, errors={stats['errors']}")
     return stats
 
 
-async def process_new_sheet_rows(org_id: str, sheet_id: str):
+async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str = None):
     """
     Reads ALL synced rows from MongoDB for the given sheet and passes them
     to active automation triggers. The automation engine's dedup system
     (google_sheet_sent_numbers) ensures each phone number only receives
     a message once per flow — so it's safe to pass all rows every time.
 
-    Called by the scheduler after each sync poll and after manual sync.
+    If target_flow_id is provided, only that flow will be processed (faster).
     """
     triggers = await asyncio.to_thread(
         lambda: list(db.automation_triggers.find({
@@ -249,30 +343,47 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
         }))
     )
 
+    if target_flow_id:
+        triggers = [t for t in triggers if t.get("flow_id") == target_flow_id]
+
     if not triggers:
         return
 
-    # Fetch ALL synced rows for this sheet from MongoDB.
-    # The automation dedup system ensures idempotency, so passing all rows
-    # is safe and handles edge cases like:
-    #   - Automation published after rows were synced
-    #   - Previous automation run failed midway
-    #   - Re-publish after adding new rows
+    # Fetch synced rows for this sheet from MongoDB.
     rows_collection = db[f"google_sheet_rows_{org_id}"]
-    
-    # Determine total rows to process in batches
-    total_rows = await asyncio.to_thread(
-        lambda: rows_collection.count_documents({"sheet_id": sheet_id})
-    )
-    if total_rows == 0:
-        return
-
-    logger.info(f"[GoogleSheetAuto] Processing {total_rows} rows from DB for {len(triggers)} triggers on sheet {sheet_id}")
 
     for trigger in triggers:
         flow_id = trigger.get("flow_id")
         trigger_config = trigger.get("filters", {})
+        message_config = trigger.get("message_config", {})
         message_text = trigger.get("message_text", "")
+        
+        # Apply row range from trigger config (1-based row numbers)
+        row_start = trigger_config.get("row_start")
+        row_end = trigger_config.get("row_end")
+
+        # Build specific filter for this trigger's range
+        trigger_row_filter = {"sheet_id": sheet_id}
+        if row_start is not None or row_end is not None:
+            trigger_row_filter["row_number"] = {}
+            if row_start is not None:
+                trigger_row_filter["row_number"]["$gte"] = int(row_start)
+            if row_end is not None:
+                trigger_row_filter["row_number"]["$lte"] = int(row_end)
+
+        # Count rows for THIS trigger's specific range
+        trigger_total_rows = await asyncio.to_thread(
+            lambda f=trigger_row_filter: rows_collection.count_documents(f)
+        )
+        if trigger_total_rows == 0:
+            logger.debug(f"[GoogleSheetAuto] No rows found in range {row_start}-{row_end} for flow {flow_id}")
+            continue
+
+        logger.info(f"[GoogleSheetAuto] Processing {trigger_total_rows} rows from DB for flow {flow_id} (Range: {row_start}-{row_end})")
+
+        # If the trigger only has legacy message_text, wrap it
+        if not message_config and message_text:
+            message_config = {"text": message_text}
 
         # Safety: verify the flow still exists and is published before processing
         flow_exists = await asyncio.to_thread(
@@ -295,23 +406,23 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
             logger.debug(f"[GoogleSheetAuto] Flow {flow_id} is not published (status={flow_exists.get('status')}) — skipping")
             continue
 
-        if not message_text:
-            message_text = await asyncio.to_thread(
-                _get_flow_message_text,
+        if not message_config:
+            message_config = await asyncio.to_thread(
+                _get_flow_message_config,
                 org_id,
                 flow_id,
                 trigger.get("start_node_id"),
             )
 
-        if not message_text:
+        if not message_config:
             continue
 
         # Process rows in batches to avoid materializing the entire list
         batch_size = 1000
-        for skip in range(0, total_rows, batch_size):
+        for skip in range(0, trigger_total_rows, batch_size):
             batch_docs = await asyncio.to_thread(
-                lambda s=skip, b=batch_size: list(rows_collection.find(
-                    {"sheet_id": sheet_id},
+                lambda s=skip, b=batch_size, f=trigger_row_filter: list(rows_collection.find(
+                    f,
                     {"row_data": 1, "_id": 0}
                 ).sort("row_number", 1).skip(s).limit(b))
             )
@@ -319,13 +430,52 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str):
             batch_data = [doc.get("row_data", {}) for doc in batch_docs if doc.get("row_data")]
             if not batch_data:
                 break
+
+            # --- High-Performance Batch Deduplication ---
+            # Instead of loading ALL sent records into memory (which causes OOM at scale),
+            # we query only for the phone numbers present in the current batch.
+            batch_phones = []
+            column_name = trigger_config.get("column_name", "")
+            for row in batch_data:
+                p = _sanitize_phone(str(row.get(column_name, "")))
+                if p: batch_phones.append(p)
+            
+            already_sent_batch = set()
+            if batch_phones:
+                try:
+                    sent_records = await asyncio.to_thread(
+                        lambda: list(db[SENT_COLLECTION].find(
+                            {"flow_id": flow_id, "org_id": org_id, "status": "sent", "phone": {"$in": batch_phones}},
+                            {"phone": 1, "_id": 0}
+                        ))
+                    )
+                    already_sent_batch = {r["phone"] for r in sent_records if r.get("phone")}
+                except Exception as e:
+                    logger.error(f"[GoogleSheetAuto] Batch dedup fetch failed for flow {flow_id}: {e}")
                 
+            # Filter out rows that are ALREADY marked as sent in the DB.
+            filtered_batch_data = []
+            skipped_in_batch = 0
+            for row in batch_data:
+                phone_clean = _sanitize_phone(str(row.get(column_name, "")))
+                
+                if phone_clean in already_sent_batch:
+                    skipped_in_batch += 1
+                else:
+                    filtered_batch_data.append(row)
+            
+            if skipped_in_batch > 0:
+                logger.debug(f"[GoogleSheetAuto] Skipped {skipped_in_batch} rows already present in dedup records")
+
+            if not filtered_batch_data:
+                continue
+
             await process_google_sheet_trigger(
                 org_id=org_id,
                 flow_id=flow_id,
                 trigger_config=trigger_config,
-                message_text=message_text,
-                rows_data=batch_data,
+                message_config=message_config,
+                rows_data=filtered_batch_data,
             )
 
 
@@ -701,11 +851,11 @@ async def update_sheet_sent_status(org_id: str, message_id: str, status: str):
     await asyncio.to_thread(_sync_update)
 
 
-def _get_flow_message_text(
+def _get_flow_message_config(
     org_id: str, flow_id: str, start_node_id: Optional[str]
-) -> str:
+) -> dict:
     """
-    Walk flow nodes from start_node_id to find the first WhatsApp message text.
+    Walk flow nodes from start_node_id to find the first WhatsApp message config.
 
     Handles both node structures the frontend may produce:
       - node.config.content.text  (primary — used by execution engine)
@@ -734,27 +884,55 @@ def _get_flow_message_text(
 
             node = nodes.get(node_id, {})
             if node.get("type") == "message":
-                # Primary: node.config.content.text
-                text = node.get("config", {}).get("content", {}).get("text", "")
-                # Fallback: node.content.text
-                if not text:
-                    text = node.get("content", {}).get("text", "")
-                if text:
+                # Primary: node.config.content
+                content = node.get("config", {}).get("content", {})
+                # Fallback: node.content
+                if not content:
+                    content = node.get("content", {})
+                if content:
                     logger.info(
-                        f"[GoogleSheetAuto] Found message text in node {node_id} "
+                        f"[GoogleSheetAuto] Found message config in node {node_id} "
                         f"for flow {flow_id}"
                     )
-                    return text
+                    return content
 
             next_ids = [c["target"] for c in connections if c.get("source") == node_id]
             queue.extend(next_ids)
 
     except Exception as e:
         logger.error(
-            f"[GoogleSheetAuto] Error getting message text for flow {flow_id}: {e}"
+            f"[GoogleSheetAuto] Error getting message config for flow {flow_id}: {e}"
         )
 
-    return ""
+    return {}
+
+
+def _sanitize_phone(phone_raw: str) -> str:
+    """
+    Robust sanitization: removes leading +, then strips ALL non-digits.
+    Ensures Meta API compatibility and consistent deduplication keys.
+    """
+    if not phone_raw:
+        return ""
+    # Strip whitespace and leading +
+    phone_clean = phone_raw.strip()
+    if phone_clean.startswith("+"):
+        phone_clean = phone_clean[1:]
+    # Remove all remaining non-digits (including any + in the middle)
+    return re.sub(r"[^\d]", "", phone_clean)
+
+
+def _resolve_recursive(data, variables):
+    """
+    Recursively traverse a dict or list and resolve variables in all string values.
+    """
+    if isinstance(data, str):
+        return _resolve_variables(data, variables)
+    elif isinstance(data, list):
+        return [_resolve_recursive(item, variables) for item in data]
+    elif isinstance(data, dict):
+        return {k: _resolve_recursive(v, variables) for k, v in data.items()}
+    return data
 
 
 def _resolve_variables(text: str, variables: dict) -> str:

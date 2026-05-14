@@ -1,33 +1,49 @@
 import asyncio
+import httpx
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from config.settings import ENVIRONMENT, GOOGLE_API_KEY
 from database import get_mongo_db
 from loguru import logger
 
 db = get_mongo_db()
 
-POLL_INTERVAL_SECONDS = 15
+POLL_INTERVAL_SECONDS = 5
 _polling_task: Optional[asyncio.Task] = None
+_shared_client: Optional[httpx.AsyncClient] = None
 
 
 # ─── Startup / Shutdown ───────────────────────────────────────────────────────
 
 async def startup_google_scheduler() -> None:
-    global _polling_task
+    global _polling_task, _shared_client
     await _ensure_indexes()
-    _polling_task = asyncio.create_task(_polling_loop())
-    logger.success(f"Google Sheets scheduler started (poll interval = {POLL_INTERVAL_SECONDS}s).")
+    
+    # Initialize shared client for connection pooling
+    if _shared_client is None:
+        _shared_client = httpx.AsyncClient(timeout=30, follow_redirects=True)
+        
+    if ENVIRONMENT == "development":
+        _polling_task = asyncio.create_task(_polling_loop())
+        logger.success(f"Google Sheets scheduler started (poll interval = {POLL_INTERVAL_SECONDS}s).")
+    else:
+        logger.info(f"Google Sheets polling loop skipped (ENVIRONMENT={ENVIRONMENT}). Polling is only enabled in development.")
 
 
 async def shutdown_google_scheduler() -> None:
-    global _polling_task
+    global _polling_task, _shared_client
     if _polling_task and not _polling_task.done():
         _polling_task.cancel()
         try:
             await _polling_task
         except asyncio.CancelledError:
             pass
+    
+    if _shared_client:
+        await _shared_client.aclose()
+        _shared_client = None
+        
     logger.success("Google Sheets scheduler stopped.")
 
 
@@ -136,39 +152,33 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
         return
 
     try:
-        from api.google_sheets_routes import _sync_sheet
-        result = await _sync_sheet(org_id, sheet_id)
-        rows_added = result.get("rows_added", 0)
-        rows_updated = result.get("rows_updated", 0)
-        rows_removed = result.get("rows_removed", 0)
-        total = rows_added + rows_updated + rows_removed
-
-        if total > 0:
-            logger.info(f"[Scheduler] Synced sheet {sheet_id} for org {org_id}: +{rows_added} ~{rows_updated} -{rows_removed}")
-        
-        # ALWAYS trigger automations after a successful sync.
-        # Even if rows_processed == 0, we trigger automations because:
-        #   - Rows may have been synced on a PREVIOUS poll but the automation
-        #     wasn't published yet at that time.
-        #   - The automation's own dedup system (google_sheet_sent_numbers)
-        #     ensures the same phone number is never messaged twice.
-        #   - This makes the system self-healing: if any step failed on a
-        #     previous run, it will be retried on the next poll.
-        await _trigger_google_sheet_automations(org_id, sheet_id)
-
-    except Exception as e:
-        logger.error(f"[Scheduler] Failed to sync sheet {sheet_id} for org {org_id}: {str(e)}")
+        # Phase 1: Sync sheet data from Google to MongoDB
         try:
-            await asyncio.to_thread(
-                db.google_sheets_connections.update_one,
-                {"org_id": org_id, "sheet_id": sheet_id},
-                {"$set": {
-                    "last_sync_error": str(e),
-                    "last_sync_error_at": datetime.now(timezone.utc).isoformat()
-                }}
-            )
-        except Exception:
-            pass
+            from api.google_sheets_routes import _sync_sheet
+            # Pass the shared client to reuse connections
+            result = await _sync_sheet(org_id, sheet_id, client=_shared_client)
+        except Exception as e:
+            logger.error(f"[Scheduler] Failed to sync sheet {sheet_id} for org {org_id}: {str(e)}")
+            try:
+                await asyncio.to_thread(
+                    db.google_sheets_connections.update_one,
+                    {"org_id": org_id, "sheet_id": sheet_id},
+                    {"$set": {
+                        "last_sync_error": str(e),
+                        "last_sync_error_at": datetime.now(timezone.utc).isoformat()
+                    }}
+                )
+            except Exception:
+                pass
+
+        # Phase 2: ALWAYS trigger automations, even if sync failed.
+        # MongoDB already has cached data from previous successful syncs,
+        # and the dedup system ensures no double-sends.
+        try:
+            await _trigger_google_sheet_automations(org_id, sheet_id)
+        except Exception as e:
+            logger.error(f"[Scheduler] Error triggering automations for sheet {sheet_id}: {e}")
+
     finally:
         # Always release the lease so the next poll cycle can proceed
         try:
@@ -177,6 +187,7 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
             )
         except Exception as e:
             logger.warning(f"[Scheduler] Could not release lease for {lease_key}: {e}")
+
 
 
 async def _trigger_google_sheet_automations(org_id: str, sheet_id: str) -> None:
