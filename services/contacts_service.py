@@ -41,16 +41,20 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
         logger.warning(f"Unknown platform {platform} - skipping contact storage.")
         return
 
-    # Use update_one with upsert=True to either update existing or create new
+    # Only update full_name if it's not a placeholder
+    incoming_name = contact_data.get("full_name")
+    placeholders = ["Unknown Sender", "Contact", "Unknown"]
+    should_update_name = incoming_name and incoming_name not in placeholders
+
     update_doc = {
         "$set": {
             "whatsapp_id": contact_data.get("whatsapp_id"),
-            "full_name": contact_data.get("full_name"),
             "conversation_id": contact_data.get("conversation_id"),
             "platform": platform,
             "updated_at": now
         },
         "$setOnInsert": {
+            "full_name": incoming_name,  # Always set on initial creation
             "created_at": now,
             "categories": contact_data.get("categories", []),
             "labels": contact_data.get("labels", []),
@@ -59,6 +63,9 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
             "profile_url": contact_data.get("profile_url"),
         }
     }
+
+    if should_update_name:
+        update_doc["$set"]["full_name"] = incoming_name
 
     # Clean up $set to avoid overwriting with None if fields are missing in contact_data
     for key in list(update_doc["$set"].keys()):
