@@ -384,22 +384,48 @@ async def _execute_job(job: dict) -> None:
 
         wa_id = org["wa_id"]
 
-        # Step 3: Resolve message text (replace {{customer_name}} etc.)
-        raw_text = message_config.get("text", "")
-        resolved_text = _resolve_variables(raw_text, {"customer_name": customer_name})
+        # Step 3: Send the message (handles both plain text and templates)
+        from services.wa_service import send_whatsapp_message, send_whatsapp_template_message
 
-        # Step 4: Send via existing send_whatsapp_message()
-        from services.wa_service import send_whatsapp_message
+        template_name = message_config.get("template_name")
+        
+        if template_name:
+            # --- TEMPLATE PATH ---
+            from services.google_sheet_automation import _resolve_recursive
+            
+            # Resolve variables in components
+            components = message_config.get("components", [])
+            resolved_components = _resolve_recursive(components, {
+                "customer_name": customer_name,
+            })
 
-        result = await send_whatsapp_message(
-            message={
-                "conversation_id": conversation_id,
-                "content": resolved_text,
-                "sender_id": wa_id,
-            },
-            org_id=org_id,
-            mode="reply",
-        )
+            template_dict = {
+                "name": template_name,
+                "language": {"code": message_config.get("language_code", "en")},
+                "components": resolved_components
+            }
+
+            result = await send_whatsapp_template_message(
+                recipient_id=conversation_id.split("_")[-1], # extract phone from whatsapp_91...
+                template=template_dict,
+                wa_id=wa_id,
+                org_id=org_id,
+                mode="reply",
+            )
+        else:
+            # --- PLAIN TEXT PATH ---
+            raw_text = message_config.get("text", "")
+            resolved_text = _resolve_variables(raw_text, {"customer_name": customer_name})
+
+            result = await send_whatsapp_message(
+                message={
+                    "conversation_id": conversation_id,
+                    "content": resolved_text,
+                    "sender_id": wa_id,
+                },
+                org_id=org_id,
+                mode="reply",
+            )
 
         logger.success(
             f"[{schedule_id}] Follow-up sent to {conversation_id}. message_id={result.get('message_id')}"
