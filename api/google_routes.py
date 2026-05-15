@@ -196,10 +196,10 @@ async def get_picker_token(user: CurrentUser):
     """
     Return a short-lived OAuth access token for the Google Picker API.
 
-    The frontend needs a valid access token to open the Google Picker popup.
-    This endpoint refreshes the token if needed and returns it.
-    The access token is already scoped to drive.file — the Picker automatically
-    grants access to any file the user selects through it.
+    To maintain security, we use 'down-scoping':
+    Instead of returning the organization's master access token (which may have
+    broad permissions), we use the refresh token to request a new access token
+    restricted ONLY to the 'drive.file' scope.
     """
     try:
         org_id = user.org_id
@@ -213,15 +213,48 @@ async def get_picker_token(user: CurrentUser):
                 detail="No active Google connection. Please connect your Google account first.",
             )
 
-        from api.google_sheets_routes import refresh_google_token
+        refresh_token = connection.get("credentials", {}).get("refresh_token")
+        if not refresh_token:
+            raise HTTPException(
+                status_code=401,
+                detail="Google refresh token missing. Please reconnect your account to enable file selection.",
+            )
 
-        access_token = await refresh_google_token(org_id)
+        # ── Request a down-scoped token from Google ───────────────────────────
+        # This token will ONLY have the drive.file scope, even if the master 
+        # connection has broader permissions.
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                    "scope": "https://www.googleapis.com/auth/drive.file",
+                },
+                timeout=10
+            )
+
+        if token_response.status_code != 200:
+            logger.error(f"Down-scoped token refresh failed for org {org_id}: {token_response.text}")
+            raise HTTPException(
+                status_code=401,
+                detail="Failed to generate a secure picker token. Please try reconnecting your Google account."
+            )
+
+        token_info = token_response.json()
+        access_token = token_info.get("access_token")
+        
+        if not access_token:
+            raise HTTPException(status_code=500, detail="Google returned an empty access token.")
+
         return {"access_token": access_token}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching picker token for org {user.org_id}: {e}")
+        logger.error(f"Error generating down-scoped picker token for org {user.org_id}: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to get picker token: {str(e)}",
