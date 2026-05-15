@@ -263,7 +263,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 services.processed_message_reaction_ids[key] = timestamp
 
                                 # Extract essential data
-                                customer_phone_no = normalize_phone(message.get("from"))
+                                customer_phone_no = normalize_phone(message.get("from"), is_canonical=True)
                                 customer_name = sender_name2
                                 message_type = message.get("type")
 
@@ -359,7 +359,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             services.processed_message_ids[message_id] = time.time()
                             
                             # Extract essential data
-                            customer_phone_no = normalize_phone(message.get("from"))
+                            customer_phone_no = normalize_phone(message.get("from"), is_canonical=True)
                             message_type = message.get("type")
                             message_context = message.get("context")
 

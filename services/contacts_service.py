@@ -48,7 +48,6 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
 
     update_doc = {
         "$set": {
-            "whatsapp_id": contact_data.get("whatsapp_id"),
             "conversation_id": contact_data.get("conversation_id"),
             "platform": platform,
             "updated_at": now
@@ -66,6 +65,14 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
 
     if should_update_name:
         update_doc["$set"]["full_name"] = incoming_name
+
+    # Add platform-specific fields
+    if platform == "instagram":
+        update_doc["$set"]["instagram_id"] = contact_data.get("instagram_id")
+        update_doc["$set"]["username"] = contact_data.get("username")
+    elif platform == "whatsapp":
+        update_doc["$set"]["phone_number"] = contact_data.get("phone_number")
+        update_doc["$set"]["whatsapp_id"] = contact_data.get("whatsapp_id")
 
     # Clean up $set to avoid overwriting with None if fields are missing in contact_data
     for key in list(update_doc["$set"].keys()):

@@ -60,15 +60,16 @@ def inject_variables(data, variables: dict):
     # Return ints, bools, etc., as is
     return data
 
-def normalize_phone(phone_raw: str, default_country_code: str = "91") -> str:
+def normalize_phone(phone_raw: str, default_country_code: str = "91", is_canonical: bool = False) -> str:
     """
     Robust normalization to Meta's format (no symbols, includes country code).
     Ensures that numbers with/without prefixes map to the same canonical ID.
     
-    Example (India):
-    - '9133800607'   -> '919133800607'
-    - '919133800607' -> '919133800607'
-    - '+91 91338-00607' -> '919133800607'
+    Args:
+        phone_raw: The raw phone number string.
+        default_country_code: The code to prepend if a local 10-digit number is detected.
+        is_canonical: If True, treats the input as already being a full international 
+                      number (e.g. from Meta Webhook) and skips prefixing logic.
     """
     if not phone_raw:
         return ""
@@ -83,14 +84,15 @@ def normalize_phone(phone_raw: str, default_country_code: str = "91") -> str:
     if not clean:
         return ""
 
+    # If the source is canonical (Meta Webhook), return as-is
+    if is_canonical:
+        return clean
+
     # Special logic for India (default_country_code="91")
-    # If it's a 10-digit number, prepend the country code.
-    if len(clean) == 10:
+    # If it's a 10-digit number starting with a valid mobile prefix (6-9), prepend 91.
+    if len(clean) == 10 and clean[0] in "6789":
         return f"{default_country_code}{clean}"
         
-    # If it's already a 12-digit number starting with 91, it's likely already normalized.
-    # However, if someone provided an 8-digit or other length, we return the cleaned digits.
-    
     return clean
 
 def get_first_name(full_name: str):
