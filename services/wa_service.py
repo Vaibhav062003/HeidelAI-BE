@@ -79,19 +79,39 @@ async def create_or_update_whatsapp_conversation(
     # Check if the viewers set exists and is not empty
     is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
 
+    # Handle Name Resolution
+    final_customer_name = customer_name
+    
+    if existing_conversation:
+        stored_name = existing_conversation.get("customer_name")
+        meta_verified = existing_conversation.get("meta_name_verified", False)
+        
+        if last_sender == "customer":
+            # Webhook update: Always trust Meta's name and mark as verified
+            final_customer_name = customer_name
+        else:
+            # Automation/Agent update: Do NOT overwrite a verified name or an already existing valid name
+            if meta_verified:
+                final_customer_name = stored_name
+            elif stored_name and stored_name != customer_phone_no:
+                final_customer_name = stored_name
+
     # Base fields that ALWAYS get updated
     update_set = {
         "platform": "whatsapp",
         "conversation_id": conversation_id,
         "whatsapp_id": recipient_id,
         "customer_id": customer_phone_no,
-        "customer_name": customer_name,
+        "customer_name": final_customer_name,
         "last_message": last_message,
         "last_message_timestamp": now,
         "last_message_is_private_note": mode == "private",
         "last_sender": last_sender,
         "status": "open",
     }
+    
+    if last_sender == "customer":
+        update_set["meta_name_verified"] = True
 
     # Fields that ONLY get set if a NEW conversation is created
     update_set_on_insert = {

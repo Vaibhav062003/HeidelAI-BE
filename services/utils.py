@@ -88,9 +88,8 @@ def normalize_phone(phone_raw: str, default_country_code: str = "91", is_canonic
     if is_canonical:
         return clean
 
-    # Special logic for India (default_country_code="91")
-    # If it's a 10-digit number starting with a valid mobile prefix (6-9), prepend 91.
-    if len(clean) == 10 and clean[0] in "6789":
+    # If it's a 10-digit number, prepend the default country code.
+    if len(clean) == 10:
         return f"{default_country_code}{clean}"
         
     return clean

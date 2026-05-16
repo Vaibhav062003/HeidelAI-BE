@@ -249,15 +249,31 @@ async def process_google_sheet_trigger(
 
 
             if send_ok:
-                # MARK SENT in deduplication collection IMMEDIATELY
+                # Immediate atomic write with retry
                 dedup_success = False
                 for attempt in range(3):
                     try:
-                        await asyncio.to_thread(_mark_sent, org_id, flow_id, phone, sheet_id, msg_id)
+                        # Use replace_one with upsert to atomically claim + mark sent
+                        result = await asyncio.to_thread(
+                            lambda: db[SENT_COLLECTION].replace_one(
+                                {"org_id": org_id, "flow_id": flow_id, "phone": phone},
+                                {
+                                    "org_id": org_id,
+                                    "flow_id": flow_id,
+                                    "phone": phone,
+                                    "sheet_id": sheet_id,
+                                    "status": "sent",
+                                    "message_id": msg_id,
+                                    "sent_at": datetime.now(timezone.utc),
+                                    "updated_at": datetime.now(timezone.utc),
+                                },
+                                upsert=True
+                            )
+                        )
                         dedup_success = True
                         break
                     except Exception as e:
-                        logger.error(f"[GoogleSheetAuto] Dedup mark_sent failed ({attempt+1}/3) for {phone}: {e}")
+                        logger.error(f"[GoogleSheetAuto] Dedup write failed ({attempt+1}/3) for {phone}: {e}")
                         await asyncio.sleep(0.3)
 
                 if not dedup_success:

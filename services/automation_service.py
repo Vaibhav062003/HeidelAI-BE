@@ -732,12 +732,15 @@ def validate_flow_structure(flow_data: Dict) -> tuple:
             # Strict check for WhatsApp message received trigger (New System)
             if trigger.get("type") == "whatsapp_message_received":
                 config = trigger.get("config", {})
-                if not config.get("keyword"):
-                    return False, "WhatsApp message trigger requires at least one keyword"
+                keyword = config.get("keyword")
+                # Reject None, empty string, empty list
+                if not keyword or (isinstance(keyword, (list, str)) and not any(keyword)):
+                    return False, "WhatsApp message trigger requires at least one non-empty keyword"
 
         # Strict check for WhatsApp message received trigger (Legacy System)
         if flow_data.get("trigger_from") == "webhook" and flow_data.get("trigger_event") == "message_received":
-            if not flow_data.get("trigger_messages"):
+            trigger_msgs = flow_data.get("trigger_messages")
+            if not trigger_msgs or (isinstance(trigger_msgs, (list, str)) and not any(trigger_msgs)):
                 return False, "WhatsApp flow requires trigger keywords for message_received event"
 
         return True, None

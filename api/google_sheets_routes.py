@@ -754,7 +754,13 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
 
     # Use the passed-in shared client if available, otherwise create a new one
     fetch_start = time.time()
-    http_client = client or httpx.AsyncClient(timeout=15)
+    created_client = False
+    http_client = client
+    
+    if http_client is None:
+        http_client = httpx.AsyncClient(timeout=15)
+        created_client = True
+
     try:
         response = await http_client.get(
             sheets_url, 
@@ -770,7 +776,7 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
             )
     finally:
         # Only close the client if we created it ourselves (not the shared one)
-        if client is None:
+        if created_client:
             await http_client.aclose()
     fetch_time = time.time() - fetch_start
 

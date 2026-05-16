@@ -10,6 +10,7 @@ from core.services import services
 from database import get_mongo_db
 from loguru import logger
 from services.websocket_service import broadcast_on_stats_update
+from services.utils import normalize_phone
 
 
 
@@ -41,10 +42,7 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
         logger.warning(f"Unknown platform {platform} - skipping contact storage.")
         return
 
-    # Only update full_name if it's not a placeholder
     incoming_name = contact_data.get("full_name")
-    placeholders = ["Unknown Sender", "Contact", "Unknown"]
-    should_update_name = incoming_name and incoming_name not in placeholders
 
     update_doc = {
         "$set": {
@@ -53,7 +51,7 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
             "updated_at": now
         },
         "$setOnInsert": {
-            "full_name": incoming_name,  # Always set on initial creation
+            "full_name": incoming_name,
             "created_at": now,
             "categories": contact_data.get("categories", []),
             "labels": contact_data.get("labels", []),
@@ -62,9 +60,6 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
             "profile_url": contact_data.get("profile_url"),
         }
     }
-
-    if should_update_name:
-        update_doc["$set"]["full_name"] = incoming_name
 
     # Add platform-specific fields
     if platform == "instagram":
@@ -292,7 +287,7 @@ def process_bulk_wa_contact_upload(org_id: str, file_content: bytes, filename: s
         full_name = str(row['name']).strip() if pd.notna(row['name']) else None
         
         raw_phone = str(row['phone']) if pd.notna(row['phone']) else ""
-        clean_phone = "".join(filter(str.isdigit, raw_phone))
+        clean_phone = normalize_phone(raw_phone)
 
         if not full_name or not clean_phone or len(clean_phone) < 10:
             skipped_rows += 1

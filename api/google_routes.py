@@ -213,6 +213,14 @@ async def get_picker_token(user: CurrentUser):
                 detail="No active Google connection. Please connect your Google account first.",
             )
 
+        scopes = connection.get("scopes", [])
+        if "https://www.googleapis.com/auth/drive.file" not in scopes:
+            logger.warning(f"Picker token requested but connection lacks drive.file scope: {scopes}")
+            raise HTTPException(
+                status_code=403,
+                detail="Google connection does not have permission for file access. Please reconnect."
+            )
+
         refresh_token = connection.get("credentials", {}).get("refresh_token")
         if not refresh_token:
             raise HTTPException(
