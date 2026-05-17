@@ -24,11 +24,11 @@ async def startup_google_scheduler() -> None:
     if _shared_client is None:
         _shared_client = httpx.AsyncClient(timeout=30, follow_redirects=True)
         
-    if ENVIRONMENT == "development":
+    if ENVIRONMENT != "production":
         _polling_task = asyncio.create_task(_polling_loop())
-        logger.success(f"Google Sheets scheduler started (poll interval = {POLL_INTERVAL_SECONDS}s).")
+        logger.success(f"Google Sheets scheduler started (poll interval = {POLL_INTERVAL_SECONDS}s, ENV={ENVIRONMENT or 'default'}).")
     else:
-        logger.info(f"Google Sheets polling loop skipped (ENVIRONMENT={ENVIRONMENT}). Polling is only enabled in development.")
+        logger.info(f"Google Sheets polling loop skipped (ENVIRONMENT=production).")
 
 
 async def shutdown_google_scheduler() -> None:

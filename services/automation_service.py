@@ -277,11 +277,11 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
                     logger.warning(f"whatsapp_followup trigger missing conversation_id — skipping.")
                     continue
 
-                delay_seconds, message_text = _extract_delay_and_message(
+                delay_seconds, message_config = _extract_delay_and_message(
                     start_node_id, nodes, connections
                 )
 
-                if delay_seconds is None or message_text is None:
+                if delay_seconds is None or message_config is None:
                     logger.warning(
                         f"Could not extract delay/message from flow {flow_id}. "
                         f"Ensure a smart_delay node and a message node are connected."
@@ -293,7 +293,7 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
                     flow_id=flow_id,
                     conversation_id=conversation_id,
                     delay_seconds=delay_seconds,
-                    message_config={"text": message_text},
+                    message_config=message_config,
                 )
                 logger.success(
                     f"Scheduled WhatsApp follow-up — flow={flow_id}, "
@@ -463,12 +463,12 @@ def _extract_delay_and_message(
 ) -> tuple:
     """
     Walk graph: start_node (smart_delay) → message_node
-    Returns (delay_seconds, message_text) or (None, None) on failure.
+    Returns (delay_seconds, message_config: dict) or (None, None) on failure.
     """
     UNIT_TO_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
 
     delay_seconds = None
-    message_text = None
+    message_config = None
 
     start_node = nodes.get(start_node_id, {})
 
@@ -481,15 +481,16 @@ def _extract_delay_and_message(
         for msg_id in _children(start_node_id, connections):
             msg_node = nodes.get(msg_id, {})
             if msg_node.get("type") == "message":
-                # Primary path: node.config.content.text
-                text = msg_node.get("config", {}).get("content", {}).get("text", "")
-                # Fallback path: node.content.text
-                if not text:
-                    text = msg_node.get("content", {}).get("text", "")
-                message_text = text
-                break
+                # Extract full content config (handles both text and templates)
+                content = msg_node.get("config", {}).get("content", {})
+                if not content:
+                    content = msg_node.get("content", {})
+                
+                if content:
+                    message_config = content
+                    break
 
-    return delay_seconds, message_text
+    return delay_seconds, message_config
 
 
 def _extract_message_from_start(
@@ -727,6 +728,20 @@ def validate_flow_structure(flow_data: Dict) -> tuple:
                     return False, "row_start must be >= 1"
                 if row_end is not None and row_start is not None and row_end < row_start:
                     return False, "row_end must be >= row_start"
+
+            # Strict check for WhatsApp message received trigger (New System)
+            if trigger.get("type") == "whatsapp_message_received":
+                config = trigger.get("config", {})
+                keyword = config.get("keyword")
+                # Reject None, empty string, empty list
+                if not keyword or (isinstance(keyword, (list, str)) and not any(keyword)):
+                    return False, "WhatsApp message trigger requires at least one non-empty keyword"
+
+        # Strict check for WhatsApp message received trigger (Legacy System)
+        if flow_data.get("trigger_from") == "webhook" and flow_data.get("trigger_event") == "message_received":
+            trigger_msgs = flow_data.get("trigger_messages")
+            if not trigger_msgs or (isinstance(trigger_msgs, (list, str)) and not any(trigger_msgs)):
+                return False, "WhatsApp flow requires trigger keywords for message_received event"
 
         return True, None
 

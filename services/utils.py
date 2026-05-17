@@ -60,6 +60,40 @@ def inject_variables(data, variables: dict):
     # Return ints, bools, etc., as is
     return data
 
+def normalize_phone(phone_raw: str, default_country_code: str = "91", is_canonical: bool = False) -> str:
+    """
+    Robust normalization to Meta's format (no symbols, includes country code).
+    Ensures that numbers with/without prefixes map to the same canonical ID.
+    
+    Args:
+        phone_raw: The raw phone number string.
+        default_country_code: The code to prepend if a local 10-digit number is detected.
+        is_canonical: If True, treats the input as already being a full international 
+                      number (e.g. from Meta Webhook) and skips prefixing logic.
+    """
+    if not phone_raw:
+        return ""
+    
+    import re
+    # Strip all non-digits
+    clean = re.sub(r"[^\d]", "", str(phone_raw))
+    
+    # Strip leading 0s (common in local formats)
+    clean = clean.lstrip("0")
+    
+    if not clean:
+        return ""
+
+    # If the source is canonical (Meta Webhook), return as-is
+    if is_canonical:
+        return clean
+
+    # If it's a 10-digit number, prepend the default country code.
+    if len(clean) == 10:
+        return f"{default_country_code}{clean}"
+        
+    return clean
+
 def get_first_name(full_name: str):
     if not full_name:
         return "there"
