@@ -703,17 +703,26 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
+        auto_ai_disabled = body.get("auto_disabled")  # Optional field to indicate if this toggle is from an auto-trigger
         
         if ai_enabled is None:
             return {"status": "error", "message": "Incorrect request body"}
         
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
-        
+        messages_collection = db[f"messages_{org_id}"]
+
+        update_fields = {
+            "is_ai_enabled": ai_enabled
+        }
+
+        if auto_ai_disabled is not None:
+            update_fields["auto_ai_disabled"] = auto_ai_disabled
+
         # Update the conversation
         result = conversations_collection.update_one(
             {"conversation_id": conversation_id},
-            {"$set": {"is_ai_enabled": ai_enabled}}
+            {"$set": update_fields}
         )
         
         if result.matched_count == 0:
@@ -721,6 +730,45 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         
         # Get updated conversation for broadcasting
         updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+
+        if auto_ai_disabled == True:
+            sender_id = f"system_auto" if auto_ai_disabled else "system"
+            sender_name = "System (Auto)" if auto_ai_disabled else "System"
+            
+        
+            msg_id = str(uuid.uuid4())
+            msg_doc = {
+                "id": msg_id,
+                "message_id": msg_id,
+                "temp_id": None,
+                "conversation_id": conversation_id,
+                "platform": "internal",
+                "type": "system_message",
+                "content": "Ai is disabled for this conversation, you can re-enable it anytime by clicking on the enable AI button manually",
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "role": "agent",
+                "timestamp": datetime.now(),
+                "status": "sent"
+            }
+
+            messages_collection.insert_one(msg_doc)
+
+            # Broadcast the newly added message
+            if wa_id in services.whatsapp_connections_map:
+                logger.info(f"Broadcasting system message for AI disabled to WhatsApp connections of wa_id: {wa_id}")
+                await broadcast_whatsapp_message(wa_id, "conversation_updated", {
+                    "message": {
+                        "id": msg_doc["id"],
+                        "conversation_id": msg_doc["conversation_id"],
+                        "content": msg_doc["content"],
+                        "sender_id": msg_doc["sender_id"],
+                        "sender_name": msg_doc["sender_name"],
+                        "timestamp": msg_doc["timestamp"].isoformat(),
+                        "status": msg_doc["status"],
+                        "type": msg_doc["type"]
+                    }
+                })
         
         if updated_conversation:
             # Format for broadcasting
