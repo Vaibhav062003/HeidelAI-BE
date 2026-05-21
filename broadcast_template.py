@@ -31,29 +31,11 @@ THANKYOU_REPLY_PAYLOAD = {
     ]
 }
 
-# 2. Button Template (Summer Camp / Social Links)
-SOCIAL_MEDIA_LINKS_PAYLOAD = {
-    "name": "summer_camp", # Currently matches the button structure requested
+# 2. Button Template (Vedic Maths Books)
+# TODO: Replace with the approved WhatsApp template name for the books broadcast.
+VEDIC_MATHS_BOOKS_PAYLOAD = {
+    "name": "vedic_maths_books",
     "language": {"code": "en"}
-}
-
-# 3. Another Image Header Template
-FOLLOW_UP_VMSC_PAYLOAD = {
-    "name": "followup_vmsc",
-    "language": {"code": "en"},
-    "components": [
-        {
-            "type": "HEADER",
-            "parameters": [
-                {
-                    "type": "IMAGE",
-                    "image": {
-                        "link": "https://scontent.whatsapp.net/v/t61.29466-34/639841005_1598700581281688_8141986341136125935_n.png?ccb=1-7&_nc_sid=8b1bef&_nc_ohc=HhP3qVTpGpsQ7kNvwEHVM2W&_nc_oc=AdmQXjeGx9Q0zIWwgJ2NCfHV6b9A4o8YFSiiqh7MS_SF2UGsS0fzyQEMKtxre43YYr_BPwIx1CJbBh1mKkU5Bm-4&_nc_zt=3&_nc_ht=scontent.whatsapp.net&edm=AH51TzQEAAAA&_nc_gid=9qHInY5x-CIiEmpZyVkHRw&_nc_tpa=Q5bMBQE9sEy5lGNoeK3myzvg3I7rJVoZ655tZD0hUkL0NsNW3C-RhofzHTfssydD-cq2xH-7A9oy43aK&oh=01_Q5Aa4AFFyyXdQtrBCSxt8Ts4V7HTVY_xGrrZDDVgnNhqiXHkoA&oe=69DA218F"
-                    }
-                }
-            ]
-        }
-    ]
 }
 
 def get_contacts_from_db():
@@ -111,7 +93,7 @@ def run_broadcast(contact_list, template_payload, phone_id, access_token, delay_
 
 if __name__ == "__main__":
     # 1. Choose template
-    template_payload = SOCIAL_MEDIA_LINKS_PAYLOAD  # Change here: THANKYOU_REPLY_PAYLOAD, FOLLOW_UP_VMSC_PAYLOAD
+    template_payload = VEDIC_MATHS_BOOKS_PAYLOAD  # Change here: THANKYOU_REPLY_PAYLOAD, VEDIC_MATHS_BOOKS_PAYLOAD
     
     # 2. Transcribed contacts (126 numbers from image)
     target_contacts = [
