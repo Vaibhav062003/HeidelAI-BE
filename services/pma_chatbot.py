@@ -8,7 +8,6 @@ from schemas.models import (
     ActionButton,
     InteractiveListMessage,
     InteractiveReplyButtonMessage,
-    InteractiveUrlButtonMessage,
     ListRow,
     ListSection,
     ReplyButton,
@@ -21,9 +20,6 @@ ORG_ID = settings.PMA_ORG_ID
 
 # TODO: Replace with the approved promotional post/video URL for the books flow.
 VEDIC_MATHS_BOOKS_PROMO_VIDEO_URL = ""
-
-# TODO: Replace with the exact Amazon product URL for the Vedic Maths Books.
-VEDIC_MATHS_BOOKS_AMAZON_URL = "https://www.amazon.in/"
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://heidelai-chatbot-2.koyeb.app"
@@ -185,41 +181,28 @@ def get_introduction_message(sender_name: str):
 
 
 def get_vedic_maths_books_message():
-    header = None
-    if VEDIC_MATHS_BOOKS_PROMO_VIDEO_URL:
-        header = {
-            "type": "video",
-            "video": {"link": VEDIC_MATHS_BOOKS_PROMO_VIDEO_URL},
-        }
-
-    return InteractiveUrlButtonMessage(
-        type="cta_url",
-        header=header,
-        body_text=(
-            "🚀 Unlock the Power of Speed Maths with Vedic Mathematics! 📚✨\n\n"
-            "Presenting the complete set of\n"
-            "🔹 Volume 1\n"
-            "🔹 Volume 2\n"
-            "🔹 Volume 3\n"
-            "🔹 Volume 4\n\n"
-            "Specially designed for school students, competitive exams, Olympiads, Banking, JEE, CAT, UPSC, MPSC and more.\n\n"
-            "🎉 Get the Complete Set at 20% DISCOUNT\n"
-            "📦 Courier Charges Extra\n\n"
-            "📞 Contact for Orders:\n"
-            "📱 9503498556\n"
-            "📱 8055579965\n\n"
-            "🏢 Parijat Academy’s E-learning Pvt Ltd\n"
-            "📍 Karve Nagar, Pune\n\n"
-            "👨‍🏫 Author: Vijaay V Kulkarni\n"
-            "Founder & Vedic Maths Coach\n"
-            "🏆 Awarded \"Best Creative Excellence in Maths Coaching\" by CCE Finland\n\n"
-            "🌐 Visit: www.paarijatacademy.in\n\n"
-            "✨ Learn Faster\n"
-            "✨ Calculate Smarter\n"
-            "✨ Become a Mathematician Now!"
-        ),
-        button_text="Buy on Amazon",
-        url=VEDIC_MATHS_BOOKS_AMAZON_URL,
+    return (
+        "🚀 Unlock the Power of Speed Maths with Vedic Mathematics! 📚✨\n\n"
+        "Presenting the complete set of\n"
+        "🔹 Volume 1\n"
+        "🔹 Volume 2\n"
+        "🔹 Volume 3\n"
+        "🔹 Volume 4\n\n"
+        "Specially designed for school students, competitive exams, Olympiads, Banking, JEE, CAT, UPSC, MPSC and more.\n\n"
+        "🎉 Get the Complete Set at 20% DISCOUNT\n"
+        "📦 Courier Charges Extra\n\n"
+        "📞 Contact for Orders:\n"
+        "📱 9503498556\n"
+        "📱 8055579965\n\n"
+        "🏢 Parijat Academy’s E-learning Pvt Ltd\n"
+        "📍 Karve Nagar, Pune\n\n"
+        "👨‍🏫 Author: Vijaay V Kulkarni\n"
+        "Founder & Vedic Maths Coach\n"
+        "🏆 Awarded \"Best Creative Excellence in Maths Coaching\" by CCE Finland\n\n"
+        "🌐 Visit: www.paarijatacademy.in\n\n"
+        "✨ Learn Faster\n"
+        "✨ Calculate Smarter\n"
+        "✨ Become a Mathematician Now!"
     )
 
 
