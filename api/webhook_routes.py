@@ -22,7 +22,7 @@ from services.ig_service import *
 from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButton, InteractiveReplyButtonMessage
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, IG_APP_SECRET
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
@@ -46,26 +46,35 @@ async def forward_webhook_to_dev(body: bytes, headers: dict):
             logger.error(f"Failed to forward webhook to Dev: {e}")
 
 def validate_signature(raw_body: bytes, signature: str) -> bool:
-    # Calculate the hash
-    expected_signature = hmac.new(
-        key=APP_SECRET.encode('utf-8'), 
-        msg=raw_body, 
+    try:
+        payload = json.loads(raw_body)
+        platform = payload.get("object", "")
+    except Exception:
+        return False
+
+    if platform == "instagram":
+        secret = IG_APP_SECRET
+    else:
+        secret = APP_SECRET  # whatsapp + anything else
+
+    expected = hmac.new(
+        key=secret.encode('utf-8'),
+        msg=raw_body,
         digestmod=hashlib.sha256
     ).hexdigest()
-    
-    our_sig = f"sha256={expected_signature}"
-    
-    # If they don't match, log EVERYTHING before failing
+
+    our_sig = f"sha256={expected}"
+
     if not hmac.compare_digest(our_sig, signature):
         logger.error("🚨 SIGNATURE MISMATCH DETECTED 🚨")
-        # Mask the secret so you don't leak the whole thing in logs, but check the length!
-        logger.error(f"1. App Secret Prefix: {APP_SECRET[:4]}*** (Total Length: {len(APP_SECRET)})")
-        logger.error(f"2. Meta's Signature:  {signature}")
-        logger.error(f"3. Our Signature:     {our_sig}")
-        logger.error(f"4. Raw Bytes Length:  {len(raw_body)}")
-        logger.error(f"5. Raw Payload:       {raw_body.decode('utf-8', errors='replace')}")
-        
-    return hmac.compare_digest(our_sig, signature)
+        logger.error(f"1. Platform:          {platform}")
+        logger.error(f"2. Secret Prefix:     {secret[:4]}*** (Length: {len(secret)})")
+        logger.error(f"3. Meta's Signature:  {signature}")
+        logger.error(f"4. Our Signature:     {our_sig}")
+        logger.error(f"5. Raw Bytes Length:  {len(raw_body)}")
+        return False
+
+    return True
 
 # Middleware or decorator to validate signature for POST requests
 async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
