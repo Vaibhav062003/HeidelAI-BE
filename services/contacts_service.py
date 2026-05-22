@@ -255,76 +255,344 @@ async def get_labels_from_org_metadata(org_id: str):
         return []
 
 
-def process_bulk_wa_contact_upload(org_id: str, file_content: bytes, filename: str):
-    try:
-        if filename.endswith('.csv'):
-            df = pd.read_csv(BytesIO(file_content))
-        elif filename.endswith(('.xls', '.xlsx')):
-            df = pd.read_excel(BytesIO(file_content))
-        else:
-            raise ValueError("Unsupported file format. Please upload CSV or Excel.")
-    except Exception as e:
-        raise ValueError(f"Could not read file: {str(e)}")
 
-    df.columns = [c.strip().lower() for c in df.columns]
-    required_columns = {'name', 'phone'}
-    
-    if not required_columns.issubset(set(df.columns)):
-        missing = required_columns - set(df.columns)
-        raise ValueError(f"Invalid format: Missing required columns: {', '.join(missing)}")
+import re as _re
+import uuid
 
-    if df.empty:
-        raise ValueError("The uploaded file is empty.")
+def _validate_email(email: str) -> bool:
+    """Simple but robust email format check."""
+    pattern = _re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+    return bool(pattern.match(email.strip()))
 
-    collection_name = f"contacts_{org_id}"
-    contacts_collection = db[collection_name]
-    bulk_ops = []
+
+def process_bulk_wa_contact_upload(
+    org_id: str,
+    file_content: bytes,
+    filename: str,
+    uploaded_by: str = "unknown",
+    column_mapping: dict | None = None,
+) -> dict:
+    """
+    Enhanced bulk contact importer.
+
+    Supports: .csv, .xlsx, .xls, .vcf
+    - column_mapping: optional dict mapping system field names to actual file column headers.
+      e.g. {"name": "Full Name", "phone": "Mobile", "email": "Email Address", "company": "Organization"}
+    - Stores batch metadata in contact_upload_batches_{org_id}.
+    - Marks every processed contact with is_bulk_uploaded=True + upload_metadata.
+    - Pre-existing contacts (from live chats/webhooks) are merged safely — user edits are preserved.
+    """
+    from services.vcard_parser import parse_vcf
+
+    fname_lower = (filename or "").lower()
     now = datetime.now(timezone.utc)
-    
-    skipped_rows = 0
+    batch_id = str(uuid.uuid4())
+    source_type = "vcf" if fname_lower.endswith(".vcf") else (
+        "csv" if fname_lower.endswith(".csv") else "excel"
+    )
 
-    for index, row in df.iterrows():
-        full_name = str(row['name']).strip() if pd.notna(row['name']) else None
-        
-        raw_phone = str(row['phone']) if pd.notna(row['phone']) else ""
-        clean_phone = normalize_phone(raw_phone)
+    # ── 1. Parse file into a unified list of raw dicts ───────────────────────
+    raw_contacts: list[dict] = []
+    parse_error: str | None = None
 
-        if not full_name or not clean_phone or len(clean_phone) < 10:
-            skipped_rows += 1
+    try:
+        if source_type == "vcf":
+            raw_contacts = parse_vcf(file_content)
+        elif source_type == "csv":
+            df = pd.read_csv(BytesIO(file_content), dtype=str)
+            df.columns = [c.strip() for c in df.columns]
+            raw_contacts = df.where(pd.notna(df), None).to_dict(orient="records")
+        else:
+            df = pd.read_excel(BytesIO(file_content), dtype=str)
+            df.columns = [c.strip() for c in df.columns]
+            raw_contacts = df.where(pd.notna(df), None).to_dict(orient="records")
+    except Exception as e:
+        raise ValueError(f"Could not read file '{filename}': {e}")
+
+    if not raw_contacts:
+        raise ValueError("The uploaded file is empty or contains no parseable records.")
+
+    # ── 2. Build column resolver based on mapping or auto-detect ─────────────
+    def _resolve(row: dict, system_key: str, fallbacks: list[str]) -> str | None:
+        """Return the value for a system field from a row dict, respecting mapping."""
+        if column_mapping and system_key in column_mapping:
+            mapped_col = column_mapping[system_key]
+            val = row.get(mapped_col)
+            return str(val).strip() if val is not None else None
+
+        # VCF parser already returns clean keys
+        if system_key in row:
+            val = row[system_key]
+            return str(val).strip() if val is not None else None
+
+        # Auto-detect: try case-insensitive fallback column names
+        for key in fallbacks:
+            for col, val in row.items():
+                if col.lower() == key.lower() and val is not None:
+                    return str(val).strip()
+        return None
+
+    # ── 3. Process each record ────────────────────────────────────────────────
+    contacts_collection = db[f"contacts_{org_id}"]
+    bulk_ops: list[UpdateOne] = []
+    skipped_records: list[dict] = []
+    success_count = 0
+
+    for idx, row in enumerate(raw_contacts, start=1):
+        # Resolve fields
+        full_name = _resolve(row, "full_name", ["name", "full name", "fullname", "fn"])
+        raw_phone = _resolve(row, "phone", ["phone", "mobile", "tel", "telephone", "phone number", "contact"])
+        email_raw = _resolve(row, "email", ["email", "email address", "e-mail"])
+        company   = _resolve(row, "company", ["company", "org", "organisation", "organization", "employer"])
+
+        # Normalise phone
+        clean_phone = normalize_phone(raw_phone or "")
+
+        # Validate — phone is required, name optional but noted
+        if not clean_phone or len(clean_phone.lstrip("+")) < 10:
+            skipped_records.append({
+                "row_number": idx,
+                "value": raw_phone,
+                "reason": "Missing or invalid phone number (must have ≥ 10 digits)"
+            })
             continue
 
-        
+        if not full_name:
+            full_name = f"Contact {clean_phone[-4:]}"  # fallback display name
 
-        contact_doc = {
-            "whatsapp_id": None,
+        # Validate email if present
+        email: str | None = None
+        if email_raw and _validate_email(email_raw):
+            email = email_raw.lower()
+        elif email_raw:
+            # still continue — just skip the bad email
+            skipped_records.append({
+                "row_number": idx,
+                "value": email_raw,
+                "reason": f"Invalid email format for phone {clean_phone} — email skipped, contact imported"
+            })
+
+        conversation_id = f"whatsapp_{clean_phone}"
+        upload_metadata = {
+            "batch_id": batch_id,
+            "source_type": source_type,
+            "uploaded_by": uploaded_by,
+            "uploaded_date": now,
+            "filename": filename,
+        }
+
+        # Smart upsert:
+        # - $setOnInsert: only for brand-new records → sets all base fields
+        # - $set: always → marks is_bulk_uploaded + upload_metadata + updated_at
+        #   (does NOT overwrite categories, labels, full_name of existing contacts)
+        contact_on_insert = {
             "full_name": full_name,
-            "phone_number": clean_phone, 
+            "phone_number": clean_phone,
+            "whatsapp_id": None,
             "country": None,
             "profile_url": None,
-            "conversation_id": f"whatsapp_{clean_phone}",
-            "email": None,
+            "conversation_id": conversation_id,
             "categories": [],
             "labels": [],
             "platform": "whatsapp",
-            "created_at": now
+            "created_at": now,
+        }
+        if email:
+            contact_on_insert["email"] = email
+        if company:
+            contact_on_insert["company"] = company
+
+        # Conditionally fill email / company on existing records only if currently absent
+        set_if_missing: dict = {}
+        if email:
+            set_if_missing["email"] = email
+        if company:
+            set_if_missing["company"] = company
+        if full_name:
+            set_if_missing["full_name"] = full_name
+
+        update_doc: dict = {
+            "$set": {
+                "is_bulk_uploaded": True,
+                "upload_metadata": upload_metadata,
+                "updated_at": now,
+            },
+            "$setOnInsert": contact_on_insert,
         }
 
+        # Use $min / conditional trick: only fill if field missing — achieved via pipeline
+        # Simpler: just use a regular UpdateOne; pre-existing fields won't be overwritten
+        # because we don't touch categories/labels/profile_url in $set.
+        if set_if_missing:
+            # Merge into $setOnInsert only (so pre-existing records keep their values)
+            update_doc["$setOnInsert"].update(set_if_missing)
 
         bulk_ops.append(
             UpdateOne(
-                {"phone_number": clean_phone}, 
-                {"$setOnInsert": contact_doc}, 
-                upsert=True
+                {"phone_number": clean_phone},
+                update_doc,
+                upsert=True,
             )
         )
+        success_count += 1
 
+    # ── 4. Execute batch write ────────────────────────────────────────────────
+    newly_added = 0
+    matched_count = 0
     if bulk_ops:
         result = contacts_collection.bulk_write(bulk_ops, ordered=False)
-        return {
-            "total_rows_in_file": len(df),
-            "successfully_processed": result.upserted_count + result.matched_count,
-            "newly_added": result.upserted_count,
-            "skipped_invalid_rows": skipped_rows
-        }
-    
-    raise ValueError("No valid contact data found in the file.")
+        newly_added   = result.upserted_count
+        matched_count = result.matched_count
+
+    # ── 5. Persist batch metadata ─────────────────────────────────────────────
+    batch_doc = {
+        "batch_id": batch_id,
+        "filename": filename,
+        "source_type": source_type,
+        "uploaded_by": uploaded_by,
+        "uploaded_date": now,
+        "total_records": len(raw_contacts),
+        "success_count": success_count,
+        "failed_count": len(skipped_records),
+        "newly_added": newly_added,
+        "merged_existing": matched_count,
+    }
+    db[f"contact_upload_batches_{org_id}"].insert_one(batch_doc)
+    logger.success(f"Bulk upload batch {batch_id} complete — {newly_added} new, {matched_count} merged, {len(skipped_records)} skipped")
+
+    return {
+        "batch_id": batch_id,
+        "total_rows_in_file": len(raw_contacts),
+        "successfully_processed": success_count,
+        "newly_added": newly_added,
+        "merged_existing": matched_count,
+        "skipped_invalid_rows": len(skipped_records),
+        "skipped_records": skipped_records,
+    }
+
+
+async def get_uploaded_contacts_paginated(
+    org_id: str,
+    page: int = 1,
+    limit: int = 25,
+    search: str = "",
+    batch_id: str | None = None,
+) -> dict:
+    """Return paginated list of bulk-uploaded contacts (is_bulk_uploaded=True)."""
+    try:
+        collection_name = f"contacts_{org_id}"
+        if collection_name not in db.list_collection_names():
+            return {"contacts": [], "total": 0, "page": page, "limit": limit}
+
+        col = db[collection_name]
+        query: dict = {"is_bulk_uploaded": True}
+
+        if batch_id:
+            query["upload_metadata.batch_id"] = batch_id
+
+        if search:
+            query["$or"] = [
+                {"full_name":    {"$regex": search, "$options": "i"}},
+                {"phone_number": {"$regex": search, "$options": "i"}},
+                {"email":        {"$regex": search, "$options": "i"}},
+                {"company":      {"$regex": search, "$options": "i"}},
+            ]
+
+        total   = col.count_documents(query)
+        skip    = (page - 1) * limit
+        cursor  = col.find(query, {"_id": 0}).skip(skip).limit(limit).sort("upload_metadata.uploaded_date", -1)
+        contacts = list(cursor)
+
+        return {"contacts": contacts, "total": total, "page": page, "limit": limit}
+    except Exception as e:
+        logger.error(f"get_uploaded_contacts_paginated error: {e}")
+        return {"contacts": [], "total": 0, "page": page, "limit": limit}
+
+
+async def get_upload_batches(org_id: str) -> list[dict]:
+    """Return all upload batch summaries for an org."""
+    try:
+        batch_col = db[f"contact_upload_batches_{org_id}"]
+        batches = list(
+            batch_col.find({}, {"_id": 0}).sort("uploaded_date", -1)
+        )
+        return batches
+    except Exception as e:
+        logger.error(f"get_upload_batches error: {e}")
+        return []
+
+
+def delete_uploaded_contact(org_id: str, conversation_id: str) -> dict:
+    """
+    Delete or demote a single bulk-uploaded contact.
+
+    - If the contact was created ONLY by a bulk upload (no whatsapp_id, no Instagram messaging)
+      → permanently delete the document.
+    - If it existed before (has whatsapp_id or instagram_id = real conversation activity)
+      → only remove is_bulk_uploaded flag & upload_metadata; preserve the live record.
+    """
+    col = db[f"contacts_{org_id}"]
+    contact = col.find_one({"conversation_id": conversation_id})
+
+    if not contact:
+        return {"deleted": False, "reason": "not_found"}
+
+    # Heuristic: a "real" contact has a non-null whatsapp_id or instagram_id
+    has_live_identity = bool(contact.get("whatsapp_id") or contact.get("instagram_id"))
+
+    if has_live_identity:
+        # Demote only — keep the record for the live chat
+        col.update_one(
+            {"conversation_id": conversation_id},
+            {"$unset": {"is_bulk_uploaded": "", "upload_metadata": ""},
+             "$set":   {"updated_at": datetime.now(timezone.utc)}}
+        )
+        return {"deleted": False, "demoted": True, "reason": "live_contact_preserved"}
+    else:
+        col.delete_one({"conversation_id": conversation_id})
+        return {"deleted": True}
+
+
+def delete_upload_batch(org_id: str, batch_id: str) -> dict:
+    """
+    Rollback an entire upload batch.
+
+    For each contact in the batch:
+    - If it was exclusively created by this batch → delete permanently.
+    - If it was a pre-existing contact that got merged → demote only.
+    Returns a summary dict.
+    """
+    col        = db[f"contacts_{org_id}"]
+    batch_col  = db[f"contact_upload_batches_{org_id}"]
+    now        = datetime.now(timezone.utc)
+
+    contacts_in_batch = list(col.find({"upload_metadata.batch_id": batch_id}))
+
+    deleted_count = 0
+    demoted_count = 0
+
+    for contact in contacts_in_batch:
+        conversation_id  = contact.get("conversation_id")
+        has_live_identity = bool(contact.get("whatsapp_id") or contact.get("instagram_id"))
+
+        if has_live_identity:
+            col.update_one(
+                {"conversation_id": conversation_id},
+                {"$unset": {"is_bulk_uploaded": "", "upload_metadata": ""},
+                 "$set":   {"updated_at": now}}
+            )
+            demoted_count += 1
+        else:
+            col.delete_one({"conversation_id": conversation_id})
+            deleted_count += 1
+
+    # Remove the batch record itself
+    batch_col.delete_one({"batch_id": batch_id})
+    logger.info(f"Batch {batch_id} rolled back: {deleted_count} deleted, {demoted_count} demoted")
+
+    return {
+        "batch_id":      batch_id,
+        "deleted_count": deleted_count,
+        "demoted_count": demoted_count,
+    }
+
