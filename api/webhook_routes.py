@@ -22,7 +22,7 @@ from services.ig_service import *
 from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButton, InteractiveReplyButtonMessage
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, IG_APP_SECRET
+from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, INSTAGRAM_APP_SECRET
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
@@ -53,7 +53,7 @@ def validate_signature(raw_body: bytes, signature: str) -> bool:
         return False
 
     if platform == "instagram":
-        secret = IG_APP_SECRET
+        secret = INSTAGRAM_APP_SECRET
     else:
         secret = APP_SECRET  # whatsapp + anything else
 
