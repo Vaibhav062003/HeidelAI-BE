@@ -40,6 +40,7 @@ class Services:
         self.whatsapp_clients = defaultdict(set) # For WhatsApp event broadcasting -> { wa_id: { client_id1, client_id2 } }
         self.client_metadata = {}  # Reverse mapping (for cleanup) -> { client_id: { "ig_id": "...", "wa_id": "..." } }
         self.agent_clients = defaultdict(set) # Track agents by Clerk User ID -> { user_id: { client_id1, client_id2 } }
+        self.org_clients = defaultdict(set)   # Track agents by Org ID -> { org_id: { client_id1, client_id2 } }
 
         # === Agents ===
         self.prompt_cache = {}

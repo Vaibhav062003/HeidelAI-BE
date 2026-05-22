@@ -254,6 +254,68 @@ async def get_labels_from_org_metadata(org_id: str):
     else:
         return []
 
+async def get_unread_counts_by_labels(org_id: str):
+    """
+    Get labels from org metadata and calculate unread conversation count for each label.
+    Returns a dictionary: { "label_name": unread_count, ... }
+    """
+    try:
+        # 1. Get all labels defined for this org
+        all_labels = await get_labels_from_org_metadata(org_id)
+        
+        # Initialize results with 0 for all known labels
+        result_map = {label: 0 for label in all_labels}
+        
+        # 2. Aggregate unread counts from conversations joined with contacts
+        # We count conversations where unread_count > 0
+        from database import get_async_mongo_db
+        async_db = get_async_mongo_db()
+        
+        conv_col = async_db[f"conversations_{org_id}"]
+        
+        pipeline = [
+            # Only conversations with unread messages
+            {"$match": {"unread_count": {"$gt": 0}}},
+            # Join with contacts to get labels
+            {
+                "$lookup": {
+                    "from": f"contacts_{org_id}",
+                    "localField": "conversation_id",
+                    "foreignField": "conversation_id",
+                    "as": "contact"
+                }
+            },
+            # Only keep those that have a corresponding contact
+            {"$match": {"contact": {"$ne": []}}},
+            # Unwind the contact array
+            {"$unwind": "$contact"},
+            # Unwind the labels array within the contact
+            {"$unwind": "$contact.labels"},
+            # Group by label and count conversations
+            {
+                "$group": {
+                    "_id": "$contact.labels",
+                    "unread_count": {"$sum": 1}
+                }
+            }
+        ]
+        
+        cursor = conv_col.aggregate(pipeline)
+        async for doc in cursor:
+            label_name = doc["_id"]
+            count = doc["unread_count"]
+            # Strictly only include labels that exist in org metadata
+            if label_name in result_map:
+                result_map[label_name] = count
+                
+        return result_map
+
+
+    except Exception as e:
+        logger.error(f"Error in get_unread_counts_by_labels for {org_id}: {e}")
+        return {}
+
+
 
 
 import re as _re

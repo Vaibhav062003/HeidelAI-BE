@@ -19,6 +19,7 @@ from services.websocket_service import broadcast_team_message
 from database import get_mongo_db, get_async_mongo_db
 
 from loguru import logger
+from dateutil import parser
 
 
 db = get_mongo_db()
@@ -51,20 +52,11 @@ async def fetch_conversations_new(
         "_id": 0,
     }
 
-    # Filtering logic for Team Chat
-    # 1. Customer conversations: type != "team"
-    # 2. Team conversations: type == "team" AND current_user_id in participants
-    # TODO: seperate out the team and non-team conversations filtering don't add both in one call
+    # Only customer conversations — team conversations are in their own
+    # dedicated collection (team_conversations_{org_id}) and fetched
+    # via GET /api/team/conversations
     base_conditions = [
-        {
-            "$or": [
-                {"type": {"$ne": "team"}},
-                {
-                    "type": "team",
-                    "participants": current_user_id
-                }
-            ]
-        }
+        {"type": {"$ne": "team"}}
     ]
 
     # Labels filter
@@ -141,65 +133,33 @@ async def fetch_conversations_new(
         conv_type = doc.get("type")
         platform = doc.get("platform")
         
-        if conv_type == "team":
-            # For Team chats, use participants but check online status
-            participants = doc.get("participants", [])
-            other_participants = [p for p in participants if p != current_user_id]
-            
-            # logic for "is_online": if ANY other participant is online
-            is_online = False
-            if other_participants:
-                for p_id in other_participants:
-                    if p_id in services.agent_clients and services.agent_clients[p_id]:
-                        is_online = True
-                        break
-            
-            unread_map = doc.get("unread", {})
-            user_unread = unread_map.get(current_user_id, 0) if current_user_id else 0
-            
-            conv_obj = {
-                "id": doc.get("conversation_id"),
-                "customer_name": doc.get("customer_name") or doc.get("conversation_id"),
-                "last_message": doc.get("last_message", ""),
-                "timestamp": (
-                    doc["last_message_timestamp"].isoformat()
-                    if isinstance(doc.get("last_message_timestamp"), datetime)
-                    else None
-                ),
-                "unread_count": user_unread,
-                "platform": platform or "internal",
-                "type": "team",
-                "participants": participants,
-                "is_online": is_online
-            }
-        else:
-            conv_obj = {
-                "id": doc.get("conversation_id"),
-                "platform": platform,
-                "type": conv_type,
-                "customer_id": doc.get("customer_username"),
-                "phone_number": doc.get("customer_id") if platform == "whatsapp" else None,
-                "customer_name": doc.get("customer_name") or "Unknown",
-                "last_message": doc.get("last_message") or "",
-                "last_message_is_private_note": doc.get("last_message_is_private_note", False),
-                "timestamp": (
-                    doc["last_message_timestamp"].isoformat()
-                    if isinstance(doc.get("last_message_timestamp"), datetime)
-                    else None
-                ),
-                "unread_count": doc.get("unread_count", 0),
-                "status": doc.get("status"),
-                "priority": doc.get("priority"),
-                "sentiment": doc.get("sentiment"),
-                "assigned_agent": doc.get("assigned_agent", {}),
-                "is_ai_enabled": doc.get("is_ai_enabled"),
-                "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
-                "assignment_history": doc.get("assignment_history", []),
-                "suggestions": doc.get("suggestions", []),
-                "summary": doc.get("summary", []),
-                "participants": doc.get("participants", []),
-                "unread": doc.get("unread", {})
-            }
+        conv_obj = {
+            "id": doc.get("conversation_id"),
+            "platform": platform,
+            "type": conv_type,
+            "customer_id": doc.get("customer_username"),
+            "phone_number": doc.get("customer_id") if platform == "whatsapp" else None,
+            "customer_name": doc.get("customer_name") or "Unknown",
+            "last_message": doc.get("last_message") or "",
+            "last_message_is_private_note": doc.get("last_message_is_private_note", False),
+            "timestamp": (
+                doc["last_message_timestamp"].isoformat()
+                if isinstance(doc.get("last_message_timestamp"), datetime)
+                else None
+            ),
+            "unread_count": doc.get("unread_count", 0),
+            "status": doc.get("status"),
+            "priority": doc.get("priority"),
+            "sentiment": doc.get("sentiment"),
+            "assigned_agent": doc.get("assigned_agent", {}),
+            "is_ai_enabled": doc.get("is_ai_enabled"),
+            "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
+            "assignment_history": doc.get("assignment_history", []),
+            "suggestions": doc.get("suggestions", []),
+            "summary": doc.get("summary", []),
+            "participants": doc.get("participants", []),
+            "unread": doc.get("unread", {})
+        }
             
         result.append(conv_obj)
 
@@ -308,24 +268,13 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
              )
              assigned_convo = current_convo
 
-        # Reset unread count
-        if assigned_convo and assigned_convo.get("type") == "team":
+        # For team conversations, unread is tracked per user (unread.{agent_id}),
+        # so we avoid resetting the aggregate unread_count here to prevent
+        # inconsistent unread state.
+        if not assigned_convo or assigned_convo.get("type") != "team":
             convo_collection.update_one(
                 {"conversation_id": conversation_id},
-                {
-                    "$set": {
-                        f"unread.{agent_id}": 0
-                    }
-                }
-            )
-        else:
-            convo_collection.update_one(
-                {"conversation_id": conversation_id},
-                {
-                    "$set": {
-                        "unread_count": 0
-                    }
-                }
+                {"$set": {"unread_count": 0}}
             )
 
         messages = []
@@ -583,7 +532,7 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, user_full_name: Optional[str] = None, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
@@ -624,11 +573,19 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 else:
                     raise ValueError("Not a template")
             except (json.JSONDecodeError, ValueError, TypeError):
-                res = await send_whatsapp_message({
-                    "conversation_id": conversation_id,
-                    "content": content,
-                    "sender_id": wa_id,
-                }, org_id, mode, temp_id, context_type, context)
+                res = await send_whatsapp_message(
+                    {
+                        "conversation_id": conversation_id,
+                        "content": content,
+                        "sender_id": wa_id,
+                    }, 
+                    org_id=org_id, 
+                    mode=mode, 
+                    temp_id=temp_id, 
+                    context_type=context_type, 
+                    context=context, 
+                    user_full_name=user_full_name
+                )
         return res
     
     elif platform == "instagram":
@@ -665,8 +622,20 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             sorted_ids = sorted(participants)
             conversation_id = f"team_{sorted_ids[0]}_{sorted_ids[1]}"
         
-        now = datetime.now(timezone.utc)
-        convo_collection = db[f"conversations_{org_id}"]
+        if timestamp:
+            try:
+                now = parser.parse(timestamp)
+                if now.tzinfo is None:
+                    now = now.replace(tzinfo=timezone.utc)
+                else:
+                    now = now.astimezone(timezone.utc)
+            except Exception:
+                now = datetime.now(timezone.utc)
+        else:
+            now = datetime.now(timezone.utc)
+
+        # Team conversations and messages live in their own dedicated collections
+        convo_collection = db[f"team_conversations_{org_id}"]
         
         convo = convo_collection.find_one({"conversation_id": conversation_id})
         
@@ -717,7 +686,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                     }
                 )
         
-        messages_collection = db[f"messages_{org_id}"]
+        messages_collection = db[f"team_messages_{org_id}"]
         sender_id = context.get("sender_id") if context else None
         sender_name = context.get("sender_name") if context else None
         
@@ -725,6 +694,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         msg_doc = {
             "id": msg_id,
             "message_id": msg_id,
+            "temp_id": temp_id,
             "conversation_id": conversation_id,
             "platform": "internal",
             "type": "text",
@@ -761,9 +731,10 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             update_query
         )
 
-        broadcast_payload = {k: v for k, v in msg_doc.items() if k != "_id"}
+        from services.utils import serialize_mongo
+        broadcast_payload = serialize_mongo(msg_doc)
         await broadcast_team_message(org_id, conversation_id, participants, broadcast_payload)
         
-        return {"status": "sent", "conversation_id": conversation_id}
+        return {"status": "sent", "conversation_id": conversation_id, "message_id": msg_id}
     else:
         raise HTTPException(status_code=400, detail="Unsupported platform")

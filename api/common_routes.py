@@ -32,6 +32,7 @@ from services.contacts_service import (
     remove_label_from_org_metadata,
     get_tags_from_org_metadata,
     get_labels_from_org_metadata,
+    get_unread_counts_by_labels,
     process_bulk_wa_contact_upload,
     get_uploaded_contacts_paginated,
     get_upload_batches,
@@ -149,6 +150,7 @@ async def send_message_endpoint(
     platform: str = Form(...),
     mode: str = Form(...),
     temp_id: Optional[str] = Form(None), 
+    timestamp: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     context_type: Optional[str] = Form(None),
     context: Optional[str] = Form(None)
@@ -158,6 +160,7 @@ async def send_message_endpoint(
     The body should contain the necessary fields for sending the message.
     """
     org_id = user.org_id
+    user_full_name = user.full_name or "You"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
@@ -174,10 +177,12 @@ async def send_message_endpoint(
         conversation_id, 
         content if content else None, 
         mode,
+        user_full_name,
         file if file else None, 
         temp_id if temp_id else None,
         context_type if context_type else None,
-        context_dict
+        context_dict,
+        timestamp=timestamp
     )
 
     return {"message": "Message sent", "details": res}
@@ -457,6 +462,15 @@ async def get_labels(user: CurrentUser):
     result = await get_labels_from_org_metadata(user.org_id)
 
     return {"labels": result}
+
+@router.get("/api/org/metadata/labels-unread")
+async def get_labels_unread(user: CurrentUser):
+    """Get labels for the organization with unread counts."""
+
+    result = await get_unread_counts_by_labels(user.org_id)
+
+    return {"labels": result}
+
 
 
 @router.get("/api/agents-on-conversation")

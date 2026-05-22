@@ -27,10 +27,27 @@ else:
 ENV = os.getenv("ENV", "prod")
 logger.success(f"Running in {ENV} environment.")
 
+if ENV == "prod":
+    alowed_origins = [
+        "https://www.heidelai.com", 
+        "https://heidelai.com",
+    ]
+else:
+    alowed_origins = [
+        "https://www.heidelai.com", 
+        "https://heidelai.com",
+        "https://www.development.heidelai.com", 
+        "https://development.heidelai.com",
+        "https://www.testing.heidelai.com", 
+        "https://testing.heidelai.com",
+        "http://localhost", 
+        "http://localhost:3000", 
+    ]
+
 app = FastAPI(
     lifespan=lifespan, 
     redoc_url="/redoc" if ENV != "prod" else None,
-    # docs_url="/docs" if ENV != "prod" else None,
+    docs_url="/docs" if ENV != "prod" else None,
     title="HeidelAI Backend API",
     )
 
@@ -52,17 +69,7 @@ app.include_router(router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://www.heidelai.com", 
-        "https://heidelai.com",
-        "https://www.deveopment.heidelai.com", 
-        "https://development.heidelai.com",
-        "https://www.testing.heidelai.com", 
-        "https://testing.heidelai.com",
-        "http://localhost", 
-        "http://localhost:3000", 
-        # Add www subdomain
-    ],
+    allow_origins=alowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

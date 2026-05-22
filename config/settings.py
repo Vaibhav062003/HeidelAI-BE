@@ -7,6 +7,7 @@ load_dotenv()
 IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
 IG_ID = os.getenv("IG_ID")
 IG_VERSION = os.getenv("IG_VERSION")
+WA_VERSION = os.getenv("WA_VERSION")
 BUSINESS_ID = os.getenv("BUSINESS_ID")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -80,6 +81,7 @@ ENVIRONMENT = os.getenv("ENVIRONMENT")
 
 HEIDELAI_ORG_WA_ID = os.getenv("HEIDELAI_ORG_WA_ID")
 PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
+LEE_DEALER_ORG_WA_ID = os.getenv("LEE_DEALER_ORG_WA_ID")
 X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making & validating API calls between different koyeb instances
 
 # Google OAuth 
@@ -107,3 +109,6 @@ LEE_DEALER_ORG_WA_ID=os.getenv("LEE_DEALER_ORG_WA_ID")
 
 KARAN_ORG_ID=os.getenv("KARAN_ORG_ID")
 KARAN_ORG_WA_ID=os.getenv("KARAN_ORG_WA_ID")
+
+TECHNET_ORG_ID=os.getenv("TECHNET_ORG_ID")
+TECHNET_ORG_WA_ID=os.getenv("TECHNET_ORG_WA_ID")
