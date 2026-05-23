@@ -171,6 +171,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         background_tasks.add_task(forward_webhook_to_dev2, body=body, headers=forward_headers, url=DEV_WHATSAPP_WEBHOOK_URL)
 
     elif object_type == "instagram" and account_id == ALLOWED_INSTAGRAM_ID:
+        is_echo = payload["entry"][0]["messaging"][0].get("message", {}).get("is_echo", False)
+        if is_echo:
+            logger.info(f"Instagram webhook received echo message for account {account_id}. Skipping forwarding.")
+            return {"status": "ok"}
         logger.info(f"Instagram webhook matched allowed account {account_id}. Forwarding.")
         forward_headers = {
             key: value
