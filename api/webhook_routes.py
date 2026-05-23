@@ -175,6 +175,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         if is_echo:
             logger.info(f"Instagram webhook received echo message for account {account_id}. Skipping forwarding.")
             return {"status": "ok"}
+        is_read_event = payload["entry"][0]["messaging"][0].get("read", False)
+        if is_read_event:
+            logger.info(f"Instagram webhook received read event for account {account_id}. Skipping forwarding.")
+            return {"status": "ok"}
         logger.info(f"Instagram webhook matched allowed account {account_id}. Forwarding.")
         forward_headers = {
             key: value
