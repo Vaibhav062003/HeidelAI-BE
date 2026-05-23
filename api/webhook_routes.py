@@ -46,18 +46,26 @@ async def forward_webhook_to_dev(body: bytes, headers: dict):
             logger.error(f"Failed to forward webhook to Dev: {e}")
 
 async def forward_webhook_to_dev2(body: bytes, headers: dict, url: str):
-    """
-    Forwards the raw webhook body and necessary headers to the dev environment.
-    """
     async with httpx.AsyncClient() as client:
         try:
-            # We use `content=body` to send the exact raw bytes, 
-            # preserving the integrity of the payload for signature validation.
             response = await client.post(url, content=body, headers=headers)
             response.raise_for_status()
             logger.info(f"Successfully replicated webhook to Dev2. Status: {response.status_code}")
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Failed to forward webhook to Dev2: HTTP {e.response.status_code} "
+                f"| URL: {url} "
+                f"| Response body: {e.response.text}"
+            )
+        except httpx.RequestError as e:
+            logger.error(
+                f"Failed to forward webhook to Dev2: Request error "
+                f"| Type: {type(e).__name__} "
+                f"| Detail: {repr(e)} "
+                f"| URL: {url}"
+            )
         except Exception as e:
-            logger.error(f"Failed to forward webhook to Dev2: {e}")
+            logger.error(f"Failed to forward webhook to Dev2: Unexpected error | {type(e).__name__}: {repr(e)}")
 
 def validate_signature(raw_body: bytes, signature: str) -> bool:
     try:
