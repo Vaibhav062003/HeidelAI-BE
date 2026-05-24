@@ -4,7 +4,7 @@ import asyncio
 import httpx
 import requests
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Third-party modules
 import cloudinary
@@ -39,6 +39,7 @@ from config.settings import (
     CLOUDINARY_API_SECRET
 )
 from loguru import logger
+from services.websocket_service import broadcast_main_ws
 
 
 cloudinary.config(
@@ -703,17 +704,26 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
+        auto_ai_disabled = body.get("auto_disabled")  # Optional field to indicate if this toggle is from an auto-trigger
         
         if ai_enabled is None:
             return {"status": "error", "message": "Incorrect request body"}
         
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
-        
+        messages_collection = db[f"messages_{org_id}"]
+
+        update_fields = {
+            "is_ai_enabled": ai_enabled
+        }
+
+        if auto_ai_disabled is not None:
+            update_fields["auto_ai_disabled"] = auto_ai_disabled
+
         # Update the conversation
         result = conversations_collection.update_one(
             {"conversation_id": conversation_id},
-            {"$set": {"is_ai_enabled": ai_enabled}}
+            {"$set": update_fields}
         )
         
         if result.matched_count == 0:
@@ -721,8 +731,79 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         
         # Get updated conversation for broadcasting
         updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+
+        # Determine if we should add a system message
+        should_add_system_msg = False
+        system_content = ""
+        sender_id = "system"
+        sender_name = "System"
+
+        # Only add system messages and broadcast if the state ACTUALLY changed
+        if result.modified_count > 0:
+            if ai_enabled == False and auto_ai_disabled == True:
+                should_add_system_msg = True
+                system_content = "Ai is disabled for this conversation, you can re-enable it anytime by clicking on the enable AI button manually"
+                sender_id = "system_auto"
+                sender_name = "System (Auto)"
+            elif ai_enabled == True:
+                should_add_system_msg = True
+                system_content = "Ai is enabled for this conversation"
+                sender_id = "system"
+                sender_name = "System"
+
+            if should_add_system_msg:
+                msg_id = str(uuid.uuid4())
+                msg_doc = {
+                    "id": msg_id,
+                    "message_id": msg_id,
+                    "temp_id": None,
+                    "conversation_id": conversation_id,
+                    "platform": "internal",
+                    "type": "system_message",
+                    "content": system_content,
+                    "sender_id": sender_id,
+                    "sender_name": sender_name,
+                    "role": "agent",
+                    "timestamp": datetime.now(timezone.utc),
+                    "status": "sent"
+                }
+
+                messages_collection.insert_one(msg_doc)
+
+                broadcast_msg = {
+                    "id": msg_doc["id"],
+                    "platform": "whatsapp",
+                    "conversation_id": msg_doc["conversation_id"],
+                    "content": msg_doc["content"],
+                    "sender_id": msg_doc["sender_id"],
+                    "role": msg_doc["role"],
+                    "timestamp": msg_doc["timestamp"].isoformat(),
+                    "status": msg_doc["status"],
+                    "sender_name": msg_doc["sender_name"],
+                    "type": msg_doc["type"],
+                    "temp_id": None,
+                    "payload": None,
+                    "mode": None,
+                    "context_type": None,
+                    "context": None
+                }
+
+                # Broadcast to main websocket manager
+                await broadcast_main_ws(
+                    platform_id=wa_id,
+                    platform_type="whatsapp",
+                    event_type="new_message",
+                    payload={"message": broadcast_msg}
+                )
+
+                # Broadcast to WhatsApp-specific legacy connections
+                if wa_id in services.whatsapp_connections_map:
+                    logger.info(f"Broadcasting system message for AI status change to WhatsApp connections of wa_id: {wa_id}")
+                    await broadcast_whatsapp_message(wa_id, "new_message", {
+                        "message": broadcast_msg
+                    })
         
-        if updated_conversation:
+        if updated_conversation and result.modified_count > 0:
             # Format for broadcasting
             broadcast_conversation = dict(updated_conversation)
             if "last_message_timestamp" in broadcast_conversation:
@@ -730,6 +811,15 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
             if "_id" in broadcast_conversation:
                 broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
             
+            # Broadcast to main websocket manager
+            
+            await broadcast_main_ws(
+                platform_id=wa_id,
+                platform_type="whatsapp",
+                event_type="conversation_updated",
+                payload={"conversation": broadcast_conversation}
+            )
+
             # Broadcast to WhatsApp-specific connections
             if wa_id in services.whatsapp_connections_map:
                 await broadcast_whatsapp_message(wa_id, "conversation_updated", {
