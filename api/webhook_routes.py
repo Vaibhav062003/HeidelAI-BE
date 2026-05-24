@@ -11,7 +11,7 @@ import httpx
 # Internal Modules 
 from core.managers import manager
 from services.automation_service import execute_whatsapp_flow
-from services.pma_chatbot import get_step_three_ai_message, get_step_three_vedic_ai_message, process_onboarding_if_needed, send_to_pma_chatbot
+from services.pma_chatbot import get_vedic_maths_books_message, process_onboarding_if_needed, send_to_pma_chatbot
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
@@ -799,40 +799,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         return {"status": "ok"}
                                 
                                 if is_pma_wa and ai_enabled and is_production:
-                                    step_two_content = convo_doc.get("step_two_content", "vedic_ai_intro") if convo_doc else "vedic_ai_intro"
                                     if selection_id:
                                         match selection_id:
-                                            case "step_two_yes":
-                                                if step_two_content == "vedic_ai_intro":
-                                                    await send_interactive_whatsapp_message(
-                                                        org_id=org_id,
-                                                        conversation_id=conversation_id,
-                                                        sender_id=whatsapp_business_id,
-                                                        interactive_message=get_step_three_vedic_ai_message()
-                                                    )
-                                                    return {"status": "ok"}
-                                                else:
-                                                    await send_interactive_whatsapp_message(
-                                                        org_id=org_id,
-                                                        conversation_id=conversation_id,
-                                                        sender_id=whatsapp_business_id,
-                                                        interactive_message=get_step_three_ai_message()
-                                                    )
-                                                    return {"status": "ok"}
-
                                             case "india" | "abroad":
                                                 flow_response = await process_onboarding_if_needed(user_input=selection_id, conversation_id=conversation_id, org_id=org_id, stage="awaiting_location", whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
-                                                if flow_response:
-                                                    await send_interactive_whatsapp_message(
-                                                        org_id=org_id,
-                                                        conversation_id=conversation_id,
-                                                        sender_id=whatsapp_business_id,
-                                                        interactive_message=flow_response
-                                                    )
-                                                    return {"status": "ok"}
-
-                                            case "vedic_maths_intro" | "ai_intro" | "vedic_ai_intro":
-                                                flow_response = await process_onboarding_if_needed(user_input=selection_id, conversation_id=conversation_id, org_id=org_id, stage="awaiting_introduction", whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                                 if flow_response:
                                                     await send_interactive_whatsapp_message(
                                                         org_id=org_id,
@@ -946,6 +916,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                                 return {"status": "ok"}                                
 
+                                            case "vedic_maths_books":
+                                                await send_whatsapp_message(
+                                                    org_id=org_id,
+                                                    mode="reply",
+                                                    message={
+                                                        "sender_id": whatsapp_business_id,
+                                                        "conversation_id": conversation_id,
+                                                        "content": get_vedic_maths_books_message()
+                                                    }
+                                                )
+
+                                                return {"status": "ok"}
+
                                             case "vedic_maths_teacher":
                                                 # Send info about Teacher Training
                                                 await send_whatsapp_message(
@@ -990,27 +973,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                                 return {"status": "ok"}
 
-                                            case "vedic_maths_summer_camp":
-                                                await send_interactive_whatsapp_message(
-                                                    org_id=org_id,
-                                                    conversation_id=conversation_id,
-                                                    sender_id=whatsapp_business_id,
-                                                    interactive_message=InteractiveUrlButtonMessage(
-                                                        type="cta_url",
-                                                        header={
-                                                            "type": "image",
-                                                            "image": {
-                                                                "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1773070610/WhatsApp_Image_2026-03-09_at_3.02.13_PM_tcdpby.jpg"
-                                                            }
-                                                        },
-                                                        body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n🕰️ Eve 4 to 5.30 PM\n\n⚡ Limited Seats Available – Book Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 8055579965\n\n✨ Let’s Make Maths Your Child’s Best Friend!",
-                                                        button_text="Register Now",
-                                                        url="https://forms.gle/hPMw7inpe7H1E4gF9"
-                                                    )
-                                                )
-
-                                                return {"status": "ok"}
-                                            
                                             # --- Fallback for unknown IDs ---
                                             case _:
                                                 chatbot_response = await send_to_pma_chatbot(
