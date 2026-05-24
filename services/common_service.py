@@ -337,7 +337,6 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
                 "$set": {
                     "status": "closed",
                     "closed_at": now,
-                    "last_message_timestamp": now,
                     "assigned_agent": None,
                     "closure_reason": reason
                 }

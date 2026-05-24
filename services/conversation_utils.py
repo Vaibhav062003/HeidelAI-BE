@@ -27,7 +27,6 @@ async def reopen_conversation(org_id: str, conversation_id: str):
                     },
                  "$set": {
                     "started_at": datetime.now(timezone.utc),
-                    "last_message_timestamp": datetime.now(timezone.utc),
                     "status": "open"
                     }
                 },
