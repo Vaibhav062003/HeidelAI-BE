@@ -22,7 +22,10 @@ from services.ig_service import *
 from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButton, InteractiveReplyButtonMessage
 from schemas.models import MessageRole
 from database import get_mongo_db
-from config.settings import VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, INSTAGRAM_APP_SECRET, DEV_INSTAGRAM_WEBHOOK_URL, DEV_WHATSAPP_WEBHOOK_URL, ALLOWED_INSTAGRAM_ID, ALLOWED_WHATSAPP_ID
+from config.settings import (
+    VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, 
+    LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, INSTAGRAM_APP_SECRET, DEV_INSTAGRAM_WEBHOOK_URL, DEV_WHATSAPP_WEBHOOK_URL, 
+    ALLOWED_INSTAGRAM_ID, ALLOWED_WHATSAPP_ID, GIGA_ORG_WA_ID)
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
@@ -483,6 +486,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_pma_wa = whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID
                             is_lee_dealer_wa = whatsapp_business_id == LEE_DEALER_ORG_WA_ID
                             is_karan_wa = whatsapp_business_id == KARAN_ORG_WA_ID
+                            is_giga_wa = whatsapp_business_id == GIGA_ORG_WA_ID
+
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
                             # fetch org + convo flags
@@ -492,6 +497,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info(f"is_pma_wa: {is_pma_wa}")
                             logger.info(f"is_lee_dealer_wa: {is_lee_dealer_wa}")
                             logger.info(f"is_karan_wa: {is_karan_wa}")
+                            logger.info(f"is_giga_wa: {is_giga_wa}")
                             logger.info(f"is_production: {is_production}")
                             logger.info(f"is_dev: {is_dev}")
                             logger.info(f"ai_enabled: {ai_enabled}") 
