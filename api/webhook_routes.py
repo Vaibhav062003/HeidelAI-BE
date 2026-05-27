@@ -427,6 +427,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_technet_wa = whatsapp_business_id == TECHNET_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
+                            is_test = ENVIRONMENT == "test"
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
 
@@ -436,6 +437,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info(f"is_technet_wa: {is_technet_wa}")
                             logger.info(f"is_production: {is_production}")
                             logger.info(f"is_dev: {is_dev}")
+                            logger.info(f"is_test: {is_test}")
                             logger.info(f"ai_enabled: {ai_enabled}") 
 
                             whatsapp_flow = flow_collection.find_one({"trigger_from": "webhook", "trigger_event": "message_received", "status": "active"})
@@ -582,7 +584,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_production:
+                                elif is_pma_wa and ai_enabled and is_test:
 
                                     flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                         
@@ -798,7 +800,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     if automation_response:
                                         return {"status": "ok"}
                                 
-                                if is_pma_wa and ai_enabled and is_production:
+                                if is_pma_wa and ai_enabled and is_test:
                                     if selection_id:
                                         match selection_id:
                                             case "india" | "abroad":
