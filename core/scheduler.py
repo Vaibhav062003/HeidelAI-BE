@@ -10,6 +10,8 @@ from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
 # from services.websocket_service import broadcast_on_stats_update
 from loguru import logger
+from config.settings import LEE_ORG_ID
+
 
 
 db = get_mongo_db()
@@ -218,21 +220,38 @@ async def process_time_based_tasks():
 
 import asyncio
 
-async def update_ai_status():
-    logger.info("processing auto ai status")
+ENSURED_INDEX_COLLECTIONS = set()
+
+async def update_ai_status(org_type: str = "all"):
+    logger.info(f"processing auto ai status for type: {org_type}")
     try:
         now = datetime.now(timezone.utc)
         
-        # 1. Non-blocking retrieval of organizations
-        org_docs = list(await asyncio.to_thread(lambda: list(db.organizations.find({}, {"org_id": 1, "wa_id": 1}))))
+        # Build query to fetch only required organizations
+        query = {}
+        if org_type == "lee" and LEE_ORG_ID:
+            query = {"org_id": LEE_ORG_ID}
+        elif org_type == "others" and LEE_ORG_ID:
+            query = {"org_id": {"$ne": LEE_ORG_ID}}
+            
+        org_docs = list(await asyncio.to_thread(
+            lambda: list(db.organizations.find(query, {"org_id": 1, "wa_id": 1}))
+        ))
         
-        total_updated = 0
+        if not org_docs:
+            return
 
-        for org in org_docs:
-            org_id = org["org_id"]
+        async def process_single_org(org_id: str):
             conv_col = db[f"conversations_{org_id}"]
-            # Ensure optimal query index exists (idempotent, fast in MongoDB)
-            await asyncio.to_thread(conv_col.create_index, [("auto_ai_disabled", 1), ("auto_ai_disabled_until", 1)])
+            col_name = conv_col.name
+            
+            # Ensure optimal query index exists (only once per runtime session)
+            if col_name not in ENSURED_INDEX_COLLECTIONS:
+                await asyncio.to_thread(
+                    conv_col.create_index, 
+                    [("auto_ai_disabled", 1), ("auto_ai_disabled_until", 1)]
+                )
+                ENSURED_INDEX_COLLECTIONS.add(col_name)
 
             # Non-blocking update of the conversations
             result = await asyncio.to_thread(
@@ -251,18 +270,31 @@ async def update_ai_status():
                     }
                 }
             )
+            return result.modified_count
 
-            total_updated += result.modified_count
+        # Run organization updates concurrently
+        tasks = [process_single_org(org["org_id"]) for org in org_docs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        total_updated = 0
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error(f"Error during parallel update: {res}")
+            elif isinstance(res, int):
+                total_updated += res
         
         if total_updated > 0:
-            logger.info(f"updated {total_updated} conversations")
+            logger.info(f"updated {total_updated} conversations (type: {org_type})")
     except Exception as e:
-        logger.error(f"Error updating ai status: {e}")
+        logger.error(f"Error updating ai status for type {org_type}: {e}")
             
+
 
 def start_scheduler():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
-    scheduler.add_job(update_ai_status, "interval", minutes=1, next_run_time=datetime.now(timezone.utc))
+    scheduler.add_job(update_ai_status, "interval", minutes=5, args=["lee"], next_run_time=datetime.now(timezone.utc))
+    scheduler.add_job(update_ai_status, "interval", hours=1, args=["others"], next_run_time=datetime.now(timezone.utc))
     scheduler.start()
     logger.success("APScheduler started (interval = 6 hours).")
+
