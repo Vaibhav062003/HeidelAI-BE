@@ -216,8 +216,53 @@ async def process_time_based_tasks():
         org_id = org["org_id"]
         await process_inactivity_for_org(org_id)
 
+import asyncio
+
+async def update_ai_status():
+    logger.info("processing auto ai status")
+    try:
+        now = datetime.now(timezone.utc)
+        
+        # 1. Non-blocking retrieval of organizations
+        org_docs = list(await asyncio.to_thread(lambda: list(db.organizations.find({}, {"org_id": 1, "wa_id": 1}))))
+        
+        total_updated = 0
+
+        for org in org_docs:
+            org_id = org["org_id"]
+            conv_col = db[f"conversations_{org_id}"]
+            # Ensure optimal query index exists (idempotent, fast in MongoDB)
+            await asyncio.to_thread(conv_col.create_index, [("auto_ai_disabled", 1), ("auto_ai_disabled_until", 1)])
+
+            # Non-blocking update of the conversations
+            result = await asyncio.to_thread(
+                conv_col.update_many,
+                {
+                    "auto_ai_disabled": True,
+                    "auto_ai_disabled_until": {"$lte": now}
+                },
+                {
+                    "$set": {
+                        "is_ai_enabled": True,
+                        "auto_ai_disabled": False
+                    },
+                    "$unset": {
+                        "auto_ai_disabled_until": ""
+                    }
+                }
+            )
+
+            total_updated += result.modified_count
+        
+        if total_updated > 0:
+            logger.info(f"updated {total_updated} conversations")
+    except Exception as e:
+        logger.error(f"Error updating ai status: {e}")
+            
+
 def start_scheduler():
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
+    scheduler.add_job(update_ai_status, "interval", minutes=1, next_run_time=datetime.now(timezone.utc))
     scheduler.start()
     logger.success("APScheduler started (interval = 6 hours).")

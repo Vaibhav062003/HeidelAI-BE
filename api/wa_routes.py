@@ -4,7 +4,7 @@ import asyncio
 import httpx
 import requests
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Third-party modules
 import cloudinary
@@ -36,7 +36,8 @@ from config.settings import (
     VERSION,
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
-    CLOUDINARY_API_SECRET
+    CLOUDINARY_API_SECRET,
+    LEE_ORG_ID
 )
 from loguru import logger
 from services.websocket_service import broadcast_main_ws
@@ -714,11 +715,19 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         messages_collection = db[f"messages_{org_id}"]
 
         update_fields = {
-            "is_ai_enabled": ai_enabled
+            "is_ai_enabled": ai_enabled,
+            "auto_ai_disabled": auto_ai_disabled
         }
 
-        if auto_ai_disabled is not None:
-            update_fields["auto_ai_disabled"] = auto_ai_disabled
+        if auto_ai_disabled:
+            update_fields= {
+                "is_ai_enabled": ai_enabled,
+                "auto_ai_disabled": auto_ai_disabled,
+                "auto_ai_disabled_until": (datetime.now(timezone.utc)) + timedelta(hours=1)
+            }
+        else:
+            # If manually toggling AI, clear the auto-disable timer field
+            update_fields["auto_ai_disabled_until"] = None
 
         # Update the conversation
         result = conversations_collection.update_one(
@@ -738,19 +747,16 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         sender_id = "system"
         sender_name = "System"
 
+        time_Str = "1 hr" if org_id == LEE_ORG_ID else '5 min'
+
         # Only add system messages and broadcast if the state ACTUALLY changed
         if result.modified_count > 0:
             if ai_enabled == False and auto_ai_disabled == True:
                 should_add_system_msg = True
-                system_content = "Ai is disabled for this conversation, you can re-enable it anytime by clicking on the enable AI button manually"
+                system_content = f"Ai is disabled for this conversation, will be enabled after {time_Str}"
                 sender_id = "system_auto"
                 sender_name = "System (Auto)"
-            elif ai_enabled == True:
-                should_add_system_msg = True
-                system_content = "Ai is enabled for this conversation"
-                sender_id = "system"
-                sender_name = "System"
-
+           
             if should_add_system_msg:
                 msg_id = str(uuid.uuid4())
                 msg_doc = {
