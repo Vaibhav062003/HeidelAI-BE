@@ -719,11 +719,12 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
             "auto_ai_disabled": auto_ai_disabled
         }
 
+        disable_duration = timedelta(minutes=5) if org_id == LEE_ORG_ID else timedelta(hours=1)
         if auto_ai_disabled:
             update_fields= {
                 "is_ai_enabled": ai_enabled,
                 "auto_ai_disabled": auto_ai_disabled,
-                "auto_ai_disabled_until": (datetime.now(timezone.utc)) + timedelta(hours=1)
+                "auto_ai_disabled_until": (datetime.now(timezone.utc) + disable_duration)
             }
         else:
             # If manually toggling AI, clear the auto-disable timer field
@@ -747,7 +748,7 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         sender_id = "system"
         sender_name = "System"
 
-        time_Str = "1 hr" if org_id == LEE_ORG_ID else '5 min'
+        time_Str = "5 min" if org_id == LEE_ORG_ID else '1 hr'
 
         # Only add system messages and broadcast if the state ACTUALLY changed
         if result.modified_count > 0:
