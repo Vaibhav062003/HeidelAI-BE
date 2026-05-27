@@ -23,8 +23,9 @@ from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButto
 from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import (
-    VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, 
-    LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, INSTAGRAM_APP_SECRET, GIGA_ORG_WA_ID)
+    VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, TEST_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, 
+    LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, INSTAGRAM_APP_SECRET, GIGA_ORG_WA_ID,
+    EGENIE_WA_ID, EGENIE_IG_ID, SAHIL_WA_ID, SAHIL_IG_ID)
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
@@ -46,6 +47,20 @@ async def forward_webhook_to_dev(body: bytes, headers: dict):
             logger.info(f"Successfully replicated webhook to Dev. Status: {response.status_code}")
         except Exception as e:
             logger.error(f"Failed to forward webhook to Dev: {e}")
+            
+async def forward_webhook_to_test(body: bytes, headers: dict):
+    """
+    Forwards the raw webhook body and necessary headers to the test environment.
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            # We use `content=body` to send the exact raw bytes, 
+            # preserving the integrity of the payload for signature validation.
+            response = await client.post(TEST_WEBHOOK_URL, content=body, headers=headers)
+            response.raise_for_status()
+            logger.info(f"Successfully replicated webhook to Test. Status: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Failed to forward webhook to Test: {e}")
 
 def validate_signature(raw_body: bytes, signature: str) -> bool:
     try:
@@ -117,7 +132,7 @@ async def verify_webhook(request: Request):
 @router.post("")
 async def handle_webhook(request: Request, x_hub_signature_256: str = Header(None), background_tasks: BackgroundTasks = None):
     """
-    This weebhook accepts POST requests from 
+    This weebhook accepts POST requests from META with a valid signature only
     """
     await signature_required(request, x_hub_signature_256)
 
@@ -126,32 +141,42 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     # First, validate the signature
     body = await request.body()
 
-    if background_tasks and DEV_WEBHOOK_URL:
-        # Cherry-pick only the necessary headers. 
-        # Don't forward the 'Host' header, as that will confuse your dev server.
+    # ── Extract account ID and object type ──────────────────────────────────
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        logger.error("Webhook received non-JSON body")
+        return Response(status_code=400)
+
+    object_type: str = payload.get("object", "")
+    account_id: str | None = None
+
+    try:
+        account_id = payload["entry"][0]["id"]
+    except (KeyError, IndexError):
+        logger.warning("Could not extract entry[0].id from webhook payload")
+
+    if (object_type == "whatsapp_business_account" and account_id == EGENIE_WA_ID) or (object_type == "instagram" and account_id == EGENIE_IG_ID):
+        logger.info(f"WhatsApp/Instagram webhook matched allowed account {account_id}. Forwarding.")
         forward_headers = {
-            "x-hub-signature-256": x_hub_signature_256,
-            "Content-Type": request.headers.get("content-type", "application/json")
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
         }
-        background_tasks.add_task(forward_webhook_to_dev, body, forward_headers)
+        background_tasks.add_task(forward_webhook_to_test, body=body, headers=forward_headers)
+        return Response(status_code=200)
+    
+    elif (object_type == "whatsapp_business_account" and account_id == SAHIL_WA_ID) or (object_type == "instagram" and account_id == SAHIL_IG_ID):
+        logger.info(f"WhatsApp/Instagram webhook matched allowed account {account_id}. Forwarding.")
+        forward_headers = {
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
+        }
+        background_tasks.add_task(forward_webhook_to_dev, body=body, headers=forward_headers)
+        return Response(status_code=200)
 
     payload_str = body.decode('utf-8')
-
-    # payload_str = request.state.payload_body.decode('utf-8')
-    # payload = json.loads(payload_str)
-
-    # logger.info("Incoming webhook payload:", json.dumps(payload, indent=2))
-    
-    # Validate signature
-    # if not x_hub_signature_256:
-    #     logger.error(f"NO Signature: {payload_str}")
-    #     raise HTTPException(status_code=403, detail="Signature missing")
-    
-    # if not validate_signature(payload_str, x_hub_signature_256):
-    #     logger.warning(f"Validate Signature: {x_hub_signature_256}")
-    #     raise HTTPException(status_code=403, detail="Invalid signature")
-    
-    # logger.success(f"RECEIVED CORRECT SIGNATURE: {x_hub_signature_256}")
 
     # Now parse the payload
     payload = json.loads(payload_str)

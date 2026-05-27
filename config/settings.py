@@ -75,6 +75,7 @@ CLERK_TOKEN = os.getenv("CLERK_TOKEN_KEY")
 
 # Webhook for Dev
 DEV_WEBHOOK_URL = os.getenv("DEV_WEBHOOK_URL", "").strip().strip("'\"")
+TEST_WEBHOOK_URL = os.getenv("TEST_WEBHOOK_URL", "").strip().strip("'\"")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT")
 
@@ -112,3 +113,9 @@ KARAN_ORG_WA_ID=os.getenv("KARAN_ORG_WA_ID")
 
 GIGA_ORG_ID=os.getenv("GIGA_ORG_ID")
 GIGA_ORG_WA_ID=os.getenv("GIGA_ORG_WA_ID")
+
+EGENIE_WA_ID=os.getenv("EGENIE_WA_ID")
+EGENIE_IG_ID=os.getenv("EGENIE_IG_ID")
+
+SAHIL_WA_ID=os.getenv("SAHIL_WA_ID")
+SAHIL_IG_ID=os.getenv("SAHIL_IG_ID")
