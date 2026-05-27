@@ -24,8 +24,7 @@ from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import (
     VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, 
-    LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, INSTAGRAM_APP_SECRET, DEV_INSTAGRAM_WEBHOOK_URL, DEV_WHATSAPP_WEBHOOK_URL, 
-    ALLOWED_INSTAGRAM_ID, ALLOWED_WHATSAPP_ID, GIGA_ORG_WA_ID)
+    LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, INSTAGRAM_APP_SECRET, GIGA_ORG_WA_ID)
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
@@ -47,28 +46,6 @@ async def forward_webhook_to_dev(body: bytes, headers: dict):
             logger.info(f"Successfully replicated webhook to Dev. Status: {response.status_code}")
         except Exception as e:
             logger.error(f"Failed to forward webhook to Dev: {e}")
-
-async def forward_webhook_to_dev2(body: bytes, headers: dict, url: str):
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, content=body, headers=headers)
-            response.raise_for_status()
-            logger.info(f"Successfully replicated webhook to Dev2. Status: {response.status_code}")
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                f"Failed to forward webhook to Dev2: HTTP {e.response.status_code} "
-                f"| URL: {url} "
-                f"| Response body: {e.response.text}"
-            )
-        except httpx.RequestError as e:
-            logger.error(
-                f"Failed to forward webhook to Dev2: Request error "
-                f"| Type: {type(e).__name__} "
-                f"| Detail: {repr(e)} "
-                f"| URL: {url}"
-            )
-        except Exception as e:
-            logger.error(f"Failed to forward webhook to Dev2: Unexpected error | {type(e).__name__}: {repr(e)}")
 
 def validate_signature(raw_body: bytes, signature: str) -> bool:
     try:
@@ -148,47 +125,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
     # First, validate the signature
     body = await request.body()
-
-    # ── Extract account ID and object type ──────────────────────────────────
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        logger.error("Webhook received non-JSON body")
-        return Response(status_code=400)
-
-    object_type: str = payload.get("object", "")
-    account_id: str | None = None
-
-    try:
-        account_id = payload["entry"][0]["id"]
-    except (KeyError, IndexError):
-        logger.warning("Could not extract entry[0].id from webhook payload")
-
-    if object_type == "whatsapp_business_account" and account_id == ALLOWED_WHATSAPP_ID:
-        logger.info(f"WhatsApp webhook matched allowed account {account_id}. Forwarding.")
-        forward_headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
-        }
-        background_tasks.add_task(forward_webhook_to_dev2, body=body, headers=forward_headers, url=DEV_WHATSAPP_WEBHOOK_URL)
-
-    elif object_type == "instagram" and account_id == ALLOWED_INSTAGRAM_ID:
-        is_echo = payload["entry"][0]["messaging"][0].get("message", {}).get("is_echo", False)
-        if is_echo:
-            logger.info(f"Instagram webhook received echo message for account {account_id}. Skipping forwarding.")
-            return {"status": "ok"}
-        is_read_event = payload["entry"][0]["messaging"][0].get("read", False)
-        if is_read_event:
-            logger.info(f"Instagram webhook received read event for account {account_id}. Skipping forwarding.")
-            return {"status": "ok"}
-        logger.info(f"Instagram webhook matched allowed account {account_id}. Forwarding.")
-        forward_headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
-        }
-        background_tasks.add_task(forward_webhook_to_dev2, body=body, headers=forward_headers, url=DEV_INSTAGRAM_WEBHOOK_URL)
 
     if background_tasks and DEV_WEBHOOK_URL:
         # Cherry-pick only the necessary headers. 
