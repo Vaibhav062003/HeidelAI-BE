@@ -584,7 +584,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_test:
+                                elif is_pma_wa and ai_enabled and is_dev:
 
                                     flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                         
@@ -800,7 +800,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     if automation_response:
                                         return {"status": "ok"}
                                 
-                                if is_pma_wa and ai_enabled and is_test:
+                                if is_pma_wa and ai_enabled and is_dev:
                                     if selection_id:
                                         match selection_id:
                                             case "india" | "abroad":
