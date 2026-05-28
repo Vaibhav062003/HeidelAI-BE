@@ -241,15 +241,21 @@ async def process_onboarding_if_needed(
     if stage == "welcome" or stage is None:
         reply = get_location_message(sender_name)
 
-        await send_whatsapp_message(
-            org_id=org_id,
-            mode="reply",
-            message={
-                "sender_id" : whatsapp_business_id,
-                "conversation_id" : conversation_id,
-                "content": get_introduction_message(sender_name),
-            }
-        )
+        try:
+            await send_whatsapp_message(
+                org_id=org_id,
+                mode="reply",
+                message={
+                    "sender_id" : whatsapp_business_id,
+                    "conversation_id" : conversation_id,
+                    "content": get_introduction_message(sender_name),
+                }
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to send onboarding introduction for conversation_id={conversation_id}; "
+                "continuing to update onboarding stage to awaiting_location"
+            )
 
         await conversations_col().update_one(
             {"conversation_id": conversation_id},
