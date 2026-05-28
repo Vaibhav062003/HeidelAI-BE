@@ -919,13 +919,23 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                 return {"status": "ok"}                                
 
                                             case "vedic_maths_books":
+                                                await send_interactive_whatsapp_message(
+                                                    org_id=org_id,
+                                                    conversation_id=conversation_id,
+                                                    sender_id=whatsapp_business_id,
+                                                    interactive_message=get_vedic_maths_books_message()
+                                                )
+                                                
                                                 await send_whatsapp_message(
                                                     org_id=org_id,
                                                     mode="reply",
                                                     message={
                                                         "sender_id": whatsapp_business_id,
                                                         "conversation_id": conversation_id,
-                                                        "content": get_vedic_maths_books_message()
+                                                        "content": (
+                                                            "https://youtube.com/watch?v=ztvJiASRm0w&si=t2tiBQN9ZqO92Ua3"
+                                                        ),
+                                                        "preview_url": True,
                                                     }
                                                 )
 
@@ -971,6 +981,25 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                         url="https://paarijatacademy.in/courses/",
                                                         button_text="Details & Contact"
                                                     )
+                                                )
+
+                                                return {"status": "ok"}
+                                        
+                                        
+                                            case "order_books":
+                                                await send_whatsapp_message(
+                                                    org_id=org_id,
+                                                    mode="reply",
+                                                    message={
+                                                        "sender_id" : whatsapp_business_id,
+                                                        "conversation_id" : conversation_id,
+                                                        "content": (
+                                                        "*Please contact below numbers to place order*\n\n"
+                                                        
+                                                        "📱 9503498556\n"
+                                                        "📱 8055579965\n\n"
+                                                    )
+                                                    }
                                                 )
 
                                                 return {"status": "ok"}

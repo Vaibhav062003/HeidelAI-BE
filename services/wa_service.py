@@ -468,7 +468,11 @@ async def send_whatsapp_message(
                 data["context"] = {
                     "message_id": context.get("mid")
                 }
-            
+
+            preview_url = message.get("preview_url")
+            if preview_url:
+                data["preview_url"] = preview_url
+
             if mode == "reply" or mode == "ai":
                 # Send message via WhatsApp Cloud API
                 url = f"https://graph.facebook.com/{IG_VERSION}/{connection['phone_id']}/messages"
