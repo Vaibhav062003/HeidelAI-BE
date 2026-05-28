@@ -919,15 +919,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                 return {"status": "ok"}                                
 
                                             case "vedic_maths_books":
-                                                await send_whatsapp_message(
+                                                await send_interactive_whatsapp_message(
                                                     org_id=org_id,
-                                                    mode="reply",
-                                                    message={
-                                                        "sender_id": whatsapp_business_id,
-                                                        "conversation_id": conversation_id,
-                                                        "content": get_vedic_maths_books_message()
-                                                    }
+                                                    conversation_id=conversation_id,
+                                                    sender_id=whatsapp_business_id,
+                                                    interactive_message=get_vedic_maths_books_message()
                                                 )
+                                                
                                                 await send_whatsapp_message(
                                                     org_id=org_id,
                                                     mode="reply",

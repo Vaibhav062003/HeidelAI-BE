@@ -185,10 +185,6 @@ def get_location_message(sender_name: str):
     )
 
 
-def get_introduction_message(sender_name: str):
-    return get_location_message(sender_name)
-
-
 def get_vedic_maths_books_message():
     return InteractiveReplyButtonMessage(
         type="button",
