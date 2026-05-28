@@ -110,12 +110,9 @@ def _parse_single_block(block: str) -> dict:
             company = org_m.group(1).split(";")[0].strip()
             continue
 
-    # Prefer a mobile/cell number if tagged, otherwise take the first
-    primary_phone = None
-    for p in phones:
-        # TEL;TYPE=CELL or TEL;CELL=... would have been in the line before the colon
-        primary_phone = p
-        break  # first is fine — we already filtered type above
+    # Use the first valid phone number encountered in the vCard block.
+    # TEL parameters such as TYPE=CELL are not parsed here.
+    primary_phone = phones[0] if phones else None
 
     return {
         "full_name": full_name or None,

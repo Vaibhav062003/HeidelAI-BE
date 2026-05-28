@@ -1,9 +1,12 @@
 from datetime import datetime, timezone
-from fastapi import BackgroundTasks, HTTPException
-from pymongo.errors import PyMongoError
-import pandas as pd
 from io import BytesIO
+import re
+import uuid
+
+from fastapi import BackgroundTasks, HTTPException
+import pandas as pd
 from pymongo import UpdateOne
+from pymongo.errors import PyMongoError, BulkWriteError
 
 # Internal Modules
 from core.services import services
@@ -12,9 +15,10 @@ from loguru import logger
 from services.websocket_service import broadcast_on_stats_update
 from services.utils import normalize_phone
 
-
-
 db = get_mongo_db()
+
+# Pre-compiled regex patterns for performance
+EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 
 def store_contact_background(background_tasks: BackgroundTasks, org_id: str, platform: str, contact_data: dict):
     """
@@ -318,13 +322,9 @@ async def get_unread_counts_by_labels(org_id: str):
 
 
 
-import re as _re
-import uuid
-
 def _validate_email(email: str) -> bool:
     """Simple but robust email format check."""
-    pattern = _re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
-    return bool(pattern.match(email.strip()))
+    return bool(EMAIL_PATTERN.match(email.strip()))
 
 
 def process_bulk_wa_contact_upload(
@@ -349,13 +349,19 @@ def process_bulk_wa_contact_upload(
     fname_lower = (filename or "").lower()
     now = datetime.now(timezone.utc)
     batch_id = str(uuid.uuid4())
-    source_type = "vcf" if fname_lower.endswith(".vcf") else (
-        "csv" if fname_lower.endswith(".csv") else "excel"
-    )
+    if fname_lower.endswith(".vcf"):
+        source_type = "vcf"
+    elif fname_lower.endswith(".csv"):
+        source_type = "csv"
+    elif fname_lower.endswith(".xls") or fname_lower.endswith(".xlsx"):
+        source_type = "excel"
+    else:
+        raise ValueError(
+        f"Unsupported file format for '{filename}'. Supported formats are: .csv, .xls, .xlsx, .vcf"
+            )
 
     # ── 1. Parse file into a unified list of raw dicts ───────────────────────
     raw_contacts: list[dict] = []
-    parse_error: str | None = None
 
     try:
         if source_type == "vcf":
@@ -396,6 +402,27 @@ def process_bulk_wa_contact_upload(
 
     # ── 3. Process each record ────────────────────────────────────────────────
     contacts_collection = db[f"contacts_{org_id}"]
+
+    # Pre-gather all phone numbers from the file to batch-query existing ones for O(1) deduplication
+    uploaded_phones = set()
+    for row in raw_contacts:
+        raw_phone = _resolve(row, "phone", ["phone", "mobile", "tel", "telephone", "phone number", "contact"])
+        clean_phone = normalize_phone(raw_phone or "")
+        if clean_phone:
+            uploaded_phones.add(clean_phone)
+
+    existing_phones = set()
+    if uploaded_phones:
+        try:
+            cursor = contacts_collection.find(
+                {"phone_number": {"$in": list(uploaded_phones)}},
+                {"phone_number": 1, "_id": 0}
+            )
+            existing_phones = {doc["phone_number"] for doc in cursor if doc.get("phone_number")}
+        except Exception as e:
+            logger.error(f"Error querying existing contacts for deduplication: {e}")
+
+    processed_in_batch = set()
     bulk_ops: list[UpdateOne] = []
     skipped_records: list[dict] = []
     success_count = 0
@@ -418,6 +445,26 @@ def process_bulk_wa_contact_upload(
                 "reason": "Missing or invalid phone number (must have ≥ 10 digits)"
             })
             continue
+
+        # Skip if contact already exists in database (as requested: do not overwrite/update existing records)
+        if clean_phone in existing_phones:
+            skipped_records.append({
+                "row_number": idx,
+                "value": raw_phone,
+                "reason": f"Contact already exists in the system (phone: {clean_phone})"
+            })
+            continue
+
+        # Skip if duplicate within the same uploaded file
+        if clean_phone in processed_in_batch:
+            skipped_records.append({
+                "row_number": idx,
+                "value": raw_phone,
+                "reason": f"Duplicate phone number in the uploaded file (phone: {clean_phone})"
+            })
+            continue
+
+        processed_in_batch.add(clean_phone)
 
         if not full_name:
             full_name = f"Contact {clean_phone[-4:]}"  # fallback display name
@@ -443,10 +490,7 @@ def process_bulk_wa_contact_upload(
             "filename": filename,
         }
 
-        # Smart upsert:
-        # - $setOnInsert: only for brand-new records → sets all base fields
-        # - $set: always → marks is_bulk_uploaded + upload_metadata + updated_at
-        #   (does NOT overwrite categories, labels, full_name of existing contacts)
+        # Sets all base fields for new records
         contact_on_insert = {
             "full_name": full_name,
             "phone_number": clean_phone,
@@ -464,15 +508,6 @@ def process_bulk_wa_contact_upload(
         if company:
             contact_on_insert["company"] = company
 
-        # Conditionally fill email / company on existing records only if currently absent
-        set_if_missing: dict = {}
-        if email:
-            set_if_missing["email"] = email
-        if company:
-            set_if_missing["company"] = company
-        if full_name:
-            set_if_missing["full_name"] = full_name
-
         update_doc: dict = {
             "$set": {
                 "is_bulk_uploaded": True,
@@ -482,13 +517,6 @@ def process_bulk_wa_contact_upload(
             "$setOnInsert": contact_on_insert,
         }
 
-        # Use $min / conditional trick: only fill if field missing — achieved via pipeline
-        # Simpler: just use a regular UpdateOne; pre-existing fields won't be overwritten
-        # because we don't touch categories/labels/profile_url in $set.
-        if set_if_missing:
-            # Merge into $setOnInsert only (so pre-existing records keep their values)
-            update_doc["$setOnInsert"].update(set_if_missing)
-
         bulk_ops.append(
             UpdateOne(
                 {"phone_number": clean_phone},
@@ -496,15 +524,31 @@ def process_bulk_wa_contact_upload(
                 upsert=True,
             )
         )
-        success_count += 1
 
     # ── 4. Execute batch write ────────────────────────────────────────────────
     newly_added = 0
     matched_count = 0
     if bulk_ops:
-        result = contacts_collection.bulk_write(bulk_ops, ordered=False)
-        newly_added   = result.upserted_count
-        matched_count = result.matched_count
+        try:
+            result = contacts_collection.bulk_write(bulk_ops, ordered=False)
+            newly_added   = result.upserted_count
+            matched_count = result.matched_count
+        except BulkWriteError as bwe:
+            # Catch write errors to prevent API crashes and capture partial successes
+            details = bwe.details
+            newly_added   = details.get("nUpserted", 0)
+            matched_count = details.get("nMatched", 0)
+            
+            write_errors = details.get("writeErrors", [])
+            for err in write_errors:
+                logger.error(f"Bulk write error details: {err}")
+                skipped_records.append({
+                    "row_number": "N/A",
+                    "value": f"Record Index {err.get('index')}",
+                    "reason": f"Database write failure: {err.get('errmsg', 'Unknown database error')}"
+                })
+        
+        success_count = newly_added + matched_count
 
     # ── 5. Persist batch metadata ─────────────────────────────────────────────
     batch_doc = {
@@ -553,11 +597,16 @@ async def get_uploaded_contacts_paginated(
             query["upload_metadata.batch_id"] = batch_id
 
         if search:
+            # Enforce a max length of 100 characters to prevent parsing issues
+            safe_search = str(search)[:100].strip()
+            # Escape special regex characters to prevent regex injection (ReDoS) and literal matching
+            escaped_search = re.escape(safe_search)
+
             query["$or"] = [
-                {"full_name":    {"$regex": search, "$options": "i"}},
-                {"phone_number": {"$regex": search, "$options": "i"}},
-                {"email":        {"$regex": search, "$options": "i"}},
-                {"company":      {"$regex": search, "$options": "i"}},
+                {"full_name":    {"$regex": escaped_search, "$options": "i"}},
+                {"phone_number": {"$regex": escaped_search, "$options": "i"}},
+                {"email":        {"$regex": escaped_search, "$options": "i"}},
+                {"company":      {"$regex": escaped_search, "$options": "i"}},
             ]
 
         total   = col.count_documents(query)

@@ -517,6 +517,15 @@ async def bulk_upload_whatsapp_contacts(
             except Exception:
                 raise HTTPException(status_code=400, detail="column_mapping must be valid JSON")
 
+            # Validate that mapping is a dictionary with string keys and values
+            if not isinstance(mapping, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="column_mapping must be a JSON object with string keys and string values"
+                )
+
         stats = process_bulk_wa_contact_upload(
             org_id=org_id,
             file_content=content,
