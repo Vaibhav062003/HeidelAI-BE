@@ -78,20 +78,6 @@ def validate_signature(raw_body: bytes, signature: str) -> bool:
     expected = hmac.new(
         key=secret.encode('utf-8'),
         msg=raw_body,
-    try:
-        payload = json.loads(raw_body)
-        platform = payload.get("object", "")
-    except Exception:
-        return False
-
-    if platform == "instagram":
-        secret = INSTAGRAM_APP_SECRET
-    else:
-        secret = APP_SECRET  # whatsapp + anything else
-
-    expected = hmac.new(
-        key=secret.encode('utf-8'),
-        msg=raw_body,
         digestmod=hashlib.sha256
     ).hexdigest()
 
@@ -107,14 +93,7 @@ def validate_signature(raw_body: bytes, signature: str) -> bool:
         return False
 
     return True
-        logger.error(f"1. Platform:          {platform}")
-        logger.error(f"2. Secret Prefix:     {secret[:4]}*** (Length: {len(secret)})")
-        logger.error(f"3. Meta's Signature:  {signature}")
-        logger.error(f"4. Our Signature:     {our_sig}")
-        logger.error(f"5. Raw Bytes Length:  {len(raw_body)}")
-        return False
 
-    return True
 
 # Middleware or decorator to validate signature for POST requests
 async def signature_required(request: Request, x_hub_signature_256: str = Header(None)):
@@ -632,7 +611,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_dev:
+                                elif is_pma_wa and ai_enabled and is_production:
 
                                     flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                         
@@ -677,7 +656,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
                                         }, org_id, "ai")
 
-                                elif ai_enabled and is_dev and is_lee_dealer_wa:
+                                elif ai_enabled and is_production and is_lee_dealer_wa:
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
 
                                     print("*" * 80 )
@@ -848,7 +827,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     if automation_response:
                                         return {"status": "ok"}
                                 
-                                if is_pma_wa and ai_enabled and is_dev:
+                                if is_pma_wa and ai_enabled and is_production:
                                     if selection_id:
                                         match selection_id:
                                             case "india" | "abroad":
