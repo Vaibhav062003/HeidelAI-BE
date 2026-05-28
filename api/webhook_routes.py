@@ -1002,6 +1002,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                     }
                                                 )
 
+                                                return {"status": "ok"}
+
                                             # --- Fallback for unknown IDs ---
                                             case _:
                                                 chatbot_response = await send_to_pma_chatbot(
