@@ -13,6 +13,7 @@ from schemas.models import (
     ReplyButton,
 )
 from services.utils import get_first_name
+from services.wa_service import send_whatsapp_message
 
 db = get_async_mongo_db()
 
@@ -115,6 +116,14 @@ MENU_MESSAGE_SECTIONS = [
     ),
 ]
 
+def get_introduction_message(sender_name: str):
+    # Safely get the first name, default to "there" if sender_name is empty/None
+    first_name = get_first_name(sender_name)
+
+    return (
+        f"Hello {first_name}👋🏻\n\n"
+        "Give your child a power-packed learning advantage this summer! 🚀\n\nAt Parijat Academy, we combine Vedic Maths + AI Basics to build:\n✅ Super-fast calculation skills\n✅ Sharp logical thinking\n✅ Confidence in academics\n✅ Future-ready AI awareness\n\n👉🏻 Fill this form to reserve your child’s seat today!\n🔗   https://forms.gle/6ZoiPxw1op4PsByb9\n\n📲📞 Call/WhatsApp Now: 9503498556/7030617881\n🌐 www.paarijatacademy.in/ 🌐 www.aijunior.in"
+    )
 
 def get_menu_message(location: str):
     return InteractiveListMessage(
@@ -181,7 +190,15 @@ def get_introduction_message(sender_name: str):
 
 
 def get_vedic_maths_books_message():
-    return (
+    return InteractiveReplyButtonMessage(
+        type="button",
+        header={
+            "type": "image",
+            "image": {
+                "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1779986749/WhatsApp_Image_2026-05-20_at_3.13.09_PM_urq9ue.jpg",
+            },
+        },
+        body_text=(
         "🚀 Unlock the Power of Speed Maths with Vedic Mathematics! 📚✨\n\n"
         "Presenting the complete set of\n"
         "🔹 Volume 1\n"
@@ -203,6 +220,13 @@ def get_vedic_maths_books_message():
         "✨ Learn Faster\n"
         "✨ Calculate Smarter\n"
         "✨ Become a Mathematician Now!"
+        ),
+        buttons=[
+            ActionButton(
+                type="reply",
+                reply=ReplyButton(id="order_books", title="Order Books"),
+            ),
+        ],
     )
 
 
@@ -220,6 +244,16 @@ async def process_onboarding_if_needed(
     # STAGE 1: Welcome
     if stage == "welcome" or stage is None:
         reply = get_location_message(sender_name)
+
+        await send_whatsapp_message(
+            org_id=org_id,
+            mode="reply",
+            message={
+                "sender_id" : whatsapp_business_id,
+                "conversation_id" : conversation_id,
+                "content": get_introduction_message(sender_name),
+            }
+        )
 
         await conversations_col().update_one(
             {"conversation_id": conversation_id},

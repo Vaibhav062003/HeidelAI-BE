@@ -468,6 +468,9 @@ async def send_whatsapp_message(
                 data["context"] = {
                     "message_id": context.get("mid")
                 }
+                
+            if message.preview_url:
+                data["preview_url"] = message.preview_url
             
             if mode == "reply" or mode == "ai":
                 # Send message via WhatsApp Cloud API
