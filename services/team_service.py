@@ -19,6 +19,7 @@ from loguru import logger
 
 from core.services import services
 from database import get_mongo_db, get_async_mongo_db
+from services.utils import serialize_mongo
 
 
 db = get_mongo_db()
@@ -65,7 +66,7 @@ async def fetch_team_conversations(
         user_unread = unread_map.get(current_user_id, 0)
 
         lmt = doc.get("last_message_timestamp")
-        timestamp = lmt.isoformat() if isinstance(lmt, datetime) else None
+        timestamp = serialize_mongo(lmt) if isinstance(lmt, datetime) else None
 
         result.append({
             "id": doc.get("conversation_id"),
@@ -113,7 +114,7 @@ async def fetch_ai_escalations(org_id: str) -> List[Dict]:
         for field in ["timestamp", "created_at"]:
             val = doc.get(field)
             if isinstance(val, datetime):
-                doc[field] = val.isoformat()
+                doc[field] = serialize_mongo(val)
 
     logger.info(f"[team_service] Fetched {len(raw_docs)} AI escalations for org {org_id}")
     return raw_docs
@@ -188,8 +189,8 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
     # Broadcast via WebSocket
     # Prepare broadcast payload (format timestamps as ISO string)
     broadcast_payload = escalation_doc.copy()
-    broadcast_payload["timestamp"] = broadcast_payload["timestamp"].isoformat()
-    broadcast_payload["created_at"] = broadcast_payload["created_at"].isoformat()
+    broadcast_payload["timestamp"] = serialize_mongo(broadcast_payload["timestamp"])
+    broadcast_payload["created_at"] = serialize_mongo(broadcast_payload["created_at"])
     
     await broadcast_ai_escalation(org_id, broadcast_payload)
 
@@ -238,7 +239,7 @@ async def fetch_team_messages(
         for msg in messages:
             ts = msg.get("timestamp")
             if isinstance(ts, datetime):
-                msg["timestamp"] = ts.isoformat()
+                msg["timestamp"] = serialize_mongo(ts)
 
         logger.info(
             f"[team_service] Fetched {len(messages)} messages "

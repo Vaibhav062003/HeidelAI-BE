@@ -11,7 +11,7 @@ import httpx
 # Internal Modules 
 from core.managers import manager
 from services.automation_service import execute_whatsapp_flow
-from services.pma_chatbot import get_step_three_ai_message, get_step_three_vedic_ai_message, process_onboarding_if_needed, send_to_pma_chatbot
+from services.pma_chatbot import get_vedic_maths_books_message, process_onboarding_if_needed, send_to_pma_chatbot
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
@@ -19,6 +19,7 @@ from services.heidelai_bot import send_to_chatbot
 from services.agent_service import send_to_agent
 from services.wa_service import *
 from services.ig_service import *
+from services.utils import normalize_phone
 from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButton, InteractiveReplyButtonMessage
 from schemas.models import MessageRole
 from database import get_mongo_db
@@ -77,6 +78,20 @@ def validate_signature(raw_body: bytes, signature: str) -> bool:
     expected = hmac.new(
         key=secret.encode('utf-8'),
         msg=raw_body,
+    try:
+        payload = json.loads(raw_body)
+        platform = payload.get("object", "")
+    except Exception:
+        return False
+
+    if platform == "instagram":
+        secret = INSTAGRAM_APP_SECRET
+    else:
+        secret = APP_SECRET  # whatsapp + anything else
+
+    expected = hmac.new(
+        key=secret.encode('utf-8'),
+        msg=raw_body,
         digestmod=hashlib.sha256
     ).hexdigest()
 
@@ -84,6 +99,14 @@ def validate_signature(raw_body: bytes, signature: str) -> bool:
 
     if not hmac.compare_digest(our_sig, signature):
         logger.error("🚨 SIGNATURE MISMATCH DETECTED 🚨")
+        logger.error(f"1. Platform:          {platform}")
+        logger.error(f"2. Secret Prefix:     {secret[:4]}*** (Length: {len(secret)})")
+        logger.error(f"3. Meta's Signature:  {signature}")
+        logger.error(f"4. Our Signature:     {our_sig}")
+        logger.error(f"5. Raw Bytes Length:  {len(raw_body)}")
+        return False
+
+    return True
         logger.error(f"1. Platform:          {platform}")
         logger.error(f"2. Secret Prefix:     {secret[:4]}*** (Length: {len(secret)})")
         logger.error(f"3. Meta's Signature:  {signature}")
@@ -298,7 +321,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 services.processed_message_reaction_ids[key] = timestamp
 
                                 # Extract essential data
-                                customer_phone_no = message.get("from")
+                                customer_phone_no = normalize_phone(message.get("from"), is_canonical=True)
                                 customer_name = sender_name2
                                 message_type = message.get("type")
 
@@ -394,7 +417,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             services.processed_message_ids[message_id] = time.time()
                             
                             # Extract essential data
-                            customer_phone_no = message.get("from")
+                            customer_phone_no = normalize_phone(message.get("from"), is_canonical=True)
                             message_type = message.get("type")
                             message_context = message.get("context")
 
@@ -451,6 +474,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
+                            is_test = ENVIRONMENT == "test"
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
 
@@ -461,6 +485,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info(f"is_giga_wa: {is_giga_wa}")
                             logger.info(f"is_production: {is_production}")
                             logger.info(f"is_dev: {is_dev}")
+                            logger.info(f"is_test: {is_test}")
                             logger.info(f"ai_enabled: {ai_enabled}") 
 
                             whatsapp_flow = flow_collection.find_one({"trigger_from": "webhook", "trigger_event": "message_received", "status": "active"})
@@ -520,7 +545,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
 
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
-                                if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
+                                if ai_enabled and is_test and not is_heidelai and not is_pma_wa:
+                                    await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
+
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     if whatsapp_flow:
                                         automation_response = await execute_whatsapp_flow(
@@ -539,6 +566,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         # If the flow handled the message successfully, exit early.
                                         if automation_response:
                                             return {"status": "ok"}
+
+                                    if not convo_doc:
+                                        convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
 
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
                                     chatbot_response = await send_to_agent(
@@ -602,7 +632,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_production:
+                                elif is_pma_wa and ai_enabled and is_dev:
 
                                     flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                         
@@ -818,41 +848,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     if automation_response:
                                         return {"status": "ok"}
                                 
-                                if is_pma_wa and ai_enabled and is_production:
-                                    step_two_content = convo_doc.get("step_two_content", "vedic_ai_intro") if convo_doc else "vedic_ai_intro"
+                                if is_pma_wa and ai_enabled and is_dev:
                                     if selection_id:
                                         match selection_id:
-                                            case "step_two_yes":
-                                                if step_two_content == "vedic_ai_intro":
-                                                    await send_interactive_whatsapp_message(
-                                                        org_id=org_id,
-                                                        conversation_id=conversation_id,
-                                                        sender_id=whatsapp_business_id,
-                                                        interactive_message=get_step_three_vedic_ai_message()
-                                                    )
-                                                    return {"status": "ok"}
-                                                else:
-                                                    await send_interactive_whatsapp_message(
-                                                        org_id=org_id,
-                                                        conversation_id=conversation_id,
-                                                        sender_id=whatsapp_business_id,
-                                                        interactive_message=get_step_three_ai_message()
-                                                    )
-                                                    return {"status": "ok"}
-
                                             case "india" | "abroad":
                                                 flow_response = await process_onboarding_if_needed(user_input=selection_id, conversation_id=conversation_id, org_id=org_id, stage="awaiting_location", whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
-                                                if flow_response:
-                                                    await send_interactive_whatsapp_message(
-                                                        org_id=org_id,
-                                                        conversation_id=conversation_id,
-                                                        sender_id=whatsapp_business_id,
-                                                        interactive_message=flow_response
-                                                    )
-                                                    return {"status": "ok"}
-
-                                            case "vedic_maths_intro" | "ai_intro" | "vedic_ai_intro":
-                                                flow_response = await process_onboarding_if_needed(user_input=selection_id, conversation_id=conversation_id, org_id=org_id, stage="awaiting_introduction", whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                                 if flow_response:
                                                     await send_interactive_whatsapp_message(
                                                         org_id=org_id,
@@ -966,6 +966,29 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                                 return {"status": "ok"}                                
 
+                                            case "vedic_maths_books":
+                                                await send_interactive_whatsapp_message(
+                                                    org_id=org_id,
+                                                    conversation_id=conversation_id,
+                                                    sender_id=whatsapp_business_id,
+                                                    interactive_message=get_vedic_maths_books_message()
+                                                )
+                                                
+                                                await send_whatsapp_message(
+                                                    org_id=org_id,
+                                                    mode="reply",
+                                                    message={
+                                                        "sender_id": whatsapp_business_id,
+                                                        "conversation_id": conversation_id,
+                                                        "content": (
+                                                            "https://youtube.com/watch?v=ztvJiASRm0w&si=t2tiBQN9ZqO92Ua3"
+                                                        ),
+                                                        "preview_url": True,
+                                                    }
+                                                )
+
+                                                return {"status": "ok"}
+
                                             case "vedic_maths_teacher":
                                                 # Send info about Teacher Training
                                                 await send_whatsapp_message(
@@ -1009,28 +1032,26 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                 )
 
                                                 return {"status": "ok"}
-
-                                            case "vedic_maths_summer_camp":
-                                                await send_interactive_whatsapp_message(
+                                        
+                                        
+                                            case "order_books":
+                                                await send_whatsapp_message(
                                                     org_id=org_id,
-                                                    conversation_id=conversation_id,
-                                                    sender_id=whatsapp_business_id,
-                                                    interactive_message=InteractiveUrlButtonMessage(
-                                                        type="cta_url",
-                                                        header={
-                                                            "type": "image",
-                                                            "image": {
-                                                                "link": "https://res.cloudinary.com/djpc5zfgz/image/upload/v1773070610/WhatsApp_Image_2026-03-09_at_3.02.13_PM_tcdpby.jpg"
-                                                            }
-                                                        },
-                                                        body_text="☀️ This Summer, Make Maths Your Child’s Superpower!\n🚀 Parijat Academy presents\n🎯 VEDIC MATHS SUMMER CAMP 2026\n\nGive your child the gift of faster calculations, sharper brain power & more confidence in Maths!\n📚 In this 15-Day Power Camp students will learn:\n✔ Super Fast Calculations\n✔ Tricks for Multiplication & Division\n✔ Improve Speed & Accuracy\n✔ Boost Confidence in Maths\n\n👦👧 Perfect for students aged 9+\n\n📅 Camp Dates:\n1st April – 15th April 2026\n🕰️ Eve 4 to 5.30 PM\n\n⚡ Limited Seats Available – Book Now!\n\n📞 Call / WhatsApp to Register:\n📱 9503498556\n📱 8055579965\n\n✨ Let’s Make Maths Your Child’s Best Friend!",
-                                                        button_text="Register Now",
-                                                        url="https://forms.gle/hPMw7inpe7H1E4gF9"
+                                                    mode="reply",
+                                                    message={
+                                                        "sender_id" : whatsapp_business_id,
+                                                        "conversation_id" : conversation_id,
+                                                        "content": (
+                                                        "*Please contact below numbers to place order*\n\n"
+                                                        
+                                                        "📱 9503498556\n"
+                                                        "📱 8055579965\n\n"
                                                     )
+                                                    }
                                                 )
 
                                                 return {"status": "ok"}
-                                            
+
                                             # --- Fallback for unknown IDs ---
                                             case _:
                                                 chatbot_response = await send_to_pma_chatbot(

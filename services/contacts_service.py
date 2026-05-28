@@ -10,6 +10,7 @@ from core.services import services
 from database import get_mongo_db
 from loguru import logger
 from services.websocket_service import broadcast_on_stats_update
+from services.utils import normalize_phone
 
 
 
@@ -41,12 +42,40 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
         logger.warning(f"Unknown platform {platform} - skipping contact storage.")
         return
 
-    if contacts_collection.find_one(unique_filter):
-        logger.info(f"Contact already exists for {platform}: {unique_filter}")
-        return
-    
-    contacts_collection.insert_one(contact_data)
-    logger.success(f"Added new contact for {platform}: {unique_filter}")
+    incoming_name = contact_data.get("full_name")
+
+    update_doc = {
+        "$set": {
+            "conversation_id": contact_data.get("conversation_id"),
+            "platform": platform,
+            "updated_at": now
+        },
+        "$setOnInsert": {
+            "full_name": incoming_name,
+            "created_at": now,
+            "categories": contact_data.get("categories", []),
+            "labels": contact_data.get("labels", []),
+            "email": contact_data.get("email"),
+            "country": contact_data.get("country"),
+            "profile_url": contact_data.get("profile_url"),
+        }
+    }
+
+    # Add platform-specific fields
+    if platform == "instagram":
+        update_doc["$set"]["instagram_id"] = contact_data.get("instagram_id")
+        update_doc["$set"]["username"] = contact_data.get("username")
+    elif platform == "whatsapp":
+        update_doc["$set"]["phone_number"] = contact_data.get("phone_number")
+        update_doc["$set"]["whatsapp_id"] = contact_data.get("whatsapp_id")
+
+    # Clean up $set to avoid overwriting with None if fields are missing in contact_data
+    for key in list(update_doc["$set"].keys()):
+        if update_doc["$set"][key] is None:
+            del update_doc["$set"][key]
+
+    contacts_collection.update_one(unique_filter, update_doc, upsert=True)
+    logger.success(f"Stored/Updated contact for {platform}: {unique_filter}")
     
 async def get_contacts_for_org(org_id: str):
     """
@@ -225,6 +254,68 @@ async def get_labels_from_org_metadata(org_id: str):
     else:
         return []
 
+async def get_unread_counts_by_labels(org_id: str):
+    """
+    Get labels from org metadata and calculate unread conversation count for each label.
+    Returns a dictionary: { "label_name": unread_count, ... }
+    """
+    try:
+        # 1. Get all labels defined for this org
+        all_labels = await get_labels_from_org_metadata(org_id)
+        
+        # Initialize results with 0 for all known labels
+        result_map = {label: 0 for label in all_labels}
+        
+        # 2. Aggregate unread counts from conversations joined with contacts
+        # We count conversations where unread_count > 0
+        from database import get_async_mongo_db
+        async_db = get_async_mongo_db()
+        
+        conv_col = async_db[f"conversations_{org_id}"]
+        
+        pipeline = [
+            # Only conversations with unread messages
+            {"$match": {"unread_count": {"$gt": 0}}},
+            # Join with contacts to get labels
+            {
+                "$lookup": {
+                    "from": f"contacts_{org_id}",
+                    "localField": "conversation_id",
+                    "foreignField": "conversation_id",
+                    "as": "contact"
+                }
+            },
+            # Only keep those that have a corresponding contact
+            {"$match": {"contact": {"$ne": []}}},
+            # Unwind the contact array
+            {"$unwind": "$contact"},
+            # Unwind the labels array within the contact
+            {"$unwind": "$contact.labels"},
+            # Group by label and count conversations
+            {
+                "$group": {
+                    "_id": "$contact.labels",
+                    "unread_count": {"$sum": 1}
+                }
+            }
+        ]
+        
+        cursor = conv_col.aggregate(pipeline)
+        async for doc in cursor:
+            label_name = doc["_id"]
+            count = doc["unread_count"]
+            # Strictly only include labels that exist in org metadata
+            if label_name in result_map:
+                result_map[label_name] = count
+                
+        return result_map
+
+
+    except Exception as e:
+        logger.error(f"Error in get_unread_counts_by_labels for {org_id}: {e}")
+        return {}
+
+
 
 def process_bulk_wa_contact_upload(org_id: str, file_content: bytes, filename: str):
     try:
@@ -258,7 +349,7 @@ def process_bulk_wa_contact_upload(org_id: str, file_content: bytes, filename: s
         full_name = str(row['name']).strip() if pd.notna(row['name']) else None
         
         raw_phone = str(row['phone']) if pd.notna(row['phone']) else ""
-        clean_phone = "".join(filter(str.isdigit, raw_phone))
+        clean_phone = normalize_phone(raw_phone)
 
         if not full_name or not clean_phone or len(clean_phone) < 10:
             skipped_rows += 1

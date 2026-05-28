@@ -10,6 +10,7 @@ from database import get_mongo_db
 from schemas.models import WhatsAppInteractiveMessage
 from services.utils import get_first_name, inject_variables, serialize_mongo
 from services.wa_service import send_interactive_whatsapp_message, send_whatsapp_message
+from core.services import services
 from loguru import logger
 
 db = get_mongo_db()
@@ -276,11 +277,11 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
                     logger.warning(f"whatsapp_followup trigger missing conversation_id — skipping.")
                     continue
 
-                delay_seconds, message_text = _extract_delay_and_message(
+                delay_seconds, message_config = _extract_delay_and_message(
                     start_node_id, nodes, connections
                 )
 
-                if delay_seconds is None or message_text is None:
+                if delay_seconds is None or message_config is None:
                     logger.warning(
                         f"Could not extract delay/message from flow {flow_id}. "
                         f"Ensure a smart_delay node and a message node are connected."
@@ -292,7 +293,7 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
                     flow_id=flow_id,
                     conversation_id=conversation_id,
                     delay_seconds=delay_seconds,
-                    message_config={"text": message_text},
+                    message_config=message_config,
                 )
                 logger.success(
                     f"Scheduled WhatsApp follow-up — flow={flow_id}, "
@@ -314,11 +315,21 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
         )
 
         if updated_flow:
-            # Start deferred background tasks after flow is successfully published
-            from services.google_sheet_automation import process_google_sheet_trigger
+            # Process existing sheet rows IMMEDIATELY after publish.
+            # Strategy: sync sheet → process via the MongoDB path (same as scheduler).
+            # This avoids a redundant direct Google API fetch and ensures consistency.
+            # NOTE: Task references are stored in a global set to prevent garbage collection
+            # from silently cancelling them (Python asyncio best practice).
             for params in deferred_tasks:
-                asyncio.create_task(process_google_sheet_trigger(**params))
-                logger.success(f"Started deferred immediate processing for google_sheet flow {flow_id}")
+                sheet_id = params.get("trigger_config", {}).get("sheet_id")
+                if sheet_id:
+                    task = asyncio.create_task(
+                        _safe_immediate_sheet_processing(org_id, flow_id, sheet_id)
+                    )
+                    services.background_tasks.add(task)
+                    task.add_done_callback(services.background_tasks.discard)
+                    logger.success(f"Started immediate sheet processing for google_sheet flow {flow_id}, sheet {sheet_id}")
+
 
             return serialize_mongo(updated_flow)
         return None
@@ -326,6 +337,45 @@ async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"Error publishing automation flow: {str(e)}")
         raise
+
+
+async def _safe_immediate_sheet_processing(org_id: str, flow_id: str, sheet_id: str):
+    """
+    Immediately sync and process sheet rows on publish with a 3-phase speed optimization:
+      1. PRE-SYNC: Instant send to already cached rows in MongoDB for the target flow.
+      2. SYNC: Fast bulk-reconciliation with Google Sheets.
+      3. POST-SYNC: Full check for all active flows to catch new data.
+    """
+    try:
+        from services.google_sheet_automation import process_new_sheet_rows
+        from api.google_sheets_routes import _sync_sheet
+
+        # Phase 1: PRE-SYNC (Instant gratification)
+        # Process whatever is already in MongoDB for THIS flow immediately.
+        logger.info(f"[PublishSync] Phase 1/3: PRE-SYNC processing for flow {flow_id}...")
+        await process_new_sheet_rows(org_id, sheet_id, target_flow_id=flow_id)
+
+        # Phase 2: SYNC (Optimized reconciliation)
+        # Ensure MongoDB has the latest data from Google Sheets.
+        logger.info(f"[PublishSync] Phase 2/3: Syncing sheet {sheet_id}...")
+        try:
+            sync_result = await _sync_sheet(org_id, sheet_id)
+            logger.info(
+                f"[PublishSync] Synced sheet {sheet_id}: "
+                f"+{sync_result.get('rows_added', 0)} ~{sync_result.get('rows_updated', 0)}"
+            )
+        except Exception as e:
+            logger.warning(f"[PublishSync] Sheet sync failed, continuing with existing cache: {e}")
+
+        # Phase 3: POST-SYNC (Completeness)
+        # Process all rows again for all triggers (idempotency ensured by dedup collection).
+        logger.info(f"[PublishSync] Phase 3/3: POST-SYNC full check for sheet {sheet_id}...")
+        await process_new_sheet_rows(org_id, sheet_id)
+        
+        logger.success(f"[PublishSync] Completed optimized immediate processing for flow {flow_id}")
+
+    except Exception as e:
+        logger.error(f"[PublishSync] FAILED immediate processing for flow {flow_id}: {e}")
 
 
 # =============================================================================
@@ -413,12 +463,12 @@ def _extract_delay_and_message(
 ) -> tuple:
     """
     Walk graph: start_node (smart_delay) → message_node
-    Returns (delay_seconds, message_text) or (None, None) on failure.
+    Returns (delay_seconds, message_config: dict) or (None, None) on failure.
     """
     UNIT_TO_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
 
     delay_seconds = None
-    message_text = None
+    message_config = None
 
     start_node = nodes.get(start_node_id, {})
 
@@ -431,22 +481,23 @@ def _extract_delay_and_message(
         for msg_id in _children(start_node_id, connections):
             msg_node = nodes.get(msg_id, {})
             if msg_node.get("type") == "message":
-                # Primary path: node.config.content.text
-                text = msg_node.get("config", {}).get("content", {}).get("text", "")
-                # Fallback path: node.content.text
-                if not text:
-                    text = msg_node.get("content", {}).get("text", "")
-                message_text = text
-                break
+                # Extract full content config (handles both text and templates)
+                content = msg_node.get("config", {}).get("content", {})
+                if not content:
+                    content = msg_node.get("content", {})
+                
+                if content:
+                    message_config = content
+                    break
 
-    return delay_seconds, message_text
+    return delay_seconds, message_config
 
 
 def _extract_message_from_start(
     start_node_id: str,
     nodes: dict,
     connections: list,
-) -> Optional[str]:
+) -> Optional[dict]:
     """
     Walk from start_node_id to find the first message node.
     Used by _handle_google_sheet_trigger.
@@ -466,13 +517,12 @@ def _extract_message_from_start(
 
         node = nodes.get(node_id, {})
         if node.get("type") == "message":
-            # Primary path: node.config.content.text
-            text = node.get("config", {}).get("content", {}).get("text", "")
-            # Fallback path: node.content.text
-            if not text:
-                text = node.get("content", {}).get("text", "")
-            if text:
-                return text
+            # Return the full content object (which contains text, template_name, etc.)
+            content = node.get("config", {}).get("content", {})
+            if not content:
+                content = node.get("content", {})
+            if content:
+                return content
 
         next_ids = _children(node_id, connections)
         queue.extend(next_ids)
@@ -504,10 +554,16 @@ async def _handle_google_sheet_trigger(
         )
         return None
 
-    # Get message text from the flow's message node
-    message_text = _extract_message_from_start(start_node_id, nodes, connections)
-    if not message_text:
-        logger.warning(f"No message text found for google_sheet flow {flow_id} — skipping.")
+    # Get message config from the flow's message node
+    message_config = _extract_message_from_start(start_node_id, nodes, connections)
+    if not message_config:
+        logger.debug(
+             "Message extraction debug for flow {}: start_node_id={}, node_count={}, connection_count={}",
+             flow_id,
+             start_node_id,
+             len(nodes),
+             len(connections),
+         )
         return None
 
     # Register the trigger (with message_text stored for scheduler use)
@@ -525,7 +581,8 @@ async def _handle_google_sheet_trigger(
             "row_start": config.get("row_start"),
             "row_end": config.get("row_end"),
         },
-        "message_text": message_text,
+        "message_config": message_config,
+        "message_text": message_config.get("text", ""),  # Fallback for older triggers
         "start_node_id": start_node_id,
         "status": "active",
         "registered_at": datetime.now(timezone.utc),
@@ -543,8 +600,8 @@ async def _handle_google_sheet_trigger(
     return {
         "org_id": org_id,
         "flow_id": flow_id,
-        "trigger_config": config,
-        "message_text": message_text,
+        "trigger_config": trigger_doc["filters"],
+        "message_config": message_config,
     }
 
 
@@ -672,6 +729,20 @@ def validate_flow_structure(flow_data: Dict) -> tuple:
                 if row_end is not None and row_start is not None and row_end < row_start:
                     return False, "row_end must be >= row_start"
 
+            # Strict check for WhatsApp message received trigger (New System)
+            if trigger.get("type") == "whatsapp_message_received":
+                config = trigger.get("config", {})
+                keyword = config.get("keyword")
+                # Reject None, empty string, empty list
+                if not keyword or (isinstance(keyword, (list, str)) and not any(keyword)):
+                    return False, "WhatsApp message trigger requires at least one non-empty keyword"
+
+        # Strict check for WhatsApp message received trigger (Legacy System)
+        if flow_data.get("trigger_from") == "webhook" and flow_data.get("trigger_event") == "message_received":
+            trigger_msgs = flow_data.get("trigger_messages")
+            if not trigger_msgs or (isinstance(trigger_msgs, (list, str)) and not any(trigger_msgs)):
+                return False, "WhatsApp flow requires trigger keywords for message_received event"
+
         return True, None
 
     except Exception as e:
@@ -731,6 +802,7 @@ async def execute_whatsapp_flow(
     welcome_message = flow.get("welcome_message")
     welcome_message_ids = [btn["reply"]["id"] for btn in welcome_message.get("interactive", {}).get("buttons", [])] if welcome_message and welcome_message.get("type") == "interactive" else []
     introduction_message = flow.get("introduction_message")
+    start_node_id = flow.get("start_node_id")
     flow_nodes = flow.get("nodes", {})
 
     trigger_keywords = [msg.strip().lower() for msg in trigger_messages.split(",")] if trigger_messages else []
@@ -775,20 +847,16 @@ async def execute_whatsapp_flow(
             return False
 
     # Welcome / keyword trigger
-    if welcome_message:
-        is_new_session = stage == "welcome"
+    if welcome_message or start_node_id:
         is_keyword_match = (
             message_type == "text"
             and trigger_event == "message_received"
             and message_content.strip().lower() in trigger_keywords
         )
 
-        if not (is_new_session or is_keyword_match):
-            logger.info(f"[{org_id}] Message did not match welcome flow triggers, routing to AI...")
+        if not is_keyword_match:
+            logger.info(f"[{org_id}] Message did not match flow trigger keywords, routing to AI...")
             return False
-
-        welcome_type = welcome_message.get("type")
-        logger.info(f"[{org_id}] Trigger conditions met. Sending welcome message (Type: {welcome_type})")
 
         # Send optional introduction first
         if introduction_message:
@@ -800,19 +868,44 @@ async def execute_whatsapp_flow(
                 await _send_interactive_message(**ctx, raw_data=introduction_message.get("interactive", {}), template_variables=template_variables, label="introduction")
                 logger.info(f"[{org_id}] Successfully sent introduction interactive message.")
 
-        # Send welcome message
-        if welcome_type == "text":
-            await _send_text_message(**ctx, raw_content=welcome_message.get("content", ""), template_variables=template_variables)
-            _complete_onboarding(org_id, conversation_id)  # plain-text welcome → done immediately
-            logger.success(f"[{org_id}] Successfully sent text welcome message and completed onboarding.")
-            return True
+        if start_node_id and start_node_id in flow_nodes:
+            logger.info(f"[{org_id}] Trigger conditions met. Starting flow at node '{start_node_id}'")
+            node_data = flow_nodes[start_node_id]
+            node_type = node_data.get("type")
 
-        elif welcome_type == "interactive":
-            ok = await _send_interactive_message(**ctx, raw_data=welcome_message.get("interactive", {}), template_variables=template_variables, label="welcome")
-            if ok:
-                # Keep stage as "welcome" until they actually click a button
-                logger.success(f"[{org_id}] Successfully sent interactive welcome message. Awaiting user selection.")
-            return ok
+            _complete_onboarding(org_id, conversation_id)
+
+            if node_type == "text":
+                await _send_text_message(**ctx, raw_content=node_data.get("content", ""), template_variables=template_variables)
+                logger.success(f"[{org_id}] Successfully sent text start node and completed onboarding.")
+                return True
+            elif node_type in {"button", "list", "cta_url"}:
+                ok = await _send_interactive_message(**ctx, raw_data=node_data, template_variables=template_variables, label=start_node_id)
+                if ok:
+                    logger.success(f"[{org_id}] Successfully sent interactive start node. Awaiting user selection.")
+                return ok
+            else:
+                logger.warning(f"[{org_id}] Unknown start node_type '{node_type}'")
+                return False
+
+        elif welcome_message:
+            # Legacy fallback
+            welcome_type = welcome_message.get("type")
+            logger.info(f"[{org_id}] Trigger conditions met. Sending legacy welcome message (Type: {welcome_type})")
+
+            # Send welcome message
+            if welcome_type == "text":
+                await _send_text_message(**ctx, raw_content=welcome_message.get("content", ""), template_variables=template_variables)
+                _complete_onboarding(org_id, conversation_id)  # plain-text welcome → done immediately
+                logger.success(f"[{org_id}] Successfully sent text welcome message and completed onboarding.")
+                return True
+
+            elif welcome_type == "interactive":
+                ok = await _send_interactive_message(**ctx, raw_data=welcome_message.get("interactive", {}), template_variables=template_variables, label="welcome")
+                if ok:
+                    # Keep stage as "welcome" until they actually click a button
+                    logger.success(f"[{org_id}] Successfully sent interactive welcome message. Awaiting user selection.")
+                return ok
 
     logger.warning(f"[{org_id}] Flow execution fell through all scenarios. Routing to AI...")
     return False

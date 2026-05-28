@@ -45,6 +45,7 @@ class Services:
         # === Agents ===
         self.prompt_cache = {}
         self.agents: Dict[str, CompiledStateGraph] = {}
+        self.background_tasks = set()
         self.NO_AUTO_CLOSE_ORGS = [EGENIE_ORG_ID]
 
 services = Services()
