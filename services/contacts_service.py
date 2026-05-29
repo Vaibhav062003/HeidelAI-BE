@@ -327,6 +327,25 @@ def _validate_email(email: str) -> bool:
     return bool(EMAIL_PATTERN.match(email.strip()))
 
 
+def get_org_default_country_code(org_id: str) -> str:
+    """
+    Retrieve the organization's connected phone's country code prefix.
+    If none is found or it's invalid, fallback to '91'.
+    """
+    try:
+        connection = db.whatsapp_connections.find_one({"org_id": org_id, "is_active": True})
+        if not connection:
+            connection = db.whatsapp_connections.find_one({"org_id": org_id})
+        
+        if connection and connection.get("phone"):
+            phone = str(connection["phone"]).strip().lstrip("+")
+            if len(phone) > 10:
+                return phone[:-10]
+    except Exception as e:
+        logger.error(f"Error fetching default country code for org {org_id}: {e}")
+    return "91"
+
+
 def process_bulk_wa_contact_upload(
     org_id: str,
     file_content: bytes,
@@ -383,10 +402,12 @@ def process_bulk_wa_contact_upload(
     # ── 2. Build column resolver based on mapping or auto-detect ─────────────
     def _resolve(row: dict, system_key: str, fallbacks: list[str]) -> str | None:
         """Return the value for a system field from a row dict, respecting mapping."""
-        if column_mapping and system_key in column_mapping:
-            mapped_col = column_mapping[system_key]
-            val = row.get(mapped_col)
-            return str(val).strip() if val is not None else None
+        resolved_key = "full_name" if system_key == "name" else system_key
+        if column_mapping:
+            mapped_col = column_mapping.get(resolved_key) or column_mapping.get(system_key)
+            if mapped_col:
+                val = row.get(mapped_col)
+                return str(val).strip() if val is not None else None
 
         # VCF parser already returns clean keys
         if system_key in row:
@@ -402,12 +423,13 @@ def process_bulk_wa_contact_upload(
 
     # ── 3. Process each record ────────────────────────────────────────────────
     contacts_collection = db[f"contacts_{org_id}"]
+    default_cc = get_org_default_country_code(org_id)
 
     # Pre-gather all phone numbers from the file to batch-query existing ones for O(1) deduplication
     uploaded_phones = set()
     for row in raw_contacts:
         raw_phone = _resolve(row, "phone", ["phone", "mobile", "tel", "telephone", "phone number", "contact"])
-        clean_phone = normalize_phone(raw_phone or "")
+        clean_phone = normalize_phone(raw_phone or "", default_country_code=default_cc)
         if clean_phone:
             uploaded_phones.add(clean_phone)
 
@@ -435,7 +457,7 @@ def process_bulk_wa_contact_upload(
         company   = _resolve(row, "company", ["company", "org", "organisation", "organization", "employer"])
 
         # Normalise phone
-        clean_phone = normalize_phone(raw_phone or "")
+        clean_phone = normalize_phone(raw_phone or "", default_country_code=default_cc)
 
         # Validate — phone is required, name optional but noted
         if not clean_phone or len(clean_phone.lstrip("+")) < 10:
@@ -443,15 +465,6 @@ def process_bulk_wa_contact_upload(
                 "row_number": idx,
                 "value": raw_phone,
                 "reason": "Missing or invalid phone number (must have ≥ 10 digits)"
-            })
-            continue
-
-        # Skip if contact already exists in database (as requested: do not overwrite/update existing records)
-        if clean_phone in existing_phones:
-            skipped_records.append({
-                "row_number": idx,
-                "value": raw_phone,
-                "reason": f"Contact already exists in the system (phone: {clean_phone})"
             })
             continue
 

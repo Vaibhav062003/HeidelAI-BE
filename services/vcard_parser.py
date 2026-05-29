@@ -12,9 +12,9 @@ from typing import Optional
 # Regex helpers
 _TEL_RE      = re.compile(r"^TEL[^:]*:(.+)$", re.IGNORECASE)
 _EMAIL_RE    = re.compile(r"^EMAIL[^:]*:(.+)$", re.IGNORECASE)
-_FN_RE       = re.compile(r"^FN:(.+)$", re.IGNORECASE)
-_N_RE        = re.compile(r"^N:(.+)$", re.IGNORECASE)
-_ORG_RE      = re.compile(r"^ORG:(.+)$", re.IGNORECASE)
+_FN_RE       = re.compile(r"^FN[^:]*:(.+)$", re.IGNORECASE)
+_N_RE        = re.compile(r"^N[^:]*:(.+)$", re.IGNORECASE)
+_ORG_RE      = re.compile(r"^ORG[^:]*:(.+)$", re.IGNORECASE)
 
 
 def _clean_phone(raw: str) -> str:
@@ -129,10 +129,11 @@ def parse_vcf(content: bytes) -> list[dict]:
     Contacts whose phone is None (or too short) will be filtered by the caller.
     """
     try:
-        text = content.decode("utf-8")
+        text = content.decode("utf-8-sig")
     except UnicodeDecodeError:
         text = content.decode("latin-1", errors="replace")
 
+    text = text.lstrip("\ufeff")
     blocks = _split_blocks(text)
     contacts = [_parse_single_block(b) for b in blocks]
     return contacts

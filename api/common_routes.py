@@ -4,6 +4,7 @@ from config.settings import ACCESS_TOKEN
 from config.settings import APP_ID
 from services.cloudinary_service import upload_media_to_cloudinary
 import json
+import asyncio
 from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form, status
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -508,6 +509,8 @@ async def bulk_upload_whatsapp_contacts(
     import json
     try:
         org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Invalid organization ID")
         content = await file.read()
 
         mapping = None
@@ -526,12 +529,16 @@ async def bulk_upload_whatsapp_contacts(
                     detail="column_mapping must be a JSON object with string keys and string values"
                 )
 
-        stats = process_bulk_wa_contact_upload(
-            org_id=org_id,
-            file_content=content,
-            filename=file.filename or "",
-            uploaded_by=user.user_id,
-            column_mapping=mapping,
+        loop = asyncio.get_running_loop()
+        stats = await loop.run_in_executor(
+            None,
+            lambda: process_bulk_wa_contact_upload(
+                org_id=org_id,
+                file_content=content,
+                filename=file.filename or "",
+                uploaded_by=user.user_id,
+                column_mapping=mapping,
+            )
         )
 
         return {
@@ -580,7 +587,8 @@ async def delete_single_uploaded_contact(conversation_id: str, user: CurrentUser
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
-    result = delete_uploaded_contact(org_id, conversation_id)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: delete_uploaded_contact(org_id, conversation_id))
     if result.get("reason") == "not_found":
         raise HTTPException(status_code=404, detail="Contact not found")
     return result
@@ -592,7 +600,8 @@ async def rollback_upload_batch(batch_id: str, user: CurrentUser):
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
-    result = delete_upload_batch(org_id, batch_id)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: delete_upload_batch(org_id, batch_id))
     return result
 
 
