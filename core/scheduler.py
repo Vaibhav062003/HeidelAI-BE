@@ -8,6 +8,8 @@ from core.services import services
 from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
+from services.agent_service import send_to_agent
+from services.wa_service import send_whatsapp_message
 # from services.websocket_service import broadcast_on_stats_update
 from loguru import logger
 from config.settings import LEE_ORG_ID
@@ -225,9 +227,6 @@ ENSURED_INDEX_COLLECTIONS = set()
 async def trigger_ai_invocation_after_reenabling(org_id: str, conv: dict, wa_id: Optional[str]):
     conversation_id = conv["conversation_id"]
     try:
-        from services.agent_service import send_to_agent
-        from services.wa_service import send_whatsapp_message
-
         logger.info(f"Triggering AI auto-activation invocation for conversation: {conversation_id} in org: {org_id}")
 
         chatbot_response = await send_to_agent(
