@@ -990,7 +990,7 @@ async def upload_and_send_whatsapp_media(
         # Add caption if provided for media types that support it
         if caption and media_type in ['image', 'video', 'document']:
             send_data[media_type]["caption"] = caption
-        
+    
         # Send the media message
         async with httpx.AsyncClient() as client:
             send_response = await client.post(

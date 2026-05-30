@@ -1,7 +1,7 @@
 from pymongo import UpdateOne
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
+from typing import Optional
 # === Internal Modules ===
 from database import get_mongo_db
 from core.services import services
@@ -222,6 +222,42 @@ import asyncio
 
 ENSURED_INDEX_COLLECTIONS = set()
 
+async def trigger_ai_invocation_after_reenabling(org_id: str, conv: dict, wa_id: Optional[str]):
+    conversation_id = conv["conversation_id"]
+    try:
+        from services.agent_service import send_to_agent
+        from services.wa_service import send_whatsapp_message
+
+        logger.info(f"Triggering AI auto-activation invocation for conversation: {conversation_id} in org: {org_id}")
+
+        chatbot_response = await send_to_agent(
+            conversation_id=conversation_id,
+            user_input="hi",
+            persona=conv.get("persona", "fallback"),
+            location=conv.get("location", "india"),
+            customer_name=conv.get("customer_name", "Customer"),
+            org_id=org_id,
+            source="webhook",
+        )
+        final_response = chatbot_response.get("final_response")
+        
+        if final_response:
+            resolved_wa_id = conv.get("whatsapp_id") or wa_id
+            if resolved_wa_id:
+                await send_whatsapp_message({
+                    "conversation_id": conversation_id,
+                    "content": final_response,
+                    "sender_id": resolved_wa_id,
+                }, org_id, "ai")
+                logger.success(f"Successfully re-enabled AI and sent auto-invoked message to {conversation_id} for org {org_id}")
+            else:
+                logger.error(f"Cannot send WhatsApp message after re-enabling AI, WABA ID not found for org {org_id}")
+        else:
+            logger.warning(f"No response generated from agent for re-enabled AI conversation {conversation_id}")
+    except Exception as e:
+        logger.error(f"Error during AI invocation after re-enabling for {conversation_id} (org {org_id}): {e}", exc_info=True)
+
+
 async def update_ai_status(org_type: str = "all"):
     logger.info(f"processing auto ai status for type: {org_type}")
     try:
@@ -241,7 +277,15 @@ async def update_ai_status(org_type: str = "all"):
         if not org_docs:
             return
 
-        async def process_single_org(org_id: str):
+        # Pre-fetch WABA IDs from all connections to avoid N database queries in loops
+        org_ids = [org["org_id"] for org in org_docs]
+        connections = list(await asyncio.to_thread(
+            lambda: list(db.whatsapp_connections.find({"org_id": {"$in": org_ids}}, {"org_id": 1, "wa_id": 1}))
+        ))
+        org_to_wa_id = {conn["org_id"]: conn["wa_id"] for conn in connections if "org_id" in conn and "wa_id" in conn}
+
+        async def process_single_org(org_doc: dict):
+            org_id = org_doc["org_id"]
             conv_col = db[f"conversations_{org_id}"]
             col_name = conv_col.name
             
@@ -253,12 +297,33 @@ async def update_ai_status(org_type: str = "all"):
                 )
                 ENSURED_INDEX_COLLECTIONS.add(col_name)
 
+            # Query conversations that need AI re-enabling with selective projection
+            conversations_to_update = await asyncio.to_thread(
+                lambda: list(conv_col.find(
+                    {
+                        "auto_ai_disabled": True,
+                        "auto_ai_disabled_until": {"$lte": now}
+                    },
+                    {
+                        "conversation_id": 1,
+                        "persona": 1,
+                        "location": 1,
+                        "customer_name": 1,
+                        "whatsapp_id": 1
+                    }
+                ))
+            )
+
+            if not conversations_to_update:
+                return 0
+
+            conv_ids = [c["conversation_id"] for c in conversations_to_update]
+
             # Non-blocking update of the conversations
             result = await asyncio.to_thread(
                 conv_col.update_many,
                 {
-                    "auto_ai_disabled": True,
-                    "auto_ai_disabled_until": {"$lte": now}
+                    "conversation_id": {"$in": conv_ids}
                 },
                 {
                     "$set": {
@@ -270,10 +335,18 @@ async def update_ai_status(org_type: str = "all"):
                     }
                 }
             )
+
+            # Trigger AI auto-invocation for each conversation that was updated
+            wa_id_fallback = org_to_wa_id.get(org_id) or org_doc.get("wa_id")
+            for conv in conversations_to_update:
+                asyncio.create_task(
+                    trigger_ai_invocation_after_reenabling(org_id, conv, wa_id_fallback)
+                )
+
             return result.modified_count
 
         # Run organization updates concurrently
-        tasks = [process_single_org(org["org_id"]) for org in org_docs]
+        tasks = [process_single_org(org) for org in org_docs]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         total_updated = 0
