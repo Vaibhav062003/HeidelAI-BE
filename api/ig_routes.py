@@ -1,7 +1,6 @@
 from fastapi import APIRouter, File, Form, HTTPException, Depends, Response, Query, UploadFile
 from datetime import datetime
 from pymongo import ReturnDocument
-
 from config.settings import *
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.ig_service import *
@@ -13,6 +12,7 @@ from services.platforms.instagram_service import InstagramService
 from database import get_mongo_db
 from pymongo import ReturnDocument
 import cloudinary
+import requests
 
 from loguru import logger
 

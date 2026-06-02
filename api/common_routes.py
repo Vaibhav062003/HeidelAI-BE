@@ -4,6 +4,7 @@ from config.settings import ACCESS_TOKEN
 from config.settings import APP_ID
 from services.cloudinary_service import upload_media_to_cloudinary
 import json
+import asyncio
 from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form, status
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -33,7 +34,11 @@ from services.contacts_service import (
     get_tags_from_org_metadata,
     get_labels_from_org_metadata,
     get_unread_counts_by_labels,
-    process_bulk_wa_contact_upload
+    process_bulk_wa_contact_upload,
+    get_uploaded_contacts_paginated,
+    get_upload_batches,
+    delete_uploaded_contact,
+    delete_upload_batch,
     )
 
 from services.ig_service import send_instagram_reaction
@@ -491,17 +496,51 @@ async def get_agents_on_conversation():
     }
 
 @router.post("/api/contacts/bulk-upload")
-async def bulk_upload_whatsapp_contacts(user: CurrentUser, file: UploadFile = File(...)):
+async def bulk_upload_whatsapp_contacts(
+    user: CurrentUser,
+    file: UploadFile = File(...),
+    column_mapping: Optional[str] = Form(None),
+):
     """
-    Endpoint to upload CSV or Excel file for bulk whatsapp contact storage.
+    Endpoint to upload CSV, Excel, or VCF file for bulk WhatsApp contact storage.
+    Accepts an optional JSON string `column_mapping` e.g.
+    '{"full_name": "Full Name", "phone": "Mobile", "email": "Email Address", "company": "Org"}'
     """
+    import json
     try:
         org_id = user.org_id
-
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Invalid organization ID")
         content = await file.read()
-        
-        stats = process_bulk_wa_contact_upload(org_id, content, file.filename)
-        
+
+        mapping = None
+        if column_mapping:
+            try:
+                mapping = json.loads(column_mapping)
+            except Exception:
+                raise HTTPException(status_code=400, detail="column_mapping must be valid JSON")
+
+            # Validate that mapping is a dictionary with string keys and values
+            if not isinstance(mapping, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="column_mapping must be a JSON object with string keys and string values"
+                )
+
+        loop = asyncio.get_running_loop()
+        stats = await loop.run_in_executor(
+            None,
+            lambda: process_bulk_wa_contact_upload(
+                org_id=org_id,
+                file_content=content,
+                filename=file.filename or "",
+                uploaded_by=user.user_id,
+                column_mapping=mapping,
+            )
+        )
+
         return {
             "message": f"Successfully processed {file.filename}",
             "data": stats
@@ -509,9 +548,62 @@ async def bulk_upload_whatsapp_contacts(user: CurrentUser, file: UploadFile = Fi
 
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Bulk upload failed: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error during processing.")
+
+
+@router.get("/api/contacts/uploaded")
+async def get_uploaded_contacts(
+    user: CurrentUser,
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=200),
+    search: str = Query(""),
+    batch_id: Optional[str] = Query(None),
+):
+    """Return paginated list of bulk-uploaded contacts for this org."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    result = await get_uploaded_contacts_paginated(org_id, page=page, limit=limit, search=search, batch_id=batch_id)
+    return result
+
+
+@router.get("/api/contacts/upload-batches")
+async def list_upload_batches(user: CurrentUser):
+    """Return all upload batch records for this org."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    batches = await get_upload_batches(org_id)
+    return {"batches": batches}
+
+
+@router.delete("/api/contacts/uploaded/{conversation_id}")
+async def delete_single_uploaded_contact(conversation_id: str, user: CurrentUser):
+    """Delete or demote a single bulk-uploaded contact."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: delete_uploaded_contact(org_id, conversation_id))
+    if result.get("reason") == "not_found":
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return result
+
+
+@router.delete("/api/contacts/upload-batches/{batch_id}")
+async def rollback_upload_batch(batch_id: str, user: CurrentUser):
+    """Roll back an entire upload batch (delete new contacts, demote merged ones)."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: delete_upload_batch(org_id, batch_id))
+    return result
+
 
 @router.post("/api/templates/upload-media")
 async def upload_media(user: CurrentUser, file: UploadFile = File(...)):

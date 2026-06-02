@@ -89,7 +89,6 @@ async def schedule_followup_message(org_id: str, conversation_id: str):
                 {"conversation_id": conversation_id},
                 {"$set": {
                     "status": "follow-up",
-                    "last_message_timestamp": datetime.now(timezone.utc)
                 }}
             )
         except PyMongoError as e:
