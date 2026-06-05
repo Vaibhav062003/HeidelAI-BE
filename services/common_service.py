@@ -208,34 +208,46 @@ async def fetch_conversation(org_id: str, conversation_id: str):
             detail="Failed to fetch conversation"
         )
 
-async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent_username: str):
+async def fetch_messages(
+    org_id: str,
+    conversation_id: str,
+    agent_id: str,
+    agent_username: str,
+    before: Optional[str] = None,      # ISO timestamp cursor
+    limit: int = 30
+):
     """
-    Fetch messages and private notes for a specific conversation.
-    Also auto-assigns the agent to the conversation if it is unassigned.
+    Fetch messages and private notes for a specific conversation with cursor-based pagination.
+
     Arguments:
     - org_id: Organization ID
     - conversation_id: Conversation ID
+    - agent_id: ID of the agent
     - agent_username: Username of the agent accessing this conversation
+    - before: ISO timestamp — fetch messages strictly before this time (pagination cursor)
+    - limit: Max number of messages to return (default 30)
 
     Returns:
-    - A dictionary with 'messages' (list of messages and notes) and 'assignment' (assignment details)
+    - A dictionary with:
+        - 'messages': list of messages and notes (oldest→newest)
+        - 'assignment': assignment details
+        - 'has_more': whether older messages exist beyond this page
+        - 'next_cursor': ISO timestamp to pass as `before` in the next request
     """
-
     try:
         org_messages_collection_name = f"messages_{org_id}"
         private_note_collection_name = f"private_notes_{org_id}"
-
-        # Auto assigning agent to the conversation if it is unassigned
         org_conversations_collection_name = f"conversations_{org_id}"
-        convo_collection = db[org_conversations_collection_name]
 
+        convo_collection = db[org_conversations_collection_name]
         now = datetime.now(timezone.utc)
 
+        # --- Auto-assign agent if conversation is unassigned ---
         assigned_convo = convo_collection.find_one_and_update(
             {
                 "conversation_id": conversation_id,
                 "$or": [
-                    {"assigned_agent" : {"$exists": False}},
+                    {"assigned_agent": {"$exists": False}},
                     {"assigned_agent": None}
                 ],
                 "status": "open"
@@ -261,61 +273,79 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
         )
 
         if assigned_convo is None:
-             # The conversation was already assigned or closed. Fetch the current assignment details.
-             current_convo = convo_collection.find_one(
-                 {"conversation_id": conversation_id},
-                 projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0}
-             )
-             assigned_convo = current_convo
+            assigned_convo = convo_collection.find_one(
+                {"conversation_id": conversation_id},
+                projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0}
+            )
 
-        # For team conversations, unread is tracked per user (unread.{agent_id}),
-        # so we avoid resetting the aggregate unread_count here to prevent
-        # inconsistent unread state.
         if not assigned_convo or assigned_convo.get("type") != "team":
             convo_collection.update_one(
                 {"conversation_id": conversation_id},
                 {"$set": {"unread_count": 0}}
             )
 
-        messages = []
-        notes = []
-        
-        # Fetching messages
+        time_filter: dict = {"conversation_id": conversation_id}
+        if before:
+            try:
+                before_dt = datetime.fromisoformat(before)
+                if before_dt.tzinfo is None:
+                    before_dt = before_dt.replace(tzinfo=timezone.utc)
+                time_filter["timestamp"] = {"$lt": before_dt}
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid `before` cursor — must be a valid ISO timestamp")
+
+        fetch_limit = limit + 1
+
+        messages, notes = [], []
+
         if org_messages_collection_name in db.list_collection_names():
-            org_messages_collection = db[org_messages_collection_name]
-            messages = list(org_messages_collection.find(
-                {"conversation_id": conversation_id},
-                {"_id": 0}  
-            ).sort("timestamp", 1))  
-        
-        #Fetching private notes
-        if private_note_collection_name in db.list_collection_names():
-            private_note_collection = db[private_note_collection_name]
-            notes = list(private_note_collection.find(
-                    {"conversation_id": conversation_id},
-                    {"_id": 0}
-                ).sort("timestamp", 1)
+            messages = list(
+                db[org_messages_collection_name]
+                .find(time_filter, {"_id": 0})
+                .sort("timestamp", -1)      # newest first to get the right window
+                .limit(fetch_limit)
             )
 
-        # Merging both messages and notes
-        combined = messages + notes
+        if private_note_collection_name in db.list_collection_names():
+            notes = list(
+                db[private_note_collection_name]
+                .find(time_filter, {"_id": 0})
+                .sort("timestamp", -1)
+                .limit(fetch_limit)
+            )
 
-        # Normalizing timestamps
+        combined = messages + notes
+        combined.sort(key=lambda x: x.get("timestamp"), reverse=True)  # newest first
+
+        has_more = len(combined) > limit
+        if has_more:
+            combined = combined[:limit]     # trim the probe item
+
+        # Normalize timestamps
         for msg in combined:
             ts = msg.get("timestamp")
             if isinstance(ts, datetime):
                 msg["timestamp"] = ts.isoformat()
 
-        combined.sort(key=lambda x: x.get("timestamp"), reverse=False)
-        
-        return {"messages": combined, "assignment": assigned_convo}
-    
+        # Reverse to chronological (oldest→newest)
+        combined.reverse()
+
+        # next_cursor = oldest message in this page
+        # Frontend passes this as `before` when user scrolls up
+        next_cursor = combined[0].get("timestamp") if has_more and combined else None
+
+        return {
+            "messages": combined,      
+            "assignment": assigned_convo,
+            "has_more": has_more,
+            "next_cursor": next_cursor
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching messages or private notes for {conversation_id} of org {org_id}: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to fetch messages: {str(e)}"
-        )
+        logger.error(f"Error fetching messages for {conversation_id} of org {org_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch messages: {str(e)}")
 
 async def close_conversation(org_id: str, conversation_id: str, reason: str):
     """
