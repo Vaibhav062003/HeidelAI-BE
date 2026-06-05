@@ -157,18 +157,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         account_id = payload["entry"][0]["id"]
     except (KeyError, IndexError):
         logger.warning("Could not extract entry[0].id from webhook payload")
-
-    if (object_type == "whatsapp_business_account" and account_id == EGENIE_WA_ID) or (object_type == "instagram" and account_id == EGENIE_IG_ID):
-        logger.info(f"WhatsApp/Instagram webhook matched allowed account {account_id}. Forwarding.")
-        forward_headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
-        }
-        background_tasks.add_task(forward_webhook_to_test, body=body, headers=forward_headers)
-        return Response(status_code=200)
     
-    elif (object_type == "whatsapp_business_account" and account_id == SAHIL_WA_ID) or (object_type == "instagram" and account_id == SAHIL_IG_ID):
+    if (object_type == "whatsapp_business_account" and (account_id == SAHIL_WA_ID or account_id == EGENIE_WA_ID )) or (object_type == "instagram" and (account_id == SAHIL_IG_ID or account_id == EGENIE_IG_ID)):
         logger.info(f"WhatsApp/Instagram webhook matched allowed account {account_id}. Forwarding.")
         forward_headers = {
             key: value
