@@ -705,10 +705,13 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
-        auto_ai_disabled = body.get("auto_disabled")  # Optional field to indicate if this toggle is from an auto-trigger
+        auto_ai_disabled = bool(body.get("auto_disabled", False))
         
         if ai_enabled is None:
             return {"status": "error", "message": "Incorrect request body"}
+        
+        if ai_enabled and auto_ai_disabled:
+            return {"status": "error", "message": "Cannot auto-disable AI while keeping it enabled"}
         
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
@@ -719,15 +722,11 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
             "auto_ai_disabled": auto_ai_disabled
         }
 
-        disable_duration = timedelta(minutes=5) if org_id == LEE_ORG_ID else timedelta(hours=1)
-        if auto_ai_disabled:
-            update_fields= {
-                "is_ai_enabled": ai_enabled,
-                "auto_ai_disabled": auto_ai_disabled,
-                "auto_ai_disabled_until": (datetime.now(timezone.utc) + disable_duration)
-            }
+        if not ai_enabled and auto_ai_disabled:
+            disable_duration = timedelta(minutes=5) if org_id == LEE_ORG_ID else timedelta(hours=1)
+            update_fields["auto_ai_disabled_until"] = datetime.now(timezone.utc) + disable_duration
         else:
-            # If manually toggling AI, clear the auto-disable timer field
+            # If manually toggling AI, or enabling it, clear the auto-disable timer field
             update_fields["auto_ai_disabled_until"] = None
 
         # Update the conversation

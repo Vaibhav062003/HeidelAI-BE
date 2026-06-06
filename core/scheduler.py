@@ -257,6 +257,10 @@ async def trigger_ai_invocation_after_reenabling(org_id: str, conv: dict, wa_id:
         logger.error(f"Error during AI invocation after re-enabling for {conversation_id} (org {org_id}): {e}", exc_info=True)
 
 
+# Keep strong references to background tasks to prevent GC
+_background_tasks = set()
+
+
 async def update_ai_status(org_type: str = "all"):
     logger.info(f"processing auto ai status for type: {org_type}")
     try:
@@ -264,10 +268,18 @@ async def update_ai_status(org_type: str = "all"):
         
         # Build query to fetch only required organizations
         query = {}
-        if org_type == "lee" and LEE_ORG_ID:
+        if org_type == "lee":
+            if not LEE_ORG_ID:
+                logger.info("Skipping update_ai_status for 'lee' org type because LEE_ORG_ID is not configured.")
+                return
             query = {"org_id": LEE_ORG_ID}
-        elif org_type == "others" and LEE_ORG_ID:
-            query = {"org_id": {"$ne": LEE_ORG_ID}}
+        elif org_type == "others":
+            if LEE_ORG_ID:
+                query = {"org_id": {"$ne": LEE_ORG_ID}}
+            else:
+                query = {}
+        elif org_type == "all":
+            query = {}
             
         org_docs = list(await asyncio.to_thread(
             lambda: list(db.organizations.find(query, {"org_id": 1, "wa_id": 1}))
@@ -316,33 +328,48 @@ async def update_ai_status(org_type: str = "all"):
             if not conversations_to_update:
                 return 0
 
-            conv_ids = [c["conversation_id"] for c in conversations_to_update]
-
-            # Non-blocking update of the conversations
-            result = await asyncio.to_thread(
-                conv_col.update_many,
-                {
-                    "conversation_id": {"$in": conv_ids}
-                },
-                {
-                    "$set": {
-                        "is_ai_enabled": True,
-                        "auto_ai_disabled": False
-                    },
-                    "$unset": {
-                        "auto_ai_disabled_until": ""
-                    }
-                }
-            )
-
-            # Trigger AI auto-invocation for each conversation that was updated
-            wa_id_fallback = org_to_wa_id.get(org_id) or org_doc.get("wa_id")
+            # Atomic check-and-update for each conversation to avoid read-then-write race
+            updated_conversations = []
             for conv in conversations_to_update:
-                asyncio.create_task(
-                    trigger_ai_invocation_after_reenabling(org_id, conv, wa_id_fallback)
+                updated_doc = await asyncio.to_thread(
+                    lambda: conv_col.find_one_and_update(
+                        {
+                            "conversation_id": conv["conversation_id"],
+                            "auto_ai_disabled": True,
+                            "auto_ai_disabled_until": {"$lte": now}
+                        },
+                        {
+                            "$set": {
+                                "is_ai_enabled": True,
+                                "auto_ai_disabled": False
+                            },
+                            "$unset": {
+                                "auto_ai_disabled_until": ""
+                            }
+                        }
+                    )
                 )
+                if updated_doc:
+                    updated_conversations.append(conv)
 
-            return result.modified_count
+            if not updated_conversations:
+                return 0
+
+            # Trigger AI auto-invocation for each conversation that was successfully updated
+            wa_id_fallback = org_to_wa_id.get(org_id) or org_doc.get("wa_id")
+            
+            # Bounded task concurrency (limit to 10 concurrent sends)
+            sem = asyncio.Semaphore(10)
+            async def sem_task(conv_data):
+                async with sem:
+                    await trigger_ai_invocation_after_reenabling(org_id, conv_data, wa_id_fallback)
+
+            for conv in updated_conversations:
+                task = asyncio.create_task(sem_task(conv))
+                _background_tasks.add(task)
+                task.add_done_callback(_background_tasks.discard)
+
+            return len(updated_conversations)
 
         # Run organization updates concurrently
         tasks = [process_single_org(org) for org in org_docs]
