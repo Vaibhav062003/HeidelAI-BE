@@ -287,11 +287,13 @@ async def fetch_messages(
         time_filter: dict = {"conversation_id": conversation_id}
         if before:
             try:
-                before_dt = datetime.fromisoformat(before)
+                before_dt = parser.isoparse(before)
                 if before_dt.tzinfo is None:
                     before_dt = before_dt.replace(tzinfo=timezone.utc)
+                else:
+                    before_dt = before_dt.astimezone(timezone.utc)
                 time_filter["timestamp"] = {"$lt": before_dt}
-            except ValueError:
+            except (ValueError, TypeError):
                 raise HTTPException(status_code=400, detail="Invalid `before` cursor — must be a valid ISO timestamp")
 
         fetch_limit = limit + 1
