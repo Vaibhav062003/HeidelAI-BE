@@ -132,16 +132,22 @@ async def get_conversation(conversation_id: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail="Failed to fetch conversation")
 
 @router.get("/api/conversations/{conversation_id}/messages")
-async def get_messages(conversation_id: str, 
-                       user: CurrentUser,
-                       agent_username: str = Query(..., description="Username of the agent accessing this conversation")
-                       ):
-    """Fetch messages for a specific Instagram conversation"""
+async def get_messages(
+    conversation_id: str,
+    user: CurrentUser,
+    agent_username: str = Query(..., description="Username of the agent accessing this conversation"),
+    before: Optional[str] = Query(None, description="Fetch messages before this ISO timestamp (for pagination)"),
+    limit: int = Query(30, ge=1, le=100, description="Number of messages to return")
+):
+    """Fetch messages for a specific conversation with lazy loading support"""
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
-    
-    return await fetch_messages(org_id, conversation_id, user.user_id, agent_username)
+
+    return await fetch_messages(
+        org_id, conversation_id, user.user_id, agent_username,
+        before=before, limit=limit
+    )
 
 @router.post("/api/conversations/send-message")
 async def send_message_endpoint(
