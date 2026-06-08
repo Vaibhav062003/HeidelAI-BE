@@ -296,7 +296,7 @@ async def fetch_messages(
                 else:
                     ts_part = before  # backwards compat
 
-                before_dt = datetime.fromisoformat(ts_part)
+                before_dt = parser.isoparse(ts_part) 
                 if before_dt.tzinfo is None:
                     before_dt = before_dt.replace(tzinfo=timezone.utc)
 
