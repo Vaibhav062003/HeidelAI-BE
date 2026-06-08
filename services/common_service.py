@@ -284,15 +284,36 @@ async def fetch_messages(
                 {"$set": {"unread_count": 0}}
             )
 
+        # Parse compound cursor
         time_filter: dict = {"conversation_id": conversation_id}
+        last_id = None
+
         if before:
             try:
-                before_dt = datetime.fromisoformat(before)
+                # Expect cursor format: "2024-01-01T12:00:00+00:00__msg_abc123"
+                if "__" in before:
+                    ts_part, last_id = before.split("__", 1)
+                else:
+                    ts_part = before  # backwards compat
+
+                before_dt = datetime.fromisoformat(ts_part)
                 if before_dt.tzinfo is None:
                     before_dt = before_dt.replace(tzinfo=timezone.utc)
-                time_filter["timestamp"] = {"$lt": before_dt}
+
+                if last_id:
+                    # Stable compound filter: same timestamp but id not yet seen, OR strictly older
+                    time_filter["$or"] = [
+                        {"timestamp": {"$lt": before_dt}},
+                        {
+                            "timestamp": before_dt,
+                            "id": {"$lt": last_id}  # lexicographic tie-break on id
+                        }
+                    ]
+                else:
+                    time_filter["timestamp"] = {"$lt": before_dt}
+
             except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid `before` cursor — must be a valid ISO timestamp")
+                raise HTTPException(status_code=400, detail="Invalid `before` cursor")
 
         fetch_limit = limit + 1
 
@@ -302,7 +323,7 @@ async def fetch_messages(
             messages = list(
                 db[org_messages_collection_name]
                 .find(time_filter, {"_id": 0})
-                .sort("timestamp", -1)      # newest first to get the right window
+                .sort([("timestamp", -1), ("id", -1)])  # ← compound sort
                 .limit(fetch_limit)
             )
 
@@ -310,16 +331,16 @@ async def fetch_messages(
             notes = list(
                 db[private_note_collection_name]
                 .find(time_filter, {"_id": 0})
-                .sort("timestamp", -1)
+                .sort([("timestamp", -1), ("id", -1)])  # ← compound sort
                 .limit(fetch_limit)
             )
 
         combined = messages + notes
-        combined.sort(key=lambda x: x.get("timestamp"), reverse=True)  # newest first
+        combined.sort(key=lambda x: (x.get("timestamp"), x.get("id")), reverse=True)
 
         has_more = len(combined) > limit
         if has_more:
-            combined = combined[:limit]     # trim the probe item
+            combined = combined[:limit]
 
         # Normalize timestamps
         for msg in combined:
@@ -327,12 +348,14 @@ async def fetch_messages(
             if isinstance(ts, datetime):
                 msg["timestamp"] = ts.isoformat()
 
-        # Reverse to chronological (oldest→newest)
-        combined.reverse()
+        combined.reverse()  # back to chronological for frontend
 
-        # next_cursor = oldest message in this page
-        # Frontend passes this as `before` when user scrolls up
-        next_cursor = combined[0].get("timestamp") if has_more and combined else None
+        # ← Compound cursor: oldest message's timestamp + id
+        if has_more and combined:
+            oldest = combined[0]
+            next_cursor = f"{oldest.get('timestamp')}__{oldest.get('id', '')}"
+        else:
+            next_cursor = None
 
         return {
             "messages": combined,      
