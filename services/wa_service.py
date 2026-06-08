@@ -206,6 +206,7 @@ async def store_whatsapp_message(
     type: Optional[str],
     payload: Optional[dict],
     sender_name: str,
+    sender_id: str,
     recipient_id: str,
     role: MessageRole,
     mode: Optional[str] = None,
@@ -213,6 +214,7 @@ async def store_whatsapp_message(
     raw_data: Optional[dict] = None,
     status: Optional[str] = "received",
     temp_id: Optional[str] = None,
+    message_type: Optional[str] = None,
     context_type: Optional[str] = None,
     context: Optional[dict] = None,
     bot_context: Optional[dict] = None

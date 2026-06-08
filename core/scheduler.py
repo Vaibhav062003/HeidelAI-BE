@@ -227,14 +227,24 @@ ENSURED_INDEX_COLLECTIONS = set()
 async def trigger_ai_invocation_after_reenabling(org_id: str, conv: dict, wa_id: Optional[str]):
     conversation_id = conv["conversation_id"]
     try:
+        # Re-verify AI status before invocation to prevent race conditions
+        conv_col = db[f"conversations_{org_id}"]
+        latest_conv = await asyncio.to_thread(
+            lambda: conv_col.find_one({"conversation_id": conversation_id}, {"is_ai_enabled": 1, "persona": 1, "location": 1, "customer_name": 1, "whatsapp_id": 1})
+        )
+        
+        if not latest_conv or not latest_conv.get("is_ai_enabled", True):
+            logger.info(f"Skipping AI auto-activation for {conversation_id}: AI is currently disabled.")
+            return
+
         logger.info(f"Triggering AI auto-activation invocation for conversation: {conversation_id} in org: {org_id}")
 
         chatbot_response = await send_to_agent(
             conversation_id=conversation_id,
             user_input="hi",
-            persona=conv.get("persona", "fallback"),
-            location=conv.get("location", "india"),
-            customer_name=conv.get("customer_name", "Customer"),
+            persona=latest_conv.get("persona", "fallback"),
+            location=latest_conv.get("location", "india"),
+            customer_name=latest_conv.get("customer_name", "Customer"),
             org_id=org_id,
             source="webhook",
         )
