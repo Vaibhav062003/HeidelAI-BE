@@ -13,6 +13,8 @@ rem-venv
 
 test.py
 /backendenv
+/stagenv
+stage-requirements.txt
 myenv/
 
 # Temp
