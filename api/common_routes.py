@@ -1,15 +1,19 @@
+import json
 import requests
+import httpx
+from typing import Optional
 from database import get_mongo_db
-from config.settings import ACCESS_TOKEN
 from config.settings import APP_ID
+from config.settings import ACCESS_TOKEN
 from services.cloudinary_service import upload_media_to_cloudinary
 import json
 import asyncio
 from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form, status
 from fastapi.responses import JSONResponse
-from typing import Optional
-import httpx
+from services.cloudinary_service import upload_media_to_cloudinary
+from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form, status, Request
 
+from core.limiter import limiter
 from auth.dependencies import CurrentUser
 from core.services import services
 from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, UpdateLabelsRequest, CannedResponse, SendReactionRequest
@@ -58,11 +62,13 @@ router = APIRouter(tags=["Common Routes"])
 db = get_mongo_db()
 
 @router.get("/")
-async def health_check():
+@limiter.limit("60/minute")
+async def health_check(request: Request):
     return {"status": "ok"}
 
 @router.head("/health", status_code=status.HTTP_200_OK)
-async def health_check_head(response: Response):
+@limiter.limit("10/minute")
+async def health_check_head(request: Request, response: Response):
     """
     Lightweight uptime check.
     Returns 200 OK with custom headers, but NO body content.
@@ -72,11 +78,14 @@ async def health_check_head(response: Response):
     return None
 
 @router.get("/favicon.ico", include_in_schema=False)
-def favicon():
+@limiter.limit("60/minute")
+def favicon(request: Request):
     return Response(status_code=204) 
 
 @router.get("/api/conversations")
+@limiter.limit("30/minute")
 async def get_conversations(
+    request: Request, 
     user: CurrentUser,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100), # Limit max fetch to 100
@@ -115,7 +124,8 @@ async def get_conversations(
         raise HTTPException(status_code=500, detail="Failed to fetch conversations")
 
 @router.get("/api/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str, user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_conversation(request: Request, conversation_id: str, user: CurrentUser):
     """
     Fetch the conversation of a specific user for the organization.
     Returns the conversation in the standard format for compatibility with the frontend
@@ -132,7 +142,9 @@ async def get_conversation(conversation_id: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail="Failed to fetch conversation")
 
 @router.get("/api/conversations/{conversation_id}/messages")
+@limiter.limit("30/minute")
 async def get_messages(
+    request: Request, 
     conversation_id: str,
     user: CurrentUser,
     agent_username: str = Query(..., description="Username of the agent accessing this conversation"),
@@ -150,7 +162,9 @@ async def get_messages(
     )
 
 @router.post("/api/conversations/send-message")
+@limiter.limit("30/minute")
 async def send_message_endpoint(
+    request: Request, 
     user: CurrentUser,
     conversation_id: str = Form(...),
     content: Optional[str] = Form(None),
@@ -195,7 +209,9 @@ async def send_message_endpoint(
     return {"message": "Message sent", "details": res}
 
 @router.post("/api/conversations/send_reaction")
+@limiter.limit("30/minute")
 async def send_reaction_endpoint(
+    request: Request, 
     user: CurrentUser,
     data: SendReactionRequest
 ):
@@ -230,7 +246,8 @@ async def send_reaction_endpoint(
     return {"message": "Reaction sent", "details": res}
 
 @router.post("/api/conversations/{conversation_id}/reopen")
-async def reopen_conversation_endpoint(user: CurrentUser, conversation_id: str):
+@limiter.limit("60/minute")
+async def reopen_conversation_endpoint(request: Request, user: CurrentUser, conversation_id: str):
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
@@ -238,7 +255,8 @@ async def reopen_conversation_endpoint(user: CurrentUser, conversation_id: str):
     return await reopen_conversation(org_id, conversation_id)
 
 @router.post("/api/conversations/{conversation_id}/close")
-async def close_conversation_endpoint(user: CurrentUser, conversation_id: str):
+@limiter.limit("60/minute")
+async def close_conversation_endpoint(request: Request, user: CurrentUser, conversation_id: str):
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
@@ -246,20 +264,22 @@ async def close_conversation_endpoint(user: CurrentUser, conversation_id: str):
     return await close_conversation(org_id, conversation_id, "Closed by agent")
 
 @router.post("/api/unarchive-data/{platform}")
-async def unarchive(user: CurrentUser, platform: str, request: UnarchiveRequest):
+@limiter.limit("30/minute")
+async def unarchive(request: Request, user: CurrentUser, platform: str, req: UnarchiveRequest):
     """
     Unarchive data for a specific platform.
     """
     logger.info(f"Unarchiving data for user: {user}")
     org_id = user.org_id
-    user_id = request.platform_id
+    user_id = req.platform_id
 
     result = await unarchive_data(org_id, platform, user_id)
 
     return result
 
 @router.post("/api/conversations/{conversation_id}/private-note")
-async def post_private_note(user: CurrentUser, conversation_id: str, body: PrivateNoteRequest):
+@limiter.limit("60/minute")
+async def post_private_note(request: Request, user: CurrentUser, conversation_id: str, body: PrivateNoteRequest):
     """
     This endpoint adds a new private note for a specific conversation.
     Private notes are stored in the private_notes collection.
@@ -309,7 +329,8 @@ async def post_private_note(user: CurrentUser, conversation_id: str, body: Priva
 #     return {"message": "Private note deleted successfully."}
 
 @router.get("/api/contacts")
-async def get_contacts(user: CurrentUser):
+@limiter.limit("60/minute")
+async def get_contacts(request: Request, user: CurrentUser):
     """
     Retrieve contacts
     """
@@ -322,7 +343,8 @@ async def get_contacts(user: CurrentUser):
     return {"contacts": contacts}
 
 @router.post("/api/contacts/update-categories")
-async def update_contact_categories(body: UpdateCategoriesRequest, user: CurrentUser):
+@limiter.limit("60/minute")
+async def update_contact_categories(request: Request, body: UpdateCategoriesRequest, user: CurrentUser):
     """
     Replace the categories array for a specific contact.
     """
@@ -334,7 +356,8 @@ async def update_contact_categories(body: UpdateCategoriesRequest, user: Current
     return await update_contact_tag_categories(org_id, body.conversation_id, body.categories)
 
 @router.post("/api/contacts/update-labels")
-async def update_contact_labels_endpoint(body: UpdateLabelsRequest, user: CurrentUser):
+@limiter.limit("60/minute")
+async def update_contact_labels_endpoint(request: Request, body: UpdateLabelsRequest, user: CurrentUser):
     """
     Replace the labels array for a specific contact.
     """
@@ -345,9 +368,9 @@ async def update_contact_labels_endpoint(body: UpdateLabelsRequest, user: Curren
     
     return await update_contact_labels(org_id, body.conversation_id, body.labels)
 
-
 @router.get("/api/products")
-def list_products(user: CurrentUser):
+@limiter.limit("60/minute")
+def list_products(request: Request, user: CurrentUser):
     """
     """
     org_id = user.org_id
@@ -357,7 +380,9 @@ def list_products(user: CurrentUser):
     return {"products": products}
 
 @router.post("/api/products/bulk-upload")
+@limiter.limit("15/minute")
 async def bulk_upload(
+    request: Request,
     user: CurrentUser,
     file: UploadFile = File(...)
 ):
@@ -375,7 +400,9 @@ async def bulk_upload(
     return JSONResponse(content=result)
 
 @router.post("/api/products")
+@limiter.limit("30/minute")
 async def create_product(
+    request: Request,
     user: CurrentUser,
     product_name: str = Form(...),
     description: str = Form(None),
@@ -397,17 +424,20 @@ async def create_product(
     return {"product": product}
 
 @router.get("/api/products/{product_mongo_id}")
-def get_product(user: CurrentUser, product_mongo_id: str):
+@limiter.limit("60/minute")
+def get_product(request: Request, user: CurrentUser, product_mongo_id: str):
     product = get_product_by_id(user.org_id, product_mongo_id)
     return {"product": product}
 
 @router.delete("/api/products/{product_mongo_id}")
-def delete_product(user: CurrentUser, product_mongo_id: str):
+@limiter.limit("30/minute")
+def delete_product(request: Request, user: CurrentUser, product_mongo_id: str):
     deleted = delete_product_by_id(user.org_id, product_mongo_id)
     return {"deleted": deleted}
 
 @router.patch("/api/org/metadata/tags/add")
-async def add_tag(user: CurrentUser, tag: str):
+@limiter.limit("30/minute")
+async def add_tag(request: Request, user: CurrentUser, tag: str):
     """
     Add a tag to the organization's metadata.
     """
@@ -421,7 +451,8 @@ async def add_tag(user: CurrentUser, tag: str):
         raise HTTPException(status_code=400, detail="Tag already exists.")
     
 @router.patch("/api/org/metadata/labels/add")
-async def add_label(user: CurrentUser, label: str):
+@limiter.limit("30/minute")
+async def add_label(request: Request, user: CurrentUser, label: str):
     """
     Add a label to the organization's metadata.
     """
@@ -435,7 +466,8 @@ async def add_label(user: CurrentUser, label: str):
         raise HTTPException(status_code=400, detail="Label already exists.")
     
 @router.patch("/api/org/metadata/tags/remove")
-async def remove_tag(user: CurrentUser, tag: str):
+@limiter.limit("30/minute")
+async def remove_tag(request: Request, user: CurrentUser, tag: str):
     """
     Remove a tag from the organization's metadata.
     """
@@ -445,7 +477,8 @@ async def remove_tag(user: CurrentUser, tag: str):
     return {"message": "Tag removed successfully."}
 
 @router.patch("/api/org/metadata/labels/remove")
-async def remove_label(user: CurrentUser, label: str):
+@limiter.limit("30/minute")
+async def remove_label(request: Request, user: CurrentUser, label: str):
     """
     Remove a label from the organization's metadata.
     """
@@ -455,7 +488,8 @@ async def remove_label(user: CurrentUser, label: str):
     return {"message": "Label removed successfully."}
 
 @router.get("/api/org/metadata/tags")
-async def get_tags(user: CurrentUser):
+@limiter.limit("60/minute")
+async def get_tags(request: Request, user: CurrentUser):
     """Get tags for the organization."""
 
     result = await get_tags_from_org_metadata(user.org_id)
@@ -463,7 +497,8 @@ async def get_tags(user: CurrentUser):
     return {"tags": result}
 
 @router.get("/api/org/metadata/labels")
-async def get_labels(user: CurrentUser):
+@limiter.limit("60/minute")
+async def get_labels(request: Request, user: CurrentUser):
     """Get labels for the organization."""
 
     result = await get_labels_from_org_metadata(user.org_id)
@@ -481,7 +516,8 @@ async def get_labels_unread(user: CurrentUser):
 
 
 @router.get("/api/agents-on-conversation")
-async def get_agents_on_conversation():
+@limiter.limit("60/minute")
+async def get_agents_on_conversation(request: Request):
     """
     For get_agents_on_conversation
     Returns the presence maps with string keys for JSON compatibility.
@@ -502,7 +538,9 @@ async def get_agents_on_conversation():
     }
 
 @router.post("/api/contacts/bulk-upload")
+@limiter.limit("30/minute")
 async def bulk_upload_whatsapp_contacts(
+    request: Request, 
     user: CurrentUser,
     file: UploadFile = File(...),
     column_mapping: Optional[str] = Form(None),
@@ -612,7 +650,8 @@ async def rollback_upload_batch(batch_id: str, user: CurrentUser):
 
 
 @router.post("/api/templates/upload-media")
-async def upload_media(user: CurrentUser, file: UploadFile = File(...)):
+@limiter.limit("30/minute")
+async def upload_media(request: Request, user: CurrentUser, file: UploadFile = File(...)):
     """
     Creates upload session and uploads file to Meta.
     Returns uploaded file handle.
@@ -702,10 +741,9 @@ async def upload_media(user: CurrentUser, file: UploadFile = File(...)):
             detail="Internal Server Error during upload."
         )
 
-        
-    
 @router.post("/api/whatsapp/upload-media")
-async def upload_whatsapp_media( user: CurrentUser, file: UploadFile = File(...)
+@limiter.limit("30/minute")
+async def upload_whatsapp_media( request: Request, user: CurrentUser, file: UploadFile = File(...)
 ):
     """
     Upload media to WhatsApp Cloud API.
@@ -718,7 +756,8 @@ async def upload_whatsapp_media( user: CurrentUser, file: UploadFile = File(...)
     )
 
 @router.delete("/api/whatsapp/delete-template")
-async def delete_whatsapp_template(user: CurrentUser, template_name: str):
+@limiter.limit("30/minute")
+async def delete_whatsapp_template(request: Request, user: CurrentUser, template_name: str):
     """
     Delete a WhatsApp template.
     """
@@ -756,7 +795,8 @@ async def delete_whatsapp_template(user: CurrentUser, template_name: str):
         )
 
 @router.post("/api/organization/toggle_ai")
-async def toggle_whatsapp_ai_status(user: CurrentUser, body: dict):
+@limiter.limit("60/minute")
+async def toggle_whatsapp_ai_status(request: Request, user: CurrentUser, body: dict):
     """Toggle AI status for a specific organization"""
     try:
         org_id = user.org_id 

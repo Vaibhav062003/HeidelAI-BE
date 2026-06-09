@@ -8,6 +8,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from loguru import logger
+from fastapi.responses import JSONResponse
+from core.limiter import limiter, get_remote_address        
+from slowapi.errors import RateLimitExceeded                       
+from slowapi.middleware import SlowAPIMiddleware                    
 
 # === Internal Modules ===
 from api import router
@@ -50,6 +54,21 @@ app = FastAPI(
     docs_url="/docs" if ENV != "prod" else None,
     title="HeidelAI Backend API",
     )
+
+# === Rate Limit State & Middleware ===                           
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)    
+
+@app.exception_handler(RateLimitExceeded)                        
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    logger.warning(f"Rate limit exceeded: {request.method} {request.url} from {get_remote_address(request)}")
+    return JSONResponse(                                        
+        status_code=429,
+        content={
+            "error": "rate_limit_exceeded",
+            "detail": "Too many requests, please slow down.",
+        }
+    )            
 
 @app.exception_handler(StarletteHTTPException)
 async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
