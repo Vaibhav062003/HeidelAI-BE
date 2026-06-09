@@ -12,6 +12,9 @@ from auth.dependencies import CurrentUser
 from services.platforms.instagram_service import InstagramService
 from schemas.models import PlatformDisconnectRequest, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
+import requests
+
+
 
 instagram_service = InstagramService()
 

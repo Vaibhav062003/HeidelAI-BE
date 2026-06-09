@@ -7,6 +7,7 @@ load_dotenv()
 IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
 IG_ID = os.getenv("IG_ID")
 IG_VERSION = os.getenv("IG_VERSION")
+WA_VERSION = os.getenv("WA_VERSION")
 BUSINESS_ID = os.getenv("BUSINESS_ID")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -55,6 +56,7 @@ JWT_HEADER_ALGORITHM = os.getenv('JWT_HEADER_ALGORITHM')
 
 # Egenie Specific Configurations
 ORG_ID = os.getenv("ORG_ID")
+LEE_ORG_ID = os.getenv("LEE_ORG_ID")
 
 #Sentence Transformers
 SENTENCE_TRANSFORMERS_MODEL = os.getenv("sentence_transformers_model")
@@ -80,8 +82,12 @@ ENVIRONMENT = os.getenv("ENVIRONMENT")
 
 HEIDELAI_ORG_WA_ID = os.getenv("HEIDELAI_ORG_WA_ID")
 PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
+LEE_DEALER_ORG_WA_ID = os.getenv("LEE_DEALER_ORG_WA_ID")
 X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making & validating API calls between different koyeb instances
 
+# Google OAuth 
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
@@ -99,5 +105,11 @@ os.environ["AZURE_OPENAI_ENDPOINT"] =os.getenv("AZURE_OPENAI_ENDPOINT")
 os.environ["AZURE_OPENAI_DEPLOYMENT"] =os.getenv("AZURE_DEPLOYMENT")
 
 PMA_ORG_ID=os.getenv("PMA_ORG_ID")
-CGSV_ORG_WA_ID=os.getenv("CGSV_ORG_WA_ID")
 EGENIE_ORG_ID=os.getenv("EGENIE_ORG_ID")
+LEE_DEALER_ORG_WA_ID=os.getenv("LEE_DEALER_ORG_WA_ID")
+
+KARAN_ORG_ID=os.getenv("KARAN_ORG_ID")
+KARAN_ORG_WA_ID=os.getenv("KARAN_ORG_WA_ID")
+
+TECHNET_ORG_ID=os.getenv("TECHNET_ORG_ID")
+TECHNET_ORG_WA_ID=os.getenv("TECHNET_ORG_WA_ID")

@@ -19,6 +19,7 @@ from services.websocket_service import broadcast_team_message
 from database import get_mongo_db, get_async_mongo_db
 
 from loguru import logger
+from dateutil import parser
 
 
 db = get_mongo_db()
@@ -32,7 +33,8 @@ async def fetch_conversations_new(
     active_tab: str = "all",
     unread_only: bool = False,
     platform: Optional[str] = None,
-    priority: Optional[str] = None
+    priority: Optional[str] = None,
+    labels: Optional[str] = None
 ) -> List[Dict]:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -50,21 +52,29 @@ async def fetch_conversations_new(
         "_id": 0,
     }
 
-    # Filtering logic for Team Chat
-    # 1. Customer conversations: type != "team"
-    # 2. Team conversations: type == "team" AND current_user_id in participants
-    # TODO: seperate out the team and non-team conversations filtering don't add both in one call
+    # Only customer conversations — team conversations are in their own
+    # dedicated collection (team_conversations_{org_id}) and fetched
+    # via GET /api/team/conversations
     base_conditions = [
-        {
-            "$or": [
-                {"type": {"$ne": "team"}},
-                {
-                    "type": "team",
-                    "participants": current_user_id
-                }
-            ]
-        }
+        {"type": {"$ne": "team"}}
     ]
+
+    # Labels filter
+    if labels:
+        labels_list = [l.strip() for l in labels.split(",") if l.strip()]
+        if labels_list:
+            contact_col = async_db[f"contacts_{org_id}"]
+            
+            # Optimization: Use regex for case-insensitive exact matching
+            regex_labels = [re.compile(f"^{re.escape(l)}$", re.IGNORECASE) for l in labels_list]
+            
+            # Fetch unique conversation_ids from contacts who have any of these labels
+            matching_ids = await contact_col.distinct("conversation_id", {"labels": {"$in": regex_labels}})
+            
+            if not matching_ids:
+                return [] # Early exit to save resources
+            
+            base_conditions.append({"conversation_id": {"$in": matching_ids}})
 
     # Tab filters
     if active_tab == "open":
@@ -123,65 +133,33 @@ async def fetch_conversations_new(
         conv_type = doc.get("type")
         platform = doc.get("platform")
         
-        if conv_type == "team":
-            # For Team chats, use participants but check online status
-            participants = doc.get("participants", [])
-            other_participants = [p for p in participants if p != current_user_id]
-            
-            # logic for "is_online": if ANY other participant is online
-            is_online = False
-            if other_participants:
-                for p_id in other_participants:
-                    if p_id in services.agent_clients and services.agent_clients[p_id]:
-                        is_online = True
-                        break
-            
-            unread_map = doc.get("unread", {})
-            user_unread = unread_map.get(current_user_id, 0) if current_user_id else 0
-            
-            conv_obj = {
-                "id": doc.get("conversation_id"),
-                "customer_name": doc.get("customer_name") or doc.get("conversation_id"),
-                "last_message": doc.get("last_message", ""),
-                "timestamp": (
-                    doc["last_message_timestamp"].isoformat()
-                    if isinstance(doc.get("last_message_timestamp"), datetime)
-                    else None
-                ),
-                "unread_count": user_unread,
-                "platform": platform or "internal",
-                "type": "team",
-                "participants": participants,
-                "is_online": is_online
-            }
-        else:
-            conv_obj = {
-                "id": doc.get("conversation_id"),
-                "platform": platform,
-                "type": conv_type,
-                "customer_id": doc.get("customer_username"),
-                "phone_number": doc.get("customer_id") if platform == "whatsapp" else None,
-                "customer_name": doc.get("customer_name") or "Unknown",
-                "last_message": doc.get("last_message") or "",
-                "last_message_is_private_note": doc.get("last_message_is_private_note", False),
-                "timestamp": (
-                    doc["last_message_timestamp"].isoformat()
-                    if isinstance(doc.get("last_message_timestamp"), datetime)
-                    else None
-                ),
-                "unread_count": doc.get("unread_count", 0),
-                "status": doc.get("status"),
-                "priority": doc.get("priority"),
-                "sentiment": doc.get("sentiment"),
-                "assigned_agent": doc.get("assigned_agent", {}),
-                "is_ai_enabled": doc.get("is_ai_enabled"),
-                "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
-                "assignment_history": doc.get("assignment_history", []),
-                "suggestions": doc.get("suggestions", []),
-                "summary": doc.get("summary", []),
-                "participants": doc.get("participants", []),
-                "unread": doc.get("unread", {})
-            }
+        conv_obj = {
+            "id": doc.get("conversation_id"),
+            "platform": platform,
+            "type": conv_type,
+            "customer_id": doc.get("customer_username"),
+            "phone_number": doc.get("customer_id") if platform == "whatsapp" else None,
+            "customer_name": doc.get("customer_name") or "Unknown",
+            "last_message": doc.get("last_message") or "",
+            "last_message_is_private_note": doc.get("last_message_is_private_note", False),
+            "timestamp": (
+                doc["last_message_timestamp"].isoformat()
+                if isinstance(doc.get("last_message_timestamp"), datetime)
+                else None
+            ),
+            "unread_count": doc.get("unread_count", 0),
+            "status": doc.get("status"),
+            "priority": doc.get("priority"),
+            "sentiment": doc.get("sentiment"),
+            "assigned_agent": doc.get("assigned_agent", {}),
+            "is_ai_enabled": doc.get("is_ai_enabled"),
+            "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
+            "assignment_history": doc.get("assignment_history", []),
+            "suggestions": doc.get("suggestions", []),
+            "summary": doc.get("summary", []),
+            "participants": doc.get("participants", []),
+            "unread": doc.get("unread", {})
+        }
             
         result.append(conv_obj)
 
@@ -230,34 +208,46 @@ async def fetch_conversation(org_id: str, conversation_id: str):
             detail="Failed to fetch conversation"
         )
 
-async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent_username: str):
+async def fetch_messages(
+    org_id: str,
+    conversation_id: str,
+    agent_id: str,
+    agent_username: str,
+    before: Optional[str] = None,      # ISO timestamp cursor
+    limit: int = 30
+):
     """
-    Fetch messages and private notes for a specific conversation.
-    Also auto-assigns the agent to the conversation if it is unassigned.
+    Fetch messages and private notes for a specific conversation with cursor-based pagination.
+
     Arguments:
     - org_id: Organization ID
     - conversation_id: Conversation ID
+    - agent_id: ID of the agent
     - agent_username: Username of the agent accessing this conversation
+    - before: ISO timestamp — fetch messages strictly before this time (pagination cursor)
+    - limit: Max number of messages to return (default 30)
 
     Returns:
-    - A dictionary with 'messages' (list of messages and notes) and 'assignment' (assignment details)
+    - A dictionary with:
+        - 'messages': list of messages and notes (oldest→newest)
+        - 'assignment': assignment details
+        - 'has_more': whether older messages exist beyond this page
+        - 'next_cursor': ISO timestamp to pass as `before` in the next request
     """
-
     try:
         org_messages_collection_name = f"messages_{org_id}"
         private_note_collection_name = f"private_notes_{org_id}"
-
-        # Auto assigning agent to the conversation if it is unassigned
         org_conversations_collection_name = f"conversations_{org_id}"
-        convo_collection = db[org_conversations_collection_name]
 
+        convo_collection = db[org_conversations_collection_name]
         now = datetime.now(timezone.utc)
 
+        # --- Auto-assign agent if conversation is unassigned ---
         assigned_convo = convo_collection.find_one_and_update(
             {
                 "conversation_id": conversation_id,
                 "$or": [
-                    {"assigned_agent" : {"$exists": False}},
+                    {"assigned_agent": {"$exists": False}},
                     {"assigned_agent": None}
                 ],
                 "status": "open"
@@ -283,72 +273,102 @@ async def fetch_messages(org_id: str, conversation_id: str, agent_id: str, agent
         )
 
         if assigned_convo is None:
-             # The conversation was already assigned or closed. Fetch the current assignment details.
-             current_convo = convo_collection.find_one(
-                 {"conversation_id": conversation_id},
-                 projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0}
-             )
-             assigned_convo = current_convo
-
-        # Reset unread count
-        if assigned_convo and assigned_convo.get("type") == "team":
-            convo_collection.update_one(
+            assigned_convo = convo_collection.find_one(
                 {"conversation_id": conversation_id},
-                {
-                    "$set": {
-                        f"unread.{agent_id}": 0
-                    }
-                }
-            )
-        else:
-            convo_collection.update_one(
-                {"conversation_id": conversation_id},
-                {
-                    "$set": {
-                        "unread_count": 0
-                    }
-                }
+                projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0}
             )
 
-        messages = []
-        notes = []
-        
-        # Fetching messages
+        if not assigned_convo or assigned_convo.get("type") != "team":
+            convo_collection.update_one(
+                {"conversation_id": conversation_id},
+                {"$set": {"unread_count": 0}}
+            )
+
+        # Parse compound cursor
+        time_filter: dict = {"conversation_id": conversation_id}
+        last_id = None
+
+        if before:
+            try:
+                # Expect cursor format: "2024-01-01T12:00:00+00:00__msg_abc123"
+                if "__" in before:
+                    ts_part, last_id = before.split("__", 1)
+                else:
+                    ts_part = before  # backwards compat
+
+                before_dt = parser.isoparse(ts_part) 
+                if before_dt.tzinfo is None:
+                    before_dt = before_dt.replace(tzinfo=timezone.utc)
+
+                if last_id:
+                    # Stable compound filter: same timestamp but id not yet seen, OR strictly older
+                    time_filter["$or"] = [
+                        {"timestamp": {"$lt": before_dt}},
+                        {
+                            "timestamp": before_dt,
+                            "id": {"$lt": last_id}  # lexicographic tie-break on id
+                        }
+                    ]
+                else:
+                    time_filter["timestamp"] = {"$lt": before_dt}
+
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid `before` cursor")
+
+        fetch_limit = limit + 1
+
+        messages, notes = [], []
+
         if org_messages_collection_name in db.list_collection_names():
-            org_messages_collection = db[org_messages_collection_name]
-            messages = list(org_messages_collection.find(
-                {"conversation_id": conversation_id},
-                {"_id": 0}  
-            ).sort("timestamp", 1))  
-        
-        #Fetching private notes
-        if private_note_collection_name in db.list_collection_names():
-            private_note_collection = db[private_note_collection_name]
-            notes = list(private_note_collection.find(
-                    {"conversation_id": conversation_id},
-                    {"_id": 0}
-                ).sort("timestamp", 1)
+            messages = list(
+                db[org_messages_collection_name]
+                .find(time_filter, {"_id": 0})
+                .sort([("timestamp", -1), ("id", -1)])  # ← compound sort
+                .limit(fetch_limit)
             )
 
-        # Merging both messages and notes
-        combined = messages + notes
+        if private_note_collection_name in db.list_collection_names():
+            notes = list(
+                db[private_note_collection_name]
+                .find(time_filter, {"_id": 0})
+                .sort([("timestamp", -1), ("id", -1)])  # ← compound sort
+                .limit(fetch_limit)
+            )
 
-        # Normalizing timestamps
+        combined = messages + notes
+        combined.sort(key=lambda x: (x.get("timestamp"), x.get("id")), reverse=True)
+
+        has_more = len(combined) > limit
+        if has_more:
+            combined = combined[:limit]
+
+        # Normalize timestamps
         for msg in combined:
             ts = msg.get("timestamp")
             if isinstance(ts, datetime):
                 msg["timestamp"] = ts.isoformat()
 
-        combined.sort(key=lambda x: x.get("timestamp"), reverse=False)
-        
-        return {"messages": combined, "assignment": assigned_convo}
-    
+        combined.reverse()  # back to chronological for frontend
+
+        # ← Compound cursor: oldest message's timestamp + id
+        if has_more and combined:
+            oldest = combined[0]
+            next_cursor = f"{oldest.get('timestamp')}__{oldest.get('id', '')}"
+        else:
+            next_cursor = None
+
+        return {
+            "messages": combined,      
+            "assignment": assigned_convo,
+            "has_more": has_more,
+            "next_cursor": next_cursor
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching messages or private notes for {conversation_id} of org {org_id}: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to fetch messages: {str(e)}"
-        )
+        logger.error(f"Error fetching messages for {conversation_id} of org {org_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch messages: {str(e)}")
 
 async def close_conversation(org_id: str, conversation_id: str, reason: str):
     """
@@ -370,7 +390,6 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
                 "$set": {
                     "status": "closed",
                     "closed_at": now,
-                    "last_message_timestamp": now,
                     "assigned_agent": None,
                     "closure_reason": reason
                 }
@@ -565,7 +584,7 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, user_full_name: Optional[str] = None, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
@@ -606,11 +625,19 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 else:
                     raise ValueError("Not a template")
             except (json.JSONDecodeError, ValueError, TypeError):
-                res = await send_whatsapp_message({
-                    "conversation_id": conversation_id,
-                    "content": content,
-                    "sender_id": wa_id,
-                }, org_id, mode, temp_id, context_type, context)
+                res = await send_whatsapp_message(
+                    {
+                        "conversation_id": conversation_id,
+                        "content": content,
+                        "sender_id": wa_id,
+                    }, 
+                    org_id=org_id, 
+                    mode=mode, 
+                    temp_id=temp_id, 
+                    context_type=context_type, 
+                    context=context, 
+                    user_full_name=user_full_name
+                )
         return res
     
     elif platform == "instagram":
@@ -647,8 +674,20 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             sorted_ids = sorted(participants)
             conversation_id = f"team_{sorted_ids[0]}_{sorted_ids[1]}"
         
-        now = datetime.now(timezone.utc)
-        convo_collection = db[f"conversations_{org_id}"]
+        if timestamp:
+            try:
+                now = parser.parse(timestamp)
+                if now.tzinfo is None:
+                    now = now.replace(tzinfo=timezone.utc)
+                else:
+                    now = now.astimezone(timezone.utc)
+            except Exception:
+                now = datetime.now(timezone.utc)
+        else:
+            now = datetime.now(timezone.utc)
+
+        # Team conversations and messages live in their own dedicated collections
+        convo_collection = db[f"team_conversations_{org_id}"]
         
         convo = convo_collection.find_one({"conversation_id": conversation_id})
         
@@ -699,7 +738,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                     }
                 )
         
-        messages_collection = db[f"messages_{org_id}"]
+        messages_collection = db[f"team_messages_{org_id}"]
         sender_id = context.get("sender_id") if context else None
         sender_name = context.get("sender_name") if context else None
         
@@ -707,6 +746,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         msg_doc = {
             "id": msg_id,
             "message_id": msg_id,
+            "temp_id": temp_id,
             "conversation_id": conversation_id,
             "platform": "internal",
             "type": "text",
@@ -743,9 +783,10 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             update_query
         )
 
-        broadcast_payload = {k: v for k, v in msg_doc.items() if k != "_id"}
+        from services.utils import serialize_mongo
+        broadcast_payload = serialize_mongo(msg_doc)
         await broadcast_team_message(org_id, conversation_id, participants, broadcast_payload)
         
-        return {"status": "sent", "conversation_id": conversation_id}
+        return {"status": "sent", "conversation_id": conversation_id, "message_id": msg_id}
     else:
         raise HTTPException(status_code=400, detail="Unsupported platform")

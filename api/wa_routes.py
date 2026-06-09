@@ -4,7 +4,7 @@ import asyncio
 import httpx
 import requests
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # Third-party modules
 import cloudinary
@@ -39,8 +39,11 @@ from config.settings import (
     VERSION,
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
-    CLOUDINARY_API_SECRET
+    CLOUDINARY_API_SECRET,
+    LEE_ORG_ID
 )
+from services.websocket_service import broadcast_main_ws
+
 
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD_NAME,
@@ -165,15 +168,16 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "access_token": access_token
         }
         phone_register_url = f"https://graph.facebook.com/v22.0/{phone_id}/register"
-        phone_register_response = requests.post(phone_register_url, json=phone_register_params)
-        logger.info(f"Phone register response: {phone_register_response.json()}")
 
-        if phone_register_response.status_code != 200:
-            logger.error(f"Register phone number error: {phone_register_response.text}")
-            raise HTTPException(
-                status_code=400, 
-                detail="Failed to register phone number. Please ensure the phone number is valid/verified and try again."
-            )
+        try:
+            phone_register_response = requests.post(phone_register_url, json=phone_register_params)
+            logger.info(f"Phone register response: {phone_register_response.json()}")
+
+            if phone_register_response.status_code != 200:
+                logger.error(f"Phone registration failed (non-fatal): {phone_register_response.text}")
+            
+        except Exception as e:
+            logger.error(f"Phone registration request failed (non-fatal): {str(e)}")
         
         # Generate a unique user_id for this WhatsApp connection
         user_id = str(uuid.uuid4())
@@ -713,17 +717,34 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
         logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
+        auto_ai_disabled = bool(body.get("auto_disabled", False))
         
         if ai_enabled is None:
             return {"status": "error", "message": "Incorrect request body"}
         
+        if ai_enabled and auto_ai_disabled:
+            return {"status": "error", "message": "Cannot auto-disable AI while keeping it enabled"}
+        
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
-        
+        messages_collection = db[f"messages_{org_id}"]
+
+        update_fields = {
+            "is_ai_enabled": ai_enabled,
+            "auto_ai_disabled": auto_ai_disabled
+        }
+
+        if not ai_enabled and auto_ai_disabled:
+            disable_duration = timedelta(minutes=5) if org_id == LEE_ORG_ID else timedelta(hours=1)
+            update_fields["auto_ai_disabled_until"] = datetime.now(timezone.utc) + disable_duration
+        else:
+            # If manually toggling AI, or enabling it, clear the auto-disable timer field
+            update_fields["auto_ai_disabled_until"] = None
+
         # Update the conversation
         result = conversations_collection.update_one(
             {"conversation_id": conversation_id},
-            {"$set": {"is_ai_enabled": ai_enabled}}
+            {"$set": update_fields}
         )
         
         if result.matched_count == 0:
@@ -731,8 +752,76 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
         
         # Get updated conversation for broadcasting
         updated_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+
+        # Determine if we should add a system message
+        should_add_system_msg = False
+        system_content = ""
+        sender_id = "system"
+        sender_name = "System"
+
+        time_Str = "5 min" if org_id == LEE_ORG_ID else '1 hr'
+
+        # Only add system messages and broadcast if the state ACTUALLY changed
+        if result.modified_count > 0:
+            if ai_enabled == False and auto_ai_disabled == True:
+                should_add_system_msg = True
+                system_content = f"Ai is disabled for this conversation, will be enabled after {time_Str}"
+                sender_id = "system_auto"
+                sender_name = "System (Auto)"
+           
+            if should_add_system_msg:
+                msg_id = str(uuid.uuid4())
+                msg_doc = {
+                    "id": msg_id,
+                    "message_id": msg_id,
+                    "temp_id": None,
+                    "conversation_id": conversation_id,
+                    "platform": "internal",
+                    "type": "system_message",
+                    "content": system_content,
+                    "sender_id": sender_id,
+                    "sender_name": sender_name,
+                    "role": "agent",
+                    "timestamp": datetime.now(timezone.utc),
+                    "status": "sent"
+                }
+
+                messages_collection.insert_one(msg_doc)
+
+                broadcast_msg = {
+                    "id": msg_doc["id"],
+                    "platform": "whatsapp",
+                    "conversation_id": msg_doc["conversation_id"],
+                    "content": msg_doc["content"],
+                    "sender_id": msg_doc["sender_id"],
+                    "role": msg_doc["role"],
+                    "timestamp": msg_doc["timestamp"].isoformat(),
+                    "status": msg_doc["status"],
+                    "sender_name": msg_doc["sender_name"],
+                    "type": msg_doc["type"],
+                    "temp_id": None,
+                    "payload": None,
+                    "mode": None,
+                    "context_type": None,
+                    "context": None
+                }
+
+                # Broadcast to main websocket manager
+                await broadcast_main_ws(
+                    platform_id=wa_id,
+                    platform_type="whatsapp",
+                    event_type="new_message",
+                    payload={"message": broadcast_msg}
+                )
+
+                # Broadcast to WhatsApp-specific legacy connections
+                if wa_id in services.whatsapp_connections_map:
+                    logger.info(f"Broadcasting system message for AI status change to WhatsApp connections of wa_id: {wa_id}")
+                    await broadcast_whatsapp_message(wa_id, "new_message", {
+                        "message": broadcast_msg
+                    })
         
-        if updated_conversation:
+        if updated_conversation and result.modified_count > 0:
             # Format for broadcasting
             broadcast_conversation = dict(updated_conversation)
             if "last_message_timestamp" in broadcast_conversation:
@@ -740,6 +829,15 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
             if "_id" in broadcast_conversation:
                 broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
             
+            # Broadcast to main websocket manager
+            
+            await broadcast_main_ws(
+                platform_id=wa_id,
+                platform_type="whatsapp",
+                event_type="conversation_updated",
+                payload={"conversation": broadcast_conversation}
+            )
+
             # Broadcast to WhatsApp-specific connections
             if wa_id in services.whatsapp_connections_map:
                 await broadcast_whatsapp_message(wa_id, "conversation_updated", {
@@ -906,7 +1004,7 @@ async def upload_and_send_whatsapp_media(
         # Add caption if provided for media types that support it
         if caption and media_type in ['image', 'video', 'document']:
             send_data[media_type]["caption"] = caption
-        
+    
         # Send the media message
         async with httpx.AsyncClient() as client:
             send_response = await client.post(
@@ -1245,6 +1343,7 @@ async def bulk_send_whatsapp_message(
         # Enqueue the heavy work as a background task
         background_tasks.add_task(
             run_bulk_send_job,
+            wa_id=wa_id,
             job_id=job_id,
             org_id=org_id,
             phone_id=phone_id,

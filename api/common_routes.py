@@ -5,6 +5,10 @@ from typing import Optional
 from database import get_mongo_db
 from config.settings import APP_ID
 from config.settings import ACCESS_TOKEN
+from services.cloudinary_service import upload_media_to_cloudinary
+import json
+import asyncio
+from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form, status
 from fastapi.responses import JSONResponse
 from services.cloudinary_service import upload_media_to_cloudinary
 from fastapi import APIRouter, HTTPException, Response, Query, File, UploadFile, Form, status, Request
@@ -33,7 +37,12 @@ from services.contacts_service import (
     remove_label_from_org_metadata,
     get_tags_from_org_metadata,
     get_labels_from_org_metadata,
-    process_bulk_wa_contact_upload
+    get_unread_counts_by_labels,
+    process_bulk_wa_contact_upload,
+    get_uploaded_contacts_paginated,
+    get_upload_batches,
+    delete_uploaded_contact,
+    delete_upload_batch,
     )
 
 from services.ig_service import send_instagram_reaction
@@ -84,7 +93,8 @@ async def get_conversations(
     active_tab: str = Query("all"),
     unread_only: bool = Query(False),
     platform: Optional[str] = None,
-    priority: Optional[str] = None
+    priority: Optional[str] = None,
+    labels: Optional[str] = None
 ):
     """
     Get conversations for the current user's organization
@@ -103,7 +113,8 @@ async def get_conversations(
             active_tab=active_tab,
             unread_only=unread_only,
             platform=platform,
-            priority=priority
+            priority=priority,
+            labels=labels
         )
 
     except HTTPException:
@@ -132,16 +143,23 @@ async def get_conversation(request: Request, conversation_id: str, user: Current
 
 @router.get("/api/conversations/{conversation_id}/messages")
 @limiter.limit("30/minute")
-async def get_messages(request: Request, conversation_id: str, 
-                       user: CurrentUser,
-                       agent_username: str = Query(..., description="Username of the agent accessing this conversation")
-                       ):
-    """Fetch messages for a specific Instagram conversation"""
+async def get_messages(
+    request: Request, 
+    conversation_id: str,
+    user: CurrentUser,
+    agent_username: str = Query(..., description="Username of the agent accessing this conversation"),
+    before: Optional[str] = Query(None, description="Fetch messages before this ISO timestamp (for pagination)"),
+    limit: int = Query(30, ge=1, le=100, description="Number of messages to return")
+):
+    """Fetch messages for a specific conversation with lazy loading support"""
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
-    
-    return await fetch_messages(org_id, conversation_id, user.user_id, agent_username)
+
+    return await fetch_messages(
+        org_id, conversation_id, user.user_id, agent_username,
+        before=before, limit=limit
+    )
 
 @router.post("/api/conversations/send-message")
 @limiter.limit("30/minute")
@@ -153,6 +171,7 @@ async def send_message_endpoint(
     platform: str = Form(...),
     mode: str = Form(...),
     temp_id: Optional[str] = Form(None), 
+    timestamp: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     context_type: Optional[str] = Form(None),
     context: Optional[str] = Form(None)
@@ -162,6 +181,7 @@ async def send_message_endpoint(
     The body should contain the necessary fields for sending the message.
     """
     org_id = user.org_id
+    user_full_name = user.full_name or "You"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
@@ -178,10 +198,12 @@ async def send_message_endpoint(
         conversation_id, 
         content if content else None, 
         mode,
+        user_full_name,
         file if file else None, 
         temp_id if temp_id else None,
         context_type if context_type else None,
-        context_dict
+        context_dict,
+        timestamp=timestamp
     )
 
     return {"message": "Message sent", "details": res}
@@ -483,6 +505,16 @@ async def get_labels(request: Request, user: CurrentUser):
 
     return {"labels": result}
 
+@router.get("/api/org/metadata/labels-unread")
+async def get_labels_unread(user: CurrentUser):
+    """Get labels for the organization with unread counts."""
+
+    result = await get_unread_counts_by_labels(user.org_id)
+
+    return {"labels": result}
+
+
+
 @router.get("/api/agents-on-conversation")
 @limiter.limit("60/minute")
 async def get_agents_on_conversation(request: Request):
@@ -507,17 +539,52 @@ async def get_agents_on_conversation(request: Request):
 
 @router.post("/api/contacts/bulk-upload")
 @limiter.limit("30/minute")
-async def bulk_upload_whatsapp_contacts(request: Request, user: CurrentUser, file: UploadFile = File(...)):
+async def bulk_upload_whatsapp_contacts(
+    request: Request, 
+    user: CurrentUser,
+    file: UploadFile = File(...),
+    column_mapping: Optional[str] = Form(None),
+):
     """
-    Endpoint to upload CSV or Excel file for bulk whatsapp contact storage.
+    Endpoint to upload CSV, Excel, or VCF file for bulk WhatsApp contact storage.
+    Accepts an optional JSON string `column_mapping` e.g.
+    '{"full_name": "Full Name", "phone": "Mobile", "email": "Email Address", "company": "Org"}'
     """
+    import json
     try:
         org_id = user.org_id
-
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Invalid organization ID")
         content = await file.read()
-        
-        stats = process_bulk_wa_contact_upload(org_id, content, file.filename)
-        
+
+        mapping = None
+        if column_mapping:
+            try:
+                mapping = json.loads(column_mapping)
+            except Exception:
+                raise HTTPException(status_code=400, detail="column_mapping must be valid JSON")
+
+            # Validate that mapping is a dictionary with string keys and values
+            if not isinstance(mapping, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="column_mapping must be a JSON object with string keys and string values"
+                )
+
+        loop = asyncio.get_running_loop()
+        stats = await loop.run_in_executor(
+            None,
+            lambda: process_bulk_wa_contact_upload(
+                org_id=org_id,
+                file_content=content,
+                filename=file.filename or "",
+                uploaded_by=user.user_id,
+                column_mapping=mapping,
+            )
+        )
+
         return {
             "message": f"Successfully processed {file.filename}",
             "data": stats
@@ -525,9 +592,62 @@ async def bulk_upload_whatsapp_contacts(request: Request, user: CurrentUser, fil
 
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Bulk upload failed: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error during processing.")
+
+
+@router.get("/api/contacts/uploaded")
+async def get_uploaded_contacts(
+    user: CurrentUser,
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=200),
+    search: str = Query(""),
+    batch_id: Optional[str] = Query(None),
+):
+    """Return paginated list of bulk-uploaded contacts for this org."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    result = await get_uploaded_contacts_paginated(org_id, page=page, limit=limit, search=search, batch_id=batch_id)
+    return result
+
+
+@router.get("/api/contacts/upload-batches")
+async def list_upload_batches(user: CurrentUser):
+    """Return all upload batch records for this org."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    batches = await get_upload_batches(org_id)
+    return {"batches": batches}
+
+
+@router.delete("/api/contacts/uploaded/{conversation_id}")
+async def delete_single_uploaded_contact(conversation_id: str, user: CurrentUser):
+    """Delete or demote a single bulk-uploaded contact."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: delete_uploaded_contact(org_id, conversation_id))
+    if result.get("reason") == "not_found":
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return result
+
+
+@router.delete("/api/contacts/upload-batches/{batch_id}")
+async def rollback_upload_batch(batch_id: str, user: CurrentUser):
+    """Roll back an entire upload batch (delete new contacts, demote merged ones)."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, lambda: delete_upload_batch(org_id, batch_id))
+    return result
+
 
 @router.post("/api/templates/upload-media")
 @limiter.limit("30/minute")
