@@ -4,7 +4,7 @@ import asyncio
 import httpx
 import requests
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Third-party modules
 import cloudinary
@@ -36,7 +36,8 @@ from config.settings import (
     VERSION,
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
-    CLOUDINARY_API_SECRET
+    CLOUDINARY_API_SECRET,
+    LEE_ORG_ID
 )
 from loguru import logger
 from services.websocket_service import broadcast_main_ws
@@ -704,21 +705,29 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
-        auto_ai_disabled = body.get("auto_disabled")  # Optional field to indicate if this toggle is from an auto-trigger
+        auto_ai_disabled = bool(body.get("auto_disabled", False))
         
         if ai_enabled is None:
             return {"status": "error", "message": "Incorrect request body"}
+        
+        if ai_enabled and auto_ai_disabled:
+            return {"status": "error", "message": "Cannot auto-disable AI while keeping it enabled"}
         
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
         messages_collection = db[f"messages_{org_id}"]
 
         update_fields = {
-            "is_ai_enabled": ai_enabled
+            "is_ai_enabled": ai_enabled,
+            "auto_ai_disabled": auto_ai_disabled
         }
 
-        if auto_ai_disabled is not None:
-            update_fields["auto_ai_disabled"] = auto_ai_disabled
+        if not ai_enabled and auto_ai_disabled:
+            disable_duration = timedelta(minutes=5) if org_id == LEE_ORG_ID else timedelta(hours=1)
+            update_fields["auto_ai_disabled_until"] = datetime.now(timezone.utc) + disable_duration
+        else:
+            # If manually toggling AI, or enabling it, clear the auto-disable timer field
+            update_fields["auto_ai_disabled_until"] = None
 
         # Update the conversation
         result = conversations_collection.update_one(
@@ -738,19 +747,16 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         sender_id = "system"
         sender_name = "System"
 
+        time_Str = "5 min" if org_id == LEE_ORG_ID else '1 hr'
+
         # Only add system messages and broadcast if the state ACTUALLY changed
         if result.modified_count > 0:
             if ai_enabled == False and auto_ai_disabled == True:
                 should_add_system_msg = True
-                system_content = "Ai is disabled for this conversation, you can re-enable it anytime by clicking on the enable AI button manually"
+                system_content = f"Ai is disabled for this conversation, will be enabled after {time_Str}"
                 sender_id = "system_auto"
                 sender_name = "System (Auto)"
-            elif ai_enabled == True:
-                should_add_system_msg = True
-                system_content = "Ai is enabled for this conversation"
-                sender_id = "system"
-                sender_name = "System"
-
+           
             if should_add_system_msg:
                 msg_id = str(uuid.uuid4())
                 msg_doc = {
@@ -983,7 +989,7 @@ async def upload_and_send_whatsapp_media(
         # Add caption if provided for media types that support it
         if caption and media_type in ['image', 'video', 'document']:
             send_data[media_type]["caption"] = caption
-        
+    
         # Send the media message
         async with httpx.AsyncClient() as client:
             send_response = await client.post(
