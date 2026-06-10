@@ -4,21 +4,24 @@ import asyncio
 import httpx
 import requests
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Third-party modules
 import cloudinary
+from loguru import logger
 from fastapi import (
-    APIRouter,
-    BackgroundTasks,
-    HTTPException,
     Form,
     File,
+    Depends,
+    Request,
+    APIRouter,
     UploadFile,
-    Depends
+    HTTPException,
+    BackgroundTasks
 )
 
 # Internal modules
+from core.limiter import limiter
 from core.services import services
 from services.utils import serialize_mongo
 from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template, BulkMessageRequest
@@ -36,9 +39,9 @@ from config.settings import (
     VERSION,
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
-    CLOUDINARY_API_SECRET
+    CLOUDINARY_API_SECRET,
+    LEE_ORG_ID
 )
-from loguru import logger
 from services.websocket_service import broadcast_main_ws
 
 
@@ -55,13 +58,14 @@ db = get_mongo_db()
 router = APIRouter(prefix="/api/whatsapp", tags=["WhatsApp"])
 
 @router.post("/auth")
-async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser):
+@limiter.limit("10/minute")
+async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, user: CurrentUser):
     try:
         # Extract authorization code from request
-        code = request.code
+        code = req.code
         # redirect_uri = request.redirect_uri
         org_id = user.org_id
-        whatsapp_business_id = request.waba_id
+        whatsapp_business_id = req.waba_id
         
         if not code:
             raise HTTPException(status_code=400, detail="Authorization code is required")
@@ -232,7 +236,8 @@ async def whatsapp_auth_exchange(request: WhatsappAuthRequest, user: CurrentUser
         raise HTTPException(status_code=500, detail=f"WhatsApp authentication error: {str(e)}")
     
 @router.post("/disconnect")
-async def whatsapp_disconnect(request: PlatformDisconnectRequest, user: CurrentUser):
+@limiter.limit("10/minute")
+async def whatsapp_disconnect(request: Request, req: PlatformDisconnectRequest, user: CurrentUser):
     """Disconnect a WhatsApp Account from the system"""
     try:
         org_id = user.org_id
@@ -253,7 +258,8 @@ async def whatsapp_disconnect(request: PlatformDisconnectRequest, user: CurrentU
         raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
 
 @router.get("/{whatsapp_id}/details")
-async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)):
+@limiter.limit("20/minute")
+async def get_whatsapp_details(request: Request, whatsapp_id: str, _: None = Depends(require_auth)):
     """
     Fetch detailed WhatsApp Business Account information from Meta Graph API
     
@@ -359,7 +365,9 @@ async def get_whatsapp_details(whatsapp_id: str, _: None = Depends(require_auth)
         raise HTTPException(status_code=500, detail=f"Failed to fetch WhatsApp details: {str(e)}")
 
 @router.get("/{whatsapp_id}/analytics/conversations")
+@limiter.limit("30/minute")
 async def get_whatsapp_conversation_analytics(
+    request: Request,
     whatsapp_id: str,
     start_date: Optional[int] = None,
     end_date: Optional[int] = None,
@@ -504,7 +512,8 @@ async def get_whatsapp_conversation_analytics(
         )
 
 @router.get("/conversations")
-async def get_whatsapp_conversations(user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_whatsapp_conversations(request: Request, user: CurrentUser):
     """
     Fetch all conversations for a specific WhatsApp business account ID
     Returns them in the standard conversation format for compatibility with the frontend
@@ -563,7 +572,8 @@ async def get_whatsapp_conversations(user: CurrentUser):
         )
 
 @router.get("/conversations/{conversation_id}")
-async def get_whatsapp_conversation(conversation_id: str, user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_whatsapp_conversation(request: Request, conversation_id: str, user: CurrentUser):
     """
     Fetch a specific conversation for an Whatsapp business account ID
     Returns the conversation in the standard format for compatibility with the frontend
@@ -605,7 +615,8 @@ async def get_whatsapp_conversation(conversation_id: str, user: CurrentUser):
         )
 
 @router.get("/conversations/{conversation_id}/messages")
-async def get_whatsapp_messages(conversation_id: str, user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_whatsapp_messages(request: Request, conversation_id: str, user: CurrentUser):
     """Fetch messages for a specific WhatsApp conversation"""
     try:
         org_id = user.org_id 
@@ -669,7 +680,8 @@ async def get_whatsapp_messages(conversation_id: str, user: CurrentUser):
 #         )
 
 @router.get("/conversations/{conversation_id}/ai")
-async def get_whatsapp_ai_status(conversation_id: str, user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_whatsapp_ai_status(request: Request, conversation_id: str, user: CurrentUser):
     """Get AI status for a specific WhatsApp conversation"""
     try:
 
@@ -694,7 +706,8 @@ async def get_whatsapp_ai_status(conversation_id: str, user: CurrentUser):
         )
 
 @router.post("/conversations/{conversation_id}/toggle_ai")
-async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: CurrentUser):
+@limiter.limit("30/minute")
+async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body: dict, user: CurrentUser):
     """Toggle AI status for a specific WhatsApp conversation"""
     try:
         org_id = user.org_id 
@@ -704,21 +717,29 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
         # Get the enabled status from request body
         ai_enabled = body.get("enabled")
-        auto_ai_disabled = body.get("auto_disabled")  # Optional field to indicate if this toggle is from an auto-trigger
+        auto_ai_disabled = bool(body.get("auto_disabled", False))
         
         if ai_enabled is None:
             return {"status": "error", "message": "Incorrect request body"}
+        
+        if ai_enabled and auto_ai_disabled:
+            return {"status": "error", "message": "Cannot auto-disable AI while keeping it enabled"}
         
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
         messages_collection = db[f"messages_{org_id}"]
 
         update_fields = {
-            "is_ai_enabled": ai_enabled
+            "is_ai_enabled": ai_enabled,
+            "auto_ai_disabled": auto_ai_disabled
         }
 
-        if auto_ai_disabled is not None:
-            update_fields["auto_ai_disabled"] = auto_ai_disabled
+        if not ai_enabled and auto_ai_disabled:
+            disable_duration = timedelta(minutes=5) if org_id == LEE_ORG_ID else timedelta(hours=1)
+            update_fields["auto_ai_disabled_until"] = datetime.now(timezone.utc) + disable_duration
+        else:
+            # If manually toggling AI, or enabling it, clear the auto-disable timer field
+            update_fields["auto_ai_disabled_until"] = None
 
         # Update the conversation
         result = conversations_collection.update_one(
@@ -738,19 +759,16 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         sender_id = "system"
         sender_name = "System"
 
+        time_Str = "5 min" if org_id == LEE_ORG_ID else '1 hr'
+
         # Only add system messages and broadcast if the state ACTUALLY changed
         if result.modified_count > 0:
             if ai_enabled == False and auto_ai_disabled == True:
                 should_add_system_msg = True
-                system_content = "Ai is disabled for this conversation, you can re-enable it anytime by clicking on the enable AI button manually"
+                system_content = f"Ai is disabled for this conversation, will be enabled after {time_Str}"
                 sender_id = "system_auto"
                 sender_name = "System (Auto)"
-            elif ai_enabled == True:
-                should_add_system_msg = True
-                system_content = "Ai is enabled for this conversation"
-                sender_id = "system"
-                sender_name = "System"
-
+           
             if should_add_system_msg:
                 msg_id = str(uuid.uuid4())
                 msg_doc = {
@@ -836,7 +854,8 @@ async def toggle_whatsapp_ai_status(conversation_id: str, body: dict, user: Curr
         )
 
 @router.post("/conversations/send_message")
-async def process_whatsapp_message(message: dict, user: CurrentUser):
+@limiter.limit("30/minute")
+async def process_whatsapp_message(request: Request, message: dict, user: CurrentUser):
     """Send a message to a WhatsApp conversation"""
     # Get Instagram-specific collections
     org_id = user.org_id
@@ -852,7 +871,9 @@ async def process_whatsapp_message(message: dict, user: CurrentUser):
     return res
     
 @router.post("/{whatsapp_id}/media/send")
+@limiter.limit("30/minute")
 async def upload_and_send_whatsapp_media(
+    request: Request, 
     whatsapp_id: str, 
     recipient_id: str = Form(...),
     caption: Optional[str] = Form(None), 
@@ -983,7 +1004,7 @@ async def upload_and_send_whatsapp_media(
         # Add caption if provided for media types that support it
         if caption and media_type in ['image', 'video', 'document']:
             send_data[media_type]["caption"] = caption
-        
+    
         # Send the media message
         async with httpx.AsyncClient() as client:
             send_response = await client.post(
@@ -1047,7 +1068,8 @@ async def upload_and_send_whatsapp_media(
         )
 
 @router.get("/profile")
-async def get_whatsapp_profile(user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_whatsapp_profile(request: Request, user: CurrentUser):
     """
     Fetch detailed WhatsApp profile information
     
@@ -1090,9 +1112,9 @@ async def get_whatsapp_profile(user: CurrentUser):
         logger.error(f"Error fetching WhatsApp profile: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch WhatsApp profile: {str(e)}")
 
-
 @router.get("/templates")
-async def fetch_templates(user: CurrentUser):
+@limiter.limit("60/minute")
+async def fetch_templates(request: Request, user: CurrentUser):
     """
     fetch prebuilt templates:
     """
@@ -1132,7 +1154,8 @@ async def fetch_templates(user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to fetch prebuilt templates: {str(e)}")
 
 @router.post("/templates")
-async def whatsapp_create_template(user: CurrentUser, template: Template):
+@limiter.limit("30/minute")
+async def whatsapp_create_template(request: Request, user: CurrentUser, template: Template):
     """
         Create templates
     """
@@ -1174,9 +1197,9 @@ async def whatsapp_create_template(user: CurrentUser, template: Template):
         logger.error(f"Unexpected error creating templates: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create templates: {str(e)}")
 
-
 @router.delete("/templates/{template_name}")
-async def delete_whatsapp_template(template_name: str, user: CurrentUser):
+@limiter.limit("30/minute")
+async def delete_whatsapp_template(request: Request, template_name: str, user: CurrentUser):
     """
     Delete a WhatsApp template by name.
     """
@@ -1256,8 +1279,10 @@ async def delete_whatsapp_template(template_name: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to delete template: {str(e)}")
 
 @router.post("/bulk/send")
+@limiter.limit("30/minute")
 async def bulk_send_whatsapp_message(
-    request: BulkMessageRequest,
+    request: Request,
+    req: BulkMessageRequest,
     background_tasks: BackgroundTasks,
     user: CurrentUser,
 ):
@@ -1344,5 +1369,3 @@ async def bulk_send_whatsapp_message(
     except Exception as e:
         logger.error(f"Error enqueueing bulk WhatsApp send: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Bulk send failed: {str(e)}")
-
-

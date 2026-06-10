@@ -1,15 +1,19 @@
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from loguru import logger
 from typing import Optional
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+
+from core.limiter import limiter
 from auth.dependencies import CurrentUser
 from services.dashboard_service import aggregate_dashboard_stats
-from loguru import logger
 
 
 router = APIRouter(tags=["Dashboard Routes"])
 
 @router.get("/api/dashboard/stats")
+@limiter.limit("20/minute")  
 async def get_dashboard_stats(
+    request: Request,
     user: CurrentUser,
     target_date: Optional[str] = Query(None, description="ISO date string for single day stats"),
     start_date: Optional[str] = Query(None, description="ISO start date string for range"),

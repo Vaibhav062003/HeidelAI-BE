@@ -1,15 +1,17 @@
-from auth.dependencies import CurrentUser
-from fastapi import APIRouter, Depends, HTTPException
-from database import get_mongo_db
 from loguru import logger
+from fastapi import APIRouter, Request, HTTPException
 
+from core.limiter import limiter
+from database import get_mongo_db
+from auth.dependencies import CurrentUser
 
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/integrations", tags=["Integrations"])
 
 @router.get("/status")
-async def get_integrations_status(user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_integrations_status(request: Request, user: CurrentUser):
     """
     Fetch all the integrations status for a specific Organization using org_id
     Returns integrations with their status as true or false
