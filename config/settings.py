@@ -77,12 +77,14 @@ CLERK_TOKEN = os.getenv("CLERK_TOKEN_KEY")
 
 # Webhook for Dev
 DEV_WEBHOOK_URL = os.getenv("DEV_WEBHOOK_URL", "").strip().strip("'\"")
+TEST_WEBHOOK_URL = os.getenv("TEST_WEBHOOK_URL", "").strip().strip("'\"")
 
 ENVIRONMENT = os.getenv("ENVIRONMENT")
 
 HEIDELAI_ORG_WA_ID = os.getenv("HEIDELAI_ORG_WA_ID")
 PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
 LEE_DEALER_ORG_WA_ID = os.getenv("LEE_DEALER_ORG_WA_ID")
+KARAN_ORG_WA_ID = os.getenv("KARAN_ORG_WA_ID")
 X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making & validating API calls between different koyeb instances
 
 # Google OAuth 
@@ -111,5 +113,11 @@ LEE_DEALER_ORG_WA_ID=os.getenv("LEE_DEALER_ORG_WA_ID")
 KARAN_ORG_ID=os.getenv("KARAN_ORG_ID")
 KARAN_ORG_WA_ID=os.getenv("KARAN_ORG_WA_ID")
 
-TECHNET_ORG_ID=os.getenv("TECHNET_ORG_ID")
-TECHNET_ORG_WA_ID=os.getenv("TECHNET_ORG_WA_ID")
+GIGA_ORG_ID=os.getenv("GIGA_ORG_ID")
+GIGA_ORG_WA_ID=os.getenv("GIGA_ORG_WA_ID")
+
+EGENIE_WA_ID=os.getenv("EGENIE_WA_ID")
+EGENIE_IG_ID=os.getenv("EGENIE_IG_ID")
+
+SAHIL_WA_ID=os.getenv("SAHIL_WA_ID")
+SAHIL_IG_ID=os.getenv("SAHIL_IG_ID")
