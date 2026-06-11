@@ -69,8 +69,10 @@ def _split_blocks(raw_text: str) -> list[str]:
     return blocks
 
 
-def _parse_single_block(block: str) -> dict:
-    """Parse a single BEGIN:VCARD … END:VCARD block."""
+def _parse_single_block(block: str) -> list[dict]:
+    """Parse a single BEGIN:VCARD … END:VCARD block.
+    Returns a list of contacts if multiple phone numbers are present.
+    """
     full_name: Optional[str] = None
     phones:    list[str]     = []
     email:     Optional[str] = None
@@ -110,16 +112,21 @@ def _parse_single_block(block: str) -> dict:
             company = org_m.group(1).split(";")[0].strip()
             continue
 
-    # Use the first valid phone number encountered in the vCard block.
-    # TEL parameters such as TYPE=CELL are not parsed here.
-    primary_phone = phones[0] if phones else None
+    if not phones:
+        return [{
+            "full_name": full_name or None,
+            "phone":     None,
+            "email":     email,
+            "company":   company,
+        }]
 
-    return {
+    # Yield a separate contact record for every phone number found
+    return [{
         "full_name": full_name or None,
-        "phone":     primary_phone,
+        "phone":     p,
         "email":     email,
         "company":   company,
-    }
+    } for p in phones]
 
 
 def parse_vcf(content: bytes) -> list[dict]:
@@ -135,5 +142,7 @@ def parse_vcf(content: bytes) -> list[dict]:
 
     text = text.lstrip("\ufeff")
     blocks = _split_blocks(text)
-    contacts = [_parse_single_block(b) for b in blocks]
+    contacts = []
+    for b in blocks:
+        contacts.extend(_parse_single_block(b))
     return contacts
