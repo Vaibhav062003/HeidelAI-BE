@@ -144,21 +144,22 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     body = await request.body()
 
     # ── Extract account ID and object type ──────────────────────────────────
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        logger.error("Webhook received non-JSON body")
-        return Response(status_code=400)
+    if ENVIRONMENT == "production":
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            logger.error("Webhook received non-JSON body")
+            return Response(status_code=400)
 
-    object_type: str = payload.get("object", "")
-    account_id: str | None = None
+        object_type: str = payload.get("object", "")
+        account_id: str | None = None
 
-    try:
-        account_id = payload["entry"][0]["id"]
-    except (KeyError, IndexError):
-        logger.warning("Could not extract entry[0].id from webhook payload")
+        try:
+            account_id = payload["entry"][0]["id"]
+        except (KeyError, IndexError):
+            logger.warning("Could not extract entry[0].id from webhook payload")
     
-    if (object_type == "whatsapp_business_account" and (account_id == SAHIL_WA_ID or account_id == EGENIE_WA_ID )) or (object_type == "instagram" and (account_id == SAHIL_IG_ID or account_id == EGENIE_IG_ID)):
+        if (object_type == "whatsapp_business_account" and (account_id == SAHIL_WA_ID or account_id == EGENIE_WA_ID )) or (object_type == "instagram" and (account_id == SAHIL_IG_ID or account_id == EGENIE_IG_ID)):
         logger.info(f"WhatsApp/Instagram webhook matched allowed account {account_id}. Forwarding.")
         forward_headers = {
             key: value
