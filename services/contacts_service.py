@@ -456,6 +456,7 @@ def process_bulk_wa_contact_upload(
 
     processed_in_batch = set()
     bulk_ops: list[UpdateOne] = []
+    conversation_bulk_ops: list[UpdateOne] = []
     skipped_records: list[dict] = []
     success_count = 0
 
@@ -561,6 +562,14 @@ def process_bulk_wa_contact_upload(
                 # Remove full_name from $setOnInsert to avoid MongoDB conflict
                 # (same field cannot be in both $set and $setOnInsert)
                 contact_on_insert.pop("full_name", None)
+                
+                # Update conversation document so UI conversation list shows new name immediately
+                conversation_bulk_ops.append(
+                    UpdateOne(
+                        {"conversation_id": conversation_id},
+                        {"$set": {"customer_name": full_name}}
+                    )
+                )
 
             update_doc: dict = {
                 "$set": set_fields,
@@ -599,6 +608,13 @@ def process_bulk_wa_contact_upload(
                 })
         
         success_count = newly_added + matched_count
+
+    # Execute conversation name updates if any VCF contacts were updated
+    if conversation_bulk_ops:
+        try:
+            db[f"conversations_{org_id}"].bulk_write(conversation_bulk_ops, ordered=False)
+        except Exception as e:
+            logger.error(f"Error updating conversation names from VCF upload: {e}")
 
     # ── 5. Persist batch metadata ─────────────────────────────────────────────
     batch_doc = {
