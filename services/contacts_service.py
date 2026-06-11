@@ -503,77 +503,77 @@ def process_bulk_wa_contact_upload(
                 })
                 continue
 
-        processed_in_batch.add(clean_phone)
+            processed_in_batch.add(clean_phone)
 
-        if not full_name:
-            full_name = f"Contact {clean_phone[-4:]}"  # fallback display name
+            if not full_name:
+                full_name = f"Contact {clean_phone[-4:]}"  # fallback display name
 
-        # Validate email if present
-        email: str | None = None
-        if email_raw and _validate_email(email_raw):
-            email = email_raw.lower()
-        elif email_raw:
-            # still continue — just skip the bad email
-            skipped_records.append({
-                "row_number": idx,
-                "value": email_raw,
-                "reason": f"Invalid email format for phone {clean_phone} — email skipped, contact imported"
-            })
+            # Validate email if present
+            email: str | None = None
+            if email_raw and _validate_email(email_raw):
+                email = email_raw.lower()
+            elif email_raw:
+                # still continue — just skip the bad email
+                skipped_records.append({
+                    "row_number": idx,
+                    "value": email_raw,
+                    "reason": f"Invalid email format for phone {clean_phone} — email skipped, contact imported"
+                })
 
-        conversation_id = f"whatsapp_{clean_phone}"
-        upload_metadata = {
-            "batch_id": batch_id,
-            "source_type": source_type,
-            "uploaded_by": uploaded_by,
-            "uploaded_date": now,
-            "filename": filename,
-        }
+            conversation_id = f"whatsapp_{clean_phone}"
+            upload_metadata = {
+                "batch_id": batch_id,
+                "source_type": source_type,
+                "uploaded_by": uploaded_by,
+                "uploaded_date": now,
+                "filename": filename,
+            }
 
-        # Sets all base fields for new records
-        contact_on_insert = {
-            "full_name": full_name,
-            "phone_number": clean_phone,
-            "whatsapp_id": None,
-            "country": None,
-            "profile_url": None,
-            "conversation_id": conversation_id,
-            "categories": [],
-            "labels": [],
-            "platform": "whatsapp",
-            "created_at": now,
-        }
-        if email:
-            contact_on_insert["email"] = email
-        if company:
-            contact_on_insert["company"] = company
+            # Sets all base fields for new records
+            contact_on_insert = {
+                "full_name": full_name,
+                "phone_number": clean_phone,
+                "whatsapp_id": None,
+                "country": None,
+                "profile_url": None,
+                "conversation_id": conversation_id,
+                "categories": [],
+                "labels": [],
+                "platform": "whatsapp",
+                "created_at": now,
+            }
+            if email:
+                contact_on_insert["email"] = email
+            if company:
+                contact_on_insert["company"] = company
 
-        set_fields: dict = {
-            "is_bulk_uploaded": True,
-            "upload_metadata": upload_metadata,
-            "updated_at": now,
-        }
+            set_fields: dict = {
+                "is_bulk_uploaded": True,
+                "upload_metadata": upload_metadata,
+                "updated_at": now,
+            }
 
-        # For VCF uploads: force-update the contact name on existing records
-        # and lock it so WhatsApp API profile-name webhooks don't overwrite it.
-        if source_type == "vcf" and full_name:
-            set_fields["full_name"] = full_name
-            set_fields["name_locked_by_vcf"] = True
-            # Remove full_name from $setOnInsert to avoid MongoDB conflict
-            # (same field cannot be in both $set and $setOnInsert)
-            contact_on_insert.pop("full_name", None)
+            # For VCF uploads: force-update the contact name on existing records
+            # and lock it so WhatsApp API profile-name webhooks don't overwrite it.
+            if source_type == "vcf" and full_name:
+                set_fields["full_name"] = full_name
+                set_fields["name_locked_by_vcf"] = True
+                # Remove full_name from $setOnInsert to avoid MongoDB conflict
+                # (same field cannot be in both $set and $setOnInsert)
+                contact_on_insert.pop("full_name", None)
 
-        update_doc: dict = {
-            "$set": set_fields,
-            "$setOnInsert": contact_on_insert,
-        }
+            update_doc: dict = {
+                "$set": set_fields,
+                "$setOnInsert": contact_on_insert,
+            }
 
-        bulk_ops.append(
-            UpdateOne(
-                {"phone_number": clean_phone},
-                update_doc,
-                upsert=True,
+            bulk_ops.append(
+                UpdateOne(
+                    {"phone_number": clean_phone},
+                    update_doc,
+                    upsert=True,
+                )
             )
-        )
 
     # ── 4. Execute batch write ────────────────────────────────────────────────
     newly_added = 0
