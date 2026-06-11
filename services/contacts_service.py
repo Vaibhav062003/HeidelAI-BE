@@ -48,21 +48,31 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
 
     incoming_name = contact_data.get("full_name")
 
+    # Check if the contact's name was locked by a VCF upload.
+    # If so, we must NOT overwrite the name from a webhook/API call.
+    existing_contact = contacts_collection.find_one(unique_filter, {"name_locked_by_vcf": 1, "_id": 0})
+    is_name_locked = existing_contact.get("name_locked_by_vcf", False) if existing_contact else False
+
+    set_on_insert_doc = {
+        "created_at": now,
+        "categories": contact_data.get("categories", []),
+        "labels": contact_data.get("labels", []),
+        "email": contact_data.get("email"),
+        "country": contact_data.get("country"),
+        "profile_url": contact_data.get("profile_url"),
+    }
+
+    # Only set name on insert if the name is NOT locked by VCF
+    if not is_name_locked:
+        set_on_insert_doc["full_name"] = incoming_name
+
     update_doc = {
         "$set": {
             "conversation_id": contact_data.get("conversation_id"),
             "platform": platform,
             "updated_at": now
         },
-        "$setOnInsert": {
-            "full_name": incoming_name,
-            "created_at": now,
-            "categories": contact_data.get("categories", []),
-            "labels": contact_data.get("labels", []),
-            "email": contact_data.get("email"),
-            "country": contact_data.get("country"),
-            "profile_url": contact_data.get("profile_url"),
-        }
+        "$setOnInsert": set_on_insert_doc,
     }
 
     # Add platform-specific fields
@@ -449,94 +459,121 @@ def process_bulk_wa_contact_upload(
     skipped_records: list[dict] = []
     success_count = 0
 
-    for idx, row in enumerate(raw_contacts, start=1):
+    idx = 0
+    for row in raw_contacts:
+        idx += 1
         # Resolve fields
         full_name = _resolve(row, "full_name", ["name", "full name", "fullname", "fn"])
-        raw_phone = _resolve(row, "phone", ["phone", "mobile", "tel", "telephone", "phone number", "contact"])
+        
+        # Clean duplicated names like Name | Name or Name | Company from sync tools
+        if full_name and "|" in full_name:
+            full_name = full_name.split("|")[0].strip()
+
+        raw_phone_str = _resolve(row, "phone", ["phone", "mobile", "tel", "telephone", "phone number", "contact"])
         email_raw = _resolve(row, "email", ["email", "email address", "e-mail"])
         company   = _resolve(row, "company", ["company", "org", "organisation", "organization", "employer"])
 
-        # Normalise phone
-        clean_phone = normalize_phone(raw_phone or "", default_country_code=default_cc)
+        # Support multiple phone numbers separated by comma or semicolon
+        phone_list = []
+        if raw_phone_str:
+            phone_list = [p.strip() for p in re.split(r'[,;]+', str(raw_phone_str)) if p.strip()]
+        
+        if not phone_list:
+            phone_list = [""]
 
-        # Validate — phone is required, name optional but noted
-        if not clean_phone or len(clean_phone.lstrip("+")) < 10:
-            skipped_records.append({
-                "row_number": idx,
-                "value": raw_phone,
-                "reason": "Missing or invalid phone number (must have ≥ 10 digits)"
-            })
-            continue
+        for raw_phone in phone_list:
+            # Normalise phone
+            clean_phone = normalize_phone(raw_phone, default_country_code=default_cc)
 
-        # Skip if duplicate within the same uploaded file
-        if clean_phone in processed_in_batch:
-            skipped_records.append({
-                "row_number": idx,
-                "value": raw_phone,
-                "reason": f"Duplicate phone number in the uploaded file (phone: {clean_phone})"
-            })
-            continue
+            # Validate — phone is required, name optional but noted
+            if not clean_phone or len(clean_phone.lstrip("+")) < 10:
+                skipped_records.append({
+                    "row_number": idx,
+                    "value": raw_phone,
+                    "reason": "Missing or invalid phone number (must have ≥ 10 digits)"
+                })
+                continue
 
-        processed_in_batch.add(clean_phone)
+            # Skip if duplicate within the same uploaded file
+            if clean_phone in processed_in_batch:
+                skipped_records.append({
+                    "row_number": idx,
+                    "value": raw_phone,
+                    "reason": f"Duplicate phone number in the uploaded file (phone: {clean_phone})"
+                })
+                continue
 
-        if not full_name:
-            full_name = f"Contact {clean_phone[-4:]}"  # fallback display name
+            processed_in_batch.add(clean_phone)
 
-        # Validate email if present
-        email: str | None = None
-        if email_raw and _validate_email(email_raw):
-            email = email_raw.lower()
-        elif email_raw:
-            # still continue — just skip the bad email
-            skipped_records.append({
-                "row_number": idx,
-                "value": email_raw,
-                "reason": f"Invalid email format for phone {clean_phone} — email skipped, contact imported"
-            })
+            if not full_name:
+                full_name = f"Contact {clean_phone[-4:]}"  # fallback display name
 
-        conversation_id = f"whatsapp_{clean_phone}"
-        upload_metadata = {
-            "batch_id": batch_id,
-            "source_type": source_type,
-            "uploaded_by": uploaded_by,
-            "uploaded_date": now,
-            "filename": filename,
-        }
+            # Validate email if present
+            email: str | None = None
+            if email_raw and _validate_email(email_raw):
+                email = email_raw.lower()
+            elif email_raw:
+                # still continue — just skip the bad email
+                skipped_records.append({
+                    "row_number": idx,
+                    "value": email_raw,
+                    "reason": f"Invalid email format for phone {clean_phone} — email skipped, contact imported"
+                })
 
-        # Sets all base fields for new records
-        contact_on_insert = {
-            "full_name": full_name,
-            "phone_number": clean_phone,
-            "whatsapp_id": None,
-            "country": None,
-            "profile_url": None,
-            "conversation_id": conversation_id,
-            "categories": [],
-            "labels": [],
-            "platform": "whatsapp",
-            "created_at": now,
-        }
-        if email:
-            contact_on_insert["email"] = email
-        if company:
-            contact_on_insert["company"] = company
+            conversation_id = f"whatsapp_{clean_phone}"
+            upload_metadata = {
+                "batch_id": batch_id,
+                "source_type": source_type,
+                "uploaded_by": uploaded_by,
+                "uploaded_date": now,
+                "filename": filename,
+            }
 
-        update_doc: dict = {
-            "$set": {
+            # Sets all base fields for new records
+            contact_on_insert = {
+                "full_name": full_name,
+                "phone_number": clean_phone,
+                "whatsapp_id": None,
+                "country": None,
+                "profile_url": None,
+                "conversation_id": conversation_id,
+                "categories": [],
+                "labels": [],
+                "platform": "whatsapp",
+                "created_at": now,
+            }
+            if email:
+                contact_on_insert["email"] = email
+            if company:
+                contact_on_insert["company"] = company
+
+            set_fields: dict = {
                 "is_bulk_uploaded": True,
                 "upload_metadata": upload_metadata,
                 "updated_at": now,
-            },
-            "$setOnInsert": contact_on_insert,
-        }
+            }
 
-        bulk_ops.append(
-            UpdateOne(
-                {"phone_number": clean_phone},
-                update_doc,
-                upsert=True,
+            # For VCF uploads: force-update the contact name on existing records
+            # and lock it so WhatsApp API profile-name webhooks don't overwrite it.
+            if source_type == "vcf" and full_name:
+                set_fields["full_name"] = full_name
+                set_fields["name_locked_by_vcf"] = True
+                # Remove full_name from $setOnInsert to avoid MongoDB conflict
+                # (same field cannot be in both $set and $setOnInsert)
+                contact_on_insert.pop("full_name", None)
+
+            update_doc: dict = {
+                "$set": set_fields,
+                "$setOnInsert": contact_on_insert,
+            }
+
+            bulk_ops.append(
+                UpdateOne(
+                    {"phone_number": clean_phone},
+                    update_doc,
+                    upsert=True,
+                )
             )
-        )
 
     # ── 4. Execute batch write ────────────────────────────────────────────────
     newly_added = 0
@@ -668,7 +705,7 @@ def delete_uploaded_contact(org_id: str, conversation_id: str) -> dict:
         # Demote only — keep the record for the live chat
         col.update_one(
             {"conversation_id": conversation_id},
-            {"$unset": {"is_bulk_uploaded": "", "upload_metadata": ""},
+            {"$unset": {"is_bulk_uploaded": "", "upload_metadata": "", "name_locked_by_vcf": ""},
              "$set":   {"updated_at": datetime.now(timezone.utc)}}
         )
         return {"deleted": False, "demoted": True, "reason": "live_contact_preserved"}
@@ -702,7 +739,7 @@ def delete_upload_batch(org_id: str, batch_id: str) -> dict:
         if has_live_identity:
             col.update_one(
                 {"conversation_id": conversation_id},
-                {"$unset": {"is_bulk_uploaded": "", "upload_metadata": ""},
+                {"$unset": {"is_bulk_uploaded": "", "upload_metadata": "", "name_locked_by_vcf": ""},
                  "$set":   {"updated_at": now}}
             )
             demoted_count += 1
