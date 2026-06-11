@@ -144,29 +144,30 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     body = await request.body()
 
     # ── Extract account ID and object type ──────────────────────────────────
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        logger.error("Webhook received non-JSON body")
-        return Response(status_code=400)
+    if ENVIRONMENT == "production":
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            logger.error("Webhook received non-JSON body")
+            return Response(status_code=400)
 
-    object_type: str = payload.get("object", "")
-    account_id: str | None = None
+        object_type: str = payload.get("object", "")
+        account_id: str | None = None
 
-    try:
-        account_id = payload["entry"][0]["id"]
-    except (KeyError, IndexError):
-        logger.warning("Could not extract entry[0].id from webhook payload")
+        try:
+            account_id = payload["entry"][0]["id"]
+        except (KeyError, IndexError):
+            logger.warning("Could not extract entry[0].id from webhook payload")
     
-    if (object_type == "whatsapp_business_account" and (account_id == SAHIL_WA_ID or account_id == EGENIE_WA_ID )) or (object_type == "instagram" and (account_id == SAHIL_IG_ID or account_id == EGENIE_IG_ID)):
-        logger.info(f"WhatsApp/Instagram webhook matched allowed account {account_id}. Forwarding.")
-        forward_headers = {
-            key: value
-            for key, value in request.headers.items()
-            if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
-        }
-        background_tasks.add_task(forward_webhook_to_dev, body=body, headers=forward_headers)
-        return Response(status_code=200)
+        if (object_type == "whatsapp_business_account" and (account_id == SAHIL_WA_ID or account_id == EGENIE_WA_ID )) or (object_type == "instagram" and (account_id == SAHIL_IG_ID or account_id == EGENIE_IG_ID)):
+            logger.info(f"WhatsApp/Instagram webhook matched allowed account {account_id}. Forwarding.")
+            forward_headers = {
+                key: value
+                for key, value in request.headers.items()
+                if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
+            }
+            background_tasks.add_task(forward_webhook_to_dev, body=body, headers=forward_headers)
+            return Response(status_code=200)
 
     payload_str = body.decode('utf-8')
 
@@ -514,7 +515,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
 
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
-                                if ai_enabled and is_production and not is_heidelai and not is_pma_wa:
+                                if ai_enabled and is_dev and not is_heidelai and not is_pma_wa:
                                     await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
                                     # Execute the WhatsApp Automation Flow first (if it exists)
