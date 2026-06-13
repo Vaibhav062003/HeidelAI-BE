@@ -40,7 +40,7 @@ from config.settings import (
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
-    LEE_ORG_ID
+    LEE_DEALER_ORG_ID
 )
 from services.websocket_service import broadcast_main_ws
 
@@ -735,7 +735,7 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
         }
 
         if not ai_enabled and auto_ai_disabled:
-            disable_duration = timedelta(minutes=5) if org_id == LEE_ORG_ID else timedelta(hours=1)
+            disable_duration = timedelta(minutes=5) if org_id == LEE_DEALER_ORG_ID else timedelta(hours=1)
             update_fields["auto_ai_disabled_until"] = datetime.now(timezone.utc) + disable_duration
         else:
             # If manually toggling AI, or enabling it, clear the auto-disable timer field
@@ -759,7 +759,7 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
         sender_id = "system"
         sender_name = "System"
 
-        time_Str = "5 min" if org_id == LEE_ORG_ID else '1 hr'
+        time_Str = "5 min" if org_id == LEE_DEALER_ORG_ID else '1 hr'
 
         # Only add system messages and broadcast if the state ACTUALLY changed
         if result.modified_count > 0:
