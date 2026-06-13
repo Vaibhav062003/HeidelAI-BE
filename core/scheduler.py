@@ -12,7 +12,7 @@ from services.agent_service import send_to_agent
 from services.wa_service import send_whatsapp_message
 # from services.websocket_service import broadcast_on_stats_update
 from loguru import logger
-from config.settings import LEE_ORG_ID
+from config.settings import LEE_DEALER_ORG_ID
 
 
 
@@ -279,13 +279,13 @@ async def update_ai_status(org_type: str = "all"):
         # Build query to fetch only required organizations
         query = {}
         if org_type == "lee":
-            if not LEE_ORG_ID:
-                logger.info("Skipping update_ai_status for 'lee' org type because LEE_ORG_ID is not configured.")
+            if not LEE_DEALER_ORG_ID:
+                logger.info("Skipping update_ai_status for 'lee' org type because LEE_DEALER_ORG_ID is not configured.")
                 return
-            query = {"org_id": LEE_ORG_ID}
+            query = {"org_id": LEE_DEALER_ORG_ID}
         elif org_type == "others":
-            if LEE_ORG_ID:
-                query = {"org_id": {"$ne": LEE_ORG_ID}}
+            if LEE_DEALER_ORG_ID:
+                query = {"org_id": {"$ne": LEE_DEALER_ORG_ID}}
             else:
                 query = {}
         elif org_type == "all":

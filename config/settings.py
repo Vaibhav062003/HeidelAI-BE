@@ -56,7 +56,7 @@ JWT_HEADER_ALGORITHM = os.getenv('JWT_HEADER_ALGORITHM')
 
 # Egenie Specific Configurations
 ORG_ID = os.getenv("ORG_ID")
-LEE_ORG_ID = os.getenv("LEE_ORG_ID")
+LEE_DEALER_ORG_ID = os.getenv("LEE_DEALER_ORG_ID")
 
 #Sentence Transformers
 SENTENCE_TRANSFORMERS_MODEL = os.getenv("sentence_transformers_model")
