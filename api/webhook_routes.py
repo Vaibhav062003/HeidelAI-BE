@@ -24,7 +24,7 @@ from schemas.models import ActionButton, InteractiveUrlButtonMessage, ReplyButto
 from schemas.models import MessageRole
 from database import get_mongo_db
 from config.settings import (
-    VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, TECHNET_ORG_WA_ID, INSTAGRAM_APP_SECRET
+    VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, TECHNET_ORG_WA_ID, KOMAL_ORG_WA_ID, INSTAGRAM_APP_SECRET
 )
 from core.services import services
 from loguru import logger
@@ -425,6 +425,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_lee_dealer_wa = whatsapp_business_id == LEE_DEALER_ORG_WA_ID
                             is_karan_wa = whatsapp_business_id == KARAN_ORG_WA_ID
                             is_technet_wa = whatsapp_business_id == TECHNET_ORG_WA_ID
+                            is_komal_wa = whatsapp_business_id == KOMAL_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
                             is_test = ENVIRONMENT == "test"
@@ -435,6 +436,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info(f"is_pma_wa: {is_pma_wa}")
                             logger.info(f"is_lee_dealer_wa: {is_lee_dealer_wa}")
                             logger.info(f"is_technet_wa: {is_technet_wa}")
+                            logger.info(f"is_komal_wa: {is_komal_wa}")
                             logger.info(f"is_production: {is_production}")
                             logger.info(f"is_dev: {is_dev}")
                             logger.info(f"is_test: {is_test}")
