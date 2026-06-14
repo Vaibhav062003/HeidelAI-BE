@@ -1,15 +1,17 @@
 import os
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
-from auth.dependencies import CurrentUser
+from core.limiter import limiter
 from database import get_mongo_db
+from auth.dependencies import CurrentUser
 
 db = get_mongo_db()
 
 router = APIRouter(tags=["security"], prefix="/api/security")
 
 @router.get("/encryption-key")
-def get_encryption_key(user: CurrentUser):
+@limiter.limit("10/minute")
+def get_encryption_key(request: Request, user: CurrentUser):
     """
     Returns a passphrase string for CryptoJS.AES.encrypt(passphrase-mode).
     Stored in Mongo so the same key is reused per user.

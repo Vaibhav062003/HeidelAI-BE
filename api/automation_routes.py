@@ -1,9 +1,10 @@
 import asyncio
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Request
 
 # Internal Modules
+from core.limiter import limiter
 from database import get_mongo_db, get_async_mongo_db
 from auth.dependencies import CurrentUser
 from services.automation_service import (
@@ -67,8 +68,12 @@ class UpdateFlowRequest(BaseModel):
 # =============================================================================
 
 @router.post("")
-async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
-    """Create a new automation flow"""
+@limiter.limit("10/minute")
+async def create_flow(request: Request, payload: CreateFlowRequest, user: CurrentUser):
+    """
+    Create a new automation flow
+    
+    """
     try:
         org_id = user.org_id
         if not org_id:
@@ -95,10 +100,16 @@ async def create_flow(payload: CreateFlowRequest, user: CurrentUser):
         logger.error(f"Error creating automation flow: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to create automation flow: {str(e)}")
 
-
 @router.get("")
-async def list_flows(user: CurrentUser, status: Optional[str] = None):
-    """List all automation flows for the organization"""
+@limiter.limit("100/minute")
+async def list_flows(request: Request, user: CurrentUser, status: Optional[str] = None):
+    """
+    List all automation flows for the organization
+    
+    Query parameters:
+    - status: Filter by status ("draft" or "published")
+    
+    """
     try:
         org_id = user.org_id
         if not org_id:

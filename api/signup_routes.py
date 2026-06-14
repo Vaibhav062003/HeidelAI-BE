@@ -1,17 +1,15 @@
-from datetime import datetime
 import uuid
-from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request
-import requests
+from datetime import datetime
 from pymongo import ReturnDocument, DESCENDING
-
+from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request
 
 # internal modules
+from loguru import logger
+from core.limiter import limiter
 from database import get_mongo_db
-
+from services.payment_service import create_subscription
 from schemas.models import InitPaymentRequest, InitSignupRequest, InviteTeamMembersRequest, SelectPlanRequest, SetPasswordRequest, VerifyOtpRequest
 from services.clerk_service import create_clerk_signup, create_organization, invite_users_to_organization, update_password_and_send_otp, verify_clerk_otp
-from services.payment_service import create_subscription
-from loguru import logger
 
 db = get_mongo_db()
 
@@ -30,7 +28,8 @@ async def get_onboarding_session(signup_session: str | None = Cookie(default=Non
     return signup_session
 
 @router.post("/init")
-async def init_signup(data: InitSignupRequest, response: Response, request: Request):
+@limiter.limit("30/minute")
+async def init_signup(request: Request, data: InitSignupRequest, response: Response):
     """
     Initialize signup process. Returns session_id.
     """
@@ -80,7 +79,8 @@ async def init_signup(data: InitSignupRequest, response: Response, request: Requ
     return {"next_step": next_step}
 
 @router.post("/set-password")
-async def set_password(data: SetPasswordRequest, request: Request, session_id: str = Depends(get_onboarding_session)):
+@limiter.limit("30/minute")
+async def set_password(request: Request, data: SetPasswordRequest, session_id: str = Depends(get_onboarding_session)):
     """
     Check if the Signup session exists, set password for the signup session & trigger email OTP to the registered email by Clerk.
     """
@@ -104,7 +104,8 @@ async def set_password(data: SetPasswordRequest, request: Request, session_id: s
     return {"success": True, "next_step": "OTP"}
 
 @router.post("/verify-otp")
-async def verify_otp(data: VerifyOtpRequest, session_id: str = Depends(get_onboarding_session)):
+@limiter.limit("30/minute")
+async def verify_otp(request: Request, data: VerifyOtpRequest, session_id: str = Depends(get_onboarding_session)):
     """
     Verify the OTP code sent to the user's email. If correct, finalize signup.
     """
@@ -126,7 +127,8 @@ async def verify_otp(data: VerifyOtpRequest, session_id: str = Depends(get_onboa
     return {"success": True, "next_step": "PLAN"}
 
 @router.post("/plan")
-async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onboarding_session)):
+@limiter.limit("30/minute")
+async def select_plan(request: Request, data: SelectPlanRequest, session_id: str = Depends(get_onboarding_session)):
     plan_id = data.plan_id
 
     if plan_id == "free":
@@ -221,9 +223,9 @@ async def select_plan(data: SelectPlanRequest, session_id: str = Depends(get_onb
     
     raise HTTPException(status_code=400, detail="Invalid Plan ID")
 
-
 @router.post("/init-payment")
-async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_onboarding_session)):
+@limiter.limit("30/minute")
+async def init_payment(request: Request, data: InitPaymentRequest, session_id: str = Depends(get_onboarding_session)):
     logger.info(f"Initiating payment for phone number: {data.phone_number}")
     phone_number = data.phone_number
 
@@ -296,7 +298,8 @@ async def init_payment(data: InitPaymentRequest, session_id: str = Depends(get_o
     return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
 
 @router.post("/init-payment/retry")
-async def init_payment(session_id: str = Depends(get_onboarding_session)):
+@limiter.limit("30/minute")
+async def init_payment(request: Request, session_id: str = Depends(get_onboarding_session)):
     logger.info(f"Retrying payment for session ID: {session_id}")
 
     subscription_status = db.subscriptions.find_one(
@@ -377,7 +380,8 @@ async def init_payment(session_id: str = Depends(get_onboarding_session)):
     return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
 
 @router.get("/subscription/status")
-async def check_subscription_status(session_id: str = Depends(get_onboarding_session)):
+@limiter.limit("60/minute")
+async def check_subscription_status(request: Request, session_id: str = Depends(get_onboarding_session)):
     subscription = db.subscriptions.find_one(
         {"session_id": session_id}, 
         {"status": 1, "_id": 0},
@@ -389,7 +393,8 @@ async def check_subscription_status(session_id: str = Depends(get_onboarding_ses
     return {"status": subscription.get("status")}
 
 @router.post("/invite-team-members")
-async def invite_team_members(data: InviteTeamMembersRequest, session_id: str = Depends(get_onboarding_session)):
+@limiter.limit("30/minute")
+async def invite_team_members(request: Request, data: InviteTeamMembersRequest, session_id: str = Depends(get_onboarding_session)):
     """
     Invite team members by storing their emails in the onboarding session.
     """

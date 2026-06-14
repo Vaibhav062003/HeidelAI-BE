@@ -1,20 +1,20 @@
-from fastapi import APIRouter, Depends
-from auth.dependencies import CurrentUser
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Request, HTTPException
 from schemas.models import CannedResponse, CannedResponseOut, UpdateCannedResponseRequest
 
+from core.limiter import limiter
+from auth.dependencies import CurrentUser
 from services.canned_responses_service import (
     get_canned_responses_for_org,
     create_canned_response_for_org,
     delete_canned_response_for_org,
     update_canned_response_for_org
 )
-from auth.dependencies import CurrentUser
 
 router = APIRouter(prefix="/api/canned_responses", tags=["Canned Responses"])
 
 @router.get("")
-async def get_canned_responses(user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_canned_responses(request: Request, user: CurrentUser):
     """
     Retrieve canned responses for the organization.
     """
@@ -27,7 +27,8 @@ async def get_canned_responses(user: CurrentUser):
     return {"canned_responses": canned_responses}
 
 @router.post("")
-async def create_canned_response(user: CurrentUser, body: CannedResponse):
+@limiter.limit("30/minute")
+async def create_canned_response(request: Request, user: CurrentUser, body: CannedResponse):
     """
     Create a single canned respones for the organization.
     """
@@ -41,7 +42,8 @@ async def create_canned_response(user: CurrentUser, body: CannedResponse):
     return {"canned_responses": canned_responses}
 
 @router.delete("/{shortcut_id}")
-async def delete_canned_response(user: CurrentUser, shortcut_id: str):
+@limiter.limit("30/minute")
+async def delete_canned_response(request: Request, user: CurrentUser, shortcut_id: str):
     """
     Delete a single canned response for the organization.
     """
@@ -55,7 +57,9 @@ async def delete_canned_response(user: CurrentUser, shortcut_id: str):
     return {"message": f"Canned response '{canned_response['shortcut']}' deleted successfully."}
 
 @router.put("/{shortcut_id}", response_model=CannedResponseOut)
+@limiter.limit("30/minute")
 async def update_canned_response(
+    request: Request,
     shortcut_id: str,
     payload: UpdateCannedResponseRequest,
     user: CurrentUser, 
