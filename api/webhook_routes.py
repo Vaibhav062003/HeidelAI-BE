@@ -440,7 +440,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             is_pma_wa = whatsapp_business_id == PARIJAT_ACADEMY_ORG_WA_ID
                             is_lee_dealer_wa = whatsapp_business_id == LEE_DEALER_ORG_WA_ID
                             is_karan_wa = whatsapp_business_id == KARAN_ORG_WA_ID
-                            is_technet_wa = whatsapp_business_id == TECHNET_ORG_WA_ID
+                            is_giga_wa = whatsapp_business_id == GIGA_ORG_WA_ID
+
+                            is_komal_wa = whatsapp_business_id == KOMAL_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
                             is_dev = ENVIRONMENT == "development"
                             is_test = ENVIRONMENT == "test"
@@ -450,7 +452,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info(f"is_heidelai: {is_heidelai}")
                             logger.info(f"is_pma_wa: {is_pma_wa}")
                             logger.info(f"is_lee_dealer_wa: {is_lee_dealer_wa}")
-                            logger.info(f"is_technet_wa: {is_technet_wa}")
+                            logger.info(f"is_karan_wa: {is_karan_wa}")
+                            logger.info(f"is_giga_wa: {is_giga_wa}")
+                            logger.info(f"is_komal_wa: {is_komal_wa}")
                             logger.info(f"is_production: {is_production}")
                             logger.info(f"is_dev: {is_dev}")
                             logger.info(f"is_test: {is_test}")
