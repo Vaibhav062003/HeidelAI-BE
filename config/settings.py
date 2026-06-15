@@ -121,3 +121,6 @@ EGENIE_IG_ID=os.getenv("EGENIE_IG_ID")
 
 SAHIL_WA_ID=os.getenv("SAHIL_WA_ID")
 SAHIL_IG_ID=os.getenv("SAHIL_IG_ID")
+
+KOMAL_ORG_ID=os.getenv("KOMAL_ORG_ID")
+KOMAL_ORG_WA_ID=os.getenv("KOMAL_ORG_WA_ID")

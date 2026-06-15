@@ -16,6 +16,7 @@ test.py
 /stagenv
 stage-requirements.txt
 myenv/
+/stagenv
 
 # Temp
 test.ipynb
