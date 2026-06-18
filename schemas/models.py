@@ -104,6 +104,11 @@ class Product(BaseModel):
     stock: Optional[int] = None
     product_image: Optional[str] = None
     image_url: Optional[str] = None
+    model_no: Optional[str] = None
+    search_text: Optional[str] = None
+    source: Optional[str] = None  # "manual" | "csv_upload" | "google_sheet"
+    source_sheet_id: Optional[str] = None
+    updated_at: Optional[datetime] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -117,7 +122,36 @@ class Product(BaseModel):
         # Remove None values if you want a clean DB
         cleaned = {k: v for k, v in data.items() if v is not None}
         return cleaned
-    
+
+
+# Product Sheet Sync Models
+class ProductSheetConnection(BaseModel):
+    org_id: str
+    sheet_id: str
+    sheet_name: str
+    tab_name: str
+    column_mapping: Dict[str, str]  # {product_field: sheet_column_name}
+    last_synced_at: Optional[datetime] = None
+    last_sync_count: int = 0
+    sync_errors: List[str] = Field(default_factory=list)
+    status: str = "active"  # "active" | "syncing" | "error"
+    connected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class PreviewProductSheetRequest(BaseModel):
+    sheet_id: str
+    tab_name: Optional[str] = None
+
+class ConnectProductSheetRequest(BaseModel):
+    sheet_id: str
+    sheet_name: str
+    tab_name: str
+    column_mapping: Dict[str, str]
+
+class SyncProductSheetRequest(BaseModel):
+    sheet_id: str
+
+
 class CannedResponse(BaseModel):
     shortcut: str
     response: str
