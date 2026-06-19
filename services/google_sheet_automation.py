@@ -435,6 +435,7 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
 
         # Process rows in batches to avoid materializing the entire list
         batch_size = 1000
+        consecutive_empty = 0
         for skip in range(0, trigger_total_rows, batch_size):
             batch_docs = await asyncio.to_thread(
                 lambda s=skip, b=batch_size, f=trigger_row_filter: list(rows_collection.find(
@@ -445,7 +446,15 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
             
             batch_data = [doc.get("row_data", {}) for doc in batch_docs if doc.get("row_data")]
             if not batch_data:
-                break
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    break
+                logger.warning(
+                    f"[GoogleSheetAuto] Empty batch at offset {skip} for flow {flow_id}, "
+                    f"attempt {consecutive_empty}/3 — skipping to next batch"
+                )
+                continue
+            consecutive_empty = 0
 
             # --- High-Performance Batch Deduplication ---
             # Instead of loading ALL sent records into memory (which causes OOM at scale),

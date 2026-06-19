@@ -6,6 +6,7 @@ from typing import Optional
 from config.settings import ENVIRONMENT, GOOGLE_API_KEY
 from database import get_mongo_db
 from loguru import logger
+import uuid
 
 db = get_mongo_db()
 
@@ -109,7 +110,8 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
     """
     lease_key = f"sync_{org_id}_{sheet_id}"
     now = datetime.now(timezone.utc)
-    expiry = now + timedelta(minutes=5)
+    expiry = now + timedelta(minutes=3)
+    sync_version = str(uuid.uuid4())
 
     # Step 1: Try to insert a fresh lease
     lease_acquired = False
@@ -120,6 +122,7 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
                 "_id": lease_key,
                 "acquired_at": now,
                 "expires_at": expiry,
+                "sync_version": sync_version,
                 "org_id": org_id,
                 "sheet_id": sheet_id,
             }
@@ -138,6 +141,7 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
                     "_id": lease_key,
                     "acquired_at": now,
                     "expires_at": expiry,
+                    "sync_version": sync_version,
                     "org_id": org_id,
                     "sheet_id": sheet_id,
                 }
@@ -180,10 +184,11 @@ async def _safe_sync_sheet(org_id: str, sheet_id: str) -> None:
             logger.error(f"[Scheduler] Error triggering automations for sheet {sheet_id}: {e}")
 
     finally:
-        # Always release the lease so the next poll cycle can proceed
+        # Only release the lease if our version still owns it (optimistic lock)
         try:
             await asyncio.to_thread(
-                db.scheduler_leases.delete_one, {"_id": lease_key}
+                db.scheduler_leases.delete_one,
+                {"_id": lease_key, "sync_version": sync_version}
             )
         except Exception as e:
             logger.warning(f"[Scheduler] Could not release lease for {lease_key}: {e}")
