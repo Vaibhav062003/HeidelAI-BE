@@ -218,8 +218,8 @@ async def instagram_auth(request: Request, req: dict, user: CurrentUser):
         conversations_collection = db[f"conversations_{org_id}"]
 
         # Ensure indexes for efficient querying
-        messages_collection.create_index("message_id", unique=True)
-        conversations_collection.create_index("conversation_id", unique=True)
+        #messages_collection.create_index("message_id", unique=True)
+        #conversations_collection.create_index("conversation_id", unique=True)
 
         # Store connection in database
         new_connection = {
