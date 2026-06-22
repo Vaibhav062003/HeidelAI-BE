@@ -47,6 +47,8 @@ async def send_ig_message(id, message_text, instagram_id, mode, org_id) -> dict:
         id: The recipient's Instagram user ID
         message_text: The message content to send
         instagram_id: Instagram business account ID to use for sending
+        mode: The mode of the message (reply or private message)
+        org_id: The organization ID
     """
     try:
         # If an Instagram business account ID is provided, look up its access token
@@ -1572,3 +1574,7 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
         
     except Exception as e:
         logger.error(f"❌ Error processing Instagram comment event: {str(e)}", exc_info=True)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(send_ig_message("1241623887433864", "Hello from the test", "17841471805170358", "reply", "org_2zV2OOhodLocEnTybzR8t9MIYCE"))

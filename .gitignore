@@ -23,3 +23,6 @@ test.ipynb
 defines.py
 temp.py
 tests/
+
+\export_mongo_conversations.py
+conversation_export.jsonl
