@@ -1609,8 +1609,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             conversation_id = await create_or_update_instagram_conversation(
                                 org_id=org_id,
-                                recipient_id=sender_id,
-                                sender_id=recipient_id,
+                                recipient_id=recipient_id,
+                                sender_id=sender_id,
                                 customer_name=name,
                                 username=username,
                                 last_message="AI: {message_text}",
@@ -1618,9 +1618,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             )
 
                             await send_ig_message(
-                                id=sender_id, 
+                                id=recipient_id, 
                                 message_text=final_response, 
-                                instagram_id=recipient_id, 
+                                instagram_id=sender_id, 
                                 mode="reply", 
                                 org_id=org_id
                             )
