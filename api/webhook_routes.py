@@ -1579,8 +1579,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         org_doc = db.organizations.find_one({"org_id": org_id},{"is_ai_enabled": 1})
                         is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
                         
-                        is_heidelai_ig = sender_id == HEIDELAI_ORG_IG_ID
-                        logger.info(f"sender_id: {sender_id}")
+                        is_heidelai_ig = recipient_id == HEIDELAI_ORG_IG_ID
+                        logger.info(f"recipient_id: {recipient_id}")
 
                         is_production = ENVIRONMENT == "production"
                         is_dev = ENVIRONMENT == "development"
@@ -1610,8 +1610,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             conversation_id = await create_or_update_instagram_conversation(
                                 org_id=org_id,
-                                recipient_id=recipient_id,
-                                sender_id=sender_id,
+                                recipient_id=sender_id,
+                                sender_id=recipient_id,
                                 customer_name=name,
                                 username=username,
                                 last_message=f"AI: {message_text}",
@@ -1619,9 +1619,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             )
 
                             await send_ig_message(
-                                id=recipient_id, 
+                                id=sender_id, 
                                 message_text=final_response, 
-                                instagram_id=sender_id, 
+                                instagram_id=recipient_id, 
                                 mode="reply", 
                                 org_id=org_id
                             )
