@@ -1580,6 +1580,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
                         
                         is_heidelai_ig = sender_id == HEIDELAI_ORG_IG_ID
+                        logger.info(f"sender_id: {sender_id}")
 
                         is_production = ENVIRONMENT == "production"
                         is_dev = ENVIRONMENT == "development"
@@ -1613,7 +1614,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 sender_id=sender_id,
                                 customer_name=name,
                                 username=username,
-                                last_message="AI: {message_text}",
+                                last_message=f"AI: {message_text}",
                                 last_sender= MessageRole.AI,
                             )
 
