@@ -26,7 +26,7 @@ from database import get_mongo_db
 from config.settings import (
     VERIFY_TOKEN, APP_SECRET, HEIDELAI_ORG_WA_ID, DEV_WEBHOOK_URL, TEST_WEBHOOK_URL, ENVIRONMENT, PARIJAT_ACADEMY_ORG_WA_ID, 
     LEE_DEALER_ORG_WA_ID, KARAN_ORG_WA_ID, INSTAGRAM_APP_SECRET, GIGA_ORG_WA_ID,
-    EGENIE_WA_ID, EGENIE_IG_ID, SAHIL_WA_ID, SAHIL_IG_ID, KOMAL_ORG_WA_ID)
+    EGENIE_WA_ID, EGENIE_IG_ID, SAHIL_WA_ID, SAHIL_IG_ID, KOMAL_ORG_WA_ID, HEIDELAI_ORG_IG_ID)
 from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
@@ -1540,8 +1540,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     logger.info(f"Message Received from {user}, Message: {message_text}")
 
-                    
-
 
                     logger.success("Calling function create_or_update_instagram_conversation")
 
@@ -1574,6 +1572,59 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     )
                     
                     if not message_echo:
+                        # Get conversation doc to check if AI is enabled
+                        convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                        is_conv_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else True
+                        
+                        org_doc = db.organizations.find_one({"org_id": org_id},{"is_ai_enabled": 1})
+                        is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
+                        
+                        is_heidelai_ig = sender_id == HEIDELAI_ORG_IG_ID
+
+                        is_production = ENVIRONMENT == "production"
+                        is_dev = ENVIRONMENT == "development"
+                        is_test = ENVIRONMENT == "test"
+
+                        # fetch org + convo flags
+                        ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
+
+                        logger.info(f"is_heidelai_ig: {is_heidelai_ig}")
+
+                        logger.info(f"is_production: {is_production}")
+                        logger.info(f"is_dev: {is_dev}")
+                        logger.info(f"is_test: {is_test}")
+                        logger.info(f"ai_enabled: {ai_enabled}") 
+
+                        if ai_enabled and is_dev:
+                            chatbot_response = await send_to_agent(
+                                conversation_id=conversation_id,
+                                user_input=message_text,
+                                persona=convo_doc.get("persona", "fallback") if convo_doc else "fallback",
+                                location=convo_doc.get("location", "india") if convo_doc else "india",
+                                customer_name=name,
+                                org_id=org_id,
+                                source="webhook",
+                            )
+                            final_response = chatbot_response["final_response"]
+
+                            conversation_id = await create_or_update_instagram_conversation(
+                                org_id=org_id,
+                                recipient_id=sender_id,
+                                sender_id=recipient_id,
+                                customer_name=name,
+                                username=username,
+                                last_message="AI: {message_text}",
+                                last_sender= MessageRole.AI,
+                            )
+
+                            await send_ig_message(
+                                id=sender_id, 
+                                message_text=final_response, 
+                                instagram_id=recipient_id, 
+                                mode="reply", 
+                                org_id=org_id
+                            )
+
                         if background_tasks:
                             background_tasks.add_task(
                                 check_and_trigger_automations,
