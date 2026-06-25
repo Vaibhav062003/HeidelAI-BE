@@ -597,7 +597,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     try:
                                         from services.oos_service import send_oos_to_dealers
                                         recent_oos = db.oos_requests.find_one(
-                                            {"conversation_id": conversation_id, "status": {"$in": ["out_of_stock", "pending_send"]}},
+                                            {"conversation_id": conversation_id, "status": "pending_send"},
                                             sort=[("created_at", -1)]
                                         )
                                         if recent_oos:

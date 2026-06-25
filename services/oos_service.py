@@ -171,7 +171,7 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     # Atomic claim: only proceed if we can transition to "sending"
     async_db = get_async_mongo_db()
     claim = await async_db["oos_requests"].update_one(
-        {"query_id": oos_doc["query_id"], "status": {"$in": ["out_of_stock", "pending_send"]}},
+        {"query_id": oos_doc["query_id"], "status": "pending_send"},
         {"$set": {"status": "sending"}}
     )
     if claim.modified_count == 0:
@@ -285,8 +285,8 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
 
     replied_message_id = message_context.get("id") if message_context else None
 
-    # Statuses where we expect dealer replies
-    active_statuses = ["dealers_contacted", "partial_replies", "out_of_stock", "sending"]
+    # Statuses where we expect dealer replies (only after message was actually sent)
+    active_statuses = ["dealers_contacted", "partial_replies", "sending"]
 
     # Try matching by message_id first
     oos_doc = None
@@ -339,10 +339,11 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
     }
 
     # Atomic update: push reply and set status in one op
+    # Accept any active status (covers race where reply arrives while still sending)
     result = await oos_col.update_one(
         {
             "query_id": oos_doc["query_id"],
-            "status": {"$in": ["dealers_contacted", "partial_replies"]}
+            "status": {"$in": active_statuses}
         },
         {
             "$push": {"dealer_replies": reply_entry},
@@ -351,7 +352,6 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
     )
 
     if result.modified_count == 0:
-        # Race: another reply already transitioned it or it was expired
         logger.warning(f"[OOS] Could not append reply for query_id={oos_doc['query_id']}, status may have changed")
         return False
 
@@ -516,7 +516,7 @@ async def process_expired_oos_requests():
     now = datetime.now(timezone.utc)
 
     cursor = async_db["oos_requests"].find({
-        "status": {"$in": ["dealers_contacted", "pending_send", "out_of_stock", "partial_replies"]},
+        "status": {"$in": ["dealers_contacted", "pending_send", "sending", "partial_replies"]},
         "expires_at": {"$lte": now}
     }).limit(PENDING_SEND_BATCH)
 
