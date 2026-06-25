@@ -33,7 +33,7 @@ SHEET_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 def is_within_dealer_hours() -> bool:
-    return WINDOW_START <= datetime.now(IST).time() <= WINDOW_END
+    return True
 
 
 def _get_sheet_by_purpose(org_id: str, purpose: str) -> Optional[Dict]:
@@ -51,66 +51,25 @@ def _sanitize_for_sheet(value: str) -> str:
 
 async def fetch_dealer_directory(org_id: str, sheet_id: Optional[str] = None, tab_name: Optional[str] = None) -> List[Dict]:
     """
-    Read dealer directory rows from the connected 'dealer_directory' Google Sheet.
+    Read dealer directory rows from the fake Google Sheet 'dealer_directory' collection in MongoDB.
     Returns list of {name, phone, brands, category} dicts.
     """
-    from api.google_sheets_routes import refresh_google_token
-
-    if not sheet_id:
-        sheet_doc = _get_sheet_by_purpose(org_id, "dealer_directory")
-        if not sheet_doc:
-            logger.warning(f"[OOS] No sheet with purpose='dealer_directory' for org {org_id}")
-            return []
-        sheet_id = sheet_doc["sheet_id"]
-        tab_name = tab_name or sheet_doc.get("tab_name", "Sheet1")
-
-    tab_name = tab_name or "Sheet1"
-
-    if not SHEET_ID_PATTERN.match(sheet_id):
-        logger.error(f"[OOS] Invalid sheet_id format: {sheet_id[:20]}")
-        return []
-
+    async_db = get_async_mongo_db()
     try:
-        access_token = await refresh_google_token(org_id)
-    except Exception as e:
-        logger.error(f"[OOS] Failed to get Google token for org {org_id}: {e}")
-        return []
-
-    encoded_tab = urllib.parse.quote(tab_name, safe="")
-    url = (
-        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-        f"/values/{encoded_tab}!A1:Z1000"
-    )
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
-        if resp.status_code == 401:
-            access_token = await refresh_google_token(org_id)
-            resp = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
-
-    if resp.status_code != 200:
-        logger.error(f"[OOS] Google Sheets API error: {resp.status_code}")
-        return []
-
-    rows = resp.json().get("values", [])
-    if len(rows) < 2:
-        return []
-
-    headers = [h.strip().lower() for h in rows[0]]
-    dealers = []
-    for row in rows[1:]:
-        row_dict = {}
-        for i, header in enumerate(headers):
-            row_dict[header] = row[i].strip() if i < len(row) and row[i] else ""
-        if row_dict.get("phone"):
+        cursor = async_db["dealer_directory"].find({"org_id": org_id, "active": True})
+        dealers = []
+        async for doc in cursor:
             dealers.append({
-                "name": row_dict.get("name", ""),
-                "phone": row_dict.get("phone", ""),
-                "brands": row_dict.get("brands", ""),
-                "category": row_dict.get("category", ""),
+                "name": doc.get("name", ""),
+                "phone": doc.get("phone", ""),
+                "brands": doc.get("brands", ""),
+                "category": doc.get("category", ""),
             })
-
-    return dealers
+        logger.info(f"[OOS] Fetched {len(dealers)} active dealers from fake sheet collection 'dealer_directory' for org {org_id}")
+        return dealers
+    except Exception as e:
+        logger.error(f"[OOS] Failed to fetch dealers from fake sheet collection 'dealer_directory' for org {org_id}: {e}")
+        return []
 
 
 def generate_dealer_message(oos_doc: dict) -> str:
@@ -160,7 +119,10 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     """
     from services.wa_service import send_whatsapp_message
 
+    logger.info(f"[OOS] send_oos_to_dealers triggered for query_id={oos_doc['query_id']} (org={org_id})")
+
     if not is_within_dealer_hours():
+        logger.info(f"[OOS] Outside dealer business hours. Keeping status as 'pending_send' for query_id={oos_doc['query_id']}")
         async_db = get_async_mongo_db()
         await async_db["oos_requests"].update_one(
             {"query_id": oos_doc["query_id"]},
@@ -175,10 +137,14 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         {"$set": {"status": "sending"}}
     )
     if claim.modified_count == 0:
+        logger.info(f"[OOS] Request query_id={oos_doc['query_id']} is already being processed or sent. Aborting duplicate send.")
         return  # already being processed
+
+    logger.info(f"[OOS] Atomic claim succeeded. Transitioned query_id={oos_doc['query_id']} to status='sending'")
 
     # Fetch dealers from Google Sheet, filter by brand
     brand = oos_doc.get("extracted_attributes", {}).get("brand")
+    logger.info(f"[OOS] Fetching dealers from directory for org {org_id}...")
     all_dealers = await fetch_dealer_directory(org_id)
 
     # Filter by brand if known
@@ -188,12 +154,15 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
             d for d in all_dealers
             if brand_lower in [b.strip().lower() for b in d.get("brands", "").split(",")]
         ]
+        logger.info(f"[OOS] Filtered {len(all_dealers)} dealers down to {len(target_dealers)} dealers matching brand='{brand}'")
     else:
         target_dealers = all_dealers
+        logger.info(f"[OOS] No brand specified. Using all {len(target_dealers)} resolved dealers.")
 
     target_dealers = target_dealers[:MAX_DEALERS_PER_SEND]
 
     if not target_dealers:
+        logger.warning(f"[OOS] No dealers found to contact for query_id={oos_doc['query_id']}. Transitioning status to 'no_dealers'")
         await async_db["oos_requests"].update_one(
             {"query_id": oos_doc["query_id"]},
             {"$set": {"status": "no_dealers"}}
@@ -202,6 +171,7 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
 
     # Generate dealer message
     dealer_message = generate_dealer_message(oos_doc)
+    logger.info(f"[OOS] Formatted dealer inquiry message:\n{dealer_message}")
 
     # Save target_dealers and message to the doc for tracking
     await async_db["oos_requests"].update_one(
@@ -229,15 +199,19 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         )
         return
 
+    logger.info(f"[OOS] Sending WhatsApp notifications to {len(target_dealers)} dealers using account WA_ID={wa_id}")
+
     sent_dealers = []
     sem = asyncio.Semaphore(5)  # max 5 concurrent WhatsApp sends
 
     async def _send_one(dealer: dict):
         dealer_phone = dealer.get("phone", "")
+        dealer_name = dealer.get("name", "")
         if not dealer_phone:
             return
         async with sem:
             try:
+                logger.info(f"[OOS] Sending WhatsApp message to dealer '{dealer_name}' at +{dealer_phone}...")
                 res = await send_whatsapp_message({
                     "conversation_id": f"dealer_{dealer_phone}",
                     "content": dealer_message,
@@ -245,14 +219,15 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
                     "recipient_override": dealer_phone,
                 }, org_id, "ai")
                 message_ids = res.get("message_ids", []) if res else []
+                logger.success(f"[OOS] WhatsApp successfully sent to dealer '{dealer_name}' at +{dealer_phone} (message_ids={message_ids})")
                 sent_dealers.append({
                     "dealer_phone": dealer_phone,
-                    "dealer_name": dealer.get("name", ""),
+                    "dealer_name": dealer_name,
                     "message_ids": message_ids,
                     "sent_at": datetime.now(timezone.utc),
                 })
             except Exception as e:
-                logger.error(f"[OOS] Failed to send to dealer {dealer_phone}: {e}")
+                logger.error(f"[OOS] Failed to send message to dealer '{dealer_name}' at +{dealer_phone}: {e}")
 
     await asyncio.gather(*[_send_one(d) for d in target_dealers])
 
@@ -267,7 +242,9 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         update
     )
     if sent_dealers:
-        logger.info(f"[OOS] Contacted {len(sent_dealers)} dealers for query_id={oos_doc['query_id']}")
+        logger.success(f"[OOS] Contacted {len(sent_dealers)} dealers successfully. Query_id={oos_doc['query_id']} transitioned status to '{new_status}'")
+    else:
+        logger.error(f"[OOS] Failed to contact any dealers for query_id={oos_doc['query_id']}. Status set to 'send_failed'")
 
 
 async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, message_context: Optional[dict] = None) -> bool:
@@ -285,20 +262,26 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
 
     replied_message_id = message_context.get("id") if message_context else None
 
+    logger.info(f"[OOS] handle_dealer_reply invoked for dealer_phone={dealer_phone}, content='{content}', replied_message_id={replied_message_id}")
+
     # Statuses where we expect dealer replies (only after message was actually sent)
     active_statuses = ["dealers_contacted", "partial_replies", "sending"]
 
     # Try matching by message_id first
     oos_doc = None
     if replied_message_id:
+        logger.info(f"[OOS] Attempting match by replied message_id: {replied_message_id}")
         oos_doc = await oos_col.find_one({
             "org_id": org_id,
             "status": {"$in": active_statuses},
             "sent_dealers.message_ids": replied_message_id
         })
+        if oos_doc:
+            logger.success(f"[OOS] Match succeeded by message_id {replied_message_id} for query_id={oos_doc['query_id']}")
 
     # Then by dealer phone in sent_dealers
     if not oos_doc:
+        logger.info(f"[OOS] Attempting match by dealer phone number: {dealer_phone}")
         oos_doc = await oos_col.find_one(
             {
                 "org_id": org_id,
@@ -307,11 +290,14 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
             },
             sort=[("created_at", -1)]
         )
+        if oos_doc:
+            logger.success(f"[OOS] Match succeeded by dealer_phone {dealer_phone} for query_id={oos_doc['query_id']}")
 
     # Also check if this phone is in target_dealers (covers the case where
     # the same number is both customer and dealer — message was sent to them
     # and they reply in the same thread before status transitions)
     if not oos_doc:
+        logger.info(f"[OOS] Attempting match by target_dealers fallback: {dealer_phone}")
         oos_doc = await oos_col.find_one(
             {
                 "org_id": org_id,
@@ -320,8 +306,11 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
             },
             sort=[("created_at", -1)]
         )
+        if oos_doc:
+            logger.success(f"[OOS] Match succeeded by target_dealers fallback for phone {dealer_phone}, query_id={oos_doc['query_id']}")
 
     if not oos_doc:
+        logger.info(f"[OOS] No active OOS request matched for dealer_phone={dealer_phone}. Falling back to normal chatbot agent.")
         return False
 
     # Get dealer name from sent_dealers
@@ -355,7 +344,7 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
         logger.warning(f"[OOS] Could not append reply for query_id={oos_doc['query_id']}, status may have changed")
         return False
 
-    logger.info(f"[OOS] Dealer reply logged from {dealer_phone} for query_id={oos_doc['query_id']}")
+    logger.success(f"[OOS] Dealer reply successfully logged in MongoDB. dealer={dealer_name} ({dealer_phone}), query_id={oos_doc['query_id']}")
 
     # Log response to Google Sheet (non-blocking, don't fail the reply flow)
     try:
