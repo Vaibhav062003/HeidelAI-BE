@@ -42,6 +42,7 @@ class ConnectSheetRequest(BaseModel):
     sheet_id: str
     sheet_name: str
     tab_name: Optional[str] = None  # None = auto-detect first tab
+    purpose: Optional[str] = None   # e.g. "dealer_directory", "dealer_responses"
 
 
 
@@ -93,7 +94,7 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
         await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("row_number", 1)], unique=True))
         await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("synced_at", -1)]))
 
-        db.google_sheets_connections.insert_one({
+        doc = {
             "org_id": org_id,
             "sheet_id": request.sheet_id,
             "sheet_name": request.sheet_name,
@@ -101,12 +102,16 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             "last_synced_at": None,
             "last_sync_rows": 0,
             "polling_enabled": True,
-            "last_processed_row_number": 0,  # 0 = never synced; first sync will auto-detect start row
-            "header_row": None,  # Cached header row number (auto-detected on first sync)
-            "col_offset": None,  # Cached column offset (auto-detected on first sync)
+            "last_processed_row_number": 0,
+            "header_row": None,
+            "col_offset": None,
             "connected_at": now,
             "updated_at": now,
-        })
+        }
+        if request.purpose:
+            doc["purpose"] = request.purpose
+
+        db.google_sheets_connections.insert_one(doc)
 
         logger.info(f"Sheet {request.sheet_id} connected for org {org_id} (tab: {tab_name})")
         return {"sheet_id": request.sheet_id, "sheet_name": request.sheet_name, "tab_name": tab_name, "message": "Sheet connected successfully."}
