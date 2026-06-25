@@ -165,33 +165,3 @@ async def internal_create_escalation(
         logger.error(f"Error in internal_create_escalation: {e}")
         raise HTTPException(status_code=500, detail="Failed to create escalation")
 
-
-# ---------------------------------------------------------------------------
-# Internal Endpoint: Fetch Dealer Directory from Google Sheet
-# ---------------------------------------------------------------------------
-
-@router.post("/internal/dealer-sheet")
-async def internal_fetch_dealer_sheet(
-    payload: dict,
-    x_internal_secret: str = Header(None, alias="X-Internal-Secret")
-):
-    """
-    Internal endpoint for the AI engine to fetch dealer directory data
-    from the connected Google Sheet tagged with purpose='dealer_directory'.
-    """
-    if not settings.X_INTERNAL_SECRET or x_internal_secret != settings.X_INTERNAL_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized internal access")
-
-    org_id = payload.get("org_id")
-    if not org_id:
-        raise HTTPException(status_code=400, detail="Missing org_id")
-
-    try:
-        from services.oos_service import fetch_dealer_directory
-        sheet_id = payload.get("sheet_id")
-        tab_name = payload.get("tab_name")
-        dealers = await fetch_dealer_directory(org_id, sheet_id, tab_name)
-        return {"dealers": dealers}
-    except Exception as e:
-        logger.error(f"Error fetching dealer sheet: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch dealer directory")

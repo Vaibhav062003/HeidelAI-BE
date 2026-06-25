@@ -113,9 +113,48 @@ async def fetch_dealer_directory(org_id: str, sheet_id: Optional[str] = None, ta
     return dealers
 
 
+def generate_dealer_message(oos_doc: dict) -> str:
+    """Generate the formatted inquiry message to send to dealers."""
+    attrs = oos_doc.get("extracted_attributes", {})
+    parts = []
+    if attrs.get("category"):
+        parts.append(f"Category: {attrs['category'].strip().title()}")
+    if attrs.get("brand"):
+        parts.append(f"Brand: {attrs['brand'].strip().upper()}")
+    if attrs.get("model_name"):
+        parts.append(f"Model: {attrs['model_name'].strip()}")
+
+    specs = attrs.get("specs", {})
+    if specs:
+        for k, v in specs.items():
+            if v is None:
+                continue
+            label = k.replace("_", " ").title()
+            if label.lower() == "ram gb":
+                label, v = "RAM", f"{v}GB"
+            elif label.lower() == "storage gb":
+                label, v = "Storage", f"{v}GB"
+            elif label.lower() == "budget max":
+                label = "Max Budget"
+                try:
+                    v = f"Rs. {float(v):,.0f}"
+                except (ValueError, TypeError):
+                    v = f"Rs. {v}"
+            parts.append(f"{label}: {v}")
+
+    spec_summary = "\n".join(f"  - {p}" for p in parts)
+    raw_query = oos_doc.get("raw_query_text", "")
+
+    message = f"New Requirement Inquiry:\nQuery: \"{raw_query}\"\n"
+    if parts:
+        message += f"Specifications:\n{spec_summary}\n"
+    message += "\nPlease reply with availability and pricing."
+    return message
+
+
 async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     """
-    Send the dealer inquiry message to all target dealers via WhatsApp.
+    Fetch dealers from Google Sheet, generate message, and send via WhatsApp.
     Only sends if within business hours (11 AM - 7:30 PM IST).
     Uses atomic status transition to prevent double-sends.
     """
@@ -129,7 +168,7 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         )
         return
 
-    # Atomic claim: only proceed if we can transition from current status to "sending"
+    # Atomic claim: only proceed if we can transition to "sending"
     async_db = get_async_mongo_db()
     claim = await async_db["oos_requests"].update_one(
         {"query_id": oos_doc["query_id"], "status": {"$in": ["out_of_stock", "pending_send"]}},
@@ -138,7 +177,22 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     if claim.modified_count == 0:
         return  # already being processed
 
-    target_dealers = oos_doc.get("target_dealers", [])[:MAX_DEALERS_PER_SEND]
+    # Fetch dealers from Google Sheet, filter by brand
+    brand = oos_doc.get("extracted_attributes", {}).get("brand")
+    all_dealers = await fetch_dealer_directory(org_id)
+
+    # Filter by brand if known
+    if brand:
+        brand_lower = brand.strip().lower()
+        target_dealers = [
+            d for d in all_dealers
+            if brand_lower in [b.strip().lower() for b in d.get("brands", "").split(",")]
+        ]
+    else:
+        target_dealers = all_dealers
+
+    target_dealers = target_dealers[:MAX_DEALERS_PER_SEND]
+
     if not target_dealers:
         await async_db["oos_requests"].update_one(
             {"query_id": oos_doc["query_id"]},
@@ -146,7 +200,20 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         )
         return
 
-    dealer_message = oos_doc.get("dealer_message", "")
+    # Generate dealer message
+    dealer_message = generate_dealer_message(oos_doc)
+
+    # Save target_dealers and message to the doc for tracking
+    await async_db["oos_requests"].update_one(
+        {"query_id": oos_doc["query_id"]},
+        {"$set": {
+            "target_dealers": [
+                {"name": d.get("name", ""), "phone": d.get("phone", ""), "brands": d.get("brands", "")}
+                for d in target_dealers
+            ],
+            "dealer_message": dealer_message,
+        }}
+    )
 
     # Resolve WhatsApp Business Account ID
     db = get_mongo_db()
