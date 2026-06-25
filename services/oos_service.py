@@ -206,6 +206,7 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
 async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, message_context: Optional[dict] = None) -> bool:
     """
     Check if an incoming WhatsApp message is a dealer replying to an OOS request.
+    Handles the case where customer and dealer are the SAME phone number.
     If matched:
       - Atomically append reply to prevent duplicates
       - Log to Google Sheet (Dealer Responses)
@@ -217,21 +218,38 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
 
     replied_message_id = message_context.get("id") if message_context else None
 
-    # Try matching by message_id first, then by dealer phone
+    # Statuses where we expect dealer replies
+    active_statuses = ["dealers_contacted", "partial_replies", "out_of_stock", "sending"]
+
+    # Try matching by message_id first
     oos_doc = None
     if replied_message_id:
         oos_doc = await oos_col.find_one({
             "org_id": org_id,
-            "status": {"$in": ["dealers_contacted", "partial_replies"]},
+            "status": {"$in": active_statuses},
             "sent_dealers.message_ids": replied_message_id
         })
 
+    # Then by dealer phone in sent_dealers
     if not oos_doc:
         oos_doc = await oos_col.find_one(
             {
                 "org_id": org_id,
-                "status": {"$in": ["dealers_contacted", "partial_replies"]},
+                "status": {"$in": active_statuses},
                 "sent_dealers.dealer_phone": dealer_phone
+            },
+            sort=[("created_at", -1)]
+        )
+
+    # Also check if this phone is in target_dealers (covers the case where
+    # the same number is both customer and dealer — message was sent to them
+    # and they reply in the same thread before status transitions)
+    if not oos_doc:
+        oos_doc = await oos_col.find_one(
+            {
+                "org_id": org_id,
+                "status": {"$in": active_statuses},
+                "target_dealers.phone": dealer_phone
             },
             sort=[("created_at", -1)]
         )
@@ -484,6 +502,7 @@ async def ensure_oos_indexes():
     col = async_db["oos_requests"]
     await col.create_index([("org_id", 1), ("status", 1), ("sent_dealers.dealer_phone", 1)])
     await col.create_index([("org_id", 1), ("status", 1), ("sent_dealers.message_ids", 1)])
+    await col.create_index([("org_id", 1), ("status", 1), ("target_dealers.phone", 1)])
     await col.create_index([("conversation_id", 1), ("status", 1), ("extracted_attributes.brand", 1)])
     await col.create_index([("status", 1), ("expires_at", 1)])
     logger.info("[OOS] Indexes ensured on oos_requests")
