@@ -122,6 +122,76 @@ def remove_expired_message_ids():
     for message_id in expired_ids:
         del services.processed_message_ids[message_id]
 
+async def check_and_handle_dealer_reply(org_id: str, customer_phone_no: str, content: str, message_context: dict | None) -> bool:
+    # 1. Look for active OOS requests (status is 'out_of_stock')
+    # If there is a context.id, match by message ID
+    replied_message_id = message_context.get("id") if message_context else None
+    
+    oos_col = db["oos_requests"]
+    
+    query = {"org_id": org_id, "status": "out_of_stock"}
+    
+    oos_doc = None
+    if replied_message_id:
+        # Match by specific message ID in sent_dealers
+        query["sent_dealers.message_ids"] = replied_message_id
+        oos_doc = oos_col.find_one(query)
+    
+    if not oos_doc:
+        # Match by sender phone number and check if they are in sent_dealers
+        phone_query = {
+            "org_id": org_id,
+            "status": "out_of_stock",
+            "sent_dealers.dealer_phone": customer_phone_no
+        }
+        # Get the latest one
+        oos_doc = oos_col.find_one(phone_query, sort=[("created_at", -1)])
+        
+    if oos_doc:
+        logger.info(f"Matched incoming message from dealer {customer_phone_no} to OOS request query_id={oos_doc['query_id']}")
+        
+        # 2. Update the OOS request status to "dealer_replied" and store the reply details
+        oos_col.update_one(
+            {"query_id": oos_doc["query_id"]},
+            {"$set": {
+                "status": "dealer_replied",
+                "dealer_reply": {
+                    "dealer_phone": customer_phone_no,
+                    "content": content,
+                    "replied_at": datetime.now(timezone.utc)
+                }
+            }}
+        )
+        
+        # 3. Escalate to human for pricing approval by creating an AI escalation in the backend
+        try:
+            from services.team_service import create_ai_escalation
+            
+            escalation_payload = {
+                "user_name": oos_doc.get("customer_name") or "Customer",
+                "customer_number": oos_doc.get("conversation_id", "").replace("whatsapp_", ""),
+                "customer_text": content,
+                "inferred_intent": "pricing_approval",
+                "status": "pending_human_review",
+                "role": "dealer_response",
+                "sender_name": f"Dealer ({customer_phone_no})",
+                "metadata": {
+                    "oos_query_id": oos_doc.get("query_id"),
+                    "dealer_phone": customer_phone_no,
+                    "customer_query": oos_doc.get("raw_query_text", ""),
+                    "dealer_reply_text": content
+                }
+            }
+            
+            await create_ai_escalation(org_id, escalation_payload)
+            logger.info(f"Successfully created AI escalation for dealer reply on OOS request {oos_doc['query_id']}")
+        except Exception as e:
+            logger.error(f"Failed to create AI escalation for dealer reply: {e}")
+            
+        return True
+        
+    return False
+
 @router.get("")
 async def verify_webhook(request: Request):
     # This is for the webhook verification (GET request)
@@ -444,7 +514,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             is_komal_wa = whatsapp_business_id == KOMAL_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
-                            is_dev = ENVIRONMENT == "development"
+                            is_dev = ENVIRONMENT in ("development", "dev")
                             is_test = ENVIRONMENT == "test"
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
@@ -469,6 +539,17 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
+
+                                # Check if this is a dealer reply to an out-of-stock request
+                                is_dealer_reply = await check_and_handle_dealer_reply(
+                                    org_id=org_id,
+                                    customer_phone_no=customer_phone_no,
+                                    content=content,
+                                    message_context=message_context
+                                )
+                                if is_dealer_reply:
+                                    logger.info(f"Dealer reply processed and intercepted. Skipping normal AI chatbot flow.")
+                                    return {"status": "ok"}
 
                                 # Storing messages from customers in the DB
                                 # Create or update conversation
@@ -572,6 +653,45 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "content": final_response,
                                         "sender_id": whatsapp_business_id,
                                     }, org_id, "ai")
+
+                                    # Check and send recent out-of-stock dealer message if logged
+                                    try:
+                                        recent_oos = db.oos_requests.find_one(
+                                            {"conversation_id": conversation_id, "status": "out_of_stock"},
+                                            sort=[("created_at", -1)]
+                                        )
+                                        if recent_oos:
+                                            created_at = recent_oos.get("created_at")
+                                            if created_at:
+                                                if created_at.tzinfo is None:
+                                                    created_at = created_at.replace(tzinfo=timezone.utc)
+                                                time_diff = (datetime.now(timezone.utc) - created_at).total_seconds()
+                                                if time_diff < 15:
+                                                    dealer_msg = recent_oos.get("dealer_message")
+                                                    if dealer_msg:
+                                                        logger.info(f"OOS request detected for {conversation_id}. Sending dealer message...")
+                                                        res_dealer = await send_whatsapp_message({
+                                                             "conversation_id": conversation_id,
+                                                             "content": dealer_msg,
+                                                             "sender_id": whatsapp_business_id,
+                                                         }, org_id, "ai")
+                                                        try:
+                                                             message_ids = res_dealer.get("message_ids", [])
+                                                             db.oos_requests.update_one(
+                                                                 {"query_id": recent_oos["query_id"]},
+                                                                 {"$push": {
+                                                                     "sent_dealers": {
+                                                                         "dealer_phone": customer_phone_no,
+                                                                         "message_ids": message_ids,
+                                                                         "sent_at": datetime.now(timezone.utc)
+                                                                     }
+                                                                 }}
+                                                             )
+                                                             logger.info(f"Logged sent dealer message mapping to OOS query_id={recent_oos['query_id']} for customer/dealer={customer_phone_no}")
+                                                        except Exception as e:
+                                                             logger.error(f"Failed to log sent dealer mapping to OOS document: {e}")
+                                    except Exception as e:
+                                        logger.error(f"Error checking/sending OOS dealer message: {e}")
 
                                     return {"status": "ok"}
 
@@ -1710,4 +1830,5 @@ async def cashfree_webhook(request: Request):
         logger.error(f"Webhook processing failed : {e}")
 
     return {"status": "processed"}
+
 
