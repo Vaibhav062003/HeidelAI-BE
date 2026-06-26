@@ -122,6 +122,15 @@ def remove_expired_message_ids():
     for message_id in expired_ids:
         del services.processed_message_ids[message_id]
 
+async def check_and_handle_dealer_reply(org_id: str, customer_phone_no: str, content: str, message_context: dict | None) -> bool:
+    """Delegate to oos_service which handles matching, logging to sheet, and escalation."""
+    from services.oos_service import handle_dealer_reply
+    try:
+        return await handle_dealer_reply(org_id, customer_phone_no, content, message_context)
+    except Exception as e:
+        logger.error(f"Error in check_and_handle_dealer_reply: {e}")
+        return False
+
 @router.get("")
 async def verify_webhook(request: Request):
     # This is for the webhook verification (GET request)
@@ -444,7 +453,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             is_komal_wa = whatsapp_business_id == KOMAL_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
-                            is_dev = ENVIRONMENT == "development"
+                            iis_dev = ENVIRONMENT == "development"
                             is_test = ENVIRONMENT == "test"
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
@@ -469,6 +478,17 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
+
+                                # Check if this is a dealer reply to an out-of-stock request
+                                is_dealer_reply = await check_and_handle_dealer_reply(
+                                    org_id=org_id,
+                                    customer_phone_no=customer_phone_no,
+                                    content=content,
+                                    message_context=message_context
+                                )
+                                if is_dealer_reply:
+                                    logger.info(f"Dealer reply processed and intercepted. Skipping normal AI chatbot flow.")
+                                    return {"status": "ok"}
 
                                 # Storing messages from customers in the DB
                                 # Create or update conversation
@@ -576,7 +596,25 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "sender_id": whatsapp_business_id,
                                         }, org_id, "ai")
 
-                                        return {"status": "ok"}
+                                    # Check and send OOS dealer messages if a recent request was logged
+                                    try:
+                                        from services.oos_service import send_oos_to_dealers
+                                        recent_oos = db.oos_requests.find_one(
+                                            {"conversation_id": conversation_id, "status": "pending_send"},
+                                            sort=[("created_at", -1)]
+                                        )
+                                        if recent_oos:
+                                            created_at = recent_oos.get("created_at")
+                                            if created_at:
+                                                if created_at.tzinfo is None:
+                                                    created_at = created_at.replace(tzinfo=timezone.utc)
+                                                time_diff = (datetime.now(timezone.utc) - created_at).total_seconds()
+                                                if time_diff < 30:
+                                                    await send_oos_to_dealers(recent_oos, org_id)
+                                    except Exception as e:
+                                        logger.error(f"Error checking/sending OOS dealer message: {e}")
+
+                                    return {"status": "ok"}
 
                                 # Handling messages received on HeidelAI's whatsapp number
                                 if is_heidelai and ai_enabled and is_production:
@@ -1765,4 +1803,5 @@ async def cashfree_webhook(request: Request):
         logger.error(f"Webhook processing failed : {e}")
 
     return {"status": "processed"}
+
 

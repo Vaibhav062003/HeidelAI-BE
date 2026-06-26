@@ -42,6 +42,7 @@ class ConnectSheetRequest(BaseModel):
     sheet_id: str
     sheet_name: str
     tab_name: Optional[str] = None  # None = auto-detect first tab
+    purpose: Optional[str] = None   # e.g. "dealer_directory", "dealer_responses"
 
 
 
@@ -83,24 +84,28 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
         await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("row_number", 1)], unique=True))
         await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("synced_at", -1)]))
 
+        insert_data = {
+            "org_id": org_id,
+            "sheet_id": request.sheet_id,
+            "sheet_name": request.sheet_name,
+            "tab_name": tab_name,
+            "last_synced_at": None,
+            "last_sync_rows": 0,
+            "polling_enabled": True,
+            "last_processed_row_number": 0,  # 0 = never synced; first sync will auto-detect start row
+            "header_row": None,  # Cached header row number (auto-detected on first sync)
+            "col_offset": None,  # Cached column offset (auto-detected on first sync)
+            "connected_at": now,
+            "updated_at": now,
+        }
+        if request.purpose:
+            insert_data["purpose"] = request.purpose
+
         # Atomic upsert: $setOnInsert ensures no duplicate connections on race condition
         result = await asyncio.to_thread(
             db.google_sheets_connections.update_one,
             {"org_id": org_id, "sheet_id": request.sheet_id},
-            {"$setOnInsert": {
-                "org_id": org_id,
-                "sheet_id": request.sheet_id,
-                "sheet_name": request.sheet_name,
-                "tab_name": tab_name,
-                "last_synced_at": None,
-                "last_sync_rows": 0,
-                "polling_enabled": True,
-                "last_processed_row_number": 0,
-                "header_row": None,
-                "col_offset": None,
-                "connected_at": now,
-                "updated_at": now,
-            }},
+            {"$setOnInsert": insert_data},
             upsert=True
         )
         if result.matched_count > 0:

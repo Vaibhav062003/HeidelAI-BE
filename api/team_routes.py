@@ -164,3 +164,4 @@ async def internal_create_escalation(
     except Exception as e:
         logger.error(f"Error in internal_create_escalation: {e}")
         raise HTTPException(status_code=500, detail="Failed to create escalation")
+
