@@ -453,7 +453,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             is_komal_wa = whatsapp_business_id == KOMAL_ORG_WA_ID
                             is_production = ENVIRONMENT == "production"
-                            is_dev = ENVIRONMENT in ("development", "dev")
+                            iis_dev = ENVIRONMENT == "development"
                             is_test = ENVIRONMENT == "test"
                             # fetch org + convo flags
                             ai_enabled = is_org_ai_enabled and is_conv_ai_enabled
