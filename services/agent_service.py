@@ -14,7 +14,8 @@ async def send_to_agent(
     customer_name: str,
     org_id: str,
     source: str = "webhook",
-    timeout: int = 20
+    timeout: int = 20,
+    reply_context_message_id: str = None
 ) -> Dict:
 
     """
@@ -42,6 +43,9 @@ async def send_to_agent(
             "source": source
         }
     
+    if reply_context_message_id:
+        payload["reply_context_message_id"] = reply_context_message_id
+
 
     # # Authorization headers
     # headers={
