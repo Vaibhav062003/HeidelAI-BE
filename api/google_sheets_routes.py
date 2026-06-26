@@ -64,15 +64,6 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
         if not db.google_connections.find_one({"org_id": org_id, "status": "active"}):
             raise HTTPException(status_code=404, detail="No active Google connection found.")
 
-        existing_connection = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": request.sheet_id})
-        if existing_connection:
-            return {
-                "sheet_id": existing_connection.get("sheet_id", request.sheet_id),
-                "sheet_name": existing_connection.get("sheet_name", request.sheet_name),
-                "tab_name": existing_connection.get("tab_name") or request.tab_name or "Sheet1",
-                "message": "Already connected."
-            }
-
         # Auto-detect the first tab if none was provided
         tab_name = request.tab_name
         if not tab_name:
@@ -87,14 +78,13 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
         now = datetime.now(timezone.utc)
         
         # Ensure indexes dynamically BEFORE inserting the connection.
-        # This prevents "zombie" states where a connection exists but indexes are missing.
         await asyncio.to_thread(lambda: db.google_sheets_connections.create_index([("org_id", 1), ("sheet_id", 1)], unique=True))
         
         rows_col = db[f"google_sheet_rows_{org_id}"]
         await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("row_number", 1)], unique=True))
         await asyncio.to_thread(lambda c=rows_col: c.create_index([("sheet_id", 1), ("synced_at", -1)]))
 
-        doc = {
+        insert_data = {
             "org_id": org_id,
             "sheet_id": request.sheet_id,
             "sheet_name": request.sheet_name,
@@ -102,16 +92,30 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             "last_synced_at": None,
             "last_sync_rows": 0,
             "polling_enabled": True,
-            "last_processed_row_number": 0,
-            "header_row": None,
-            "col_offset": None,
+            "last_processed_row_number": 0,  # 0 = never synced; first sync will auto-detect start row
+            "header_row": None,  # Cached header row number (auto-detected on first sync)
+            "col_offset": None,  # Cached column offset (auto-detected on first sync)
             "connected_at": now,
             "updated_at": now,
         }
         if request.purpose:
-            doc["purpose"] = request.purpose
+            insert_data["purpose"] = request.purpose
 
-        db.google_sheets_connections.insert_one(doc)
+        # Atomic upsert: $setOnInsert ensures no duplicate connections on race condition
+        result = await asyncio.to_thread(
+            db.google_sheets_connections.update_one,
+            {"org_id": org_id, "sheet_id": request.sheet_id},
+            {"$setOnInsert": insert_data},
+            upsert=True
+        )
+        if result.matched_count > 0:
+            existing = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": request.sheet_id})
+            return {
+                "sheet_id": existing.get("sheet_id", request.sheet_id),
+                "sheet_name": existing.get("sheet_name", request.sheet_name),
+                "tab_name": existing.get("tab_name") or tab_name or "Sheet1",
+                "message": "Already connected."
+            }
 
         logger.info(f"Sheet {request.sheet_id} connected for org {org_id} (tab: {tab_name})")
         return {"sheet_id": request.sheet_id, "sheet_name": request.sheet_name, "tab_name": tab_name, "message": "Sheet connected successfully."}
@@ -721,6 +725,22 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
             h_vals = h_resp.json().get("values", [[]])
             h_row = h_vals[0] if h_vals else []
             headers = [str(c).strip() for c in h_row[col_offset:] if c and str(c).strip()]
+            # Validate cached header still looks correct (not shifted by user edits)
+            if len(headers) < 2 or all(h.replace('.', '').replace('-', '').isdigit() for h in headers[:3] if h):
+                logger.warning(f"[SyncSheet] Cached header at row {header_row} looks invalid (numeric-only or too few columns), re-detecting...")
+                headers, header_row, col_offset = await _detect_header_row(
+                    sheet_id, tab_name, access_token, org_id
+                )
+                if headers:
+                    try:
+                        await asyncio.to_thread(
+                            db.google_sheets_connections.update_one,
+                            {"org_id": org_id, "sheet_id": sheet_id},
+                            {"$set": {"header_row": header_row, "col_offset": col_offset}}
+                        )
+                        logger.info(f"[SyncSheet] Re-cached header_row={header_row}, col_offset={col_offset}")
+                    except Exception as e:
+                        logger.warning(f"[SyncSheet] Failed to update header cache: {e}")
         else:
             raise HTTPException(status_code=502, detail=f"Google Sheets API error: {h_resp.json().get('error', {}).get('message', 'Unknown')}")
     else:
@@ -747,9 +767,10 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
     # --- Fetch ALL data rows from the sheet (full read, not incremental) ---
     data_start_row = header_row + 1
     import time
+    MAX_SHEET_ROWS = 50000
     sheets_url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
-        f"/values/{encoded_tab}!A{data_start_row}:ZZ10001"
+        f"/values/{encoded_tab}!A{data_start_row}:ZZ{data_start_row + MAX_SHEET_ROWS}"
     )
 
     logger.debug(
@@ -779,6 +800,11 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
                 headers={"Authorization": f"Bearer {access_token}"}, 
                 timeout=15
             )
+            if response.status_code == 401:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Google OAuth token refresh failed. Please reconnect your Google account."
+                )
     finally:
         # Only close the client if we created it ourselves (not the shared one)
         if created_client:
@@ -791,6 +817,10 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
         raise HTTPException(status_code=502, detail=f"Google Sheets API error: {response.json().get('error', {}).get('message', 'Unknown')}")
 
     values = response.json().get("values", [])
+    if len(values) >= MAX_SHEET_ROWS:
+        logger.warning(
+            f"[SyncSheet] Sheet {sheet_id} returned {len(values)} rows (limit {MAX_SHEET_ROWS}) — data may be truncated!"
+        )
     now = datetime.now(timezone.utc)
     collection = db[f"google_sheet_rows_{org_id}"]
 
@@ -878,11 +908,23 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
             )
             rows_added = result.upserted_count
             rows_updated = result.modified_count
+            # Check for partial write errors (ordered=False doesn't raise on partial failure)
+            write_errors = result.bulk_api_result.get("writeErrors", [])
+            if write_errors:
+                logger.warning(
+                    f"[SyncSheet] {len(write_errors)} write errors in bulk_write for {sheet_id}: "
+                    f"{write_errors[:3]}"  # Log first 3 for debugging
+                )
             logger.info(f"[SyncSheet] Bulk reconciled {len(bulk_ops)} rows for {sheet_id}: +{rows_added} ~{rows_updated}")
         except Exception as e:
             logger.error(f"[SyncSheet] Bulk write failed for {sheet_id}: {e}")
-            # Fallback stats if needed
-            rows_added = len(current_rows) 
+            # Extract actual counts from BulkWriteError if possible
+            if hasattr(e, 'details'):
+                rows_added = e.details.get('nUpserted', 0)
+                rows_updated = e.details.get('nModified', 0)
+            else:
+                rows_added = 0
+                rows_updated = 0
 
     # Update connection metadata
     max_row = max(current_row_numbers) if current_row_numbers else header_row
