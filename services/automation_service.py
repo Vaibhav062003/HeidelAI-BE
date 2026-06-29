@@ -805,7 +805,20 @@ async def execute_whatsapp_flow(
     start_node_id = flow.get("start_node_id")
     flow_nodes = flow.get("nodes", {})
 
-    trigger_keywords = [msg.strip().lower() for msg in trigger_messages.split(",")] if trigger_messages else []
+    # Parse trigger keywords — supports both single words and full sentences/phrases.
+    # Keywords are comma-separated, but we also keep the FULL string as a keyword
+    # so that phrases containing commas (e.g. "Hello, I am interested in X") still match.
+    trigger_keywords = []
+    if trigger_messages:
+        full_phrase = trigger_messages.strip().lower()
+        if full_phrase:
+            trigger_keywords.append(full_phrase)  # always add the full string as-is
+        # Also split by comma for individual keywords ("hi,hello,menu" → ["hi", "hello", "menu"])
+        for part in trigger_messages.split(","):
+            cleaned = part.strip().lower()
+            if cleaned and cleaned != full_phrase:  # avoid duplicate of full string
+                trigger_keywords.append(cleaned)
+    logger.info(f"[{org_id}] Trigger keywords: {trigger_keywords}")
     template_variables = {"customer_name": get_first_name(customer_name)}
 
     ctx = dict(org_id=org_id, whatsapp_business_id=whatsapp_business_id, conversation_id=conversation_id)
@@ -848,14 +861,25 @@ async def execute_whatsapp_flow(
 
     # Welcome / keyword trigger
     if welcome_message or start_node_id:
+        msg_lower = message_content.strip().lower() if message_content else ""
+
+        # "Contains" matching: fires if ANY keyword is found within the message,
+        # OR if the entire message is found within any keyword.
+        # This supports single words ("hi"), phrases ("I am interested in X"),
+        # and full sentences with commas ("Hello, I am interested in Custom PC Built.").
         is_keyword_match = (
             message_type == "text"
             and trigger_event == "message_received"
-            and message_content.strip().lower() in trigger_keywords
+            and msg_lower
+            and any(kw in msg_lower or msg_lower in kw for kw in trigger_keywords)
         )
 
+        if is_keyword_match:
+            matched = [kw for kw in trigger_keywords if kw in msg_lower or msg_lower in kw]
+            logger.info(f"[{org_id}] Keyword match found: message='{msg_lower}' matched={matched}")
+
         if not is_keyword_match:
-            logger.info(f"[{org_id}] Message did not match flow trigger keywords, routing to AI...")
+            logger.info(f"[{org_id}] Message '{msg_lower}' did not match flow trigger keywords {trigger_keywords}, routing to AI...")
             return False
 
         # Send optional introduction first

@@ -56,7 +56,7 @@ JWT_HEADER_ALGORITHM = os.getenv('JWT_HEADER_ALGORITHM')
 
 # Egenie Specific Configurations
 ORG_ID = os.getenv("ORG_ID")
-LEE_ORG_ID = os.getenv("LEE_ORG_ID")
+LEE_DEALER_ORG_ID = os.getenv("LEE_DEALER_ORG_ID")
 
 #Sentence Transformers
 SENTENCE_TRANSFORMERS_MODEL = os.getenv("sentence_transformers_model")
@@ -82,6 +82,8 @@ TEST_WEBHOOK_URL = os.getenv("TEST_WEBHOOK_URL", "").strip().strip("'\"")
 ENVIRONMENT = os.getenv("ENVIRONMENT")
 
 HEIDELAI_ORG_WA_ID = os.getenv("HEIDELAI_ORG_WA_ID")
+HEIDELAI_ORG_IG_ID = os.getenv("HEIDELAI_ORG_IG_ID")
+
 PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
 LEE_DEALER_ORG_WA_ID = os.getenv("LEE_DEALER_ORG_WA_ID")
 KARAN_ORG_WA_ID = os.getenv("KARAN_ORG_WA_ID")
@@ -121,3 +123,6 @@ EGENIE_IG_ID=os.getenv("EGENIE_IG_ID")
 
 SAHIL_WA_ID=os.getenv("SAHIL_WA_ID")
 SAHIL_IG_ID=os.getenv("SAHIL_IG_ID")
+
+KOMAL_ORG_ID=os.getenv("KOMAL_ORG_ID")
+KOMAL_ORG_WA_ID=os.getenv("KOMAL_ORG_WA_ID")

@@ -171,6 +171,7 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
     escalation_doc = {
         "id": data.get("id") or str(uuid.uuid4()),
         "user_name": data.get("user_name"),
+        "customer_number": data.get("customer_number"),
         "customer_text": data.get("customer_text"),
         "inferred_intent": data.get("inferred_intent"),
         "status": data.get("status", "pending_human_review"),

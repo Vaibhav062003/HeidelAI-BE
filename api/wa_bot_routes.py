@@ -12,6 +12,7 @@ from services.wa_bot_service import (
     delete_wa_bot_flow,
     publish_wa_bot_flow,
     unpublish_wa_bot_flow,
+    duplicate_wa_bot_flow,
 )
 from loguru import logger
 
@@ -225,3 +226,32 @@ async def unpublish_flow(flow_id: str, user: CurrentUser):
     except Exception as e:
         logger.error(f"unpublish wa_bot_flow {flow_id} error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to unpublish WaBot flow: {e}")
+
+
+# ─── DUPLICATE ────────────────────────────────────────────────────────────────
+
+@router.post("/{flow_id}/duplicate")
+async def duplicate_flow(flow_id: str, user: CurrentUser):
+    """
+    Create a server-side copy of a WaBot flow with a fresh identity.
+    The copy is always created in 'draft' status.
+    """
+    try:
+        org_id = user.org_id
+        if not org_id:
+            raise HTTPException(status_code=400, detail="Organization ID not found")
+
+        flow = await duplicate_wa_bot_flow(
+            org_id=org_id,
+            flow_id=flow_id,
+            created_by=user.user_id,
+        )
+        if not flow:
+            raise HTTPException(status_code=404, detail="Source WaBot flow not found")
+        return {"flow": flow, "message": "WaBot flow duplicated successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"duplicate wa_bot_flow {flow_id} error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to duplicate WaBot flow: {e}")

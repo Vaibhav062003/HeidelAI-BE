@@ -12,7 +12,7 @@ from services.agent_service import send_to_agent
 from services.wa_service import send_whatsapp_message
 # from services.websocket_service import broadcast_on_stats_update
 from loguru import logger
-from config.settings import LEE_ORG_ID
+from config.settings import LEE_DEALER_ORG_ID
 
 
 
@@ -279,13 +279,13 @@ async def update_ai_status(org_type: str = "all"):
         # Build query to fetch only required organizations
         query = {}
         if org_type == "lee":
-            if not LEE_ORG_ID:
-                logger.info("Skipping update_ai_status for 'lee' org type because LEE_ORG_ID is not configured.")
+            if not LEE_DEALER_ORG_ID:
+                logger.info("Skipping update_ai_status for 'lee' org type because LEE_DEALER_ORG_ID is not configured.")
                 return
-            query = {"org_id": LEE_ORG_ID}
+            query = {"org_id": LEE_DEALER_ORG_ID}
         elif org_type == "others":
-            if LEE_ORG_ID:
-                query = {"org_id": {"$ne": LEE_ORG_ID}}
+            if LEE_DEALER_ORG_ID:
+                query = {"org_id": {"$ne": LEE_DEALER_ORG_ID}}
             else:
                 query = {}
         elif org_type == "all":
@@ -400,10 +400,16 @@ async def update_ai_status(org_type: str = "all"):
 
 
 def start_scheduler():
+    from services.oos_service import process_pending_oos_sends, process_expired_oos_requests
+
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
     scheduler.add_job(update_ai_status, "interval", minutes=5, args=["lee"], next_run_time=datetime.now(timezone.utc))
     scheduler.add_job(update_ai_status, "interval", hours=1, args=["others"], next_run_time=datetime.now(timezone.utc))
+    # OOS: send pending dealer messages when business hours start (check every 15 min)
+    scheduler.add_job(process_pending_oos_sends, "interval", minutes=15)
+    # OOS: expire stale requests and escalate (check every hour)
+    scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
     scheduler.start()
     logger.success("APScheduler started (interval = 6 hours).")
 
