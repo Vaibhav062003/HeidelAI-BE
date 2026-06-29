@@ -538,6 +538,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
                                 if not is_heidelai and not is_pma_wa:
+                                    await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     # Runs on all environments and regardless of AI toggle
@@ -561,7 +562,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     # Fallback to AI Agent (only if AI is enabled for this org+conversation)
                                     if ai_enabled:
-                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
                                         if not convo_doc:
                                             convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
@@ -972,7 +972,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                                     id="contact_details_for_vedic_maths_regular", 
                                                                     title="Contact Details"
                                                                 )
-                                                            )
+                                                            ),
+                                                            ActionButton(
+                                                                type="reply",
+                                                                reply=ReplyButton(
+                                                                    id="fees_structure_for_vedic_maths_regular", 
+                                                                    title="Fees Structure"
+                                                                )
+                                                            ),
                                                         ],
                                                     )
                                                 )
@@ -1060,6 +1067,37 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                         "📱 9503498556\n"
                                                         "📱 8055579965\n\n"
                                                     )
+                                                    }
+                                                )
+
+                                                return {"status": "ok"}
+
+                                            case "fees_structure_for_vedic_maths_regular":
+                                                await send_whatsapp_message(
+                                                    org_id=org_id,
+                                                    mode="reply",
+                                                    message={
+                                                        "sender_id" : whatsapp_business_id,
+                                                        "conversation_id" : conversation_id,
+                                                        "content": (
+                                                            "https://connectitapp.in/parijat-academy\n\n"
+
+
+                                                            "Please find the QR inside and pay Rs 7500/-\n\n"
+
+                                                            "Registration Fees : Rs 500\n"
+                                                            "Level 1 : 3500 \n"
+                                                            "Level 2 : 3500\n"
+                                                            "2 Books : 400\n"
+                                                            "Total : 7900/-\n\n"
+
+                                                            "Payment in One Installment and get Rs 500 discount.\n\n"
+
+                                                            "Payment Only \n"
+                                                            "7000 + 400 = 7400/-\n\n"
+
+                                                            "Please send Receipt after payment"
+                                                        )
                                                     }
                                                 )
 
