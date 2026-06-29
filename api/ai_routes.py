@@ -2,9 +2,10 @@
 import dateparser
 from pymongo.errors import PyMongoError
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Request
 
 # === Internal Modules ===
+from core.limiter import limiter
 from loguru import logger
 from database import get_mongo_db
 from services.scheduler_service import schedule_followup_message
@@ -14,7 +15,6 @@ from services.ai_chatbot import update_prompt_in_cache, get_prompt
 from services.chat_analysis_service import analyze_and_update_conversation
 
 db = get_mongo_db()
-
 
 router = APIRouter(prefix="/api/ai", tags=["AI Routes"])
 
@@ -34,14 +34,16 @@ def conversation_doc_to_analysis(doc: dict) -> ChatAnalysis:
     )
 
 @router.get("/chatbot-prompt")
-async def get_chatbot_prompt(user: CurrentUser):
+@limiter.limit("20/minute")
+async def get_chatbot_prompt(request: Request, user: CurrentUser):
     """Get the chatbot prompt for the authenticated user's organization."""
     prompt = await get_prompt(user.org_id)
     
     return prompt
 
 @router.put("/chatbot-prompt")
-async def update_chatbot_prompt(payload: ChatbotPromptUpdate, user: CurrentUser):
+@limiter.limit("20/minute")
+async def update_chatbot_prompt(request: Request, payload: ChatbotPromptUpdate, user: CurrentUser):
     """
     Update the chatbot prompt for the authenticated user's organization.
     """
@@ -74,7 +76,8 @@ async def update_chatbot_prompt(payload: ChatbotPromptUpdate, user: CurrentUser)
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @router.post("/schedule-message/{conversation_id}")
-async def schedule_message(conversation_id: str, user: CurrentUser):
+@limiter.limit("100/minute")
+async def schedule_message(request: Request, conversation_id: str, user: CurrentUser):
     """
     Schedule a follow-up message for a conversation using an AI agent to determine the content and timing.
     """
@@ -88,7 +91,8 @@ async def schedule_message(conversation_id: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @router.get("/chat-analysis/{conversation_id}")
-async def run_chat_analysis(conversation_id: str, user: CurrentUser, force: bool = False):
+@limiter.limit("20/minute")
+async def run_chat_analysis(request: Request, conversation_id: str, user: CurrentUser, force: bool = False):
     """
     This endpoint retrieves the analysis results of the chat for a specific conversation.
     force: If true, forces re-analysis even if recent analysis exists.

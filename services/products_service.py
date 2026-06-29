@@ -183,34 +183,46 @@ async def bulk_upload_products_from_file(
         products_to_insert.append(mongo_doc)
 
     batch_size = services.BATCH_SIZE
-    try:
-        for i in range(0, len(products_to_insert), batch_size):
-            batch = products_to_insert[i:i + batch_size]
-            if batch:
-                res = collection.insert_many(batch)
+    batch_errors = []
+    for i in range(0, len(products_to_insert), batch_size):
+        batch = products_to_insert[i:i + batch_size]
+        if batch:
+            try:
+                res = collection.insert_many(batch, ordered=False)
                 inserted_count += len(res.inserted_ids)
-    except Exception as e:
-        return {"error": f"DB insert error: {str(e)}"}
+            except Exception as e:
+                # BulkWriteError still inserts some docs; count them
+                if hasattr(e, 'details'):
+                    inserted_count += e.details.get('nInserted', 0)
+                batch_errors.append(
+                    f"Batch {i // batch_size + 1}: {str(e)}"
+                )
 
-    _org_metadata_collection().update_one(
-        {"org_id": org_id},
-        {
-            "$set": {
-                "product_info.products_uploaded": True,
-                "product_info.last_updated_at": datetime.now(timezone.utc)
-            },
-            "$inc": {
-                "product_info.products_count": inserted_count
-            }
-        },
-        upsert=True
-    )
+    # ALWAYS update metadata with actual insert count
+    if inserted_count > 0:
+        try:
+            _org_metadata_collection().update_one(
+                {"org_id": org_id},
+                {
+                    "$set": {
+                        "product_info.products_uploaded": True,
+                        "product_info.last_updated_at": datetime.now(timezone.utc)
+                    },
+                    "$inc": {
+                        "product_info.products_count": inserted_count
+                    }
+                },
+                upsert=True
+            )
+        except Exception as meta_err:
+            batch_errors.append(f"Metadata update failed: {str(meta_err)}")
 
     return {
         "inserted": inserted_count,
         "attempted": len(products_to_insert) + len(errors),
         "skipped": len(errors),
         "errors": errors,
+        "batch_errors": batch_errors,
     }
 
 async def add_single_product(org_id: str, data: dict) -> dict:

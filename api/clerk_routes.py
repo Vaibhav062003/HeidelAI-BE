@@ -1,7 +1,8 @@
-import os, requests
-from fastapi import APIRouter, HTTPException, Query
+import requests
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, EmailStr
 
+from core.limiter import limiter
 from auth.dependencies import CurrentUser
 from config.settings import CLERK_TOKEN
 from loguru import logger
@@ -36,7 +37,8 @@ class WaitList(BaseModel):
     email: str
 
 @router.post("/invite-agent")
-def invite_agent(req: InviteAgentRequest, user: CurrentUser):  
+@limiter.limit("30/minute")
+def invite_agent(request: Request, req: InviteAgentRequest, user: CurrentUser):  
     ORG_ID = user.org_id
     url = f"{base_url}/organizations/{ORG_ID}/invitations"
     payload = {"email_address": req.email_address, "role": req.role, "redirect_url": req.redirect_url}
@@ -52,7 +54,8 @@ def invite_agent(req: InviteAgentRequest, user: CurrentUser):
         raise HTTPException(status_code=500, detail={"error": "Internal server error", "details": str(e)})
 
 @router.post("/revoke-invite")
-def revoke_invite(req: RevokeInviteRequest, user: CurrentUser):
+@limiter.limit("30/minute")
+def revoke_invite(request: Request, req: RevokeInviteRequest, user: CurrentUser):
     ORG_ID = user.org_id
     url = f"{base_url}/organizations/{ORG_ID}/invitations/{req.invitation_id}/revoke"
     payload = {"requesting_user_id": req.requesting_user_id}
@@ -67,9 +70,9 @@ def revoke_invite(req: RevokeInviteRequest, user: CurrentUser):
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": "Internal server error", "details": str(e)})
 
-
 @router.delete("/delete-member")
-def delete_member(user: CurrentUser, user_id: str = Query(...)):
+@limiter.limit("30/minute")
+def delete_member(request: Request, user: CurrentUser, user_id: str = Query(...)):
     ORG_ID = user.org_id
     url = f"{base_url}/organizations/{ORG_ID}/memberships/{user_id}"
     try:
@@ -87,7 +90,8 @@ def delete_member(user: CurrentUser, user_id: str = Query(...)):
         raise HTTPException(status_code=500, detail={"error": "Internal server error", "details": str(e)})
 
 @router.post("/waitlist")
-def waitlist_enroll(email: WaitList):
+@limiter.limit("30/minute")
+def waitlist_enroll(request: Request, email: WaitList):
     url = f"{base_url}/waitlist_entries"
     payload = {
         "email_address": email.email,

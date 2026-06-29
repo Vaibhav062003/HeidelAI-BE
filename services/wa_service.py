@@ -84,7 +84,19 @@ async def create_or_update_whatsapp_conversation(
     # Handle Name Resolution
     final_customer_name = customer_name
     
-    if existing_conversation:
+    # Check if the contact's name was locked by a VCF upload.
+    # If locked, we must use the VCF name regardless of what Meta sends.
+    contacts_col = db[f"contacts_{org_id}"]
+    contact_doc = contacts_col.find_one(
+        {"phone_number": customer_phone_no},
+        {"name_locked_by_vcf": 1, "full_name": 1, "_id": 0}
+    )
+    is_name_locked_by_vcf = contact_doc.get("name_locked_by_vcf", False) if contact_doc else False
+
+    if is_name_locked_by_vcf and contact_doc.get("full_name"):
+        # VCF name takes absolute priority — never overwrite
+        final_customer_name = contact_doc["full_name"]
+    elif existing_conversation:
         stored_name = existing_conversation.get("customer_name")
         meta_verified = existing_conversation.get("meta_name_verified", False)
         

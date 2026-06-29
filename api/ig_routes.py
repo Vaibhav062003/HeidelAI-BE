@@ -1,20 +1,18 @@
-from fastapi import APIRouter, File, Form, HTTPException, Depends, Response, Query, UploadFile
+import cloudinary
+from loguru import logger
 from datetime import datetime
 from pymongo import ReturnDocument
+from fastapi import APIRouter, File, Form, HTTPException, Request, Response, Query, UploadFile
+
 from config.settings import *
-from services.cloudinary_service import upload_media_to_cloudinary
-from services.ig_service import *
-from schemas.models import PlatformDisconnectRequest, MessageRole
-from auth.dependencies import CurrentUser
-from auth.auth_utils import admin_required, require_auth
-from services.platforms.instagram_service import InstagramService
-
 from database import get_mongo_db
-from pymongo import ReturnDocument
-import cloudinary
+from services.ig_service import *
+from core.limiter import limiter
+from auth.dependencies import CurrentUser
+from services.platforms.instagram_service import InstagramService
+from schemas.models import PlatformDisconnectRequest, MessageRole
+from services.cloudinary_service import upload_media_to_cloudinary
 import requests
-
-from loguru import logger
 
 
 
@@ -71,7 +69,8 @@ def exchange_for_long_lived_token(short_lived_token):
         }
 
 @router.get("/profile")
-async def get_instagram_profile(user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_instagram_profile(request: Request, user: CurrentUser):
     """
     Fetch detailed Instagram profile information
     
@@ -131,11 +130,12 @@ async def get_instagram_profile(user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram profile: {str(e)}")
 
 @router.post("/auth")
-async def instagram_auth(request: dict, user: CurrentUser):
+@limiter.limit("10/minute")
+async def instagram_auth(request: Request, req: dict, user: CurrentUser):
     try:
         # Extract authorization code from frontend
-        code = request.get("code")
-        redirect_uri = request.get("redirect_uri")
+        code = req.get("code")
+        redirect_uri = req.get("redirect_uri")
         org_id = user.org_id 
         
         if not code:
@@ -218,8 +218,8 @@ async def instagram_auth(request: dict, user: CurrentUser):
         conversations_collection = db[f"conversations_{org_id}"]
 
         # Ensure indexes for efficient querying
-        messages_collection.create_index("message_id", unique=True)
-        conversations_collection.create_index("conversation_id", unique=True)
+        #messages_collection.create_index("message_id", unique=True)
+        #conversations_collection.create_index("conversation_id", unique=True)
 
         # Store connection in database
         new_connection = {
@@ -264,11 +264,12 @@ async def instagram_auth(request: dict, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Instagram authentication error: {str(e)}")
 
 @router.post("/disconnect")
-async def instagram_disconnect(request: PlatformDisconnectRequest, user: CurrentUser):
+@limiter.limit("10/minute")
+async def instagram_disconnect(request: Request, req: PlatformDisconnectRequest, user: CurrentUser):
     """Revoke Instagram access token and remove connection"""
     try:
         org_id = user.org_id
-        connection_id = request.user_id
+        connection_id = req.user_id
 
         removal_result = await instagram_service.disconnect(org_id, connection_id)
 
@@ -286,50 +287,51 @@ async def instagram_disconnect(request: PlatformDisconnectRequest, user: Current
 
 # @router.get("/status")
 # async def get_instagram_status(org_id: str, instagram_id: Optional[str] = None, app_user_id: Optional[str] = None, _: None = Depends(require_auth)):
-#     """Check if Instagram account is connected and return connection details"""
-#     try:
-#         # At least one of the IDs must be provided
-#         if not instagram_id and not app_user_id:
-#             raise HTTPException(status_code=400, detail="Either instagram_id or app_user_id must be provided")
+    """Check if Instagram account is connected and return connection details"""
+    try:
+        # At least one of the IDs must be provided
+        if not instagram_id and not app_user_id:
+            raise HTTPException(status_code=400, detail="Either instagram_id or app_user_id must be provided")
         
-#         # Query by Instagram ID first if available - Remove await
-#         if instagram_id:
-#             connection = db.instagram_connections.find_one(
-#                 {"instagram_id": instagram_id, "is_active": True, "org_id": org_id}
-#             )
-#         # If Instagram ID is not available or no connection found, try with app user ID
-#         elif app_user_id:
-#             connection = db.instagram_connections.find_one(
-#                 {"app_user_id": app_user_id, "is_active": True, "org_id": org_id}
-#             )
+        # Query by Instagram ID first if available - Remove await
+        if instagram_id:
+            connection = db.instagram_connections.find_one(
+                {"instagram_id": instagram_id, "is_active": True, "org_id": org_id}
+            )
+        # If Instagram ID is not available or no connection found, try with app user ID
+        elif app_user_id:
+            connection = db.instagram_connections.find_one(
+                {"app_user_id": app_user_id, "is_active": True, "org_id": org_id}
+            )
         
-#         # If no connection found with either ID
-#         if not connection:
-#             return {
-#                 "instagram_connected": False,
-#                 "instagram_data": None
-#             }
+        # If no connection found with either ID
+        if not connection:
+            return {
+                "instagram_connected": False,
+                "instagram_data": None
+            }
         
-#         # Return connection details
-#         return {
-#             "instagram_connected": True,
-#             "org_id": org_id,
-#             "instagram_data": {
-#                 "username": connection.get("username"),
-#                 "user_id": connection.get("instagram_id"),
-#                 "profile_picture": connection.get("profile_picture"),
-#                 "business_info": connection.get("business_info"),
-#                 "connected_at": connection.get("connected_at").isoformat() if connection.get("connected_at") else None
-#             }
-#         }
+        # Return connection details
+        return {
+            "instagram_connected": True,
+            "org_id": org_id,
+            "instagram_data": {
+                "username": connection.get("username"),
+                "user_id": connection.get("instagram_id"),
+                "profile_picture": connection.get("profile_picture"),
+                "business_info": connection.get("business_info"),
+                "connected_at": connection.get("connected_at").isoformat() if connection.get("connected_at") else None
+            }
+        }
             
-#     except HTTPException as http_exc:
-#         raise http_exc
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.put("/link-user")
-async def link_instagram_to_user(instagram_id: str, app_user_id: str, user: CurrentUser):
+@limiter.limit("20/minute")
+async def link_instagram_to_user(request: Request, instagram_id: str, app_user_id: str, user: CurrentUser):
     """Link an Instagram connection to a specific app user ID"""
     try:
         org_id = user.org_id 
@@ -355,7 +357,8 @@ async def link_instagram_to_user(instagram_id: str, app_user_id: str, user: Curr
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/posts")
-async def get_instagram_posts(user: CurrentUser, limit: int = 24):
+@limiter.limit("30/minute")
+async def get_instagram_posts(request: Request, user: CurrentUser, limit: int = 24):
     """
     Fetch Instagram posts for a specific Instagram business account
     
@@ -435,7 +438,8 @@ async def get_instagram_posts(user: CurrentUser, limit: int = 24):
         raise HTTPException(status_code=500, detail=f"Failed to fetch Instagram posts: {str(e)}")
 
 @router.get("/conversations/{conversation_id}")
-async def get_instagram_conversation(conversation_id: str, user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_instagram_conversation(request: Request, conversation_id: str, user: CurrentUser):
     """
     Fetch the conversation of a specific user for the organization.
     Returns the conversation in the standard format for compatibility with the frontend
@@ -478,7 +482,8 @@ async def get_instagram_conversation(conversation_id: str, user: CurrentUser):
         )
 
 @router.get("/conversations")
-async def get_instagram_conversations(user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_instagram_conversations(request: Request, user: CurrentUser):
     """
     Fetch all the Instagram conversations for a specific Organization using org_id
     Returns them in the standard conversation format for compatibility with the frontend
@@ -538,7 +543,8 @@ async def get_instagram_conversations(user: CurrentUser):
 
 # Instagram-specific messages endpoint
 @router.get("/conversations/{conversation_id}/messages")
-async def get_instagram_messages(conversation_id: str, 
+@limiter.limit("30/minute")
+async def get_instagram_messages(request: Request, conversation_id: str, 
                                  user: CurrentUser,
                                  agent_username: str = Query(..., description="Username of the agent accessing this conversation")
                                  ):
@@ -627,7 +633,8 @@ async def get_instagram_messages(conversation_id: str,
 
 # Instagram-specific AI status endpoint
 @router.get("/conversations/{conversation_id}/ai")
-async def get_instagram_ai_status(conversation_id: str, user: CurrentUser):
+@limiter.limit("30/minute")
+async def get_instagram_ai_status(request: Request, conversation_id: str, user: CurrentUser):
     """Get AI status for a specific Instagram conversation"""
     try:
         org_id = user.org_id 
@@ -655,7 +662,8 @@ async def get_instagram_ai_status(conversation_id: str, user: CurrentUser):
 
 # Instagram-specific AI toggle endpoint
 @router.post("/conversations/{conversation_id}/toggle_ai")
-async def toggle_instagram_ai_status(conversation_id: str, body: dict, user: CurrentUser):
+@limiter.limit("30/minute")
+async def toggle_instagram_ai_status(request: Request, conversation_id: str, body: dict, user: CurrentUser):
     """Toggle AI status for a specific Instagram conversation"""
     try:
         org_id = user.org_id 
@@ -737,7 +745,8 @@ async def toggle_instagram_ai_status(conversation_id: str, body: dict, user: Cur
 
 # Instagram-specific send message endpoint
 @router.post("/conversations/send_message")
-async def send_instagram_message(message: dict, user: CurrentUser):
+@limiter.limit("30/minute")
+async def send_instagram_message(request: Request, message: dict, user: CurrentUser):
     """Send a message to an Instagram conversation"""
     try:
         org_id = user.org_id 
@@ -915,7 +924,9 @@ async def send_instagram_message(message: dict, user: CurrentUser):
 #         )
     
 @router.post("/conversations/send_media_message")
+@limiter.limit("30/minute")
 async def upload_and_send_instagram_media(
+    request: Request, 
     user: CurrentUser,
     caption: str = Form(...),
     conversation_id: str = Form(...), 
@@ -989,7 +1000,8 @@ async def upload_and_send_instagram_media(
 
 # Proxy endpoint to fetch Instagram media content and return back to frontend
 @router.get("/proxy/instagram-media")
-def proxy_instagram_media(url: str = Query(..., description="Full Instagram CDN URL")):
+@limiter.limit("60/minute")
+def proxy_instagram_media(request: Request, url: str = Query(..., description="Full Instagram CDN URL")):
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
