@@ -11,17 +11,48 @@ from api.google_sheets_routes import refresh_google_token, _force_token_refresh,
 
 
 # ─── Field Aliases ─────────────────────────────────────────────────────────────
+# Maps canonical MongoDB field names to possible sheet column name variations.
+# Used by auto_suggest_mapping() for the preview endpoint. The transform_row()
+# function does direct 1:1 snake_case mapping, so columns that already match
+# the MongoDB field name (e.g. "brand" → "brand") don't need aliases here —
+# aliases are only needed when the sheet column name differs from the DB field.
 
 FIELD_ALIASES = {
+    # --- Shared / Laptop fields ---
     "product_name": ["product name", "product_name", "name", "title", "product title", "item name", "item"],
     "model_no":     ["model_no", "model no", "model number", "model", "sku", "item code", "product code", "part number", "part no", "article no"],
     "description":  ["description", "desc", "product description", "details", "short description"],
     "price":        ["price", "mrp", "cost", "rate", "unit price", "selling price", "amount"],
     "stock":        ["stock", "quantity", "qty", "available", "inventory", "units", "available qty"],
     "image_url":    ["image", "image url", "image_url", "image link", "photo", "picture", "product image"],
+    # --- Component-specific aliases (where sheet column ≠ MongoDB field) ---
+    "brand":                         ["brand", "manufacturer", "make"],
+    "model_name":                    ["model_name", "model name"],
+    "graphics_card":                 ["graphics_card", "graphics card", "gpu"],
+    "graphics_card_space_gb":        ["graphics_card_space_gb", "graphics card space gb", "gpu memory", "vram"],
+    "ram_gb":                        ["ram_gb", "ram", "ram gb", "memory", "memory gb"],
+    "storage_gb":                    ["storage_gb", "ssd", "storage", "storage gb", "ssd gb"],
+    "ssd_type":                      ["ssd_type", "ssd type", "ssd_t", "sd_type", "storage type"],
+    "hdd":                           ["hdd", "hard disk", "hard drive"],
+    "smps":                          ["smps", "power supply", "psu"],
+    "processor":                     ["processor", "cpu", "chip"],
+    "processor_series":              ["processor_series", "processor series", "cpu series"],
+    "motherboard_series":            ["motherboard_series", "motherboard series", "motherboard_d_series", "motherboard d series"],
+    "motherboard_processor_support": ["motherboard_processor_support", "motherboard processor support", "motherboard_processor_sup_port", "motherboard processor sup port"],
+    "cabinet":                       ["cabinet", "case", "chassis"],
+    "category":                      ["category", "product category", "product type"],
+    "in_stock":                      ["in_stock", "in stock"],
 }
 
 CANONICAL_FIELDS = set(FIELD_ALIASES.keys())
+
+# Columns that, if present, strongly indicate this is a component sheet
+COMPONENT_INDICATORS = {
+    "processor_series", "motherboard_series", "motherboard_processor_support",
+    "cabinet", "smps", "hdd", "ssd_type", "graphics_card", "ram",
+    "processor", "gpu", "cpu", "psu",
+}
+
 
 
 # ─── Helper Functions ──────────────────────────────────────────────────────────
@@ -76,21 +107,46 @@ def auto_suggest_mapping(columns: list[str]) -> dict[str, str]:
 
 
 def generate_search_text(product_data: dict) -> str:
-    """Generate search_text from product fields for LLM retrieval."""
+    """Generate search_text from ALL string fields for LLM retrieval.
+    Includes product name, description, brand, model, specs — everything
+    that could help the AI find this product in a customer query."""
     parts = []
-    for key in ["product_name", "description"]:
-        val = product_data.get(key)
-        if val and str(val).strip():
-            parts.append(str(val).strip())
-    metadata = product_data.get("metadata", {})
-    for val in metadata.values():
-        if val and str(val).strip():
-            parts.append(str(val).strip())
+    # Include all string values from the document (skip internal/meta fields)
+    skip_keys = {"_id", "org_id", "source", "source_sheet_id", "search_text",
+                 "unique_identifier", "created_at", "updated_at"}
+    for key, val in product_data.items():
+        if key in skip_keys:
+            continue
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip())
     return " ".join(parts)
 
 
-def transform_row(row_data: dict, column_mapping: dict, sheet_id: str, org_id: str) -> tuple[dict | None, str | None]:
+def auto_detect_product_type(columns: list[str]) -> str:
+    """Auto-detect whether a sheet contains laptop or component data
+    based on the presence of component-specific columns."""
+    normalized = {col.strip().lower().replace(" ", "_") for col in columns}
+    matches = normalized & COMPONENT_INDICATORS
+    # If 2+ component-specific columns are present, classify as component
+    return "component" if len(matches) >= 2 else "laptop"
+
+
+def transform_row(
+    row_data: dict,
+    column_mapping: dict,
+    sheet_id: str,
+    org_id: str,
+    product_type: str = "laptop",
+) -> tuple[dict | None, str | None]:
     """Transform a sheet row dict into a product document matching the sheet columns 1:1 in snake_case.
+    
+    Args:
+        row_data: Raw row from the sheet {column_name: value}
+        column_mapping: Unused (kept for API compat) — mapping is 1:1 by column name
+        sheet_id: Source sheet ID for provenance tracking
+        org_id: Organization ID
+        product_type: "laptop" or "component" — sets the `type` field on the doc
+    
     Returns (product_doc, error_reason)."""
     doc = {}
     
@@ -119,7 +175,7 @@ def transform_row(row_data: dict, column_mapping: dict, sheet_id: str, org_id: s
     if not doc:
         return None, "empty row"
 
-    # Find a unique identifier
+    # Find a unique identifier — try known unique key columns in priority order
     unique_key = None
     for k in ["sku", "sku_full", "model_no", "model_name", "id"]:
         if k in doc and str(doc[k]).strip():
@@ -132,8 +188,15 @@ def transform_row(row_data: dict, column_mapping: dict, sheet_id: str, org_id: s
     doc["model_no"] = unique_key
     doc["unique_identifier"] = unique_key
     
-    if "type" not in doc:
-        doc["type"] = str(doc.get("category", "product")).lower()
+    # Set the product type from the connection config
+    doc["type"] = product_type
+    
+    # For components, set category from the sheet data or default
+    if product_type == "component":
+        if "category" not in doc or not doc.get("category"):
+            doc["category"] = "component"
+    elif "type" not in doc or not doc.get("type"):
+        doc["type"] = product_type
 
     now = datetime.now(timezone.utc)
     doc["source"] = "google_sheet"
@@ -141,8 +204,7 @@ def transform_row(row_data: dict, column_mapping: dict, sheet_id: str, org_id: s
     doc["org_id"] = org_id
     doc["updated_at"] = now
     
-    parts = [str(v) for v in doc.values() if isinstance(v, str)]
-    doc["search_text"] = " ".join(parts)
+    doc["search_text"] = generate_search_text(doc)
 
     return doc, None
 
@@ -170,6 +232,7 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
 
     column_mapping = connection["column_mapping"]
     tab_name = connection["tab_name"]
+    product_type = connection.get("product_type", "laptop")
 
     # Mark as syncing
     await asyncio.to_thread(
@@ -225,7 +288,7 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                 else:
                     row_data[header] = ""
 
-            product_doc, error = transform_row(row_data, column_mapping, sheet_id, org_id)
+            product_doc, error = transform_row(row_data, column_mapping, sheet_id, org_id, product_type)
             if error:
                 errors.append(f"Row {data_start_row + row_idx}: {error}")
                 continue

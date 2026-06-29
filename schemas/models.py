@@ -131,6 +131,7 @@ class ProductSheetConnection(BaseModel):
     sheet_name: str
     tab_name: str
     column_mapping: Dict[str, str]  # {product_field: sheet_column_name}
+    product_type: str = "laptop"  # "laptop" | "component"
     last_synced_at: Optional[datetime] = None
     last_sync_count: int = 0
     sync_errors: List[str] = Field(default_factory=list)
@@ -147,6 +148,7 @@ class ConnectProductSheetRequest(BaseModel):
     sheet_name: str
     tab_name: str
     column_mapping: Dict[str, str]
+    product_type: str = "laptop"  # "laptop" | "component"
 
 class SyncProductSheetRequest(BaseModel):
     sheet_id: str

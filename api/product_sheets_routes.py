@@ -18,7 +18,7 @@ from api.google_sheets_routes import (
     _fetch_sheet_tabs,
     _fetch_columns_from_tab,
 )
-from services.product_sheet_sync import auto_suggest_mapping, sync_product_sheet
+from services.product_sheet_sync import auto_suggest_mapping, auto_detect_product_type, sync_product_sheet
 from schemas.models import (
     PreviewProductSheetRequest,
     ConnectProductSheetRequest,
@@ -99,13 +99,14 @@ async def preview_product_sheet(request: PreviewProductSheetRequest, user: Curre
                             row_dict[header] = ""
                     sample_rows.append(row_dict)
 
-        # Auto-suggest mapping
+        # Auto-suggest mapping and detect product type from columns
         suggested_mapping = auto_suggest_mapping(columns)
+        detected_product_type = auto_detect_product_type(columns)
 
         logger.info(
             f"Product sheet preview for org {org_id} sheet {request.sheet_id}: "
             f"{len(columns)} columns, {len(sample_rows)} sample rows, "
-            f"{len(suggested_mapping)} auto-mapped fields"
+            f"{len(suggested_mapping)} auto-mapped fields, detected_type={detected_product_type}"
         )
 
         return {
@@ -113,6 +114,7 @@ async def preview_product_sheet(request: PreviewProductSheetRequest, user: Curre
             "sample_rows": sample_rows,
             "suggested_mapping": suggested_mapping,
             "available_tabs": available_tabs,
+            "detected_product_type": detected_product_type,
         }
 
     except HTTPException:
@@ -156,6 +158,7 @@ async def connect_product_sheet(request: ConnectProductSheetRequest, user: Curre
             "sheet_name": request.sheet_name,
             "tab_name": request.tab_name,
             "column_mapping": request.column_mapping,
+            "product_type": request.product_type,
             "last_synced_at": None,
             "last_sync_count": 0,
             "sync_errors": [],
