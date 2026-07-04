@@ -156,42 +156,6 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         ]
         logger.info(f"[OOS] Filtered {len(all_dealers)} dealers down to {len(target_dealers)} dealers matching brand='{brand}'")
         
-        # Lenovo specific consumer / commercial sub-filtering
-        if brand_lower == "lenovo":
-            raw_query = (oos_doc.get("raw_query_text", "") or "").lower()
-            model_name = (oos_doc.get("extracted_attributes", {}).get("model_name", "") or "").lower()
-            
-            # Map keywords to their target dealer categories
-            lenovo_category_map = {
-                "v14": "commercial",
-                "v15": "commercial",
-                "thinkbook": "commercial",
-                "thinkpad": "commercial",
-                "x1 carbon": "commercial",
-                "loq": "consumer",
-                "loq essential": "consumer",
-                "legion": "consumer",
-                "legion pro": "consumer",
-                "ideapad slim 1": "consumer",
-                "ideapad slim 3": "consumer",
-                "ideapad slim 5": "consumer",
-                "ideapad": "consumer",
-                "yoga": "consumer",
-            }
-            
-            # Collect unique categories matched by keywords in query or model name
-            matched_categories = {
-                category
-                for kw, category in lenovo_category_map.items()
-                if kw in raw_query or kw in model_name
-            }
-            
-            if len(matched_categories) == 1:
-                category = list(matched_categories)[0]
-                target_dealers = [d for d in target_dealers if d.get("category") == category]
-                logger.info(f"[OOS] Lenovo {category} inquiry detected. Filtered to {len(target_dealers)} dealers.")
-            else:
-                logger.info(f"[OOS] Lenovo inquiry category undetermined or mixed ({matched_categories}). Using all {len(target_dealers)} Lenovo dealers.")
     else:
         target_dealers = all_dealers
         logger.info(f"[OOS] No brand specified. Using all {len(target_dealers)} resolved dealers.")
