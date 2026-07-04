@@ -405,7 +405,7 @@ async def send_whatsapp_message(
         context: Optional[dict] = None,
         bot_context: Optional[dict] = None,
         raise_on_partial_failure: bool = False,
-        user_full_name: Optional[str] = None,
+        sender_name: Optional[str] = None,
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -517,7 +517,7 @@ async def send_whatsapp_message(
             elif mode == "ai":
                 last_message= f"AI: {content_item}"
             else:
-                last_message = f"You: {content_item}"
+                last_message = f"{sender_name}: {content_item}"
 
             wa_conversation = {
                 "last_message": last_message,
@@ -543,7 +543,7 @@ async def send_whatsapp_message(
                 customer_phone_no=recipient_id,
                 type="text",
                 payload=None,
-                sender_name="AI" if mode == "ai" else (user_full_name or "Agent"),
+                sender_name="AI" if mode == "ai" else (sender_name),
                 recipient_id=whatsapp_business_id,
                 role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
                 mode=mode,
@@ -589,7 +589,7 @@ async def send_whatsapp_message(
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
+async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str]) -> dict:
     """
     Send a template message via WhatsApp Cloud API
     """
@@ -645,7 +645,7 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
         template_name = template.get("name", "Unknown Template")
         
         wa_conversation = {
-            "last_message": f"Private Note: Shared a template: {template_name}" if mode == "private" else f"You: Shared a template: {template_name}",
+            "last_message": f"Private Note: Shared a template: {template_name}" if mode == "private" else f"{sender_name}: Shared a template: {template_name}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
@@ -677,7 +677,7 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
             customer_phone_no=recipient_id,
             type="template",
             payload=template,
-            sender_name="Agent",
+            sender_name=sender_name,
             recipient_id=wa_id,
             role=MessageRole.AGENT,
             mode=mode,
@@ -710,7 +710,8 @@ async def send_wa_media_message(
         temp_id: Optional[str], 
         mode: str, 
         context_type: Optional[str], 
-        context: Optional[dict]
+        context: Optional[dict],
+        sender_name: Optional[str],
     ) -> dict:
     """
     Send a media message via WhatsApp Cloud API
@@ -770,7 +771,7 @@ async def send_wa_media_message(
         now = datetime.now(timezone.utc)
 
         wa_conversation = {
-            "last_message": f"Private Note: {content if content else 'Shared an image'}" if mode == "private" else f"You: {content if content else 'Shared an image'}",
+            "last_message": f"Private Note: {content if content else 'Shared an image'}" if mode == "private" else f"{sender_name}: {content if content else 'Shared an image'}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
@@ -801,7 +802,7 @@ async def send_wa_media_message(
             customer_phone_no=recipient_id,
             type=media_type,
             payload={"url": media_url, "caption": content} if content else {"url": media_url},
-            sender_name="Agent",
+            sender_name=sender_name,
             recipient_id=recipient_id,
             role=MessageRole.AGENT,
             mode=mode,
@@ -824,7 +825,7 @@ async def send_wa_media_message(
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str]) -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
@@ -840,7 +841,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode, context_type, context)
+        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode, context_type, context, sender_name)
         
         return response
     except Exception as e:

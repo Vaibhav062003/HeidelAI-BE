@@ -166,22 +166,22 @@ async def get_messages(
 async def send_message_endpoint(
     request: Request, 
     user: CurrentUser,
+    temp_id: Optional[str] = Form(None), 
     conversation_id: str = Form(...),
-    content: Optional[str] = Form(None),
     platform: str = Form(...),
     mode: str = Form(...),
-    temp_id: Optional[str] = Form(None), 
-    timestamp: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None),
     context_type: Optional[str] = Form(None),
-    context: Optional[str] = Form(None)
+    context: Optional[str] = Form(None),
+    timestamp: Optional[str] = Form(None),
+    content: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
 ):    
     """
     Send a message to a specific conversation.
     The body should contain the necessary fields for sending the message.
     """
     org_id = user.org_id
-    user_full_name = user.full_name or "You"
+    sender_name = user.full_name or "Agent"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
@@ -198,7 +198,7 @@ async def send_message_endpoint(
         conversation_id, 
         content if content else None, 
         mode,
-        user_full_name,
+        sender_name,
         file if file else None, 
         temp_id if temp_id else None,
         context_type if context_type else None,
