@@ -584,7 +584,7 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, user_full_name: Optional[str] = None, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, sender_name: Optional[str] = "Agent", file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
@@ -597,7 +597,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         if file:
             recipient_id = conversation_id.replace("whatsapp_", "")
             
-            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context)
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name)
 
             if res.get("error"):
                 raise HTTPException(
@@ -620,7 +620,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                         temp_id=temp_id,
                         mode=mode,
                         context_type=context_type,
-                        context=context
+                        context=context,
+                        sender_name=sender_name
                     )
                 else:
                     raise ValueError("Not a template")
@@ -636,7 +637,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                     temp_id=temp_id, 
                     context_type=context_type, 
                     context=context, 
-                    user_full_name=user_full_name
+                    sender_name=sender_name
                 )
         return res
     
