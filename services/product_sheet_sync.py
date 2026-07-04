@@ -11,8 +11,6 @@ from loguru import logger
 
 from database import get_mongo_db
 from api.google_sheets_routes import refresh_google_token, _force_token_refresh, _detect_header_row
-from services.xlsx_reader import get_file_mime_type, is_xlsx_file, download_xlsx, parse_xlsx_values
-
 
 # ─── Field Aliases ─────────────────────────────────────────────────────────────
 # Maps canonical MongoDB field names to possible sheet column name variations.
@@ -350,9 +348,6 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
         # ── Refresh token & fetch data ───────────────────────────────────────
         access_token = await refresh_google_token(org_id)
 
-        mime_type = await get_file_mime_type(sheet_id, access_token)
-        file_is_xlsx = is_xlsx_file(mime_type)
-
         headers, header_row, col_offset = await _detect_header_row(
             sheet_id, tab_name, access_token, org_id
         )
@@ -361,33 +356,24 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
 
         data_start_row = header_row + 1
 
-        if file_is_xlsx:
-            logger.info(f"[ProductSync] File {sheet_id} is xlsx, using Drive API + openpyxl")
-            xlsx_bytes = await download_xlsx(sheet_id, access_token)
-            raw_rows = parse_xlsx_values(
-                xlsx_bytes, tab_name,
-                start_row=data_start_row,
-                end_row=data_start_row + 10000
-            )
-        else:
-            encoded_tab = urllib.parse.quote(tab_name, safe="")
-            range_str = f"{encoded_tab}!A{data_start_row}:ZZ10001"
-            url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_str}"
+        encoded_tab = urllib.parse.quote(tab_name, safe="")
+        range_str = f"{encoded_tab}!A{data_start_row}:ZZ10001"
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_str}"
 
-            async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30
+            )
+            if resp.status_code == 401:
+                access_token = await _force_token_refresh(org_id)
                 resp = await client.get(
                     url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30
                 )
-                if resp.status_code == 401:
-                    access_token = await _force_token_refresh(org_id)
-                    resp = await client.get(
-                        url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30
-                    )
-                if resp.status_code != 200:
-                    error_msg = resp.json().get("error", {}).get("message", "Unknown error")
-                    raise Exception(f"Google Sheets API error: {error_msg}")
+            if resp.status_code != 200:
+                error_msg = resp.json().get("error", {}).get("message", "Unknown error")
+                raise Exception(f"Google Sheets API error: {error_msg}")
 
-            raw_rows = resp.json().get("values", [])
+        raw_rows = resp.json().get("values", [])
 
         # ── Transform rows ───────────────────────────────────────────────────
         products_to_upsert = []
