@@ -1,7 +1,7 @@
 import httpx
 from typing import Dict, Optional
 from loguru import logger
-from config.settings import KOMAL_ORG_ID
+from config.settings import KOMAL_ORG_ID, HEIDELAI_ORG_ID
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://heidelai-chatbot-2.koyeb.app"
@@ -45,7 +45,7 @@ async def send_to_agent(
             "source": source
         }
     
-    if org_id in (KOMAL_ORG_ID, "org_32MmrGmUIrcd2AHFofV7LqCXRon"):
+    if org_id == KOMAL_ORG_ID:
         if reply_context_message_id:
             payload["reply_context_message_id"] = reply_context_message_id
             payload["version"] = version or "v2"
