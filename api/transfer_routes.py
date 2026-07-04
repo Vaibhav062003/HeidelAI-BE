@@ -8,13 +8,16 @@ with security fixes for org isolation, optimistic locking, audit trail.
 
 from datetime import datetime, timedelta
 from typing import Optional, List
+import httpx
 from fastapi import APIRouter, HTTPException, Request, status
 from bson import ObjectId
 from pydantic import BaseModel
 
 from auth.dependencies import CurrentUser
 from database import get_mongo_db, get_async_mongo_db
+from config.settings import CLERK_TOKEN
 from core.services import services
+from services.websocket_service import send_to_user
 from core.limiter import limiter
 from loguru import logger
 
@@ -122,15 +125,34 @@ async def transfer_conversation(
     if not conv:
         raise HTTPException(404, "Conversation not found")
 
-    # 2. Validate target agent exists in same org and is active
-    target_agent = await users_col.find_one({
-        "_id": ObjectId(payload.target_agent_id),
-        "org_id": user.org_id,
-        "status": {"$ne": "inactive"}
-    })
+    # 2. Validate target agent exists in same org via Clerk Backend API
+    base_url = "https://api.clerk.com/v1"
+    headers = {
+        "Authorization": f"Bearer {CLERK_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    clerk_url = f"{base_url}/organizations/{user.org_id}/memberships"
 
-    if not target_agent:
-        raise HTTPException(400, "Target agent not found or inactive")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(clerk_url, headers=headers)
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch memberships from Clerk: {resp.text}")
+                raise HTTPException(500, "Failed to validate target agent with Clerk")
+            
+            memberships_data = resp.json().get("data", [])
+    except Exception as e:
+        logger.error(f"Clerk connection error: {e}")
+        raise HTTPException(500, "Clerk service unavailable")
+
+    target_member = None
+    for m in memberships_data:
+        if m.get("public_user_data", {}).get("user_id") == payload.target_agent_id:
+            target_member = m
+            break
+
+    if not target_member:
+        raise HTTPException(400, "Target agent not found or inactive in organization")
 
     # 3. Check transfer loop
     is_loop = await check_transfer_loop(conversation_id, payload.target_agent_id, user.org_id)
@@ -141,16 +163,25 @@ async def transfer_conversation(
         )
 
     # 4. Get target agent name
-    target_name = target_agent.get("name", target_agent.get("first_name", "Agent"))
+    public_data = target_member.get("public_user_data", {})
+    target_name = f"{public_data.get('first_name', '')} {public_data.get('last_name', '')}".strip() or public_data.get("identifier") or "Agent"
 
     # 5. Optimistic locking update
-    current_version = conv.get("version", 0)
+    current_version = conv.get("version")
+
+    # Build query to match current version OR missing version field if current_version is None/0
+    query = {"conversation_id": conversation_id}
+    if not current_version:
+        query["$or"] = [
+            {"version": {"$exists": False}},
+            {"version": None},
+            {"version": 0}
+        ]
+    else:
+        query["version"] = current_version
 
     update_result = await collection.update_one(
-        {
-            "conversation_id": conversation_id,
-            "version": current_version
-        },
+        query,
         {
             "$set": {
                 "assigned_agent_id": payload.target_agent_id,
@@ -195,11 +226,12 @@ async def transfer_conversation(
 
     # 7. WebSocket notification
     try:
-        await services.send_to_user(payload.target_agent_id, {
+        await send_to_user(payload.target_agent_id, {
             "type": "conversation_transferred",
             "conversation_id": conversation_id,
             "from_agent": user.full_name or "Agent",
             "to_agent": target_name,
+            "customer_name": conv.get("customer_name") or "Customer",
             "reason": payload.reason
         })
     except Exception as e:
@@ -317,28 +349,45 @@ async def create_mentions(
     # Dedupe
     unique_usernames = list(set(payload.mentioned_usernames))
 
-    # Fetch active agents in same org
-    agents_cursor = users_col.find({
-        "org_id": user.org_id,
-        "status": {"$ne": "inactive"}
-    })
-    agents = await agents_cursor.to_list(length=None)
+    # Fetch active agents in same org via Clerk
+    base_url = "https://api.clerk.com/v1"
+    headers = {
+        "Authorization": f"Bearer {CLERK_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    clerk_url = f"{base_url}/organizations/{user.org_id}/memberships"
 
-    # Build username -> agent map (case insensitive)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(clerk_url, headers=headers)
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch memberships from Clerk: {resp.text}")
+                raise HTTPException(500, "Failed to retrieve members from Clerk")
+            memberships_data = resp.json().get("data", [])
+    except Exception as e:
+        logger.error(f"Clerk connection error: {e}")
+        raise HTTPException(500, "Clerk service unavailable")
+
+    # Build username -> agent ID map (case insensitive)
     agent_map = {}
-    for agent in agents:
-        username = agent.get("username", "").lower()
+    for m in memberships_data:
+        public_data = m.get("public_user_data", {})
+        user_id = public_data.get("user_id")
+        
+        email = public_data.get("identifier", "").lower()
+        if email:
+            agent_map[email] = user_id
+            
+        username = public_data.get("username")
         if username:
-            agent_map[username] = agent
+            agent_map[username.lower()] = user_id
 
     created_count = 0
 
     for username in unique_usernames:
-        agent = agent_map.get(username.lower())
-        if not agent:
+        agent_id = agent_map.get(username.lower())
+        if not agent_id:
             continue
-
-        agent_id = str(agent["_id"])
 
         # Check pool capacity
         pending_count = await mentions_col.count_documents({
@@ -366,7 +415,7 @@ async def create_mentions(
 
         # WebSocket notification
         try:
-            await services.send_to_user(agent_id, {
+            await send_to_user(agent_id, {
                 "type": "conversation_mention",
                 "conversation_id": conversation_id,
                 "from_agent": user.full_name or "Agent",
@@ -388,7 +437,27 @@ async def get_pending_mentions(
 
     async_db = get_async_mongo_db()
     mentions_col = async_db.conversation_mentions
-    users_col = async_db.users
+    # Fetch active agents in same org via Clerk to resolve sender names
+    base_url = "https://api.clerk.com/v1"
+    headers = {
+        "Authorization": f"Bearer {CLERK_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    clerk_url = f"{base_url}/organizations/{user.org_id}/memberships"
+
+    members_map = {}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(clerk_url, headers=headers)
+            if resp.status_code == 200:
+                memberships_data = resp.json().get("data", [])
+                for m in memberships_data:
+                    public_data = m.get("public_user_data", {})
+                    u_id = public_data.get("user_id")
+                    name = f"{public_data.get('first_name', '')} {public_data.get('last_name', '')}".strip() or public_data.get("identifier") or "Agent"
+                    members_map[u_id] = name
+    except Exception as e:
+        logger.error(f"Failed to fetch memberships from Clerk for mentions: {e}")
 
     # Fetch pending mentions
     mentions_cursor = mentions_col.find({
@@ -403,14 +472,14 @@ async def get_pending_mentions(
     result = []
     for mention in mentions:
         from_agent_id = mention.get("from_agent_id")
-        from_agent = await users_col.find_one({"_id": ObjectId(from_agent_id)})
+        from_name = members_map.get(from_agent_id, "Unknown")
 
         result.append({
             "id": str(mention["_id"]),
             "conversation_id": mention["conversation_id"],
             "from_agent": {
                 "id": from_agent_id,
-                "name": from_agent.get("name", "Agent") if from_agent else "Unknown"
+                "name": from_name
             },
             "message_content": mention["message_content"],
             "created_at": mention["created_at"].isoformat()
@@ -487,7 +556,7 @@ async def accept_mention(
 
     # Notify original agent
     try:
-        await services.send_to_user(mention["from_agent_id"], {
+        await send_to_user(mention["from_agent_id"], {
             "type": "mention_accepted",
             "conversation_id": conversation_id,
             "accepted_by": user.full_name or "Agent"
@@ -533,7 +602,7 @@ async def reject_mention(
 
     # Notify original agent
     try:
-        await services.send_to_user(mention["from_agent_id"], {
+        await send_to_user(mention["from_agent_id"], {
             "type": "mention_rejected",
             "conversation_id": mention["conversation_id"],
             "rejected_by": user.full_name or "Agent"
@@ -557,37 +626,44 @@ async def get_team_agents(
     List all active agents in organization for transfer autocomplete.
     """
 
-    async_db = get_async_mongo_db()
-    users_col = async_db.users
-
-    query = {
-        "org_id": user.org_id,
-        "status": {"$ne": "inactive"}
+    base_url = "https://api.clerk.com/v1"
+    headers = {
+        "Authorization": f"Bearer {CLERK_TOKEN}",
+        "Content-Type": "application/json"
     }
+    clerk_url = f"{base_url}/organizations/{user.org_id}/memberships"
 
-    if role:
-        query["role"] = role
-
-    agents_cursor = users_col.find(query, {
-        "_id": 1,
-        "name": 1,
-        "first_name": 1,
-        "username": 1,
-        "role": 1,
-        "status": 1
-    })
-
-    agents = await agents_cursor.to_list(length=200)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(clerk_url, headers=headers)
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch memberships from Clerk: {resp.text}")
+                raise HTTPException(500, "Failed to retrieve team agents")
+            
+            memberships_data = resp.json().get("data", [])
+    except Exception as e:
+        logger.error(f"Clerk connection error: {e}")
+        raise HTTPException(500, "Clerk service unavailable")
 
     result = []
-    for agent in agents:
-        name = agent.get("name") or agent.get("first_name") or "Agent"
+    for m in memberships_data:
+        public_data = m.get("public_user_data", {})
+        if public_data.get("banned"):
+            continue
+            
+        user_id = public_data.get("user_id")
+        
+        clerk_role = m.get("role", "org:member")
+        role_name = clerk_role.replace("org:", "")
+        
+        if role and role.lower() != role_name.lower():
+            continue
+            
+        first_name = public_data.get("first_name") or "Agent"
+        
         result.append({
-            "id": str(agent["_id"]),
-            "name": name,
-            "username": agent.get("username", ""),
-            "role": agent.get("role", "agent"),
-            "status": agent.get("status", "active")
+            "id": user_id,
+            "name": first_name
         })
 
     return result

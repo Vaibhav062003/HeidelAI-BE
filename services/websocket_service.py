@@ -370,3 +370,25 @@ async def broadcast_ai_escalation(org_id: str, payload: dict):
                 logger.error(f"Failed to send escalation to {client_id}: {e}")
         else:
             logger.warning(f"WebSocket not found for active client {client_id}")
+
+async def send_to_user(user_id: str, payload: dict):
+    """
+    Sends a WebSocket notification payload directly to all active connection channels of a user.
+    """
+    if user_id in services.agent_clients:
+        # Auto-wrap payload to ensure it matches the {type, data} format expected by frontend
+        ws_payload = payload
+        if "type" in payload and "data" not in payload:
+            ws_payload = {
+                "type": payload["type"],
+                "data": {k: v for k, v in payload.items() if k != "type"}
+            }
+
+        safe_payload = jsonable_encoder(ws_payload)
+        for client_id in list(services.agent_clients[user_id]):
+            ws = services.active_clients.get(client_id)
+            if ws:
+                try:
+                    await ws.send_json(safe_payload)
+                except Exception as e:
+                    logger.error(f"Failed to send websocket message to user {user_id}: {e}")
