@@ -9,6 +9,7 @@ with security fixes for org isolation, optimistic locking, audit trail.
 from datetime import datetime, timedelta
 from typing import Optional, List
 import httpx
+from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Request, status
 from bson import ObjectId
 from pydantic import BaseModel
@@ -24,6 +25,38 @@ from loguru import logger
 
 router = APIRouter(tags=["Transfer System"])
 db = get_mongo_db()
+
+
+
+CLERK_CACHE_TTL = 300  # seconds
+_clerk_cache: TTLCache = TTLCache(maxsize=500, ttl=CLERK_CACHE_TTL)
+_http_client = httpx.AsyncClient(timeout=10.0)
+
+async def get_org_memberships(org_id: str) -> list:
+    """Fetch org memberships from Clerk, cached per org for 5 minutes."""
+    if org_id in _clerk_cache:
+        return _clerk_cache[org_id]
+
+    url = f"https://api.clerk.com/v1/organizations/{org_id}/memberships"
+    headers = {
+        "Authorization": f"Bearer {CLERK_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    try:
+        resp = await _http_client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.error(f"Clerk memberships fetch failed: {resp.text}")
+            raise HTTPException(500, "Clerk service error")
+        data = resp.json().get("data", [])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Clerk connection error: {e}")
+        raise HTTPException(500, "Clerk service unavailable")
+
+    _clerk_cache[org_id] = data
+    return data
+
 
 
 # === Request Models ===
@@ -70,7 +103,10 @@ async def check_transfer_loop(conversation_id: str, target_agent_id: str, org_id
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{org_id}"]
 
-    conv = await collection.find_one({"conversation_id": conversation_id})
+    conv = await collection.find_one(
+        {"conversation_id": conversation_id},
+        {"assignment_history": 1}  # only fetch what we need
+    )
     if not conv:
         return False
 
@@ -125,25 +161,8 @@ async def transfer_conversation(
     if not conv:
         raise HTTPException(404, "Conversation not found")
 
-    # 2. Validate target agent exists in same org via Clerk Backend API
-    base_url = "https://api.clerk.com/v1"
-    headers = {
-        "Authorization": f"Bearer {CLERK_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    clerk_url = f"{base_url}/organizations/{user.org_id}/memberships"
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(clerk_url, headers=headers)
-            if resp.status_code != 200:
-                logger.error(f"Failed to fetch memberships from Clerk: {resp.text}")
-                raise HTTPException(500, "Failed to validate target agent with Clerk")
-            
-            memberships_data = resp.json().get("data", [])
-    except Exception as e:
-        logger.error(f"Clerk connection error: {e}")
-        raise HTTPException(500, "Clerk service unavailable")
+    # 2. Validate target agent exists in same org via Clerk
+    memberships_data = await get_org_memberships(user.org_id)
 
     target_member = None
     for m in memberships_data:
@@ -350,23 +369,7 @@ async def create_mentions(
     unique_usernames = list(set(payload.mentioned_usernames))
 
     # Fetch active agents in same org via Clerk
-    base_url = "https://api.clerk.com/v1"
-    headers = {
-        "Authorization": f"Bearer {CLERK_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    clerk_url = f"{base_url}/organizations/{user.org_id}/memberships"
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(clerk_url, headers=headers)
-            if resp.status_code != 200:
-                logger.error(f"Failed to fetch memberships from Clerk: {resp.text}")
-                raise HTTPException(500, "Failed to retrieve members from Clerk")
-            memberships_data = resp.json().get("data", [])
-    except Exception as e:
-        logger.error(f"Clerk connection error: {e}")
-        raise HTTPException(500, "Clerk service unavailable")
+    memberships_data = await get_org_memberships(user.org_id)
 
     # Build username -> agent ID map (case insensitive)
     agent_map = {}
@@ -438,24 +441,14 @@ async def get_pending_mentions(
     async_db = get_async_mongo_db()
     mentions_col = async_db.conversation_mentions
     # Fetch active agents in same org via Clerk to resolve sender names
-    base_url = "https://api.clerk.com/v1"
-    headers = {
-        "Authorization": f"Bearer {CLERK_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    clerk_url = f"{base_url}/organizations/{user.org_id}/memberships"
-
     members_map = {}
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(clerk_url, headers=headers)
-            if resp.status_code == 200:
-                memberships_data = resp.json().get("data", [])
-                for m in memberships_data:
-                    public_data = m.get("public_user_data", {})
-                    u_id = public_data.get("user_id")
-                    name = f"{public_data.get('first_name', '')} {public_data.get('last_name', '')}".strip() or public_data.get("identifier") or "Agent"
-                    members_map[u_id] = name
+        memberships_data = await get_org_memberships(user.org_id)
+        for m in memberships_data:
+            public_data = m.get("public_user_data", {})
+            u_id = public_data.get("user_id")
+            name = f"{public_data.get('first_name', '')} {public_data.get('last_name', '')}".strip() or public_data.get("identifier") or "Agent"
+            members_map[u_id] = name
     except Exception as e:
         logger.error(f"Failed to fetch memberships from Clerk for mentions: {e}")
 
@@ -626,24 +619,7 @@ async def get_team_agents(
     List all active agents in organization for transfer autocomplete.
     """
 
-    base_url = "https://api.clerk.com/v1"
-    headers = {
-        "Authorization": f"Bearer {CLERK_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    clerk_url = f"{base_url}/organizations/{user.org_id}/memberships"
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(clerk_url, headers=headers)
-            if resp.status_code != 200:
-                logger.error(f"Failed to fetch memberships from Clerk: {resp.text}")
-                raise HTTPException(500, "Failed to retrieve team agents")
-            
-            memberships_data = resp.json().get("data", [])
-    except Exception as e:
-        logger.error(f"Clerk connection error: {e}")
-        raise HTTPException(500, "Clerk service unavailable")
+    memberships_data = await get_org_memberships(user.org_id)
 
     result = []
     for m in memberships_data:
