@@ -870,6 +870,7 @@ async def process_whatsapp_message(request: Request, message: dict, user: Curren
     res = await send_whatsapp_message(message, org_id)
     return res
     
+# Not used anywhere
 @router.post("/{whatsapp_id}/media/send")
 @limiter.limit("30/minute")
 async def upload_and_send_whatsapp_media(

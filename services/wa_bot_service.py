@@ -223,8 +223,9 @@ async def publish_wa_bot_flow(
             "status":        "active",
         })
 
-    All three fields are already present in the flat document from the first
-    save, so no promotion step is needed — just flip the status.
+    We defensively set trigger_from and trigger_event here so the webhook
+    query always matches, even if those fields were somehow lost during
+    an update or manual DB edit.
     """
     try:
         col = _col(org_id)
@@ -233,10 +234,12 @@ async def publish_wa_bot_flow(
         result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
             {"$set": {
-                "status":       "active",
-                "published_at": now,
-                "updated_at":   now,
-                "updated_by":   updated_by,
+                "status":        "active",
+                "trigger_from":  "webhook",
+                "trigger_event": "message_received",
+                "published_at":  now,
+                "updated_at":    now,
+                "updated_by":    updated_by,
             }},
             return_document=True,
         )
@@ -285,4 +288,63 @@ async def unpublish_wa_bot_flow(
 
     except Exception as e:
         logger.error(f"unpublish_wa_bot_flow error: {e}")
+        raise
+
+
+# ─── DUPLICATE ────────────────────────────────────────────────────────────────
+
+async def duplicate_wa_bot_flow(
+    org_id: str,
+    flow_id: str,
+    created_by: Optional[str] = None,
+) -> Optional[Dict]:
+    """
+    Create a deep copy of an existing WaBot flow with a fresh identity.
+
+    Copies all content fields (trigger_messages, welcome_message, nodes,
+    introduction_message, start_node_id, ui_config, etc.) and ensures
+    the webhook-critical fields (trigger_from, trigger_event) are present.
+    The copy is always created in 'draft' status.
+    """
+    try:
+        col = _col(org_id)
+        source = await col.find_one({"flow_id": flow_id, "org_id": org_id})
+        if not source:
+            return None
+
+        new_flow_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+
+        # Strip identity and metadata fields — keep all content fields
+        skip_keys = {
+            "_id", "flow_id", "org_id", "created_at", "updated_at",
+            "created_by", "updated_by", "published_at", "trigger_count",
+            "last_run",
+        }
+        content = {k: v for k, v in source.items() if k not in skip_keys}
+
+        doc = {
+            **content,
+            "flow_id":       new_flow_id,
+            "org_id":        org_id,
+            "name":          f"{source.get('name', 'Untitled')} (Copy)",
+            "status":        "draft",
+            "flow_type":     "wabot",
+            "trigger_from":  source.get("trigger_from", "webhook"),
+            "trigger_event": source.get("trigger_event", "message_received"),
+            "created_at":    now,
+            "updated_at":    now,
+            "created_by":    created_by,
+            "updated_by":    created_by,
+            "published_at":  None,
+            "trigger_count": 0,
+            "last_run":      None,
+        }
+
+        await col.insert_one(doc)
+        logger.info(f"Duplicated wa_bot_flow {flow_id} → {new_flow_id} for org {org_id}")
+        return serialize_mongo(doc)
+
+    except Exception as e:
+        logger.error(f"duplicate_wa_bot_flow error: {e}")
         raise
