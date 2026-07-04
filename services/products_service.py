@@ -178,7 +178,17 @@ async def bulk_upload_products_from_file(
                 continue
 
         mongo_doc = product_obj.to_mongo()
-        mongo_doc["org_id"] = org_id 
+        mongo_doc["org_id"] = org_id
+
+        # Ensure unique_identifier and type are set for dedup consistency
+        # with Google Sheet sync pipeline
+        if "unique_identifier" not in mongo_doc:
+            # Use model_no if available, otherwise product_name
+            mongo_doc["unique_identifier"] = (
+                mongo_doc.get("model_no") or mongo_doc.get("product_name", "")
+            )
+        if "type" not in mongo_doc or not mongo_doc.get("type"):
+            mongo_doc["type"] = "laptop"  # default type for manual uploads
 
         products_to_insert.append(mongo_doc)
 
@@ -251,6 +261,14 @@ async def add_single_product(org_id: str, data: dict) -> dict:
 
     mongo_doc = product.to_mongo()
     mongo_doc["org_id"] = org_id
+
+    # Ensure dedup fields for consistency with sheet sync
+    if "unique_identifier" not in mongo_doc:
+        mongo_doc["unique_identifier"] = (
+            mongo_doc.get("model_no") or product_name
+        )
+    if "type" not in mongo_doc or not mongo_doc.get("type"):
+        mongo_doc["type"] = "laptop"
 
     result = collection.insert_one(mongo_doc)
     mongo_doc["_id"] = str(result.inserted_id)

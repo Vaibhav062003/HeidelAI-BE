@@ -3,11 +3,15 @@ import httpx
 import urllib.parse
 from datetime import datetime, timezone
 
+import re
+
 from pymongo import UpdateOne
+from pymongo.errors import BulkWriteError
 from loguru import logger
 
 from database import get_mongo_db
 from api.google_sheets_routes import refresh_google_token, _force_token_refresh, _detect_header_row
+from services.xlsx_reader import get_file_mime_type, is_xlsx_file, download_xlsx, parse_xlsx_values
 
 
 # ─── Field Aliases ─────────────────────────────────────────────────────────────
@@ -155,6 +159,9 @@ def transform_row(
             continue
             
         clean_key = col_name.strip().lower().replace(" ", "_")
+        clean_key = re.sub(r'[^a-z0-9_]', '', clean_key)
+        if not clean_key:
+            continue
         
         val_str = str(value).strip().lower()
         if val_str == "yes" or val_str == "true":
@@ -199,8 +206,6 @@ def transform_row(
         doc["type"] = product_type
 
     now = datetime.now(timezone.utc)
-    doc["source"] = "google_sheet"
-    doc["source_sheet_id"] = sheet_id
     doc["org_id"] = org_id
     doc["updated_at"] = now
     
@@ -242,44 +247,155 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
     )
 
     try:
-        # 2. Refresh token
+        products_col = db[f"products_{org_id}"]
+
+        # ── Fix 3: One-time backfill of legacy products ──────────────────────
+        # Only runs once per org; skipped on subsequent syncs via metadata flag
+        org_meta = await asyncio.to_thread(
+            db.organizations_metadata.find_one,
+            {"org_id": org_id},
+            {"_id": 0, "product_dedup_backfilled": 1}
+        )
+        if not (org_meta or {}).get("product_dedup_backfilled"):
+            try:
+                legacy_docs = await asyncio.to_thread(
+                    lambda: list(products_col.find(
+                        {"$or": [
+                            {"unique_identifier": {"$exists": False}},
+                            {"type": {"$exists": False}},
+                        ]},
+                        {"_id": 1, "model_no": 1, "product_name": 1, "type": 1,
+                         "unique_identifier": 1, "source_sheet_id": 1}
+                    ))
+                )
+                if legacy_docs:
+                    logger.info(f"[ProductSync] Backfilling {len(legacy_docs)} legacy products for org {org_id}")
+                    backfill_ops = []
+                    for doc in legacy_docs:
+                        update_fields = {}
+                        if not doc.get("unique_identifier"):
+                            update_fields["unique_identifier"] = (
+                                doc.get("model_no") or doc.get("product_name") or str(doc["_id"])
+                            )
+                        if not doc.get("type"):
+                            update_fields["type"] = "laptop"
+                        # Migrate legacy source_sheet_id → source_sheet_ids array
+                        if doc.get("source_sheet_id"):
+                            update_fields["source_sheet_ids"] = [doc["source_sheet_id"]]
+                        if update_fields:
+                            backfill_ops.append(
+                                UpdateOne({"_id": doc["_id"]}, {"$set": update_fields})
+                            )
+                    if backfill_ops:
+                        await asyncio.to_thread(
+                            lambda ops=backfill_ops: products_col.bulk_write(ops, ordered=False)
+                        )
+                    logger.info(f"[ProductSync] Backfilled {len(backfill_ops)} legacy products")
+
+                # Mark backfill as done so it never runs again for this org
+                await asyncio.to_thread(
+                    db.organizations_metadata.update_one,
+                    {"org_id": org_id},
+                    {"$set": {"product_dedup_backfilled": True}},
+                    upsert=True
+                )
+            except Exception as e:
+                logger.warning(f"[ProductSync] Legacy backfill failed (non-fatal): {e}")
+
+        # ── Fix 2: Idempotent index creation (no drop) ───────────────────────
+        try:
+            await asyncio.to_thread(
+                lambda: products_col.create_index(
+                    [("type", 1), ("unique_identifier", 1)],
+                    unique=True,
+                    sparse=True,
+                    name="type_unique_identifier_dedup"
+                )
+            )
+        except Exception as idx_err:
+            # If a legacy index with conflicting keys exists, drop it first (once)
+            if "already exists with different options" in str(idx_err) or "IndexKeySpecsConflict" in str(idx_err):
+                try:
+                    existing_indexes = await asyncio.to_thread(lambda: list(products_col.list_indexes()))
+                    for idx_info in existing_indexes:
+                        idx_key = idx_info.get("key", {})
+                        idx_name = idx_info.get("name", "")
+                        # Drop legacy indexes that conflict
+                        if idx_name in ("model_no_source_sheet_unique", "type_1_unique_identifier_1"):
+                            await asyncio.to_thread(
+                                lambda n=idx_name: products_col.drop_index(n)
+                            )
+                            logger.info(f"[ProductSync] Dropped conflicting legacy index: {idx_name}")
+                    # Retry creation
+                    await asyncio.to_thread(
+                        lambda: products_col.create_index(
+                            [("type", 1), ("unique_identifier", 1)],
+                            unique=True,
+                            sparse=True,
+                            name="type_unique_identifier_dedup"
+                        )
+                    )
+                except Exception as retry_err:
+                    logger.error(f"[ProductSync] Failed to create dedup index after cleanup: {retry_err}")
+            else:
+                logger.warning(f"[ProductSync] Index creation warning: {idx_err}")
+
+        await asyncio.to_thread(
+            lambda: products_col.create_index(
+                [("source_sheet_ids", 1)],
+                name="source_sheet_ids_idx"
+            )
+        )
+
+        # ── Refresh token & fetch data ───────────────────────────────────────
         access_token = await refresh_google_token(org_id)
 
-        # 3. Detect header row
+        mime_type = await get_file_mime_type(sheet_id, access_token)
+        file_is_xlsx = is_xlsx_file(mime_type)
+
         headers, header_row, col_offset = await _detect_header_row(
             sheet_id, tab_name, access_token, org_id
         )
         if not headers:
             raise Exception("Could not detect headers in the sheet")
 
-        # 4. Fetch ALL data rows
-        encoded_tab = urllib.parse.quote(tab_name, safe="")
         data_start_row = header_row + 1
-        range_str = f"{encoded_tab}!A{data_start_row}:ZZ10001"
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_str}"
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30
+        if file_is_xlsx:
+            logger.info(f"[ProductSync] File {sheet_id} is xlsx, using Drive API + openpyxl")
+            xlsx_bytes = await download_xlsx(sheet_id, access_token)
+            raw_rows = parse_xlsx_values(
+                xlsx_bytes, tab_name,
+                start_row=data_start_row,
+                end_row=data_start_row + 10000
             )
-            if resp.status_code == 401:
-                access_token = await _force_token_refresh(org_id)
+        else:
+            encoded_tab = urllib.parse.quote(tab_name, safe="")
+            range_str = f"{encoded_tab}!A{data_start_row}:ZZ10001"
+            url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_str}"
+
+            async with httpx.AsyncClient() as client:
                 resp = await client.get(
                     url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30
                 )
-            if resp.status_code != 200:
-                error_msg = resp.json().get("error", {}).get("message", "Unknown error")
-                raise Exception(f"Google Sheets API error: {error_msg}")
+                if resp.status_code == 401:
+                    access_token = await _force_token_refresh(org_id)
+                    resp = await client.get(
+                        url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30
+                    )
+                if resp.status_code != 200:
+                    error_msg = resp.json().get("error", {}).get("message", "Unknown error")
+                    raise Exception(f"Google Sheets API error: {error_msg}")
 
-        raw_rows = resp.json().get("values", [])
+            raw_rows = resp.json().get("values", [])
 
-        # 5. Transform rows
+        # ── Transform rows ───────────────────────────────────────────────────
         products_to_upsert = []
         errors = []
-        current_model_nos = set()
+        # Fix 4: Use unique_identifier for in-memory dedup (consistent with DB index)
+        seen_unique_ids = set()
 
         for row_idx, raw_row in enumerate(raw_rows):
-            # Build row_data dict from headers
             row_data = {}
             adjusted_row = raw_row[col_offset:] if col_offset > 0 else raw_row
             for i, header in enumerate(headers):
@@ -293,79 +409,130 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                 errors.append(f"Row {data_start_row + row_idx}: {error}")
                 continue
 
-            model_no = product_doc["model_no"]
-            if model_no in current_model_nos:
-                errors.append(f"Row {data_start_row + row_idx}: duplicate model_no '{model_no}'")
+            uid = product_doc["unique_identifier"]
+            if uid in seen_unique_ids:
+                errors.append(f"Row {data_start_row + row_idx}: duplicate unique_identifier '{uid}'")
                 continue
 
-            current_model_nos.add(model_no)
+            seen_unique_ids.add(uid)
             products_to_upsert.append(product_doc)
 
-        # 6. Reconcile with MongoDB
-        products_col = db[f"products_{org_id}"]
-
-        # Ensure indexes
-        await asyncio.to_thread(
-            lambda: products_col.create_index(
-                [("model_no", 1), ("source_sheet_id", 1)],
-                unique=True,
-                sparse=True,
-                name="model_no_source_sheet_unique"
-            )
-        )
-        await asyncio.to_thread(
-            lambda: products_col.create_index(
-                [("source_sheet_id", 1)],
-                name="source_sheet_id_idx"
-            )
-        )
-
+        # ── Reconcile with MongoDB ───────────────────────────────────────────
         now = datetime.now(timezone.utc)
         added = 0
         updated = 0
 
-        # Batch upsert
+        # Fix 1 + Fix 5: Upsert with source tracking and ordered=False
         if products_to_upsert:
             operations = []
             for doc in products_to_upsert:
+                # Strip fields managed by $setOnInsert and $addToSet to avoid
+                # MongoDB "Updating the path 'X' would create a conflict" errors
+                set_doc = {k: v for k, v in doc.items()
+                           if k not in ("source", "source_sheet_id", "source_sheet_ids", "created_at")}
                 operations.append(
                     UpdateOne(
-                        {"model_no": doc["model_no"], "source_sheet_id": sheet_id},
+                        {"unique_identifier": doc["unique_identifier"], "type": doc["type"]},
                         {
-                            "$set": doc,
-                            "$setOnInsert": {"created_at": now}
+                            # Update product data fields
+                            "$set": set_doc,
+                            # Track this sheet as a source (array, no duplicates)
+                            "$addToSet": {"source_sheet_ids": sheet_id},
+                            "$setOnInsert": {
+                                "created_at": now,
+                                "source": "google_sheet",
+                            },
                         },
                         upsert=True
                     )
                 )
 
-            # Execute in batches of 500
+            # Fix 5: Execute with ordered=False so all valid ops complete
             for i in range(0, len(operations), 500):
                 batch = operations[i:i+500]
-                result = await asyncio.to_thread(
-                    lambda b=batch: products_col.bulk_write(b)
-                )
-                added += result.upserted_count
-                updated += result.modified_count
+                try:
+                    result = await asyncio.to_thread(
+                        lambda b=batch: products_col.bulk_write(b, ordered=False)
+                    )
+                    added += result.upserted_count
+                    updated += result.modified_count
+                except BulkWriteError as bwe:
+                    # Partial success — count what did succeed
+                    details = bwe.details
+                    added += details.get("nUpserted", 0)
+                    updated += details.get("nModified", 0)
+                    write_errors = details.get("writeErrors", [])
+                    for we in write_errors[:5]:  # Log first 5 errors
+                        errors.append(f"DB write error: {we.get('errmsg', 'unknown')}")
+                    logger.warning(
+                        f"[ProductSync] Batch {i//500+1} partial failure: "
+                        f"{len(write_errors)} errors, {details.get('nUpserted',0)} upserted, "
+                        f"{details.get('nModified',0)} modified"
+                    )
 
-        # Delete stale products (from this sheet only)
-        delete_filter = {
-            "source_sheet_id": sheet_id,
-        }
-        if current_model_nos:
-            delete_filter["model_no"] = {"$nin": list(current_model_nos)}
+        # ── Fix 1: Safe stale product deletion ───────────────────────────────
+        # Only delete products that are EXCLUSIVELY owned by this sheet
+        # (i.e. source_sheet_ids == [this_sheet] and no other sources)
+        current_unique_ids = {doc["unique_identifier"] for doc in products_to_upsert}
+        removed = 0
+
+        if current_unique_ids:
+            # Products from this sheet that are no longer in the sheet data
+            delete_filter = {
+                "source_sheet_ids": sheet_id,
+                "org_id": org_id,
+                "unique_identifier": {"$nin": list(current_unique_ids)},
+            }
         else:
-            # If no products in sheet, delete all products from this sheet
-            pass
+            # Sheet is empty — target all products from this sheet
+            delete_filter = {
+                "source_sheet_ids": sheet_id,
+                "org_id": org_id,
+            }
 
-        delete_result = await asyncio.to_thread(
-            lambda: products_col.delete_many(delete_filter)
+        # Find candidates for deletion
+        stale_docs = await asyncio.to_thread(
+            lambda: list(products_col.find(
+                delete_filter,
+                {"_id": 1, "source_sheet_ids": 1, "source": 1}
+            ))
         )
-        removed = delete_result.deleted_count
 
-        # 7. Update connection metadata
+        if stale_docs:
+            delete_ids = []        # Products to fully remove
+            unlink_ops = []        # Products to just remove this sheet from their source list
+
+            for doc in stale_docs:
+                sheet_ids = doc.get("source_sheet_ids", [])
+                original_source = doc.get("source", "")
+
+                if len(sheet_ids) <= 1 and original_source != "manual" and original_source != "csv_upload":
+                    # Product only belongs to this sheet and wasn't manually uploaded — safe to delete
+                    delete_ids.append(doc["_id"])
+                else:
+                    # Product has multiple sources or was manually uploaded — just unlink this sheet
+                    unlink_ops.append(
+                        UpdateOne(
+                            {"_id": doc["_id"]},
+                            {"$pull": {"source_sheet_ids": sheet_id}}
+                        )
+                    )
+
+            if delete_ids:
+                delete_result = await asyncio.to_thread(
+                    lambda ids=delete_ids: products_col.delete_many({"_id": {"$in": ids}})
+                )
+                removed = delete_result.deleted_count
+
+            if unlink_ops:
+                await asyncio.to_thread(
+                    lambda ops=unlink_ops: products_col.bulk_write(ops, ordered=False)
+                )
+                logger.info(f"[ProductSync] Unlinked {len(unlink_ops)} products from sheet {sheet_id} (kept in DB)")
+
+        # ── Update connection metadata ───────────────────────────────────────
         total_products = await asyncio.to_thread(
-            lambda: products_col.count_documents({"source_sheet_id": sheet_id})
+            lambda: products_col.count_documents({"source_sheet_ids": sheet_id})
         )
 
         await asyncio.to_thread(
@@ -375,12 +542,12 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                 "status": "active",
                 "last_synced_at": now,
                 "last_sync_count": total_products,
-                "sync_errors": errors[:20],  # Cap at 20 errors
+                "sync_errors": errors[:20],
                 "updated_at": now,
             }}
         )
 
-        # 8. Update org metadata
+        # ── Update org metadata ──────────────────────────────────────────────
         total_all_products = await asyncio.to_thread(
             lambda: products_col.count_documents({})
         )
@@ -417,3 +584,4 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
         )
         logger.error(f"Product sheet sync failed for org {org_id} sheet {sheet_id}: {e}")
         raise
+
