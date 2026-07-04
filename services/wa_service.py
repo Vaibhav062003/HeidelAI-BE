@@ -217,10 +217,10 @@ async def store_whatsapp_message(
     customer_phone_no: str,
     type: Optional[str],
     payload: Optional[dict],
-    sender_name: str,
     recipient_id: str,
     role: MessageRole,
     mode: Optional[str] = None,
+    sender_name: Optional[str] = "Agent",
     message_id: Optional[str] = None,
     raw_data: Optional[dict] = None,
     status: Optional[str] = "received",
@@ -405,7 +405,7 @@ async def send_whatsapp_message(
         context: Optional[dict] = None,
         bot_context: Optional[dict] = None,
         raise_on_partial_failure: bool = False,
-        sender_name: Optional[str] = None,
+        sender_name: Optional[str] = "Agent",
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -589,7 +589,7 @@ async def send_whatsapp_message(
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str]) -> dict:
+async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent") -> dict:
     """
     Send a template message via WhatsApp Cloud API
     """
@@ -711,7 +711,7 @@ async def send_wa_media_message(
         mode: str, 
         context_type: Optional[str], 
         context: Optional[dict],
-        sender_name: Optional[str],
+        sender_name: Optional[str] = "Agent",
     ) -> dict:
     """
     Send a media message via WhatsApp Cloud API
@@ -825,7 +825,7 @@ async def send_wa_media_message(
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str]) -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent") -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
