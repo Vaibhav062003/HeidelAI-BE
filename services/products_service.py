@@ -182,7 +182,7 @@ async def bulk_upload_products_from_file(
 
         # Ensure unique_identifier and type are set for dedup consistency
         # with Google Sheet sync pipeline
-        if "unique_identifier" not in mongo_doc:
+        if not mongo_doc.get("unique_identifier"):
             # Use model_no if available, otherwise product_name
             mongo_doc["unique_identifier"] = (
                 mongo_doc.get("model_no") or mongo_doc.get("product_name", "")
@@ -263,7 +263,7 @@ async def add_single_product(org_id: str, data: dict) -> dict:
     mongo_doc["org_id"] = org_id
 
     # Ensure dedup fields for consistency with sheet sync
-    if "unique_identifier" not in mongo_doc:
+    if not mongo_doc.get("unique_identifier"):
         mongo_doc["unique_identifier"] = (
             mongo_doc.get("model_no") or product_name
         )

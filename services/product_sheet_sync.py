@@ -156,8 +156,8 @@ def transform_row(
         if not value or not str(value).strip():
             continue
             
-        clean_key = col_name.strip().lower().replace(" ", "_")
-        clean_key = re.sub(r'[^a-z0-9_]', '', clean_key)
+        clean_key = col_name.strip().lower()
+        clean_key = re.sub(r'[^a-z0-9]+', '_', clean_key).strip('_')
         if not clean_key:
             continue
         
@@ -259,7 +259,9 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                 legacy_docs = await asyncio.to_thread(
                     lambda: list(products_col.find(
                         {"$or": [
+                            {"unique_identifier": {"$in": [None, ""]}},
                             {"unique_identifier": {"$exists": False}},
+                            {"type": {"$in": [None, ""]}},
                             {"type": {"$exists": False}},
                         ]},
                         {"_id": 1, "model_no": 1, "product_name": 1, "type": 1,
@@ -280,6 +282,8 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                         # Migrate legacy source_sheet_id → source_sheet_ids array
                         if doc.get("source_sheet_id"):
                             update_fields["source_sheet_ids"] = [doc["source_sheet_id"]]
+                            if not doc.get("source"):
+                                update_fields["source"] = "google_sheet"
                         if update_fields:
                             backfill_ops.append(
                                 UpdateOne({"_id": doc["_id"]}, {"$set": update_fields})
