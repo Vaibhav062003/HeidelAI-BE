@@ -189,6 +189,8 @@ async def bulk_upload_products_from_file(
             )
         if "type" not in mongo_doc or not mongo_doc.get("type"):
             mongo_doc["type"] = "laptop"  # default type for manual uploads
+        if "source" not in mongo_doc or not mongo_doc.get("source"):
+            mongo_doc["source"] = "csv_upload"
 
         products_to_insert.append(mongo_doc)
 
@@ -269,6 +271,8 @@ async def add_single_product(org_id: str, data: dict) -> dict:
         )
     if "type" not in mongo_doc or not mongo_doc.get("type"):
         mongo_doc["type"] = "laptop"
+    if "source" not in mongo_doc or not mongo_doc.get("source"):
+        mongo_doc["source"] = "manual"
 
     result = collection.insert_one(mongo_doc)
     mongo_doc["_id"] = str(result.inserted_id)

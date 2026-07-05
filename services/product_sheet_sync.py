@@ -263,9 +263,11 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                             {"unique_identifier": {"$exists": False}},
                             {"type": {"$in": [None, ""]}},
                             {"type": {"$exists": False}},
+                            {"source": {"$in": [None, ""]}},
+                            {"source": {"$exists": False}},
                         ]},
                         {"_id": 1, "model_no": 1, "product_name": 1, "type": 1,
-                         "unique_identifier": 1, "source_sheet_id": 1}
+                         "unique_identifier": 1, "source_sheet_id": 1, "source": 1}
                     ))
                 )
                 if legacy_docs:
@@ -284,6 +286,8 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                             update_fields["source_sheet_ids"] = [doc["source_sheet_id"]]
                             if not doc.get("source"):
                                 update_fields["source"] = "google_sheet"
+                        elif not doc.get("source"):
+                            update_fields["source"] = "manual"
                         if update_fields:
                             backfill_ops.append(
                                 UpdateOne({"_id": doc["_id"]}, {"$set": update_fields})
