@@ -180,7 +180,8 @@ async def main_ws(websocket: WebSocket, client_id: str):
         "ig_id": ig_id,
         "wa_id": wa_id,
         "user_id": user.user_id,
-        "org_id": user.org_id
+        "org_id": user.org_id,
+        "agent_name": user.full_name,
     }
     
     # Register under organization for wide broadcasts
@@ -200,6 +201,13 @@ async def main_ws(websocket: WebSocket, client_id: str):
 
     # Step 4: Send initial stats
     # asyncio.create_task(broadcast_on_stats_update(user.org_id))
+    
+    # Step 4: Send initial presence snapshot
+    presence_snapshot = get_org_presence_snapshot(user.org_id)
+    await websocket.send_json({
+        "type": "presence_snapshot",
+        "data": presence_snapshot
+    })
 
     heartbeat_task = asyncio.create_task(start_heartbeat(client_id, websocket))
 
@@ -218,7 +226,7 @@ async def main_ws(websocket: WebSocket, client_id: str):
 
                 if event_type == "join_conversation" or event_type == "leave_conversation":
                     org_id = user.org_id
-                    handle_unread_event(org_id, client_id, data)
+                    await handle_unread_event(org_id, client_id, data)
 
                 if event_type == "typing_indicator":
                     await handle_typing_event(client_id, data)
