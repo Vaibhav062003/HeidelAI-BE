@@ -9,18 +9,21 @@ CHATBOT_BASE_URL = "https://heidelai-backend2.koyeb.app"
 async def send_to_chatbot(
     customer_phone_no: str,
     message_content: str,
-    timeout: float = 30.0
-) -> Optional[str]:
+    timeout: float = 30.0,
+    message_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
     Send a message to the HeidelAI chatbot and get a response.
-    
+
     Args:
         customer_phone_no: Customer's phone number (will be prefixed with 'whatsapp_')
         message_content: The message content from the customer
         timeout: Request timeout in seconds (default: 30s)
-        
+        message_id: Optional WhatsApp wamid of the incoming message (forwarded to the backend)
+
     Returns:
-        The chatbot's response text, or None if there was an error
+        A dict containing at least ``"response"`` on success, optionally
+        ``"reply_to_message_id"``; or None on any error.
     """
     # Prepare the identifier with whatsapp_ prefix
     identifier = f"whatsapp_{customer_phone_no}"
@@ -30,6 +33,8 @@ async def send_to_chatbot(
         "identifier": identifier,
         "query": message_content
     }
+    if message_id:
+        payload["message_id"] = message_id
     
     # API endpoint
     endpoint = f"{CHATBOT_BASE_URL}/chat"
@@ -58,39 +63,42 @@ async def send_to_chatbot(
             if chatbot_response:
                 logger.info(f"Received response from chatbot for {identifier}")
                 # logger.debug(f"Response: {chatbot_response[:100]}...")
-                return chatbot_response
+                return response_data
             else:
                 logger.error(f"No 'response' field in chatbot response: {response_data}")
                 return None
                 
     except httpx.TimeoutException:
         logger.error(f"Timeout while calling chatbot for {identifier}")
-        return "I apologize, but I'm taking longer than usual to respond. Please try again in a moment."
-        
+        return None
+
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error from chatbot: {e.response.status_code} - {e.response.text}")
-        return "I apologize, but I'm experiencing technical difficulties. Please try again later."
-        
+        return None
+
     except Exception as e:
         logger.opt(exception=True).error(f"Unexpected error calling chatbot: {str(e)}")
-        return "I apologize, but something went wrong. Please try again later."
+        return None
 
 
 def send_to_chatbot_sync(
     customer_phone_no: str,
     message_content: str,
-    timeout: float = 30.0
-) -> Optional[str]:
+    timeout: float = 30.0,
+    message_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """
     Synchronous version of send_to_chatbot for use in non-async contexts.
-    
+
     Args:
         customer_phone_no: Customer's phone number (will be prefixed with 'whatsapp_')
         message_content: The message content from the customer
         timeout: Request timeout in seconds (default: 30s)
-        
+        message_id: Optional WhatsApp wamid of the incoming message (forwarded to the backend)
+
     Returns:
-        The chatbot's response text, or None if there was an error
+        A dict containing at least ``"response"`` on success, optionally
+        ``"reply_to_message_id"``; or None on any error.
     """
     import requests
     
@@ -102,6 +110,8 @@ def send_to_chatbot_sync(
         "identifier": identifier,
         "query": message_content
     }
+    if message_id:
+        payload["message_id"] = message_id
     
     # API endpoint
     endpoint = f"{CHATBOT_BASE_URL}/chat"
@@ -130,22 +140,22 @@ def send_to_chatbot_sync(
         if chatbot_response:
             logger.info(f"Received response from chatbot for {identifier}")
             logger.debug(f"Response: {chatbot_response[:100]}...")
-            return chatbot_response
+            return response_data
         else:
             logger.error(f"No 'response' field in chatbot response: {response_data}")
             return None
             
     except requests.Timeout:
         logger.error(f"Timeout while calling chatbot for {identifier}")
-        return "I apologize, but I'm taking longer than usual to respond. Please try again in a moment."
-        
+        return None
+
     except requests.HTTPError as e:
         logger.error(f"HTTP error from chatbot: {e.response.status_code} - {e.response.text}")
-        return "I apologize, but I'm experiencing technical difficulties. Please try again later."
-        
+        return None
+
     except Exception as e:
         logger.opt(exception=True).error(f"Unexpected error calling chatbot: {str(e)}")
-        return "I apologize, but something went wrong. Please try again later."
+        return None
 
 if __name__ == "__main__":
     # Example usage
