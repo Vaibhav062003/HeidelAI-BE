@@ -79,7 +79,7 @@ async def create_or_update_whatsapp_conversation(
     convo_key = (org_id, conversation_id)
     
     # Check if the viewers set exists and is not empty
-    is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
+    is_being_viewed = len(services.org_convo_viewers.get(org_id, {}).get(conversation_id, set())) > 0
 
     # Handle Name Resolution
     final_customer_name = customer_name
