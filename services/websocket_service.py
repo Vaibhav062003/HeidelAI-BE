@@ -26,7 +26,6 @@ async def cleanup_client(client_id: str):
             org_id=org_id_for_convo,
             event_type="leave_conversation",
             payload={
-                "type": "leave_conversation",
                 "conversation_id": conversation_id,
                 "client_id": client_id,
                 "agent_name": agent_name,
@@ -195,6 +194,10 @@ async def handle_unread_event(org_id: str, client_id: str, data: dict):
     meta = services.client_metadata.get(client_id, {})
     agent_name = meta.get("agent_name")
 
+    if not conversation_id or not event_type:
+        logger.error(f"Invalid unread event data from {client_id}: {data}")
+        return
+
     if event_type == "join_conversation":
         join_conversation_presence(org_id, conversation_id, client_id)
     elif event_type == "leave_conversation":
@@ -204,7 +207,6 @@ async def handle_unread_event(org_id: str, client_id: str, data: dict):
         return
     
     payload = {
-        "type": event_type,
         "conversation_id": conversation_id,
         "client_id": client_id,
         "agent_name": agent_name,
@@ -266,15 +268,26 @@ async def broadcast_org_ws(org_id: str, event_type: str, payload: dict, exclude_
     Broadcast an event to every client connected under the same org, excluding the sender.
     """
     client_ids = services.org_clients.get(org_id, set())
+
+    disconnected_clients = []
+
     for cid in list(client_ids):
         if cid == exclude_client_id:
             continue
         ws = services.active_clients.get(cid)
         if ws:
             try:
-                await ws.send_json(payload)
-            except Exception:
-                logger.warning(f"Failed to send {event_type} to {cid}")
+                await ws.send_json({"type": event_type, "data": payload})
+            except Exception as e:
+                logger.error(f"Failed to send {event_type} to {cid}, marking as disconnected")
+            except WebSocketDisconnect:
+                logger.error(f"Client {cid} disconnected, marking as disconnected")
+                disconnected_clients.append(cid)
+
+    for client_id in disconnected_clients:
+        services.org_clients[org_id].discard(client_id)
+        services.active_clients.pop(client_id, None)
+        services.client_metadata.pop(client_id, None)
 
 async def broadcast_on_stats_update(
     org_id: str, 
