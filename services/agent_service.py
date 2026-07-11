@@ -1,7 +1,7 @@
 import httpx
 from typing import Dict, Optional
 from loguru import logger
-from config.settings import KOMAL_ORG_ID, HEIDELAI_ORG_ID
+from config.settings import KOMAL_ORG_ID
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://heidelai-chatbot-2.koyeb.app"
