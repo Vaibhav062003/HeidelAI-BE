@@ -467,7 +467,7 @@ async def create_or_update_instagram_conversation(org_id: str,
     
     convo_key = (org_id, conversation_id)
 
-    is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
+    is_being_viewed = len(services.org_convo_viewers.get(org_id, {}).get(conversation_id, set())) > 0
 
     if existing_conversation:
         

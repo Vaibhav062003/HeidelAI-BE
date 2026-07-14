@@ -13,43 +13,45 @@ async def cleanup_client(client_id: str):
     """
     logger.info(f"Disconnecting client {client_id}")
 
-    # Retrieve and remove the entry from the reverse map
-    convo_key = services.client_convo_map.pop(client_id, None)
-    
-    if convo_key:
-        logger.info(f"Cleaning up presence data for conversation {convo_key}")
-        # Remove client_id from the conversation viewers set
-        if convo_key in services.convo_viewers:
-            services.convo_viewers[convo_key].discard(client_id)
-            
-            # Cleanup: Remove the conversation entry if the set is empty
-            if not services.convo_viewers[convo_key]:
-                del services.convo_viewers[convo_key]
-
     meta = services.client_metadata.get(client_id)
+    agent_name = meta.get("agent_name") if meta else None
+
+    convo_key = services.client_convo_map.get(client_id)
+    if convo_key:
+        org_id_for_convo, conversation_id = convo_key
+        logger.info(f"Cleaning up presence data for conversation {convo_key}")
+        leave_conversation_presence(org_id_for_convo, conversation_id, client_id)
+
+        await broadcast_org_ws(
+            org_id=org_id_for_convo,
+            event_type="leave_conversation",
+            payload={
+                "conversation_id": conversation_id,
+                "client_id": client_id,
+                "agent_name": agent_name,
+            },
+            exclude_client_id=client_id,
+        )
+
     if not meta:
         return
-
     ig_id = meta.get("ig_id")
     wa_id = meta.get("wa_id")
     user_id = meta.get("user_id")
+    org_id = meta.get("org_id")
 
     if user_id and client_id in services.agent_clients.get(user_id, set()):
         services.agent_clients[user_id].remove(client_id)
         if not services.agent_clients[user_id]:
             del services.agent_clients[user_id]
-
-    org_id = meta.get("org_id")
     if org_id and client_id in services.org_clients.get(org_id, set()):
         services.org_clients[org_id].remove(client_id)
         if not services.org_clients[org_id]:
             del services.org_clients[org_id]
-
     if ig_id and client_id in services.instagram_clients[ig_id]:
         services.instagram_clients[ig_id].remove(client_id)
         if not services.instagram_clients[ig_id]:
             del services.instagram_clients[ig_id]
-
     if wa_id and client_id in services.whatsapp_clients[wa_id]:
         services.whatsapp_clients[wa_id].remove(client_id)
         if not services.whatsapp_clients[wa_id]:
@@ -57,7 +59,6 @@ async def cleanup_client(client_id: str):
 
     services.active_clients.pop(client_id, None)
     services.client_metadata.pop(client_id, None)
-
     logger.success(f"Cleaned up client {client_id}")
 
 async def handle_typing_event(client_id: str, data: dict):
@@ -183,55 +184,110 @@ async def start_heartbeat(client_id: str, websocket: WebSocket):
     except asyncio.CancelledError:
         pass
 
-def handle_unread_event(org_id: str, client_id: str, data: dict):
+async def handle_unread_event(org_id: str, client_id: str, data: dict):
     """
-    Handles join and leave conversation events for unread message tracking.
+    Handles join and leave conversation events for unread message tracking,
+    then broadcasts presence to the rest of the org.
     """
+    event_type = data.get("type")
+    conversation_id = data.get("conversation_id")
+    meta = services.client_metadata.get(client_id, {})
+    agent_name = meta.get("agent_name")
 
-    if data.get("type") == "join_conversation":
-        conversation_id = data.get("conversation_id")
+    if not conversation_id or not event_type:
+        logger.error(f"Invalid unread event data from {client_id}: {data}")
+        return
+
+    if event_type == "join_conversation":
         join_conversation_presence(org_id, conversation_id, client_id)
-    elif data.get("type") == "leave_conversation":
-        conversation_id = data.get("conversation_id")
+    elif event_type == "leave_conversation":
         leave_conversation_presence(org_id, conversation_id, client_id)
     else:
-        logger.error(f"Unknown unread event type: {data.get('type')}")
+        logger.error(f"Unknown unread event type: {event_type}")
+        return
+    
+    payload = {
+        "conversation_id": conversation_id,
+        "client_id": client_id,
+        "agent_name": agent_name,
+    }
+
+    await broadcast_org_ws(
+        org_id=org_id,
+        event_type=event_type,
+        payload=payload,
+        exclude_client_id=client_id,
+    )
 
 def join_conversation_presence(org_id: str, conversation_id: str, client_id: str):
     """
-    Adds a client to the presence tracker for a specific conversation 
-    using the multi-tenant key (org_id, conversation_id).
+    Adds a client to the presence tracker for a specific conversation,
+    indexed by org for fast org-scoped lookups.
     """
-    convo_key = (org_id, conversation_id)
-    
-    # Updating forward map (convo_viewers: (org, convo) -> {clients})
-    if convo_key not in services.convo_viewers:
-        services.convo_viewers[convo_key] = set()
-    services.convo_viewers[convo_key].add(client_id)
-    
-    # Updating reverse map (client_convo_map: client -> (org, convo))
-    services.client_convo_map[client_id] = convo_key
-    
-    logger.info(f"Client {client_id} JOINED conversation {convo_key}")
+    services.org_convo_viewers[org_id][conversation_id].add(client_id)
+    services.client_convo_map[client_id] = (org_id, conversation_id)
+    logger.info(f"Client {client_id} JOINED conversation ({org_id}, {conversation_id})")
+
 
 def leave_conversation_presence(org_id: str, conversation_id: str, client_id: str):
     """
-    Removes a client from the presence tracker and cleans up the maps.
+    Removes a client from the presence tracker and cleans up empty entries.
     """
-    convo_key = (org_id, conversation_id)
-    
-    # Updating forward map (convo_viewers)
-    if convo_key in services.convo_viewers:
-        services.convo_viewers[convo_key].discard(client_id)
-        
-        # Cleanup: Removing the conversation entry if no one is viewing it
-        if not services.convo_viewers[convo_key]:
-            del services.convo_viewers[convo_key]
-    
-    # Removing from reverse map (client_convo_map)
+    viewers = services.org_convo_viewers.get(org_id, {}).get(conversation_id)
+    if viewers:
+        viewers.discard(client_id)
+        if not viewers:
+            del services.org_convo_viewers[org_id][conversation_id]
+            # Optional: clean up empty org entry too
+            if not services.org_convo_viewers[org_id]:
+                del services.org_convo_viewers[org_id]
+
     services.client_convo_map.pop(client_id, None)
-    
-    logger.info(f"Client {client_id} LEFT conversation {convo_key}")
+    logger.info(f"Client {client_id} LEFT conversation ({org_id}, {conversation_id})")
+
+
+def get_org_presence_snapshot(org_id: str) -> list[dict]:
+    """
+    Builds a full presence snapshot for an org: which agents currently
+    have which conversations open.
+    """
+    snapshot = []
+    convo_map = services.org_convo_viewers.get(org_id, {})
+    for conversation_id, viewer_client_ids in convo_map.items():
+        for cid in viewer_client_ids:
+            meta = services.client_metadata.get(cid, {})
+            snapshot.append({
+                "conversation_id": conversation_id,
+                "client_id": cid,
+                "agent_name": meta.get("agent_name"),
+            })
+    return snapshot
+
+async def broadcast_org_ws(org_id: str, event_type: str, payload: dict, exclude_client_id: str = None):
+    """
+    Broadcast an event to every client connected under the same org, excluding the sender.
+    """
+    client_ids = services.org_clients.get(org_id, set())
+
+    disconnected_clients = []
+
+    for cid in list(client_ids):
+        if cid == exclude_client_id:
+            continue
+        ws = services.active_clients.get(cid)
+        if ws:
+            try:
+                await ws.send_json({"type": event_type, "data": payload})
+            except Exception as e:
+                logger.error(f"Failed to send {event_type} to {cid}, marking as disconnected")
+            except WebSocketDisconnect:
+                logger.error(f"Client {cid} disconnected, marking as disconnected")
+                disconnected_clients.append(cid)
+
+    for client_id in disconnected_clients:
+        services.org_clients[org_id].discard(client_id)
+        services.active_clients.pop(client_id, None)
+        services.client_metadata.pop(client_id, None)
 
 async def broadcast_on_stats_update(
     org_id: str, 
