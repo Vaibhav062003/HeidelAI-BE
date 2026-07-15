@@ -18,7 +18,7 @@ import httpx
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from pymongo import UpdateOne
 
@@ -27,6 +27,12 @@ from auth.dependencies import CurrentUser
 from config.settings import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 from loguru import logger
 import asyncio
+
+from services.google_drive_webhook import (
+    create_watch_channel,
+    stop_all_channels_for_sheet,
+    validate_webhook_notification,
+)
 
 db = get_mongo_db()
 
@@ -118,6 +124,17 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
             }
 
         logger.info(f"Sheet {request.sheet_id} connected for org {org_id} (tab: {tab_name})")
+
+        # Create a Drive watch channel for real-time notifications
+        try:
+            access_token = await refresh_google_token(org_id)
+            await create_watch_channel(request.sheet_id, org_id, access_token)
+        except Exception as wh_err:
+            logger.warning(
+                f"[Webhook] Could not create watch channel for sheet {request.sheet_id}: {wh_err}. "
+                "Reconciliation fallback will handle syncing."
+            )
+
         return {"sheet_id": request.sheet_id, "sheet_name": request.sheet_name, "tab_name": tab_name, "message": "Sheet connected successfully."}
 
     except HTTPException:
@@ -176,6 +193,13 @@ async def disconnect_sheet(
                         "hint": "Unpublish the automation(s) first, or force disconnect.",
                     }
                 )
+
+        # Stop any active watch channels for this sheet before deleting
+        try:
+            access_token = await refresh_google_token(org_id)
+            await stop_all_channels_for_sheet(org_id, sheet_id, access_token)
+        except Exception as wh_err:
+            logger.warning(f"[Webhook] Could not stop watch channels for sheet {sheet_id}: {wh_err}")
 
         result = db.google_sheets_connections.delete_one({"org_id": org_id, "sheet_id": sheet_id})
         if result.deleted_count == 0:
@@ -410,6 +434,19 @@ async def toggle_sheet_polling(sheet_id: str, user: CurrentUser):
             {"org_id": org_id, "sheet_id": sheet_id},
             {"$set": {"polling_enabled": new_state, "updated_at": datetime.now(timezone.utc)}}
         )
+
+        # Manage watch channel based on new state
+        try:
+            access_token = await refresh_google_token(org_id)
+            if new_state:
+                # Enabling — create a new watch channel
+                await create_watch_channel(sheet_id, org_id, access_token)
+            else:
+                # Disabling — stop active watch channels
+                await stop_all_channels_for_sheet(org_id, sheet_id, access_token)
+        except Exception as wh_err:
+            logger.warning(f"[Webhook] Could not manage watch channel for sheet {sheet_id}: {wh_err}")
+
         return {"sheet_id": sheet_id, "polling_enabled": new_state}
 
     except HTTPException:
@@ -417,6 +454,72 @@ async def toggle_sheet_polling(sheet_id: str, user: CurrentUser):
     except Exception as e:
         logger.error(f"Error toggling polling for {sheet_id} org {user.org_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to toggle polling: {str(e)}")
+
+
+# ─── Webhook: Receive Google Drive push notifications ──────────────────────────
+
+@router.post("/webhook")
+async def google_sheets_webhook(request: Request):
+    """
+    Receive Google Drive push notifications for sheet changes.
+
+    Google sends a POST here whenever a watched spreadsheet file changes.
+    The handler is intentionally thin: validate → identify → enqueue → return 200.
+
+    Headers from Google:
+      X-Goog-Channel-ID:      The channel ID we set at watch creation
+      X-Goog-Resource-ID:     Google's resource identifier
+      X-Goog-Resource-State:  "sync" (initial confirmation) or "update" (change)
+      X-Goog-Channel-Token:   The token we set at watch creation (for validation)
+      X-Goog-Message-Number:  Monotonic message counter for dedup
+    """
+    # Extract notification metadata from headers
+    channel_id = request.headers.get("X-Goog-Channel-ID", "")
+    resource_id = request.headers.get("X-Goog-Resource-ID", "")
+    resource_state = request.headers.get("X-Goog-Resource-State", "")
+    channel_token = request.headers.get("X-Goog-Channel-Token", "")
+    message_number = request.headers.get("X-Goog-Message-Number", "")
+
+    # Always return 200 to Google — even for invalid notifications.
+    # Returning non-200 causes Google to retry aggressively.
+
+    if not channel_id or not resource_id:
+        logger.debug("[Webhook] Received notification with missing headers, ignoring")
+        return Response(status_code=200)
+
+    # Log every notification for debugging and audit
+    logger.info(
+        f"[Webhook] Notification received: state={resource_state} "
+        f"channel={channel_id} message={message_number}"
+    )
+
+    # "sync" state is just Google confirming the watch was set up successfully
+    if resource_state == "sync":
+        logger.info(f"[Webhook] Watch confirmed for channel {channel_id}")
+        return Response(status_code=200)
+
+    # Validate channel against our stored channels
+    channel = await validate_webhook_notification(channel_id, resource_id, channel_token)
+    if not channel:
+        # Unknown channel — could be spoofed, stale, or from a different deployment
+        return Response(status_code=200)
+
+    org_id = channel["org_id"]
+    sheet_id = channel["sheet_id"]
+
+    # Enqueue the sync as a background task — don't block the webhook response
+    async def _webhook_triggered_sync():
+        try:
+            from services.google_sheets_scheduler import _safe_sync_sheet
+            await _safe_sync_sheet(org_id, sheet_id)
+        except Exception as e:
+            logger.error(
+                f"[Webhook] Sync failed for sheet {sheet_id} org {org_id}: {e}"
+            )
+
+    asyncio.create_task(_webhook_triggered_sync())
+
+    return Response(status_code=200)
 
 
 # ─── Internal Helpers ──────────────────────────────────────────────────────────
