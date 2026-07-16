@@ -538,8 +538,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
 
 
-                                #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
-                                if not is_heidelai and not is_pma_wa:
+                                #  Don't execute for heidel_ai as it is not on whatsapp flow yet but has AI
+                                if not is_heidelai:
 
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     # Runs on all environments and regardless of AI toggle
