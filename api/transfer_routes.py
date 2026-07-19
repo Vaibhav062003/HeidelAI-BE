@@ -117,15 +117,30 @@ async def check_transfer_loop(conversation_id: str, target_agent_id: str, org_id
     cutoff = datetime.utcnow() - timedelta(minutes=5)
 
     for entry in history:
-        if entry.get("to_agent", {}).get("id") == target_agent_id:
-            timestamp_str = entry.get("timestamp")
-            if timestamp_str:
-                try:
-                    entry_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                    if entry_time > cutoff:
-                        return True
-                except:
-                    pass
+        # Support both new format (to_agent.id) and legacy format (id field directly)
+        entry_agent_id = (
+            entry.get("to_agent", {}).get("id")
+            or entry.get("id")
+        )
+        if entry_agent_id != target_agent_id:
+            continue
+
+        # Support both new format (timestamp str) and legacy format (assigned_at str/datetime)
+        ts = entry.get("timestamp") or entry.get("assigned_at")
+        if not ts:
+            continue
+        try:
+            if isinstance(ts, datetime):
+                entry_time = ts
+            else:
+                entry_time = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+            # Strip timezone for naive comparison
+            if entry_time.tzinfo is not None:
+                entry_time = entry_time.replace(tzinfo=None)
+            if entry_time > cutoff:
+                return True
+        except Exception as e:
+            logger.warning(f"check_transfer_loop: could not parse timestamp '{ts}': {e}")
 
     return False
 
@@ -207,6 +222,7 @@ async def transfer_conversation(
                 "assigned_agent": {
                     "id": payload.target_agent_id,
                     "name": target_name,
+                    "username": target_name,   # kept for downstream consumers using .username
                     "assigned_at": datetime.utcnow().isoformat()
                 }
             },
@@ -392,14 +408,15 @@ async def create_mentions(
         if not agent_id:
             continue
 
-        # Check pool capacity
+        # Check pool capacity (scoped to this org to enforce per-org isolation)
         pending_count = await mentions_col.count_documents({
             "to_agent_id": agent_id,
+            "org_id": user.org_id,
             "status": "pending"
         })
 
         if pending_count >= 25:
-            logger.warning(f"Agent {agent_id} has reached mention capacity (25)")
+            logger.warning(f"Agent {agent_id} has reached mention capacity (25) in org {user.org_id}")
             continue
 
         # Create mention
@@ -493,9 +510,16 @@ async def accept_mention(
     async_db = get_async_mongo_db()
     mentions_col = async_db.conversation_mentions
 
-    # Fetch mention
+    # Validate mention_id format before use
+    try:
+        mention_oid = ObjectId(mention_id)
+    except Exception:
+        raise HTTPException(400, "Invalid mention ID")
+
+    # Fetch mention — scoped by org_id to prevent cross-tenant access
     mention = await mentions_col.find_one({
-        "_id": ObjectId(mention_id),
+        "_id": mention_oid,
+        "org_id": user.org_id,
         "to_agent_id": user.user_id,
         "status": "pending"
     })
@@ -572,9 +596,16 @@ async def reject_mention(
     async_db = get_async_mongo_db()
     mentions_col = async_db.conversation_mentions
 
-    # Fetch mention
+    # Validate mention_id format before use
+    try:
+        mention_oid = ObjectId(mention_id)
+    except Exception:
+        raise HTTPException(400, "Invalid mention ID")
+
+    # Fetch mention — scoped by org_id to prevent cross-tenant access
     mention = await mentions_col.find_one({
-        "_id": ObjectId(mention_id),
+        "_id": mention_oid,
+        "org_id": user.org_id,
         "to_agent_id": user.user_id,
         "status": "pending"
     })
