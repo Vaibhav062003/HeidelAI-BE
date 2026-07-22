@@ -36,7 +36,8 @@ async def send_to_pma_chatbot(
     org_id: str,
     source: str = "webhook",
     timeout: int = 10,
-    reply_context_message_id: str = None
+    reply_context_message_id: str = None,
+    message_id: str = None
 ) -> Dict:
     """
     Send a message to the PMA chatbot service and return the chatbot's response.
@@ -50,6 +51,9 @@ async def send_to_pma_chatbot(
         "ORG_ID": org_id,
         "source": source,
     }
+
+    if message_id:
+        payload["message_id"] = message_id
 
     if reply_context_message_id:
         payload["reply_context_message_id"] = reply_context_message_id
