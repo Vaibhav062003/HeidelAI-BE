@@ -578,6 +578,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             org_id=org_id,
                                             source="webhook",
                                             reply_context_message_id=replied_message_id,
+                                            message_id=wa_message_id,
                                         )
 
                                         final_response = chatbot_response["final_response"]
@@ -694,6 +695,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             org_id=org_id,
                                             source="webhook",
                                             reply_context_message_id=replied_message_id,
+                                            message_id=wa_message_id,
                                     )
 
                                     final_response = chatbot_response["final_response"]
@@ -731,6 +733,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         org_id=org_id,
                                         source="webhook",
                                         reply_context_message_id=replied_message_id,
+                                        message_id=wa_message_id,
                                     )
 
                                     final_response = chatbot_response["final_response"]
