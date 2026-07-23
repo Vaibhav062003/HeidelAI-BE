@@ -264,10 +264,11 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
             try:
                 logger.info(f"[OOS] Sending WhatsApp message to dealer '{dealer_name}' at +{dealer_phone}...")
                 res = await send_whatsapp_message({
-                    "conversation_id": f"dealer_{dealer_phone}",
+                    "conversation_id": f"whatsapp_{dealer_phone}",
                     "content": dealer_message,
                     "sender_id": wa_id,
                     "recipient_override": dealer_phone,
+                    "customer_name": dealer_name,
                 }, org_id, "ai")
                 message_ids = res.get("message_ids", []) if res else []
                 logger.success(f"[OOS] WhatsApp successfully sent to dealer '{dealer_name}' at +{dealer_phone} (message_ids={message_ids})")
