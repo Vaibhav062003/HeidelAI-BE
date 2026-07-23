@@ -45,6 +45,7 @@ async def create_or_update_whatsapp_conversation(
     is_ad_referral: Optional[bool] = None,
     is_auto_followup: bool = False,
     mode: Optional[str] = None,
+    extra_updates: Optional[dict] = None,
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -123,6 +124,9 @@ async def create_or_update_whatsapp_conversation(
         "last_sender": last_sender,
         "status": "open",
     }
+    
+    if extra_updates:
+        update_set.update(extra_updates)
     
     if last_sender == "customer":
         update_set["meta_name_verified"] = True

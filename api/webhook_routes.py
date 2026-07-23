@@ -122,11 +122,11 @@ def remove_expired_message_ids():
     for message_id in expired_ids:
         del services.processed_message_ids[message_id]
 
-async def check_and_handle_dealer_reply(org_id: str, customer_phone_no: str, content: str, message_context: dict | None) -> bool:
+async def check_and_handle_dealer_reply(org_id: str, customer_phone_no: str, content: str, message_context: dict | None, create_escalation: bool = True) -> bool:
     """Delegate to oos_service which handles matching, logging to sheet, and escalation."""
     from services.oos_service import handle_dealer_reply
     try:
-        return await handle_dealer_reply(org_id, customer_phone_no, content, message_context)
+        return await handle_dealer_reply(org_id, customer_phone_no, content, message_context, create_escalation=create_escalation)
     except Exception as e:
         logger.error(f"Error in check_and_handle_dealer_reply: {e}")
         return False
@@ -481,15 +481,31 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
 
+                                # Check if this is a registered dealer from the conversation doc first
+                                is_dealer = convo_doc.get("is_dealer", False) if convo_doc else False
+                                is_dealer_newly_detected = False
+                                if not is_dealer:
+                                    dealer_doc = db.dealer_directory.find_one({"org_id": org_id, "phone": customer_phone_no, "active": True})
+                                    if dealer_doc:
+                                        is_dealer = True
+                                        is_dealer_newly_detected = True
+                                        logger.info(f"Number {customer_phone_no} is a registered dealer for org {org_id}. Tagging conversation as dealer in next write.")
+                                        if convo_doc:
+                                            convo_doc["persona"] = "dealer"
+                                            convo_doc["is_dealer"] = True
+                                        else:
+                                            convo_doc = {"conversation_id": conversation_id, "persona": "dealer", "is_dealer": True, "is_ai_enabled": True}
+
                                 # Check if this is a dealer reply to an out-of-stock request
                                 is_dealer_reply = await check_and_handle_dealer_reply(
                                     org_id=org_id,
                                     customer_phone_no=customer_phone_no,
                                     content=content,
-                                    message_context=message_context
+                                    message_context=message_context,
+                                    create_escalation=not ai_enabled
                                 )
-                                if is_dealer_reply:
-                                    logger.info(f"Dealer reply processed and intercepted. Skipping normal AI chatbot flow.")
+                                if is_dealer_reply and not ai_enabled:
+                                    logger.info(f"Dealer reply processed and intercepted (AI disabled). Skipping normal AI chatbot flow.")
                                     return {"status": "ok"}
 
                                 # Storing messages from customers in the DB
@@ -503,7 +519,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         last_sender="customer",
                                         reply_window_expiry=reply_window_expiry_time_utc,
                                         is_ad_referral=is_ad_referral,
-                                        mode="reply"
+                                        mode="reply",
+                                        extra_updates={"persona": "dealer", "is_dealer": True} if is_dealer_newly_detected else None
                                     )
                                     
                                 # Store in WhatsApp-specific collections
