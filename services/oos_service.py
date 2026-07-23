@@ -104,10 +104,9 @@ def generate_dealer_message(oos_doc: dict) -> str:
     spec_summary = "\n".join(f"  - {p}" for p in parts)
     raw_query = oos_doc.get("raw_query_text", "")
 
-    message = f"New Requirement Inquiry:\nQuery: \"{raw_query}\"\n"
+    message = f"Query: \"{raw_query}\""
     if parts:
-        message += f"Specifications:\n{spec_summary}\n"
-    message += "\nPlease reply with availability and pricing."
+        message += f"\nSpecifications:\n{spec_summary}"
     return message
 
 
