@@ -519,22 +519,22 @@ async def get_labels_unread(user: CurrentUser):
 @limiter.limit("60/minute")
 async def get_agents_on_conversation(request: Request):
     """
-    For get_agents_on_conversation
     Returns the presence maps with string keys for JSON compatibility.
     """
     json_convo_viewers = {
         f"{org_id}|{convo_id}": list(client_ids)
-        for (org_id, convo_id), client_ids in services.convo_viewers.items()
+        for org_id, convo_map in services.org_convo_viewers.items()
+        for convo_id, client_ids in convo_map.items()
     }
-    
+
     json_client_convo_map = {
         client_id: f"{org_id}|{convo_id}"
         for client_id, (org_id, convo_id) in services.client_convo_map.items()
     }
-    
-    return { 
-        "convo_viewers": json_convo_viewers, 
-        "client_convo_map": json_client_convo_map 
+
+    return {
+        "convo_viewers": json_convo_viewers,
+        "client_convo_map": json_client_convo_map
     }
 
 @router.post("/api/contacts/bulk-upload")

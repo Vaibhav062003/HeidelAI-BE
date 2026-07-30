@@ -79,7 +79,7 @@ async def create_or_update_whatsapp_conversation(
     convo_key = (org_id, conversation_id)
     
     # Check if the viewers set exists and is not empty
-    is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
+    is_being_viewed = len(services.org_convo_viewers.get(org_id, {}).get(conversation_id, set())) > 0
 
     # Handle Name Resolution
     final_customer_name = customer_name
@@ -450,7 +450,7 @@ async def send_whatsapp_message(
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
 
         # Extract the recipient phone number from conversation ID
-        recipient_id = conversation_id.replace("whatsapp_", "")
+        recipient_id = message.get("recipient_override") or conversation_id.replace("whatsapp_", "").replace("dealer_", "")
 
         # Handle multi-part messages (e.g. lists returned by the agent or strings with MSG_SPLIT)
         if isinstance(original_content, list):
@@ -463,6 +463,17 @@ async def send_whatsapp_message(
         if not contents:
             logger.warning(f"Empty content provided for WhatsApp message to {recipient_id}")
             return {"message": "No content to send"}
+
+        # Ensure the conversation document exists in the database
+        await create_or_update_whatsapp_conversation(
+            org_id=org_id,
+            recipient_id=whatsapp_business_id,
+            customer_phone_no=recipient_id,
+            customer_name=message.get("customer_name") or recipient_id,
+            last_message=contents[0],
+            last_sender="ai" if mode == "ai" else "agent",
+            mode=mode
+        )
 
         last_stored_id = None
         all_message_ids = []

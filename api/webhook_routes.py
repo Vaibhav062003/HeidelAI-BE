@@ -388,6 +388,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 
                             # Check if message ID is already processed
                             message_id = message["id"]
+                            wa_message_id = message_id  # Preserve wamid before it may be overwritten by store_whatsapp_message()
                             if message_id in services.processed_message_ids:
                                 logger.info("Duplicate WhatsApp message, skipping processing.")
                                 continue
@@ -413,6 +414,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             context_type = None
                             context = None
+                            replied_message_id = None
 
                             try:
                                 reply_window_info = calculate_whatsapp_reply_window(message)
@@ -536,8 +538,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
 
 
-                                #  Don't execute for heidel_ai and pma as they are not on whatsapp flow yet but have AI
-                                if not is_heidelai and not is_pma_wa:
+                                #  Don't execute for heidel_ai as it is not on whatsapp flow yet but has AI
+                                if not is_heidelai:
                                     await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
                                     # Execute the WhatsApp Automation Flow first (if it exists)
@@ -566,6 +568,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         if not convo_doc:
                                             convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
 
+                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
                                         chatbot_response = await send_to_agent(
                                             conversation_id=conversation_id,
                                             user_input=content,
@@ -574,6 +577,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             customer_name=sender_name2,
                                             org_id=org_id,
                                             source="webhook",
+                                            reply_context_message_id=replied_message_id,
+                                            message_id=wa_message_id,
                                         )
 
                                         final_response = chatbot_response["final_response"]
@@ -621,9 +626,21 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     chatbot_response = await send_to_chatbot(
                                         customer_phone_no=customer_phone_no,
-                                        message_content=content
+                                        message_content=content,
+                                        message_id=wa_message_id
                                     )
                                 
+                                    if not chatbot_response:
+                                        return {"status": "ok"}
+
+                                    # Extract data preserving backward compatibility
+                                    if isinstance(chatbot_response, dict):
+                                        response_text = chatbot_response.get("response", "")
+                                        reply_to_message_id = chatbot_response.get("reply_to_message_id")
+                                    else:
+                                        response_text = chatbot_response
+                                        reply_to_message_id = None
+
                                     # Storing chatbot response in the DB
                                     # Create or update conversation
                                     conversation_id = await create_or_update_whatsapp_conversation(
@@ -631,17 +648,27 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         recipient_id=whatsapp_business_id,
                                         customer_phone_no=customer_phone_no,
                                         customer_name=sender_name2,
-                                        last_message=chatbot_response,
+                                        last_message=response_text,
                                         last_sender="ai",
                                         mode="reply"
                                     )
                                     
+                                    msg_kwargs = {
+                                        "message": {
+                                            "conversation_id": conversation_id,
+                                            "content": response_text,
+                                            "sender_id": HEIDELAI_ORG_WA_ID,
+                                        },
+                                        "org_id": org_id,
+                                        "mode": "ai"
+                                    }
+                                    
+                                    if reply_to_message_id:
+                                        msg_kwargs["context_type"] = "message_reply"
+                                        msg_kwargs["context"] = {"mid": reply_to_message_id}
+
                                     # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
-                                    res = await send_whatsapp_message({
-                                        "conversation_id": conversation_id,
-                                        "content": chatbot_response,
-                                        "sender_id": HEIDELAI_ORG_WA_ID,
-                                    }, org_id, "ai")
+                                    res = await send_whatsapp_message(**msg_kwargs)
 
                                     return {"status": "ok"}
 
@@ -667,6 +694,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             customer_name=sender_name2,
                                             org_id=org_id,
                                             source="webhook",
+                                            reply_context_message_id=replied_message_id,
+                                            message_id=wa_message_id,
                                     )
 
                                     final_response = chatbot_response["final_response"]
@@ -703,6 +732,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_name=sender_name2,
                                         org_id=org_id,
                                         source="webhook",
+                                        reply_context_message_id=replied_message_id,
+                                        message_id=wa_message_id,
                                     )
 
                                     final_response = chatbot_response["final_response"]

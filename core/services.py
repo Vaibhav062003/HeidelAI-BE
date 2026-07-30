@@ -22,10 +22,13 @@ class Services:
         self.whatsapp_connections_map: Dict[str, Set[str]] = {}
         self.instagram_connections_map: Dict[str, Set[str]] = {}
 
-        self.convo_viewers: dict[tuple, set[str]] = {} # {(org_id, convo_id) : ( client_id1, client_id2, ... ), ...}
         # Key: client_id (str).
         # Value: (org_id: str, conversation_id: str) TUPLE this client is viewing.
         self.client_convo_map: dict[str, tuple] = {} # dict[client_id, (org_id, conversation_id)]
+        
+        # Key: org_id
+        # Value: { conversation_id : {client_id, ...}
+        self.org_convo_viewers: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))  # { org_id : { conversation_id : {client_id, ...} }
 
         # === WebSocket State ===
         self.connected_clients: Dict[str, WebSocket] = {}
