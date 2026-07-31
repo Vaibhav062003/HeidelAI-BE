@@ -712,6 +712,8 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
     try:
         org_id = user.org_id 
         org_document = db.organizations.find_one({"org_id": org_id})
+        if not org_document:
+            raise HTTPException(status_code=404, detail="Organization not found")
 
         wa_id = org_document.get("wa_id")
         logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
@@ -734,12 +736,17 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
             "auto_ai_disabled": auto_ai_disabled
         }
 
-        if not ai_enabled and auto_ai_disabled:
+        is_org_ai_enabled = org_document.get("is_ai_enabled", False)
+
+        if not ai_enabled and auto_ai_disabled and is_org_ai_enabled:
             disable_duration = timedelta(minutes=5) if org_id == LEE_DEALER_ORG_ID else timedelta(hours=1)
             update_fields["auto_ai_disabled_until"] = datetime.now(timezone.utc) + disable_duration
         else:
-            # If manually toggling AI, or enabling it, clear the auto-disable timer field
+            # Clear the auto-disable timer. Also force auto_ai_disabled=False when org AI is
+            # disabled — prevents a stale True flag from being picked up if org AI is later re-enabled.
             update_fields["auto_ai_disabled_until"] = None
+            if not is_org_ai_enabled:
+                update_fields["auto_ai_disabled"] = False
 
         # Update the conversation
         result = conversations_collection.update_one(
@@ -763,7 +770,7 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
 
         # Only add system messages and broadcast if the state ACTUALLY changed
         if result.modified_count > 0:
-            if ai_enabled == False and auto_ai_disabled == True:
+            if ai_enabled == False and auto_ai_disabled == True and is_org_ai_enabled:
                 should_add_system_msg = True
                 system_content = f"Ai is disabled for this conversation, will be enabled after {time_Str}"
                 sender_id = "system_auto"
