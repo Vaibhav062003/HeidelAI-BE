@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 # Third-party modules
 import cloudinary
 from loguru import logger
+from pymongo import ReturnDocument
 from fastapi import (
     Form,
     File,
@@ -37,6 +38,7 @@ from config.settings import (
     ACCESS_TOKEN,
     BUSINESS_ID,
     VERSION,
+    WA_VERSION,
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
@@ -56,6 +58,212 @@ whatsapp_service = WhatsAppService()
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/whatsapp", tags=["WhatsApp"])
+
+
+def _calling_context(org_id: str, conversation_id: str | None = None, call_id: str | None = None):
+    if call_id:
+        call = db.whatsapp_calls.find_one({"call_id": call_id, "org_id": org_id})
+        if not call:
+            raise HTTPException(status_code=404, detail="This WhatsApp call is no longer available")
+        wa_id = call.get("wa_id")
+        conversation = None
+    else:
+        conversation = db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+        if not conversation or conversation.get("platform") != "whatsapp":
+            raise HTTPException(status_code=404, detail="WhatsApp conversation not found")
+        wa_id = conversation.get("whatsapp_id") or (db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}) or {}).get("wa_id")
+
+    connection = db.whatsapp_connections.find_one(
+        {"org_id": org_id, "wa_id": wa_id},
+        {"wa_id": 1, "phone_id": 1, "access_token": 1},
+    )
+    if not connection or not connection.get("phone_id") or not connection.get("access_token"):
+        raise HTTPException(status_code=409, detail="Connect a WhatsApp Cloud API number before using calls")
+
+    phone = None
+    if conversation:
+        raw_phone = str(conversation.get("customer_id") or conversation_id.removeprefix("whatsapp_"))
+        phone = "".join(character for character in raw_phone if character.isdigit())
+        if len(phone) < 7:
+            raise HTTPException(status_code=422, detail="This contact does not have a callable WhatsApp number")
+    return connection, conversation, phone
+
+
+async def _meta_call_request(connection: dict, method: str, path: str, *, json_body: dict | None = None, params: dict | None = None):
+    version = WA_VERSION or VERSION or "v24.0"
+    url = f"https://graph.facebook.com/{version}/{connection['phone_id']}/{path}"
+    headers = {"Authorization": f"Bearer {connection['access_token']}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.request(method, url, headers=headers, json=json_body, params=params)
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.is_error:
+        error = data.get("error", {}) if isinstance(data, dict) else {}
+        raise HTTPException(
+            status_code=502 if response.status_code >= 500 else 400,
+            detail={
+                "message": error.get("message") or "Meta could not complete the WhatsApp call request",
+                "code": error.get("code"),
+            },
+        )
+    return data
+
+
+def _validated_call_session(body: dict, expected_type: str):
+    session = body.get("session")
+    if not isinstance(session, dict) or session.get("sdp_type") != expected_type or not isinstance(session.get("sdp"), str):
+        raise HTTPException(status_code=422, detail=f"A WebRTC SDP {expected_type} is required")
+    if len(session["sdp"]) > 100_000:
+        raise HTTPException(status_code=413, detail="The WebRTC session description is too large")
+    return session
+
+
+@router.get("/conversations/{conversation_id}/call-permission")
+@limiter.limit("30/minute")
+async def get_call_permission(request: Request, conversation_id: str, user: CurrentUser):
+    connection, _, phone = _calling_context(user.org_id, conversation_id=conversation_id)
+    return await _meta_call_request(connection, "GET", "call_permissions", params={"user_wa_id": phone})
+
+
+@router.post("/conversations/{conversation_id}/call-permission")
+@limiter.limit("5/minute")
+async def request_call_permission(request: Request, conversation_id: str, user: CurrentUser):
+    connection, conversation, phone = _calling_context(user.org_id, conversation_id=conversation_id)
+    window_end = conversation.get("reply_window_ends_at")
+    if isinstance(window_end, datetime) and window_end <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="The reply window is closed. Send an approved call-permission template first.")
+    body = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "call_permission_request",
+            "action": {"name": "call_permission_request"},
+            "body": {"text": "Please allow us to call you on WhatsApp so we can help with your enquiry."},
+        },
+    }
+    result = await _meta_call_request(connection, "POST", "messages", json_body=body)
+    content = body["interactive"]["body"]["text"]
+    message_id = ((result.get("messages") or [{}])[0]).get("id")
+    db[f"conversations_{user.org_id}"].update_one(
+        {"conversation_id": conversation_id},
+        {"$set": {"last_message": f"{user.full_name or 'Agent'}: {content}", "last_sender": "agent", "last_message_timestamp": datetime.now(timezone.utc)}},
+    )
+    await store_whatsapp_message(
+        org_id=user.org_id,
+        content=content,
+        conversation_id=conversation_id,
+        customer_phone_no=phone,
+        type="interactive",
+        payload=body["interactive"],
+        recipient_id=connection["wa_id"],
+        role=MessageRole.AGENT,
+        sender_name=user.full_name or "Agent",
+        message_id=message_id,
+        status="sent",
+    )
+    return result
+
+
+@router.post("/conversations/{conversation_id}/calls")
+@limiter.limit("10/minute")
+async def start_whatsapp_call(request: Request, conversation_id: str, body: dict, user: CurrentUser):
+    if body.get("action") != "connect":
+        raise HTTPException(status_code=422, detail="Only the connect action can start a call")
+    session = _validated_call_session(body, "offer")
+    connection, conversation, phone = _calling_context(user.org_id, conversation_id=conversation_id)
+    result = await _meta_call_request(connection, "POST", "calls", json_body={
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "action": "connect",
+        "session": session,
+    })
+    call_id = ((result.get("calls") or [{}])[0]).get("id")
+    if not call_id:
+        raise HTTPException(status_code=502, detail="Meta did not return a WhatsApp call ID")
+    now = datetime.now(timezone.utc)
+    db.whatsapp_calls.update_one(
+        {"org_id": user.org_id, "call_id": call_id},
+        {"$set": {
+            "call_id": call_id,
+            "org_id": user.org_id,
+            "wa_id": connection["wa_id"],
+            "conversation_id": conversation_id,
+            "phone": phone,
+            "contact_name": conversation.get("customer_name") or phone,
+            "direction": "BUSINESS_INITIATED",
+            "agent_id": user.user_id,
+            "state": "ringing",
+            "updated_at": now,
+        }},
+        upsert=True,
+    )
+    await broadcast_main_ws(connection["wa_id"], "whatsapp", "whatsapp_call", {
+        "id": call_id,
+        "call_id": call_id,
+        "event": "started",
+        "direction": "BUSINESS_INITIATED",
+        "conversation_id": conversation_id,
+        "contact_name": conversation.get("customer_name") or phone,
+        "phone": phone,
+        "agent_id": user.user_id,
+    })
+    return {"call_id": call_id}
+
+
+@router.post("/calls")
+@limiter.limit("30/minute")
+async def update_whatsapp_call(request: Request, body: dict, user: CurrentUser):
+    action = body.get("action")
+    call_id = body.get("call_id")
+    if action not in {"pre_accept", "accept", "reject", "terminate"} or not isinstance(call_id, str) or not call_id.startswith("wacid."):
+        raise HTTPException(status_code=422, detail="A valid WhatsApp call action and call ID are required")
+
+    connection, _, _ = _calling_context(user.org_id, call_id=call_id)
+    calls = db.whatsapp_calls
+    call = calls.find_one({"call_id": call_id, "org_id": user.org_id})
+    owner = call.get("agent_id") if call else None
+    if owner and owner != user.user_id:
+        raise HTTPException(status_code=409, detail="Another teammate is already handling this call")
+
+    claimed_now = not owner
+    if claimed_now:
+        claimed = calls.find_one_and_update(
+            {"call_id": call_id, "org_id": user.org_id, "$or": [{"agent_id": None}, {"agent_id": user.user_id}, {"agent_id": {"$exists": False}}]},
+            {"$set": {"agent_id": user.user_id, "state": "connecting", "updated_at": datetime.now(timezone.utc)}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            raise HTTPException(status_code=409, detail="Another teammate is already handling this call")
+
+    payload = {"messaging_product": "whatsapp", "call_id": call_id, "action": action}
+    if action in {"pre_accept", "accept"}:
+        payload["session"] = _validated_call_session(body, "answer")
+    try:
+        result = await _meta_call_request(connection, "POST", "calls", json_body=payload)
+    except Exception:
+        if claimed_now:
+            calls.update_one(
+                {"call_id": call_id, "org_id": user.org_id, "agent_id": user.user_id},
+                {"$unset": {"agent_id": ""}, "$set": {"state": "ringing", "updated_at": datetime.now(timezone.utc)}},
+            )
+        raise
+    state = {"pre_accept": "connecting", "accept": "connected", "reject": "rejected", "terminate": "ended"}[action]
+    calls.update_one(
+        {"call_id": call_id, "org_id": user.org_id},
+        {"$set": {"agent_id": user.user_id, "state": state, "updated_at": datetime.now(timezone.utc)}},
+    )
+    await broadcast_main_ws(connection["wa_id"], "whatsapp", "whatsapp_call", {
+        "id": call_id,
+        "call_id": call_id,
+        "event": "claimed" if action == "pre_accept" else "terminate" if action in {"reject", "terminate"} else "accepted",
+        "agent_id": user.user_id,
+    })
+    return result
+
 
 @router.post("/auth")
 @limiter.limit("10/minute")

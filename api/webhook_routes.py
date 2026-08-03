@@ -186,7 +186,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
     # Remove expired message IDs
     remove_expired_message_ids()
 
-    logger.info(f"Incoming webhook payload:\n{json.dumps(payload, indent=2)}")
+    is_call_webhook = any(
+        change.get("field") == "calls"
+        for entry in payload.get("entry", [])
+        for change in entry.get("changes", [])
+    )
+    if is_call_webhook:
+        logger.info("Incoming WhatsApp Calling webhook (SDP redacted)")
+    else:
+        logger.info(f"Incoming webhook payload:\n{json.dumps(payload, indent=2)}")
 
     if payload["object"] == "whatsapp_business_account":
         if "entry" in payload and len(payload["entry"]) > 0:
@@ -209,6 +217,88 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     if not connection:
                         logger.error(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
                         return {"status": "ok"}
+
+                    # Calling uses the same webhook URL, but its statuses are not message receipts.
+                    if change.get("field") == "calls":
+                        org_id = connection.get("org_id")
+                        contacts = value.get("contacts") or []
+                        contact = contacts[0] if contacts else {}
+                        contact_name = contact.get("profile", {}).get("name") or "WhatsApp customer"
+                        contact_phone = contact.get("wa_id")
+                        calls_collection = db.whatsapp_calls
+
+                        for call in value.get("calls") or []:
+                            call_id = call.get("id")
+                            if not call_id:
+                                continue
+                            existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or {}
+                            session = call.get("session")
+                            session_type = session.get("sdp_type") if isinstance(session, dict) else None
+                            direction = call.get("direction") or existing.get("direction") or (
+                                "USER_INITIATED" if session_type == "offer" else "BUSINESS_INITIATED"
+                            )
+                            phone = contact_phone or (call.get("from") if direction == "USER_INITIATED" else call.get("to")) or existing.get("phone")
+                            digits = "".join(character for character in str(phone or "") if character.isdigit())
+                            conversation = db[f"conversations_{org_id}"].find_one({
+                                "$or": [
+                                    {"customer_id": {"$in": [phone, digits]}},
+                                    {"conversation_id": {"$in": [f"whatsapp_{phone}", f"whatsapp_{digits}"]}},
+                                ]
+                            }) if phone else None
+                            conversation_id = (conversation or {}).get("conversation_id") or existing.get("conversation_id")
+                            safe_call = dict(call)
+                            sdp = session.get("sdp") if isinstance(session, dict) else None
+                            if session is not None and (not isinstance(session, dict) or not isinstance(sdp, str) or len(sdp) > 100_000):
+                                safe_call["session"] = {"sdp_type": session_type} if session_type else {}
+                                logger.warning("Omitting invalid or oversized SDP from WhatsApp call {} websocket event", call_id)
+                            call_payload = {
+                                **safe_call,
+                                "id": call_id,
+                                "call_id": call_id,
+                                "direction": direction,
+                                "conversation_id": conversation_id,
+                                "contact_name": (conversation or {}).get("customer_name") or contact_name,
+                                "phone": phone,
+                                "agent_id": existing.get("agent_id"),
+                            }
+                            calls_collection.update_one(
+                                {"call_id": call_id, "org_id": org_id},
+                                {"$set": {
+                                    "call_id": call_id,
+                                    "org_id": org_id,
+                                    "wa_id": whatsapp_business_id,
+                                    "direction": direction,
+                                    "conversation_id": conversation_id,
+                                    "contact_name": call_payload["contact_name"],
+                                    "phone": phone,
+                                    "state": call.get("event") or existing.get("state"),
+                                    "updated_at": datetime.now(timezone.utc),
+                                }},
+                                upsert=True,
+                            )
+                            await broadcast_main_ws(whatsapp_business_id, "whatsapp", "whatsapp_call", call_payload)
+
+                        for status in value.get("statuses") or []:
+                            call_id = status.get("id")
+                            if not call_id:
+                                continue
+                            existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or {}
+                            calls_collection.update_one(
+                                {"call_id": call_id, "org_id": org_id},
+                                {"$set": {"state": status.get("status"), "updated_at": datetime.now(timezone.utc)}},
+                            )
+                            await broadcast_main_ws(whatsapp_business_id, "whatsapp", "whatsapp_call", {
+                                **status,
+                                "id": call_id,
+                                "call_id": call_id,
+                                "event": "status",
+                                "direction": existing.get("direction"),
+                                "conversation_id": existing.get("conversation_id"),
+                                "contact_name": existing.get("contact_name"),
+                                "phone": existing.get("phone"),
+                                "agent_id": existing.get("agent_id"),
+                            })
+                        continue
 
                     # ============================================================================
                     # Handle status updates (message delivery/read receipts)
@@ -1872,5 +1962,3 @@ async def cashfree_webhook(request: Request):
         logger.error(f"Webhook processing failed : {e}")
 
     return {"status": "processed"}
-
-

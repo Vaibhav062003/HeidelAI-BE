@@ -1734,10 +1734,23 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
     except Exception as e:
         logger.error(f"Error while sending typing indicator: {e}")
 
+def ensure_whatsapp_call_indexes() -> None:
+    try:
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("call_id", 1)],
+            unique=True,
+            name="org_id_call_id_unique",
+            partialFilterExpression={"org_id": {"$type": "string"}, "call_id": {"$type": "string"}},
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create WhatsApp call index: {e}")
+
+
 # Bulk jobs are now stored in the "bulk_jobs" collection in MongoDB.
 # This ensures they survive restarts and work across multiple instances.
 # A TTL index is created on "created_at" to clean up old jobs after 7 days (604800 seconds).
 _bulk_job_indexes_initialized = False
+
 
 def ensure_bulk_job_indexes() -> None:
     """
