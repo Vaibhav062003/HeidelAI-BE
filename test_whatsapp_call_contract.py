@@ -43,5 +43,8 @@ assert 'str(detail.get("code")) != "138000"' in wa_routes
 assert '"POST", "settings"' in wa_routes
 assert '"srtp_key_exchange_protocol": "DTLS"' in wa_routes
 assert 'error_data.get("details")' in wa_routes
+assert "window_end.tzinfo is None" in wa_routes
+assert '"errors": value.get("errors")' in webhook_routes
+assert 'call.get("status") or call.get("event")' in webhook_routes
 
 print("WhatsApp call backend contract check passed.")

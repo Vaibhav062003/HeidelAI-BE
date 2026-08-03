@@ -108,6 +108,8 @@ async def _meta_call_request(connection: dict, method: str, path: str, *, json_b
         data = {}
     if response.is_error:
         error = data.get("error", {}) if isinstance(data, dict) else {}
+        if not isinstance(error, dict):
+            error = {}
         error_data = error.get("error_data", {}) if isinstance(error, dict) else {}
         if not isinstance(error_data, dict):
             error_data = {}
@@ -168,6 +170,8 @@ async def get_call_permission(request: Request, conversation_id: str, user: Curr
 async def request_call_permission(request: Request, conversation_id: str, user: CurrentUser):
     connection, conversation, phone = _calling_context(user.org_id, conversation_id=conversation_id)
     window_end = conversation.get("reply_window_ends_at")
+    if isinstance(window_end, datetime) and window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=timezone.utc)
     if isinstance(window_end, datetime) and window_end <= datetime.now(timezone.utc):
         raise HTTPException(status_code=409, detail="The reply window is closed. Send an approved call-permission template first.")
     body = {
