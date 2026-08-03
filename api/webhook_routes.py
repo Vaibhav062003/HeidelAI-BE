@@ -544,32 +544,31 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     # Runs on all environments and regardless of AI toggle
-                                    if whatsapp_flow:
-                                        automation_response = await execute_whatsapp_flow(
-                                            flow=whatsapp_flow,
-                                            org_id=org_id,
-                                            conversation_id=conversation_id,
-                                            stage=stage,
-                                            trigger_event="message_received",
-                                            trigger_messages=whatsapp_flow.get("trigger_messages"),
-                                            message_content=content,
-                                            customer_name=sender_name2,
-                                            whatsapp_business_id=whatsapp_business_id,
-                                            message_type=message_type,
-                                        )
-
-                                        # If the flow handled the message successfully, exit early.
-                                        if automation_response:
-                                            return {"status": "ok"}
+                                if whatsapp_flow:
+                                    automation_response = await execute_whatsapp_flow(
+                                        flow=whatsapp_flow,
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        stage=stage,
+                                        trigger_event="message_received",
+                                        trigger_messages=whatsapp_flow.get("trigger_messages"),
+                                        message_content=content,
+                                        customer_name=sender_name2,
+                                        whatsapp_business_id=whatsapp_business_id,
+                                        message_type=message_type,
+                                    )
+                                    # If the flow handled the message successfully, exit early.
+                                    if automation_response:
+                                        return {"status": "ok"}
 
                                     # Fallback to AI Agent (only if AI is enabled for this org+conversation)
-                                    if ai_enabled:
+                                if ai_enabled:
 
-                                        if not convo_doc:
-                                            convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                                    if not convo_doc:
+                                        convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
 
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
-                                        chatbot_response = await send_to_agent(
+                                    chatbot_response = await send_to_agent(
                                             conversation_id=conversation_id,
                                             user_input=content,
                                             persona=convo_doc.get("persona", "fallback"),
@@ -581,12 +580,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             message_id=wa_message_id,
                                         )
 
-                                        final_response = chatbot_response["final_response"]
+                                    final_response = chatbot_response["final_response"]
 
-                                        # Update the database with the agent's response
-                                        conversation_id = await create_or_update_whatsapp_conversation(
-                                            org_id=org_id,
-                                            recipient_id=whatsapp_business_id,
+                                    # Update the database with the agent's response
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
                                             customer_phone_no=customer_phone_no,
                                             customer_name=sender_name2,
                                             last_message=final_response,
@@ -594,12 +593,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             mode="ai",
                                         )
 
-                                        # Send the WhatsApp message
-                                        res = await send_whatsapp_message({
-                                            "conversation_id": conversation_id,
-                                            "content": final_response,
-                                            "sender_id": whatsapp_business_id,
-                                        }, org_id, "ai")
+                                    # Send the WhatsApp message
+                                    res = await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": final_response,
+                                        "sender_id": whatsapp_business_id,
+                                    }, org_id, "ai")
 
                                     # Check and send OOS dealer messages if a recent request was logged
                                     try:
@@ -622,55 +621,55 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     return {"status": "ok"}
 
                                 # Handling messages received on HeidelAI's whatsapp number
-                                if is_heidelai and ai_enabled and is_production:
+                                # if is_heidelai and ai_enabled and is_production:
 
-                                    chatbot_response = await send_to_chatbot(
-                                        customer_phone_no=customer_phone_no,
-                                        message_content=content,
-                                        message_id=wa_message_id
-                                    )
+                                #     chatbot_response = await send_to_chatbot(
+                                #         customer_phone_no=customer_phone_no,
+                                #         message_content=content,
+                                #         message_id=wa_message_id
+                                #     )
                                 
-                                    if not chatbot_response:
-                                        return {"status": "ok"}
+                                #     if not chatbot_response:
+                                #         return {"status": "ok"}
 
-                                    # Extract data preserving backward compatibility
-                                    if isinstance(chatbot_response, dict):
-                                        response_text = chatbot_response.get("response", "")
-                                        reply_to_message_id = chatbot_response.get("reply_to_message_id")
-                                    else:
-                                        response_text = chatbot_response
-                                        reply_to_message_id = None
+                                #     # Extract data preserving backward compatibility
+                                #     if isinstance(chatbot_response, dict):
+                                #         response_text = chatbot_response.get("response", "")
+                                #         reply_to_message_id = chatbot_response.get("reply_to_message_id")
+                                #     else:
+                                #         response_text = chatbot_response
+                                #         reply_to_message_id = None
 
-                                    # Storing chatbot response in the DB
-                                    # Create or update conversation
-                                    conversation_id = await create_or_update_whatsapp_conversation(
-                                        org_id=org_id,
-                                        recipient_id=whatsapp_business_id,
-                                        customer_phone_no=customer_phone_no,
-                                        customer_name=sender_name2,
-                                        last_message=response_text,
-                                        last_sender="ai",
-                                        mode="reply"
-                                    )
+                                #     # Storing chatbot response in the DB
+                                #     # Create or update conversation
+                                #     conversation_id = await create_or_update_whatsapp_conversation(
+                                #         org_id=org_id,
+                                #         recipient_id=whatsapp_business_id,
+                                #         customer_phone_no=customer_phone_no,
+                                #         customer_name=sender_name2,
+                                #         last_message=response_text,
+                                #         last_sender="ai",
+                                #         mode="reply"
+                                #     )
                                     
-                                    msg_kwargs = {
-                                        "message": {
-                                            "conversation_id": conversation_id,
-                                            "content": response_text,
-                                            "sender_id": HEIDELAI_ORG_WA_ID,
-                                        },
-                                        "org_id": org_id,
-                                        "mode": "ai"
-                                    }
+                                #     msg_kwargs = {
+                                #         "message": {
+                                #             "conversation_id": conversation_id,
+                                #             "content": response_text,
+                                #             "sender_id": HEIDELAI_ORG_WA_ID,
+                                #         },
+                                #         "org_id": org_id,
+                                #         "mode": "ai"
+                                #     }
                                     
-                                    if reply_to_message_id:
-                                        msg_kwargs["context_type"] = "message_reply"
-                                        msg_kwargs["context"] = {"mid": reply_to_message_id}
+                                #     if reply_to_message_id:
+                                #         msg_kwargs["context_type"] = "message_reply"
+                                #         msg_kwargs["context"] = {"mid": reply_to_message_id}
 
-                                    # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
-                                    res = await send_whatsapp_message(**msg_kwargs)
+                                #     # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
+                                #     res = await send_whatsapp_message(**msg_kwargs)
 
-                                    return {"status": "ok"}
+                                #     return {"status": "ok"}
 
                                 elif is_pma_wa and ai_enabled and is_production:
 
