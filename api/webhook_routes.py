@@ -232,7 +232,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             if not call_id:
                                 continue
                             existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or {}
-                            session_type = (call.get("session") or {}).get("sdp_type")
+                            session = call.get("session")
+                            session_type = session.get("sdp_type") if isinstance(session, dict) else None
                             direction = call.get("direction") or existing.get("direction") or (
                                 "USER_INITIATED" if session_type == "offer" else "BUSINESS_INITIATED"
                             )
@@ -245,8 +246,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 ]
                             }) if phone else None
                             conversation_id = (conversation or {}).get("conversation_id") or existing.get("conversation_id")
+                            safe_call = dict(call)
+                            sdp = session.get("sdp") if isinstance(session, dict) else None
+                            if session is not None and (not isinstance(session, dict) or not isinstance(sdp, str) or len(sdp) > 100_000):
+                                safe_call["session"] = {"sdp_type": session_type} if session_type else {}
+                                logger.warning("Omitting invalid or oversized SDP from WhatsApp call {} websocket event", call_id)
                             call_payload = {
-                                **call,
+                                **safe_call,
+                                "id": call_id,
+                                "call_id": call_id,
                                 "direction": direction,
                                 "conversation_id": conversation_id,
                                 "contact_name": (conversation or {}).get("customer_name") or contact_name,
@@ -281,6 +289,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             )
                             await broadcast_main_ws(whatsapp_business_id, "whatsapp", "whatsapp_call", {
                                 **status,
+                                "id": call_id,
                                 "call_id": call_id,
                                 "event": "status",
                                 "direction": existing.get("direction"),
@@ -1915,4 +1924,3 @@ async def cashfree_webhook(request: Request):
         logger.error(f"Webhook processing failed : {e}")
 
     return {"status": "processed"}
-

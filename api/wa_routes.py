@@ -186,7 +186,7 @@ async def start_whatsapp_call(request: Request, conversation_id: str, body: dict
         raise HTTPException(status_code=502, detail="Meta did not return a WhatsApp call ID")
     now = datetime.now(timezone.utc)
     db.whatsapp_calls.update_one(
-        {"call_id": call_id},
+        {"org_id": user.org_id, "call_id": call_id},
         {"$set": {
             "call_id": call_id,
             "org_id": user.org_id,
@@ -203,6 +203,7 @@ async def start_whatsapp_call(request: Request, conversation_id: str, body: dict
     )
     await broadcast_main_ws(connection["wa_id"], "whatsapp", "whatsapp_call", {
         "id": call_id,
+        "call_id": call_id,
         "event": "started",
         "direction": "BUSINESS_INITIATED",
         "conversation_id": conversation_id,
@@ -257,6 +258,7 @@ async def update_whatsapp_call(request: Request, body: dict, user: CurrentUser):
     )
     await broadcast_main_ws(connection["wa_id"], "whatsapp", "whatsapp_call", {
         "id": call_id,
+        "call_id": call_id,
         "event": "claimed" if action == "pre_accept" else "terminate" if action in {"reject", "terminate"} else "accepted",
         "agent_id": user.user_id,
     })
