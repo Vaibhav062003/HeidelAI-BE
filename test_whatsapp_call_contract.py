@@ -38,5 +38,10 @@ assert '**safe_call' in webhook_routes
 assert '[("org_id", 1), ("call_id", 1)]' in wa_service
 assert "unique=True" in wa_service
 assert "ensure_whatsapp_call_indexes" in lifespan
+assert "except httpx.RequestError" in wa_routes
+assert 'str(detail.get("code")) != "138000"' in wa_routes
+assert '"POST", "settings"' in wa_routes
+assert '"srtp_key_exchange_protocol": "DTLS"' in wa_routes
+assert 'error_data.get("details")' in wa_routes
 
 print("WhatsApp call backend contract check passed.")

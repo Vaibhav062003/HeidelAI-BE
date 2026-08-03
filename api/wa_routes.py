@@ -93,22 +93,51 @@ async def _meta_call_request(connection: dict, method: str, path: str, *, json_b
     version = WA_VERSION or VERSION or "v24.0"
     url = f"https://graph.facebook.com/{version}/{connection['phone_id']}/{path}"
     headers = {"Authorization": f"Bearer {connection['access_token']}"}
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.request(method, url, headers=headers, json=json_body, params=params)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(method, url, headers=headers, json=json_body, params=params)
+    except httpx.RequestError as error:
+        logger.error("WhatsApp Calling API request failed: {} {} ({})", method, path, type(error).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail={"message": "Meta's Calling API could not be reached. Try again.", "code": "meta_network_error"},
+        ) from error
     try:
         data = response.json()
     except ValueError:
         data = {}
     if response.is_error:
         error = data.get("error", {}) if isinstance(data, dict) else {}
+        error_data = error.get("error_data", {}) if isinstance(error, dict) else {}
+        if not isinstance(error_data, dict):
+            error_data = {}
+        code = error.get("code")
+        subcode = error.get("error_subcode")
+        trace_id = error.get("fbtrace_id")
+        logger.error(
+            "WhatsApp Calling API rejected {} {}: status={} code={} subcode={} trace_id={}",
+            method, path, response.status_code, code, subcode, trace_id,
+        )
         raise HTTPException(
             status_code=502 if response.status_code >= 500 else 400,
             detail={
-                "message": error.get("message") or "Meta could not complete the WhatsApp call request",
-                "code": error.get("code"),
+                "message": error_data.get("details") or error.get("message") or "Meta could not complete the WhatsApp call request",
+                "code": code,
+                "subcode": subcode,
+                "trace_id": trace_id,
             },
         )
     return data
+
+
+async def _enable_whatsapp_calling(connection: dict):
+    return await _meta_call_request(connection, "POST", "settings", json_body={
+        "calling": {
+            "status": "ENABLED",
+            "callback_permission_status": "ENABLED",
+            "srtp_key_exchange_protocol": "DTLS",
+        },
+    })
 
 
 def _validated_call_session(body: dict, expected_type: str):
@@ -124,7 +153,14 @@ def _validated_call_session(body: dict, expected_type: str):
 @limiter.limit("30/minute")
 async def get_call_permission(request: Request, conversation_id: str, user: CurrentUser):
     connection, _, phone = _calling_context(user.org_id, conversation_id=conversation_id)
-    return await _meta_call_request(connection, "GET", "call_permissions", params={"user_wa_id": phone})
+    try:
+        return await _meta_call_request(connection, "GET", "call_permissions", params={"user_wa_id": phone})
+    except HTTPException as error:
+        detail = error.detail if isinstance(error.detail, dict) else {}
+        if str(detail.get("code")) != "138000":
+            raise
+        await _enable_whatsapp_calling(connection)
+        return await _meta_call_request(connection, "GET", "call_permissions", params={"user_wa_id": phone})
 
 
 @router.post("/conversations/{conversation_id}/call-permission")
