@@ -22,6 +22,7 @@ from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
 from services.utils import normalize_phone
+from services.push_notification_service import schedule_customer_message_push
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
@@ -227,7 +228,8 @@ async def store_whatsapp_message(
     temp_id: Optional[str] = None,
     context_type: Optional[str] = None,
     context: Optional[dict] = None,
-    bot_context: Optional[dict] = None
+    bot_context: Optional[dict] = None,
+    notify_push: bool = False,
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -281,6 +283,14 @@ async def store_whatsapp_message(
     messages_collection.insert_one(message)
 
     logger.success(f"Whatsapp message stored: {message_id}")
+
+    if notify_push and role == MessageRole.CUSTOMER and mode != "private":
+        schedule_customer_message_push(
+            org_id=org_id,
+            platform="whatsapp",
+            message_id=message_id,
+            conversation_id=conversation_id,
+        )
     
     # Keep only latest 500 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})

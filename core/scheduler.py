@@ -425,6 +425,7 @@ async def update_ai_status(org_type: str = "all"):
 
 def start_scheduler():
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests
+    from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
@@ -434,6 +435,7 @@ def start_scheduler():
     scheduler.add_job(process_pending_oos_sends, "interval", minutes=15)
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
+    scheduler.add_job(process_pending_push_notifications, "interval", minutes=1)
+    scheduler.add_job(process_pending_member_device_revocations, "interval", minutes=1)
     scheduler.start()
     logger.success("APScheduler started (interval = 6 hours).")
-

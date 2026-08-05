@@ -31,6 +31,7 @@ from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
 from services.automation_trigger_handler import check_and_trigger_automations
+from services.push_notification_service import schedule_customer_message_push
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -612,7 +613,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         raw_data=message,
                                         mode="reply",
                                         context_type=context_type,
-                                        context=context
+                                        context=context,
+                                        notify_push=True,
                                     )
 
                                 contact_data = {
@@ -865,6 +867,26 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 elif message_type == "document":
                                     content = media_data.get("caption", "Shared a document")
 
+                                # Make the new conversation and notification durable before the
+                                # external media upload; Cloudinary may be slow or unavailable.
+                                conversation_id = await create_or_update_whatsapp_conversation(
+                                    org_id=org_id,
+                                    recipient_id=whatsapp_business_id,
+                                    customer_phone_no=customer_phone_no,
+                                    customer_name=sender_name2,
+                                    last_message=content,
+                                    last_sender="customer",
+                                    reply_window_expiry=reply_window_expiry_time_utc,
+                                    is_ad_referral=is_ad_referral,
+                                    mode="reply",
+                                )
+                                schedule_customer_message_push(
+                                    org_id=org_id,
+                                    platform="whatsapp",
+                                    message_id=message_id,
+                                    conversation_id=conversation_id,
+                                )
+
                                 background_tasks.add_task(
                                     upload_and_send_whatsapp_media_background,
                                     media_url=media_url,
@@ -963,7 +985,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         raw_data=message,
                                         mode="reply",
                                         context_type=context_type,
-                                        context=context
+                                        context=context,
+                                        notify_push=True,
                                     )
 
                                 if whatsapp_flow:
@@ -1297,7 +1320,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 raw_data=message,
                                 mode="reply",
                                 context_type=context_type,
-                                context=context
+                                context=context,
+                                notify_push=True,
                             )
 
                             # Check if conversation exists
@@ -1770,6 +1794,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         message_id=ig_message_id,  # Use the ID from the webhook for deduplication
                         context_type=context_type,
                         context=context,
+                        notify_push=not message_echo,
                     )
                     
                     if not message_echo:
