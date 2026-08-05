@@ -631,8 +631,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 #  Don't execute for heidel_ai as it is not on whatsapp flow yet but has AI
                                 if not is_heidelai:
-                                    await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
-
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     # Runs on all environments and regardless of AI toggle
                                     if whatsapp_flow:
@@ -651,6 +649,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                         # If the flow handled the message successfully, exit early.
                                         if automation_response:
+                                            await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
                                             return {"status": "ok"}
 
                                     # Fallback to AI Agent (only if AI is enabled for this org+conversation)
@@ -691,6 +690,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "content": final_response,
                                             "sender_id": whatsapp_business_id,
                                         }, org_id, "ai")
+                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
                                     # Check and send OOS dealer messages if a recent request was logged
                                     try:

@@ -7,6 +7,21 @@ from loguru import logger
 
 db = get_mongo_db()
 
+
+async def latest_unread_whatsapp_message_id(org_id: str, conversation_id: str) -> str | None:
+    async_db = get_async_mongo_db()
+    message = await async_db[f"messages_{org_id}"].find_one(
+        {
+            "role": "customer",
+            "status": {"$ne": "read"},
+            "platform": "whatsapp",
+            "conversation_id": conversation_id,
+        },
+        {"message_id": 1, "_id": 0},
+        sort=[("timestamp", -1)],
+    )
+    return message.get("message_id") if message else None
+
 async def cleanup_client(client_id: str):
     """
     Clean up all references to a disconnected client.
@@ -78,6 +93,13 @@ async def handle_typing_event(client_id: str, data: dict):
     # Which platform is this typing event for?
     platform = data.get("platform")  # "instagram" or "whatsapp"
 
+    conversation_id = data.get("conversation_id")
+    org_id = meta.get("org_id")
+    is_active_viewer = services.client_convo_map.get(client_id) == (org_id, conversation_id)
+    message_id = None
+    if platform == "whatsapp" and wa_id and data.get("is_typing") is True and is_active_viewer:
+        message_id = await latest_unread_whatsapp_message_id(org_id, conversation_id)
+
     # Broadcast to Instagram
     if platform == "instagram" and ig_id:
         await broadcast_main_ws(
@@ -97,13 +119,13 @@ async def handle_typing_event(client_id: str, data: dict):
             payload=data,
             exclude_client_id=client_id 
         )
-        
-        from services.wa_service import read_message_and_typing_indicator
-        asyncio.create_task(read_message_and_typing_indicator(
-            mode="platform",
-            whatsapp_id=wa_id,
-            conversation_id=data.get("conversation_id"),
-        ))
+
+        if message_id and services.client_convo_map.get(client_id) == (org_id, conversation_id):
+            from services.wa_service import read_message_and_typing_indicator
+            asyncio.create_task(read_message_and_typing_indicator(
+                whatsapp_id=wa_id,
+                message_id=message_id,
+            ))
 
 async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: str, payload: dict, exclude_client_id: str = None):
     """
@@ -224,6 +246,17 @@ def join_conversation_presence(org_id: str, conversation_id: str, client_id: str
     Adds a client to the presence tracker for a specific conversation,
     indexed by org for fast org-scoped lookups.
     """
+    previous = services.client_convo_map.get(client_id)
+    if previous and previous != (org_id, conversation_id):
+        previous_org, previous_conversation = previous
+        previous_viewers = services.org_convo_viewers.get(previous_org, {}).get(previous_conversation)
+        if previous_viewers:
+            previous_viewers.discard(client_id)
+            if not previous_viewers:
+                del services.org_convo_viewers[previous_org][previous_conversation]
+                if not services.org_convo_viewers[previous_org]:
+                    del services.org_convo_viewers[previous_org]
+
     services.org_convo_viewers[org_id][conversation_id].add(client_id)
     services.client_convo_map[client_id] = (org_id, conversation_id)
     logger.info(f"Client {client_id} JOINED conversation ({org_id}, {conversation_id})")
@@ -242,7 +275,8 @@ def leave_conversation_presence(org_id: str, conversation_id: str, client_id: st
             if not services.org_convo_viewers[org_id]:
                 del services.org_convo_viewers[org_id]
 
-    services.client_convo_map.pop(client_id, None)
+    if services.client_convo_map.get(client_id) == (org_id, conversation_id):
+        services.client_convo_map.pop(client_id, None)
     logger.info(f"Client {client_id} LEFT conversation ({org_id}, {conversation_id})")
 
 

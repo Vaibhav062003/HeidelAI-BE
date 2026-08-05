@@ -23,6 +23,7 @@ from services.common_service import (
     fetch_conversation,
     send_message,
     fetch_messages,
+    acknowledge_conversation_opened,
     close_conversation, 
     unarchive_data, 
     add_private_note, 
@@ -160,6 +161,17 @@ async def get_messages(
         org_id, conversation_id, user.user_id, agent_username,
         before=before, limit=limit
     )
+
+@router.post("/api/conversations/{conversation_id}/acknowledge-open")
+@limiter.limit("60/minute")
+async def acknowledge_open(
+    request: Request,
+    conversation_id: str,
+    user: CurrentUser,
+    observed_counter: int = Query(..., ge=0),
+):
+    """Clear the app's unread counter without sending a platform read receipt."""
+    return await acknowledge_conversation_opened(user.org_id, conversation_id, observed_counter)
 
 @router.post("/api/conversations/send-message")
 @limiter.limit("30/minute")
