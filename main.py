@@ -44,6 +44,7 @@ else:
         "https://development.heidelai.com",
         "https://www.testing.heidelai.com", 
         "https://testing.heidelai.com",
+        "https://localhost",
         "http://localhost", 
         "http://localhost:3000", 
     ]
