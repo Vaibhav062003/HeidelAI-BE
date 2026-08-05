@@ -32,7 +32,6 @@ revocations = db.push_device_revocations
 revoked_members = db.push_revoked_push_members
 _credentials = None
 _credential_lock = asyncio.Lock()
-_background_tasks: set[asyncio.Task] = set()
 
 DEVICE_TTL_DAYS = 30
 EVENT_TTL_HOURS = 24
@@ -271,10 +270,16 @@ def process_member_device_revocation(revocation_id: str) -> None:
 
 
 async def process_pending_member_device_revocations(limit: int = 50) -> None:
-    pending = revocations.find({"status": "pending"}, {"revocation_id": 1}).sort("created_at", 1).limit(limit)
+    pending = await asyncio.to_thread(
+        lambda: list(
+            revocations.find({"status": "pending"}, {"revocation_id": 1})
+            .sort("created_at", 1)
+            .limit(limit)
+        )
+    )
     for revocation in pending:
         try:
-            process_member_device_revocation(revocation["revocation_id"])
+            await asyncio.to_thread(process_member_device_revocation, revocation["revocation_id"])
         except Exception as exc:
             logger.warning(f"Push device revocation deferred: {type(exc).__name__}")
 
@@ -322,17 +327,17 @@ def enqueue_customer_message_push(*, org_id: str, platform: str, message_id: str
     return event["event_id"]
 
 
-def schedule_customer_message_push(*, org_id: str, platform: str, message_id: str, conversation_id: str) -> None:
+async def schedule_customer_message_push(
+    *, org_id: str, platform: str, message_id: str, conversation_id: str
+) -> None:
     try:
-        event_id = enqueue_customer_message_push(
+        await asyncio.to_thread(
+            enqueue_customer_message_push,
             org_id=org_id,
             platform=platform,
             message_id=message_id,
             conversation_id=conversation_id,
         )
-        task = asyncio.create_task(process_push_event(event_id))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
     except Exception as exc:
         # Push must never make the Meta webhook fail; the stored message remains authoritative.
         logger.warning(f"Could not enqueue Android push notification: {type(exc).__name__}")
@@ -407,19 +412,20 @@ def classify_fcm_failure(status_code: int, error_code: str | None) -> Literal["p
     return "retry"
 
 
-async def _send(token: str, event_id: str) -> Literal["sent", "permanent", "retry"]:
+async def _send(
+    client: httpx.AsyncClient, token: str, event_id: str
+) -> Literal["sent", "permanent", "retry"]:
     global _credentials
     url = f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send"
     response = None
     for auth_attempt in range(2):
         access_token = await _access_token()
         try:
-            async with httpx.AsyncClient(timeout=12) as client:
-                response = await client.post(
-                    url,
-                    headers={"Authorization": f"Bearer {access_token}"},
-                    json=build_fcm_message(token, event_id),
-                )
+            response = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                json=build_fcm_message(token, event_id),
+            )
         except httpx.RequestError:
             return "retry"
         if response.status_code != 401 or auth_attempt == 1:
@@ -441,7 +447,8 @@ async def _send(token: str, event_id: str) -> Literal["sent", "permanent", "retr
 async def process_push_event(event_id: str) -> None:
     now = datetime.now(timezone.utc)
     claim_id = uuid.uuid4().hex
-    event = events.find_one_and_update(
+    event = await asyncio.to_thread(
+        events.find_one_and_update,
         {
             "event_id": event_id,
             "expires_at": {"$gt": now},
@@ -457,48 +464,54 @@ async def process_push_event(event_id: str) -> None:
         return
 
     completed = set(event.get("completed_token_hashes", []))
-    active_devices = list(
-        devices.find(
-            {"org_id": event["org_id"], "active": True, "expires_at": {"$gt": now}},
-            {"encrypted_token": 1, "token_hash": 1},
+    active_devices = await asyncio.to_thread(
+        lambda: list(
+            devices.find(
+                {"org_id": event["org_id"], "active": True, "expires_at": {"$gt": now}},
+                {"encrypted_token": 1, "token_hash": 1},
+            )
         )
     )
     retry_needed = False
 
-    for device in active_devices:
-        token_hash = device["token_hash"]
-        if token_hash in completed:
-            continue
-        try:
-            token = _fernet().decrypt(device["encrypted_token"].encode()).decode()
-            result = await _send(token, event_id)
-        except (InvalidToken, UnicodeDecodeError):
-            result = "permanent"
-        except Exception as exc:
-            logger.warning(f"Android push delivery deferred: {type(exc).__name__}")
-            result = "retry"
+    async with httpx.AsyncClient(timeout=12) as client:
+        for device in active_devices:
+            token_hash = device["token_hash"]
+            if token_hash in completed:
+                continue
+            try:
+                token = _fernet().decrypt(device["encrypted_token"].encode()).decode()
+                result = await _send(client, token, event_id)
+            except (InvalidToken, UnicodeDecodeError):
+                result = "permanent"
+            except Exception as exc:
+                logger.warning(f"Android push delivery deferred: {type(exc).__name__}")
+                result = "retry"
 
-        if result == "retry":
-            retry_needed = True
-            progress = events.update_one(
-                {"event_id": event_id, "claim_id": claim_id},
-                {"$set": {"claimed_at": datetime.now(timezone.utc)}},
-            )
-        else:
-            progress = events.update_one(
-                {"event_id": event_id, "claim_id": claim_id},
-                {
-                    "$addToSet": {"completed_token_hashes": token_hash},
-                    "$set": {"claimed_at": datetime.now(timezone.utc)},
-                },
-            )
-            if result == "permanent":
-                devices.update_one(
-                    {"token_hash": token_hash},
-                    {"$set": {"active": False, "updated_at": datetime.now(timezone.utc)}},
+            if result == "retry":
+                retry_needed = True
+                progress = await asyncio.to_thread(
+                    events.update_one,
+                    {"event_id": event_id, "claim_id": claim_id},
+                    {"$set": {"claimed_at": datetime.now(timezone.utc)}},
                 )
-        if progress.matched_count == 0:
-            return
+            else:
+                progress = await asyncio.to_thread(
+                    events.update_one,
+                    {"event_id": event_id, "claim_id": claim_id},
+                    {
+                        "$addToSet": {"completed_token_hashes": token_hash},
+                        "$set": {"claimed_at": datetime.now(timezone.utc)},
+                    },
+                )
+                if result == "permanent":
+                    await asyncio.to_thread(
+                        devices.update_one,
+                        {"token_hash": token_hash},
+                        {"$set": {"active": False, "updated_at": datetime.now(timezone.utc)}},
+                    )
+            if progress.matched_count == 0:
+                return
 
     update: dict = {"$set": {"updated_at": datetime.now(timezone.utc)}}
     if retry_needed:
@@ -509,20 +522,29 @@ async def process_push_event(event_id: str) -> None:
         })
     else:
         update["$set"].update({"status": "sent", "sent_at": datetime.now(timezone.utc)})
-    events.update_one({"event_id": event_id, "claim_id": claim_id}, update)
+    await asyncio.to_thread(events.update_one, {"event_id": event_id, "claim_id": claim_id}, update)
 
 
 async def process_pending_push_notifications(limit: int = 25) -> None:
     now = datetime.now(timezone.utc)
-    pending = events.find(
-        {
-            "expires_at": {"$gt": now},
-            "$or": [
-                {"status": "pending", "next_attempt_at": {"$lte": now}},
-                {"status": "sending", "claimed_at": {"$lt": now - timedelta(minutes=5)}},
-            ],
-        },
-        {"event_id": 1},
-    ).sort("next_attempt_at", 1).limit(limit)
+    pending = await asyncio.to_thread(
+        lambda: list(
+            events.find(
+                {
+                    "expires_at": {"$gt": now},
+                    "$or": [
+                        {"status": "pending", "next_attempt_at": {"$lte": now}},
+                        {"status": "sending", "claimed_at": {"$lt": now - timedelta(minutes=5)}},
+                    ],
+                },
+                {"event_id": 1},
+            ).sort("next_attempt_at", 1).limit(limit)
+        )
+    )
     for event in pending:
-        await process_push_event(event["event_id"])
+        try:
+            await process_push_event(event["event_id"])
+        except Exception as exc:
+            logger.warning(
+                f"Android push event {event['event_id']} deferred: {type(exc).__name__}"
+            )

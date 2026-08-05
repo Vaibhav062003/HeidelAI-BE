@@ -880,7 +880,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     is_ad_referral=is_ad_referral,
                                     mode="reply",
                                 )
-                                schedule_customer_message_push(
+                                await schedule_customer_message_push(
                                     org_id=org_id,
                                     platform="whatsapp",
                                     message_id=message_id,

@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import hashlib
 import hmac
 import json
@@ -142,14 +143,20 @@ async def clerk_membership_webhook(request: Request):
         raise HTTPException(status_code=422, detail="Membership user is missing")
 
     if event_type in created_events:
-        restore_member_push_access(org_id=org_id, user_id=user_id, event_at=event_at)
+        await asyncio.to_thread(
+            restore_member_push_access,
+            org_id=org_id,
+            user_id=user_id,
+            event_at=event_at,
+        )
         return {"status": "success"}
 
-    revocation_id = queue_member_device_revocation(
+    revocation_id = await asyncio.to_thread(
+        queue_member_device_revocation,
         org_id=org_id,
         user_id=user_id,
         revocation_id=f"clerk_{webhook_id}",
         event_at=event_at,
     )
-    process_member_device_revocation(revocation_id)
+    await asyncio.to_thread(process_member_device_revocation, revocation_id)
     return {"status": "success"}

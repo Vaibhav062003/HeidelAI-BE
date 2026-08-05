@@ -285,7 +285,7 @@ async def store_whatsapp_message(
     logger.success(f"Whatsapp message stored: {message_id}")
 
     if notify_push and role == MessageRole.CUSTOMER and mode != "private":
-        schedule_customer_message_push(
+        await schedule_customer_message_push(
             org_id=org_id,
             platform="whatsapp",
             message_id=message_id,

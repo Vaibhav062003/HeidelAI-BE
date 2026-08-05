@@ -363,7 +363,7 @@ async def store_instagram_message(
     logger.success(f"Instagram message stored: {message_id}")
 
     if notify_push and role == MessageRole.CUSTOMER and mode != "private":
-        schedule_customer_message_push(
+        await schedule_customer_message_push(
             org_id=org_id,
             platform="instagram",
             message_id=message_id,
