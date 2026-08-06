@@ -15,7 +15,7 @@ async def send_to_agent(
     customer_name: str,
     org_id: str,
     source: str = "webhook",
-    timeout: int = 20,
+    timeout: int = 30,
     reply_context_message_id: str = None,
     message_id: str = None,
     version: str = None
