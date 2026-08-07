@@ -213,11 +213,37 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     target_dealers = target_dealers[:MAX_DEALERS_PER_SEND]
 
     if not target_dealers:
-        logger.warning(f"[OOS] No dealers found to contact for query_id={oos_doc['query_id']}. Transitioning status to 'no_dealers'")
+        logger.warning(f"[OOS] No matching dealers found for brand/category in query_id={oos_doc['query_id']}. Creating escalation and setting status to 'no_dealers'")
         await async_db["oos_requests"].update_one(
             {"query_id": oos_doc["query_id"]},
             {"$set": {"status": "no_dealers"}}
         )
+        # Escalation to team when no matching dealer exists in dealer_directory
+        from services.team_service import create_ai_escalation
+        inquiry_time = oos_doc.get("created_at", "")
+        if isinstance(inquiry_time, datetime):
+            inquiry_time = inquiry_time.astimezone(IST).strftime("%H:%M %d-%b-%Y")
+
+        escalation_text = (
+            f"Customer Number: {oos_doc.get('customer_number', 'N/A')}\n"
+            f"Customer Inquiry: {oos_doc.get('raw_query_text', 'N/A')}\n"
+            f"Inquiry Time: {inquiry_time}\n"
+            f"Status: ESCALATED - No dealer found matching brand '{detected_brand or 'N/A'}' or requested category in dealer directory.\n"
+        )
+
+        await create_ai_escalation(org_id, {
+            "user_name": oos_doc.get("customer_name", "Customer"),
+            "customer_number": oos_doc.get("customer_number", ""),
+            "customer_text": escalation_text,
+            "inferred_intent": "no_dealer_found",
+            "status": "pending_human_review",
+            "role": "oos_no_dealer",
+            "sender_name": "OOS System",
+            "metadata": {
+                "oos_query_id": oos_doc.get("query_id"),
+                "detected_brand": detected_brand,
+            }
+        })
         return
 
     # Generate dealer message
