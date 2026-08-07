@@ -7,7 +7,11 @@ from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_in
 from services.automation_scheduler import startup_scheduler, shutdown_scheduler
 from services.google_sheets_scheduler import startup_google_scheduler, shutdown_google_scheduler
 from services.oos_service import ensure_oos_indexes
-from services.push_notification_service import ensure_push_notification_indexes
+from services.push_notification_service import (
+    ensure_push_notification_indexes,
+    start_push_notification_workers,
+    stop_push_notification_workers,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -25,8 +29,10 @@ async def lifespan(app: FastAPI):
     await startup_scheduler()
     await startup_google_scheduler()
     await ensure_oos_indexes()
+    await start_push_notification_workers()
     yield
     # Shutdown
+    await stop_push_notification_workers()
     await shutdown_scheduler()
     await shutdown_google_scheduler()
     clear_agents()

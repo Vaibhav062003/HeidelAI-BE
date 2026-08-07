@@ -5,7 +5,7 @@ import hmac
 from pathlib import Path
 
 
-def test_fcm_payload_contains_no_customer_data() -> None:
+def test_fcm_payload_contains_customer_preview_without_internal_ids() -> None:
     source = Path("services/push_notification_service.py").read_text()
     tree = ast.parse(source)
     function = next(
@@ -14,16 +14,34 @@ def test_fcm_payload_contains_no_customer_data() -> None:
     )
     namespace: dict = {}
     exec(compile(ast.Module(body=[function], type_ignores=[]), "<payload>", "exec"), namespace)
-    payload = namespace["build_fcm_message"]("device-token", "a" * 32)["message"]
+    payload = namespace["build_fcm_message"](
+        "device-token", "a" * 32, "Vinayaka Computers", "Need the RTX 3050 price"
+    )["message"]
 
     assert payload["data"] == {"kind": "customer_message", "event_id": "a" * 32}
     assert payload["notification"] == {
-        "title": "New customer message",
-        "body": "Open HeidelAI to view it",
+        "title": "Vinayaka Computers",
+        "body": "Need the RTX 3050 price",
     }
     serialized = str(payload).lower()
-    for forbidden in ("conversation_id", "phone", "customer_name", "message_text", "org_id"):
+    for forbidden in ("conversation_id", "phone", "message_text", "org_id"):
         assert forbidden not in serialized
+
+
+def test_customer_preview_is_read_from_the_durable_event() -> None:
+    tree = ast.parse(Path("services/push_notification_service.py").read_text())
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_clean_notification_text", "notification_content"}
+    ]
+    namespace = {"ATTACHMENT_LABELS": {}}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "<preview>", "exec"), namespace)
+    title, body = namespace["notification_content"]({
+        "notification_title": "Vinayaka Computers",
+        "notification_body": "Need the RTX 3050 price",
+    })
+    assert (title, body) == ("Vinayaka Computers", "Need the RTX 3050 price")
 
 
 def test_device_registration_cannot_choose_its_org_or_user() -> None:
@@ -139,6 +157,113 @@ def test_push_enqueue_is_durable_without_unbounded_tasks() -> None:
         and call.func.attr == "to_thread"
         for call in calls
     )
+    assert any(
+        isinstance(call.func, ast.Attribute) and call.func.attr == "put_nowait"
+        for call in calls
+    )
+
+
+def test_immediate_push_delivery_is_bounded_and_lifecycle_managed() -> None:
+    source = Path("services/push_notification_service.py").read_text()
+    tree = ast.parse(source)
+    start = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "start_push_notification_workers"
+    )
+    queue_calls = [
+        node for node in ast.walk(start)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "asyncio"
+        and node.func.attr == "Queue"
+    ]
+    assert len(queue_calls) == 1
+    assert any(keyword.arg == "maxsize" for keyword in queue_calls[0].keywords)
+    lifecycle = Path("core/lifespan.py").read_text()
+    assert "await start_push_notification_workers()" in lifecycle
+    assert "await stop_push_notification_workers()" in lifecycle
+
+
+def test_new_event_reaches_an_immediate_worker() -> None:
+    tree = ast.parse(Path("services/push_notification_service.py").read_text())
+    names = {
+        "schedule_customer_message_push",
+        "_immediate_push_worker",
+        "start_push_notification_workers",
+        "stop_push_notification_workers",
+    }
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name in names
+    ]
+    delivered: list[str] = []
+    enqueued: dict = {}
+    delivered_event = __import__("asyncio").Event()
+
+    async def process_push_event(event_id: str) -> None:
+        delivered.append(event_id)
+        delivered_event.set()
+
+    class Logger:
+        @staticmethod
+        def warning(_message: str) -> None:
+            pass
+
+    namespace = {
+        "asyncio": __import__("asyncio"),
+        "enqueue_customer_message_push": lambda **kwargs: enqueued.update(kwargs) or "event-test",
+        "process_push_event": process_push_event,
+        "logger": Logger(),
+        "_clean_notification_text": lambda value, *, limit, fallback: str(value or fallback)[:limit],
+        "ATTACHMENT_LABELS": {"image": "Sent a photo"},
+        "PUSH_QUEUE_SIZE": 2,
+        "PUSH_WORKER_COUNT": 1,
+        "_immediate_queue": None,
+        "_immediate_workers": set(),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "<workers>", "exec"), namespace)
+
+    async def run() -> None:
+        await namespace["start_push_notification_workers"]()
+        await namespace["schedule_customer_message_push"](
+            org_id="org_test",
+            platform="whatsapp",
+            message_id="message_test",
+            conversation_id="conversation_test",
+            sender_name="Vinayaka Computers",
+            content="Ryzen 5 5500 build",
+            message_type="image",
+        )
+        await __import__("asyncio").wait_for(delivered_event.wait(), timeout=1)
+        await namespace["stop_push_notification_workers"]()
+
+    __import__("asyncio").run(run())
+    assert delivered == ["event-test"]
+    assert enqueued["notification_title"] == "Vinayaka Computers"
+    assert enqueued["notification_body"] == "Ryzen 5 5500 build"
+
+
+def test_media_push_carries_preview_before_background_upload() -> None:
+    tree = ast.parse(Path("api/webhook_routes.py").read_text())
+    enqueue = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "schedule_customer_message_push"
+    )
+    keywords = {keyword.arg for keyword in enqueue.keywords}
+    assert {"sender_name", "content", "message_type"} <= keywords
+    upload = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_task"
+        and node.args
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "upload_and_send_whatsapp_media_background"
+    )
+    assert enqueue.lineno < upload.lineno
 
 
 def test_async_push_jobs_do_not_call_pymongo_directly() -> None:
@@ -226,12 +351,16 @@ def test_pending_push_batch_isolates_event_failures() -> None:
 
 
 if __name__ == "__main__":
-    test_fcm_payload_contains_no_customer_data()
+    test_fcm_payload_contains_customer_preview_without_internal_ids()
+    test_customer_preview_is_read_from_the_durable_event()
     test_device_registration_cannot_choose_its_org_or_user()
     test_only_explicit_token_errors_are_permanent()
     test_clerk_webhook_signature_verification()
     test_registration_checks_durable_membership_revocation_before_and_after_write()
     test_push_enqueue_is_durable_without_unbounded_tasks()
+    test_immediate_push_delivery_is_bounded_and_lifecycle_managed()
+    test_new_event_reaches_an_immediate_worker()
+    test_media_push_carries_preview_before_background_upload()
     test_async_push_jobs_do_not_call_pymongo_directly()
     test_one_http_client_is_reused_for_each_push_event()
     test_pending_push_batch_isolates_event_failures()

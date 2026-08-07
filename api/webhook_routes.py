@@ -885,6 +885,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     platform="whatsapp",
                                     message_id=message_id,
                                     conversation_id=conversation_id,
+                                    sender_name=sender_name2,
+                                    content=content,
+                                    message_type=message_type,
                                 )
 
                                 background_tasks.add_task(
