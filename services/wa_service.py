@@ -290,6 +290,9 @@ async def store_whatsapp_message(
             platform="whatsapp",
             message_id=message_id,
             conversation_id=conversation_id,
+            sender_name=sender_name,
+            content=content,
+            message_type=type,
         )
     
     # Keep only latest 500 messages per conversation

@@ -35,6 +35,26 @@ _credential_lock = asyncio.Lock()
 
 DEVICE_TTL_DAYS = 30
 EVENT_TTL_HOURS = 24
+PUSH_QUEUE_SIZE = 256
+PUSH_WORKER_COUNT = 2
+PUSH_SHUTDOWN_TIMEOUT_SECONDS = 15
+
+_immediate_queue: asyncio.Queue[str] | None = None
+_immediate_workers: set[asyncio.Task[None]] = set()
+_active_push_claims: dict[asyncio.Task, tuple[str, str]] = {}
+_stopping_immediate_workers = False
+
+ATTACHMENT_LABELS = {
+    "image": "Sent a photo",
+    "video": "Sent a video",
+    "voice": "Sent a voice message",
+    "audio": "Sent an audio message",
+    "file": "Sent a file",
+    "document": "Sent a document",
+    "sticker": "Sent a sticker",
+    "location": "Shared a location",
+    "contacts": "Shared a contact",
+}
 
 
 class PushConfigurationError(RuntimeError):
@@ -295,7 +315,15 @@ def resolve_event(*, org_id: str, event_id: str) -> dict | None:
     )
 
 
-def enqueue_customer_message_push(*, org_id: str, platform: str, message_id: str, conversation_id: str) -> str:
+def enqueue_customer_message_push(
+    *,
+    org_id: str,
+    platform: str,
+    message_id: str,
+    conversation_id: str,
+    notification_title: str,
+    notification_body: str,
+) -> str:
     now = datetime.now(timezone.utc)
     event_id = uuid.uuid4().hex
     try:
@@ -308,6 +336,8 @@ def enqueue_customer_message_push(*, org_id: str, platform: str, message_id: str
                     "platform": platform,
                     "message_id": message_id,
                     "conversation_id": conversation_id,
+                    "notification_title": notification_title,
+                    "notification_body": notification_body,
                     "status": "pending",
                     "attempts": 0,
                     "completed_token_hashes": [],
@@ -328,16 +358,36 @@ def enqueue_customer_message_push(*, org_id: str, platform: str, message_id: str
 
 
 async def schedule_customer_message_push(
-    *, org_id: str, platform: str, message_id: str, conversation_id: str
+    *,
+    org_id: str,
+    platform: str,
+    message_id: str,
+    conversation_id: str,
+    sender_name: object = None,
+    content: object = None,
+    message_type: str | None = None,
 ) -> None:
     try:
-        await asyncio.to_thread(
+        title = _clean_notification_text(sender_name, limit=80, fallback="Customer")
+        body = _clean_notification_text(
+            content,
+            limit=180,
+            fallback=ATTACHMENT_LABELS.get(message_type, "Sent an attachment"),
+        )
+        event_id = await asyncio.to_thread(
             enqueue_customer_message_push,
             org_id=org_id,
             platform=platform,
             message_id=message_id,
             conversation_id=conversation_id,
+            notification_title=title,
+            notification_body=body,
         )
+        if _immediate_queue is not None:
+            try:
+                _immediate_queue.put_nowait(event_id)
+            except asyncio.QueueFull:
+                logger.warning("Immediate push queue is full; durable retry will deliver it")
     except Exception as exc:
         # Push must never make the Meta webhook fail; the stored message remains authoritative.
         logger.warning(f"Could not enqueue Android push notification: {type(exc).__name__}")
@@ -373,13 +423,28 @@ async def _access_token() -> str:
         return _credentials.token
 
 
-def build_fcm_message(token: str, event_id: str) -> dict:
+def _clean_notification_text(value: object, *, limit: int, fallback: str) -> str:
+    text = " ".join(str(value or "").split()) or fallback
+    return text if len(text) <= limit else f"{text[:limit - 1]}…"
+
+
+def notification_content(event: dict) -> tuple[str, str]:
+    title = _clean_notification_text(
+        event.get("notification_title"), limit=80, fallback="New customer message"
+    )
+    body = _clean_notification_text(
+        event.get("notification_body"), limit=180, fallback="Open HeidelAI to view it"
+    )
+    return title, body
+
+
+def build_fcm_message(token: str, event_id: str, title: str, body: str) -> dict:
     return {
         "message": {
             "token": token,
             "notification": {
-                "title": "New customer message",
-                "body": "Open HeidelAI to view it",
+                "title": title,
+                "body": body,
             },
             "data": {"kind": "customer_message", "event_id": event_id},
             "android": {
@@ -413,7 +478,7 @@ def classify_fcm_failure(status_code: int, error_code: str | None) -> Literal["p
 
 
 async def _send(
-    client: httpx.AsyncClient, token: str, event_id: str
+    client: httpx.AsyncClient, token: str, event_id: str, title: str, body: str
 ) -> Literal["sent", "permanent", "retry"]:
     global _credentials
     url = f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send"
@@ -424,7 +489,7 @@ async def _send(
             response = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {access_token}"},
-                json=build_fcm_message(token, event_id),
+                json=build_fcm_message(token, event_id, title, body),
             )
         except httpx.RequestError:
             return "retry"
@@ -444,7 +509,7 @@ async def _send(
     return classify_fcm_failure(response.status_code, error_code)
 
 
-async def process_push_event(event_id: str) -> None:
+async def _process_push_event(event_id: str) -> None:
     now = datetime.now(timezone.utc)
     claim_id = uuid.uuid4().hex
     event = await asyncio.to_thread(
@@ -462,7 +527,11 @@ async def process_push_event(event_id: str) -> None:
     )
     if not event:
         return
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        _active_push_claims[current_task] = (event_id, claim_id)
 
+    title, body = notification_content(event)
     completed = set(event.get("completed_token_hashes", []))
     active_devices = await asyncio.to_thread(
         lambda: list(
@@ -481,7 +550,7 @@ async def process_push_event(event_id: str) -> None:
                 continue
             try:
                 token = _fernet().decrypt(device["encrypted_token"].encode()).decode()
-                result = await _send(client, token, event_id)
+                result = await _send(client, token, event_id, title, body)
             except (InvalidToken, UnicodeDecodeError):
                 result = "permanent"
             except Exception as exc:
@@ -511,6 +580,8 @@ async def process_push_event(event_id: str) -> None:
                         {"$set": {"active": False, "updated_at": datetime.now(timezone.utc)}},
                     )
             if progress.matched_count == 0:
+                if current_task is not None:
+                    _active_push_claims.pop(current_task, None)
                 return
 
     update: dict = {"$set": {"updated_at": datetime.now(timezone.utc)}}
@@ -523,6 +594,95 @@ async def process_push_event(event_id: str) -> None:
     else:
         update["$set"].update({"status": "sent", "sent_at": datetime.now(timezone.utc)})
     await asyncio.to_thread(events.update_one, {"event_id": event_id, "claim_id": claim_id}, update)
+    if current_task is not None:
+        _active_push_claims.pop(current_task, None)
+
+
+async def _release_push_claim(event_id: str, claim_id: str) -> None:
+    try:
+        await asyncio.shield(asyncio.to_thread(
+            events.update_one,
+            {"event_id": event_id, "claim_id": claim_id, "status": "sending"},
+            {
+                "$set": {
+                    "status": "pending",
+                    "next_attempt_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$unset": {"claim_id": "", "claimed_at": ""},
+            },
+        ))
+    except Exception as exc:
+        logger.warning(f"Could not release interrupted push claim: {type(exc).__name__}")
+
+
+async def process_push_event(event_id: str) -> None:
+    current_task = asyncio.current_task()
+    try:
+        await _process_push_event(event_id)
+    finally:
+        claim = _active_push_claims.pop(current_task, None) if current_task is not None else None
+        if claim is not None:
+            await _release_push_claim(*claim)
+
+
+async def _immediate_push_worker(queue: asyncio.Queue[str]) -> None:
+    while True:
+        event_id = await queue.get()
+        try:
+            await process_push_event(event_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"Immediate Android push deferred: {type(exc).__name__}")
+        finally:
+            queue.task_done()
+
+
+def _spawn_immediate_push_worker(queue: asyncio.Queue[str]) -> None:
+    task = asyncio.create_task(_immediate_push_worker(queue), name="android-push")
+    _immediate_workers.add(task)
+    task.add_done_callback(_immediate_push_worker_finished)
+
+
+def _immediate_push_worker_finished(task: asyncio.Task[None]) -> None:
+    _immediate_workers.discard(task)
+    if not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            logger.error(f"Immediate Android push worker stopped: {type(error).__name__}")
+    if _stopping_immediate_workers or _immediate_queue is None:
+        return
+    while len(_immediate_workers) < PUSH_WORKER_COUNT:
+        _spawn_immediate_push_worker(_immediate_queue)
+
+
+async def start_push_notification_workers() -> None:
+    global _immediate_queue, _stopping_immediate_workers
+    _stopping_immediate_workers = False
+    _immediate_workers.difference_update({task for task in _immediate_workers if task.done()})
+    if _immediate_queue is None:
+        _immediate_queue = asyncio.Queue(maxsize=PUSH_QUEUE_SIZE)
+    while len(_immediate_workers) < PUSH_WORKER_COUNT:
+        _spawn_immediate_push_worker(_immediate_queue)
+
+
+async def stop_push_notification_workers() -> None:
+    global _immediate_queue, _stopping_immediate_workers
+    _stopping_immediate_workers = True
+    queue = _immediate_queue
+    _immediate_queue = None
+    if queue is not None:
+        try:
+            await asyncio.wait_for(queue.join(), timeout=PUSH_SHUTDOWN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out draining immediate Android push queue during shutdown")
+    workers = tuple(_immediate_workers)
+    for task in workers:
+        task.cancel()
+    if workers:
+        await asyncio.gather(*workers, return_exceptions=True)
+    _immediate_workers.clear()
 
 
 async def process_pending_push_notifications(limit: int = 25) -> None:
