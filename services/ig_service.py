@@ -20,6 +20,7 @@ from database import get_mongo_db, get_mongo_client
 from core.services import services
 from services.scheduler_service import abort_scheduled_message
 from services.conversation_utils import reopen_conversation
+from services.push_notification_service import schedule_customer_message_push
 
 from config.settings import (
     IG_ID, 
@@ -305,7 +306,8 @@ async def store_instagram_message(
     mode: Optional[str] = None,
     message_id: Optional[str] = None,
     context_type: Optional[str] = None,
-    context: Optional[dict] = None
+    context: Optional[dict] = None,
+    notify_push: bool = False,
     ) -> str:
     """
     Store a message in the Instagram-specific collection and notify appropriate WebSocket clients
@@ -359,6 +361,17 @@ async def store_instagram_message(
     messages_collection.insert_one(message)
 
     logger.success(f"Instagram message stored: {message_id}")
+
+    if notify_push and role == MessageRole.CUSTOMER and mode != "private":
+        await schedule_customer_message_push(
+            org_id=org_id,
+            platform="instagram",
+            message_id=message_id,
+            conversation_id=conversation_id,
+            sender_name=sender_name,
+            content=content,
+            message_type=type,
+        )
     
     # Keep only latest 500 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
@@ -467,7 +480,7 @@ async def create_or_update_instagram_conversation(org_id: str,
     
     convo_key = (org_id, conversation_id)
 
-    is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
+    is_being_viewed = len(services.org_convo_viewers.get(org_id, {}).get(conversation_id, set())) > 0
 
     if existing_conversation:
         

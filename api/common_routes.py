@@ -23,6 +23,7 @@ from services.common_service import (
     fetch_conversation,
     send_message,
     fetch_messages,
+    acknowledge_conversation_opened,
     close_conversation, 
     unarchive_data, 
     add_private_note, 
@@ -161,27 +162,38 @@ async def get_messages(
         before=before, limit=limit
     )
 
+@router.post("/api/conversations/{conversation_id}/acknowledge-open")
+@limiter.limit("60/minute")
+async def acknowledge_open(
+    request: Request,
+    conversation_id: str,
+    user: CurrentUser,
+    observed_counter: int = Query(..., ge=0),
+):
+    """Clear the app's unread counter without sending a platform read receipt."""
+    return await acknowledge_conversation_opened(user.org_id, conversation_id, observed_counter)
+
 @router.post("/api/conversations/send-message")
 @limiter.limit("30/minute")
 async def send_message_endpoint(
     request: Request, 
     user: CurrentUser,
+    temp_id: Optional[str] = Form(None), 
     conversation_id: str = Form(...),
-    content: Optional[str] = Form(None),
     platform: str = Form(...),
     mode: str = Form(...),
-    temp_id: Optional[str] = Form(None), 
-    timestamp: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None),
     context_type: Optional[str] = Form(None),
-    context: Optional[str] = Form(None)
+    context: Optional[str] = Form(None),
+    timestamp: Optional[str] = Form(None),
+    content: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
 ):    
     """
     Send a message to a specific conversation.
     The body should contain the necessary fields for sending the message.
     """
     org_id = user.org_id
-    user_full_name = user.full_name or "You"
+    sender_name = user.full_name or "Agent"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
@@ -198,7 +210,7 @@ async def send_message_endpoint(
         conversation_id, 
         content if content else None, 
         mode,
-        user_full_name,
+        sender_name,
         file if file else None, 
         temp_id if temp_id else None,
         context_type if context_type else None,
@@ -519,22 +531,22 @@ async def get_labels_unread(user: CurrentUser):
 @limiter.limit("60/minute")
 async def get_agents_on_conversation(request: Request):
     """
-    For get_agents_on_conversation
     Returns the presence maps with string keys for JSON compatibility.
     """
     json_convo_viewers = {
         f"{org_id}|{convo_id}": list(client_ids)
-        for (org_id, convo_id), client_ids in services.convo_viewers.items()
+        for org_id, convo_map in services.org_convo_viewers.items()
+        for convo_id, client_ids in convo_map.items()
     }
-    
+
     json_client_convo_map = {
         client_id: f"{org_id}|{convo_id}"
         for client_id, (org_id, convo_id) in services.client_convo_map.items()
     }
-    
-    return { 
-        "convo_viewers": json_convo_viewers, 
-        "client_convo_map": json_client_convo_map 
+
+    return {
+        "convo_viewers": json_convo_viewers,
+        "client_convo_map": json_client_convo_map
     }
 
 @router.post("/api/contacts/bulk-upload")

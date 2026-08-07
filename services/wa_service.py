@@ -22,6 +22,7 @@ from services.conversation_utils import reopen_conversation
 from services.scheduler_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
 from services.utils import normalize_phone
+from services.push_notification_service import schedule_customer_message_push
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
@@ -79,7 +80,7 @@ async def create_or_update_whatsapp_conversation(
     convo_key = (org_id, conversation_id)
     
     # Check if the viewers set exists and is not empty
-    is_being_viewed = len(services.convo_viewers.get(convo_key, set())) > 0
+    is_being_viewed = len(services.org_convo_viewers.get(org_id, {}).get(conversation_id, set())) > 0
 
     # Handle Name Resolution
     final_customer_name = customer_name
@@ -217,17 +218,18 @@ async def store_whatsapp_message(
     customer_phone_no: str,
     type: Optional[str],
     payload: Optional[dict],
-    sender_name: str,
     recipient_id: str,
     role: MessageRole,
     mode: Optional[str] = None,
+    sender_name: Optional[str] = "Agent",
     message_id: Optional[str] = None,
     raw_data: Optional[dict] = None,
     status: Optional[str] = "received",
     temp_id: Optional[str] = None,
     context_type: Optional[str] = None,
     context: Optional[dict] = None,
-    bot_context: Optional[dict] = None
+    bot_context: Optional[dict] = None,
+    notify_push: bool = False,
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -281,6 +283,17 @@ async def store_whatsapp_message(
     messages_collection.insert_one(message)
 
     logger.success(f"Whatsapp message stored: {message_id}")
+
+    if notify_push and role == MessageRole.CUSTOMER and mode != "private":
+        await schedule_customer_message_push(
+            org_id=org_id,
+            platform="whatsapp",
+            message_id=message_id,
+            conversation_id=conversation_id,
+            sender_name=sender_name,
+            content=content,
+            message_type=type,
+        )
     
     # Keep only latest 500 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
@@ -405,7 +418,7 @@ async def send_whatsapp_message(
         context: Optional[dict] = None,
         bot_context: Optional[dict] = None,
         raise_on_partial_failure: bool = False,
-        user_full_name: Optional[str] = None,
+        sender_name: Optional[str] = "Agent",
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -450,7 +463,7 @@ async def send_whatsapp_message(
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
 
         # Extract the recipient phone number from conversation ID
-        recipient_id = conversation_id.replace("whatsapp_", "")
+        recipient_id = message.get("recipient_override") or conversation_id.replace("whatsapp_", "").replace("dealer_", "")
 
         # Handle multi-part messages (e.g. lists returned by the agent or strings with MSG_SPLIT)
         if isinstance(original_content, list):
@@ -463,6 +476,17 @@ async def send_whatsapp_message(
         if not contents:
             logger.warning(f"Empty content provided for WhatsApp message to {recipient_id}")
             return {"message": "No content to send"}
+
+        # Ensure the conversation document exists in the database
+        await create_or_update_whatsapp_conversation(
+            org_id=org_id,
+            recipient_id=whatsapp_business_id,
+            customer_phone_no=recipient_id,
+            customer_name=message.get("customer_name") or recipient_id,
+            last_message=contents[0],
+            last_sender="ai" if mode == "ai" else "agent",
+            mode=mode
+        )
 
         last_stored_id = None
         all_message_ids = []
@@ -517,7 +541,7 @@ async def send_whatsapp_message(
             elif mode == "ai":
                 last_message= f"AI: {content_item}"
             else:
-                last_message = f"You: {content_item}"
+                last_message = f"{sender_name}: {content_item}"
 
             wa_conversation = {
                 "last_message": last_message,
@@ -543,7 +567,7 @@ async def send_whatsapp_message(
                 customer_phone_no=recipient_id,
                 type="text",
                 payload=None,
-                sender_name="AI" if mode == "ai" else (user_full_name or "Agent"),
+                sender_name="AI" if mode == "ai" else (sender_name),
                 recipient_id=whatsapp_business_id,
                 role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
                 mode=mode,
@@ -589,7 +613,7 @@ async def send_whatsapp_message(
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
+async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent") -> dict:
     """
     Send a template message via WhatsApp Cloud API
     """
@@ -645,7 +669,7 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
         template_name = template.get("name", "Unknown Template")
         
         wa_conversation = {
-            "last_message": f"Private Note: Shared a template: {template_name}" if mode == "private" else f"You: Shared a template: {template_name}",
+            "last_message": f"Private Note: Shared a template: {template_name}" if mode == "private" else f"{sender_name}: Shared a template: {template_name}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
@@ -677,7 +701,7 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
             customer_phone_no=recipient_id,
             type="template",
             payload=template,
-            sender_name="Agent",
+            sender_name=sender_name,
             recipient_id=wa_id,
             role=MessageRole.AGENT,
             mode=mode,
@@ -710,7 +734,8 @@ async def send_wa_media_message(
         temp_id: Optional[str], 
         mode: str, 
         context_type: Optional[str], 
-        context: Optional[dict]
+        context: Optional[dict],
+        sender_name: Optional[str] = "Agent",
     ) -> dict:
     """
     Send a media message via WhatsApp Cloud API
@@ -770,7 +795,7 @@ async def send_wa_media_message(
         now = datetime.now(timezone.utc)
 
         wa_conversation = {
-            "last_message": f"Private Note: {content if content else 'Shared an image'}" if mode == "private" else f"You: {content if content else 'Shared an image'}",
+            "last_message": f"Private Note: {content if content else 'Shared an image'}" if mode == "private" else f"{sender_name}: {content if content else 'Shared an image'}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
@@ -801,7 +826,7 @@ async def send_wa_media_message(
             customer_phone_no=recipient_id,
             type=media_type,
             payload={"url": media_url, "caption": content} if content else {"url": media_url},
-            sender_name="Agent",
+            sender_name=sender_name,
             recipient_id=recipient_id,
             role=MessageRole.AGENT,
             mode=mode,
@@ -824,7 +849,7 @@ async def send_wa_media_message(
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict]) -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent") -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
@@ -840,7 +865,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode, context_type, context)
+        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode, context_type, context, sender_name)
         
         return response
     except Exception as e:
@@ -1722,10 +1747,23 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
     except Exception as e:
         logger.error(f"Error while sending typing indicator: {e}")
 
+def ensure_whatsapp_call_indexes() -> None:
+    try:
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("call_id", 1)],
+            unique=True,
+            name="org_id_call_id_unique",
+            partialFilterExpression={"org_id": {"$type": "string"}, "call_id": {"$type": "string"}},
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create WhatsApp call index: {e}")
+
+
 # Bulk jobs are now stored in the "bulk_jobs" collection in MongoDB.
 # This ensures they survive restarts and work across multiple instances.
 # A TTL index is created on "created_at" to clean up old jobs after 7 days (604800 seconds).
 _bulk_job_indexes_initialized = False
+
 
 def ensure_bulk_job_indexes() -> None:
     """

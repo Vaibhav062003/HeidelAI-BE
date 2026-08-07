@@ -44,7 +44,6 @@ async def fetch_conversations_new(
         "whatsapp_id": 0,
         "instagram_id": 0,
         "last_sender": 0,
-        "message_counter": 0,
         "next_action_at": 0,
         "reminder_stage": 0,
         "started_at": 0,
@@ -148,6 +147,7 @@ async def fetch_conversations_new(
                 else None
             ),
             "unread_count": doc.get("unread_count", 0),
+            "message_counter": doc.get("message_counter", 0),
             "status": doc.get("status"),
             "priority": doc.get("priority"),
             "sentiment": doc.get("sentiment"),
@@ -241,8 +241,6 @@ async def fetch_messages(
 
         convo_collection = db[org_conversations_collection_name]
         now = datetime.now(timezone.utc)
-
-        # --- Auto-assign agent if conversation is unassigned ---
         assigned_convo = convo_collection.find_one_and_update(
             {
                 "conversation_id": conversation_id,
@@ -276,12 +274,6 @@ async def fetch_messages(
             assigned_convo = convo_collection.find_one(
                 {"conversation_id": conversation_id},
                 projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0}
-            )
-
-        if not assigned_convo or assigned_convo.get("type") != "team":
-            convo_collection.update_one(
-                {"conversation_id": conversation_id},
-                {"$set": {"unread_count": 0}}
             )
 
         # Parse compound cursor
@@ -369,6 +361,17 @@ async def fetch_messages(
     except Exception as e:
         logger.error(f"Error fetching messages for {conversation_id} of org {org_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch messages: {str(e)}")
+
+
+async def acknowledge_conversation_opened(org_id: str, conversation_id: str, observed_counter: int) -> dict:
+    result = await get_async_mongo_db()[f"conversations_{org_id}"].update_one(
+        {
+            "conversation_id": conversation_id,
+            "$expr": {"$eq": [{"$ifNull": ["$message_counter", 0]}, observed_counter]},
+        },
+        {"$set": {"unread_count": 0}},
+    )
+    return {"status": "ok", "acknowledged": result.matched_count > 0}
 
 async def close_conversation(org_id: str, conversation_id: str, reason: str):
     """
@@ -584,7 +587,7 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, user_full_name: Optional[str] = None, file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, sender_name: Optional[str] = "Agent", file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
@@ -597,7 +600,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         if file:
             recipient_id = conversation_id.replace("whatsapp_", "")
             
-            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context)
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name)
 
             if res.get("error"):
                 raise HTTPException(
@@ -620,7 +623,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                         temp_id=temp_id,
                         mode=mode,
                         context_type=context_type,
-                        context=context
+                        context=context,
+                        sender_name=sender_name
                     )
                 else:
                     raise ValueError("Not a template")
@@ -636,7 +640,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                     temp_id=temp_id, 
                     context_type=context_type, 
                     context=context, 
-                    user_full_name=user_full_name
+                    sender_name=sender_name
                 )
         return res
     

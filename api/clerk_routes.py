@@ -1,4 +1,5 @@
 import requests
+import uuid
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, EmailStr
 
@@ -6,6 +7,7 @@ from core.limiter import limiter
 from auth.dependencies import CurrentUser
 from config.settings import CLERK_TOKEN
 from loguru import logger
+from services.push_notification_service import process_member_device_revocation, queue_member_device_revocation
 
 
 
@@ -74,6 +76,8 @@ def revoke_invite(request: Request, req: RevokeInviteRequest, user: CurrentUser)
 @limiter.limit("30/minute")
 def delete_member(request: Request, user: CurrentUser, user_id: str = Query(...)):
     ORG_ID = user.org_id
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admins only")
     url = f"{base_url}/organizations/{ORG_ID}/memberships/{user_id}"
     try:
         resp = requests.delete(url, headers=clerk_headers())
@@ -85,7 +89,15 @@ def delete_member(request: Request, user: CurrentUser, user_id: str = Query(...)
         if not resp.ok:
             detail = data.get("errors", [{}])[0].get("long_message", "Failed to delete member")
             raise HTTPException(status_code=resp.status_code, detail={"error": detail, "details": data})
+        revocation_id = queue_member_device_revocation(
+            org_id=ORG_ID,
+            user_id=user_id,
+            revocation_id=f"api_{uuid.uuid4().hex}",
+        )
+        process_member_device_revocation(revocation_id)
         return data
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": "Internal server error", "details": str(e)})
 
