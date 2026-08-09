@@ -14,8 +14,8 @@ from config.settings import (
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
+    WA_VERSION,
 )
-from schemas.models import MessageRole
 from loguru import logger
 
 
@@ -30,9 +30,11 @@ AUDIO_RETENTION_DAYS = 30
 AUDIO_RETENTION_TAG = "heidelai-audio-note"
 
 
-def _outbound_upload_options(semantic_type: str, convert_audio: bool) -> dict:
-    options = {"eager": [{"format": "mp3"}]} if convert_audio else {}
-    if semantic_type == "audio":
+def _outbound_upload_options(semantic_type: str, convert_audio: bool, media_kind: Optional[str] = None) -> dict:
+    options = {}
+    if convert_audio:
+        options["eager"] = [{"format": "ogg", "audio_codec": "opus"}] if media_kind == "voice_note" else [{"format": "mp3"}]
+    if semantic_type == "audio" and media_kind == "voice_note":
         options["tags"] = [AUDIO_RETENTION_TAG]
     return options
 
@@ -42,7 +44,7 @@ def _audio_retention_expression(days_threshold: int) -> str:
 
 
 def _cleanup_expired_audio_notes_sync(days_threshold: int) -> int:
-    total_deleted = 0
+    resources_by_type = {}
     next_cursor = None
 
     while True:
@@ -53,19 +55,50 @@ def _cleanup_expired_audio_notes_sync(days_threshold: int) -> int:
             search = search.next_cursor(next_cursor)
         result = search.execute()
 
-        resources_by_type = {}
         for resource in result.get("resources", []):
             public_id = resource.get("public_id")
             if public_id:
                 resources_by_type.setdefault(resource.get("resource_type", "video"), []).append(public_id)
 
-        for resource_type, public_ids in resources_by_type.items():
-            response = cloudinary.api.delete_resources(public_ids, resource_type=resource_type)
-            total_deleted += sum(status == "deleted" for status in response.get("deleted", {}).values())
-
         next_cursor = result.get("next_cursor")
         if not next_cursor:
-            return total_deleted
+            break
+
+    total_deleted = 0
+    for resource_type, public_ids in resources_by_type.items():
+        for start in range(0, len(public_ids), 100):
+            batch = public_ids[start:start + 100]
+            response = cloudinary.api.delete_resources(batch, resource_type=resource_type)
+            total_deleted += sum(status == "deleted" for status in response.get("deleted", {}).values())
+    return total_deleted
+
+
+async def _download_whatsapp_media(
+    client,
+    media_url: Optional[str],
+    media_id: str,
+    mime_type: str,
+    headers: dict,
+    phone_number_id: Optional[str] = None,
+) -> tuple[bytes, str]:
+    if not media_url:
+        media_response = await client.get(
+            f"https://graph.facebook.com/{WA_VERSION or 'v24.0'}/{media_id}",
+            headers=headers,
+            params={"phone_number_id": phone_number_id} if phone_number_id else None,
+        )
+        if media_response.status_code != 200:
+            raise RuntimeError("WhatsApp media URL could not be retrieved")
+        media_metadata = media_response.json()
+        media_url = media_metadata.get("url")
+        mime_type = media_metadata.get("mime_type") or mime_type
+        if not media_url:
+            raise RuntimeError("WhatsApp media URL was missing")
+
+    response = await client.get(media_url, headers=headers)
+    if response.status_code != 200:
+        raise RuntimeError("WhatsApp media could not be downloaded")
+    return response.content, mime_type
 
 
 async def cleanup_expired_audio_notes(days_threshold: int = AUDIO_RETENTION_DAYS) -> int:
@@ -206,28 +239,23 @@ async def check_cloudinary_storage_limit():
         return True  # Allow uploads if check fails
     
 async def upload_and_send_whatsapp_media_background(
-    media_url: str, 
+    media_url: Optional[str],
     media_id: str, 
     org_id: str, 
     mime_type: str, 
     access_token: str, 
-    content: str,
     message_type: str,
     whatsapp_business_id: str,
-    customer_phone_no: str,
-    sender_name2: str,
     message_id: str,
-    conversation_id: str,
     media_name: str,
-    reply_window_expiry_time_utc: datetime,
-    is_ad_referral: bool,
-    caption: Optional[str] = None
+    caption: Optional[str] = None,
+    phone_number_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Downloads media from WhatsApp and uploads to Cloudinary.
     This is designed to be run as a BackgroundTask.
     """
-    from services.wa_service import create_or_update_whatsapp_conversation, store_whatsapp_message
+    from services.wa_service import update_whatsapp_media_message
     logger.success(f"Background Task Started: Processing media {media_id}")
     
     headers = {
@@ -238,39 +266,44 @@ async def upload_and_send_whatsapp_media_background(
         mime_type = "pdf"
 
     try:
-        # 1. Download from WhatsApp (Async)
-        async with httpx.AsyncClient() as client:
-            response = await client.get(media_url, headers=headers)
-            
-            if response.status_code != 200:
-                logger.error(f"Error downloading from WhatsApp: {response.text}")
-                return
+        # Meta URLs are short-lived. Retry the complete retrieve/download/upload
+        # operation, using the stable media ID each time.
+        last_error = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    media_bytes, mime_type = await _download_whatsapp_media(
+                        client, media_url, media_id, mime_type, headers, phone_number_id
+                    )
 
-        # 2. Prepare file in memory
-        file_obj = io.BytesIO(response.content)
-        file_obj.name = media_id # Helps Cloudinary identify the file
+                file_obj = io.BytesIO(media_bytes)
+                file_obj.name = media_id
+                cld_resource_type = "raw"
+                if "image" in mime_type:
+                    cld_resource_type = "image"
+                elif "video" in mime_type or "audio" in mime_type:
+                    cld_resource_type = "video"
+                elif "pdf" in mime_type:
+                    cld_resource_type = "image"
 
-        cld_resource_type = "raw" 
-    
-        if "image" in mime_type:
-            cld_resource_type = "image"
-        elif "video" in mime_type:
-            cld_resource_type = "video"
-        elif "pdf" in mime_type:
-            # Cloudinary allows PDFs as 'image' to enable page previews/thumbnails
-            cld_resource_type = "image" 
-            format_for_preview = "jpg"
+                result = await asyncio.to_thread(
+                    cloudinary.uploader.upload,
+                    file_obj,
+                    folder=f"whatsapp_media/{org_id}/customer/",
+                    public_id=media_id,
+                    resource_type=cld_resource_type,
+                    **({"tags": [AUDIO_RETENTION_TAG]} if message_type == "audio" else {}),
+                )
+                if not result.get("secure_url"):
+                    raise RuntimeError("Cloudinary did not return a media URL")
+                break
+            except Exception as exc:
+                last_error = exc
+                media_url = None
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
         else:
-            # For DOCX, XLSX, ZIP, etc.
-            cld_resource_type = "raw"
-
-        # 3. Upload to Cloudinary
-        result = cloudinary.uploader.upload(
-            file_obj,
-            folder=f"whatsapp_media/{org_id}/customer/", 
-            public_id=media_id,
-            resource_type=cld_resource_type
-        )
+            raise RuntimeError("WhatsApp media processing failed after three attempts") from last_error
 
         secure_url = result.get("secure_url")
         file_format = result.get("format")
@@ -299,7 +332,8 @@ async def upload_and_send_whatsapp_media_background(
             "file_format" : file_format,
             "file_pages": file_pages,
             "media_id": media_id,
-            "mime_type": mime_type
+            "mime_type": mime_type,
+            "media_status": "ready",
         }
 
         logger.success(f"Uploaded: {secure_url}")
@@ -317,34 +351,31 @@ async def upload_and_send_whatsapp_media_background(
         # but the image is not yet uploaded to Cloudinary, so it shows loading.
         # ---------------------------------------------------------
 
-        # Create or update conversation
-        await create_or_update_whatsapp_conversation(
+        # Update the durable placeholder and broadcast the same message ID.
+        await update_whatsapp_media_message(
             org_id=org_id,
-            recipient_id=whatsapp_business_id,
-            customer_phone_no=customer_phone_no,
-            customer_name=sender_name2,
-            last_message=content,
-            reply_window_expiry=reply_window_expiry_time_utc,
-            is_ad_referral=is_ad_referral,
-            last_sender="customer"
-        )
-        
-        # Store in WhatsApp-specific collections
-        await store_whatsapp_message(
-            org_id=org_id,
-            content=caption,
-            conversation_id=conversation_id,
-            customer_phone_no=customer_phone_no,
-            type=message_type,
+            message_id=message_id,
             payload=payload,
-            sender_name=sender_name2,
             recipient_id=whatsapp_business_id,
-            role=MessageRole.CUSTOMER,
-            message_id=message_id,  # Use the ID from the webhook for deduplication
+            status="received",
         )
+        return secure_url
 
     except Exception as e:
         logger.error(f"Background Upload Failed: {e}")
+        await update_whatsapp_media_message(
+            org_id=org_id,
+            message_id=message_id,
+            payload={
+                "media_id": media_id,
+                "mime_type": mime_type,
+                "file_name": media_name,
+                "media_status": "failed",
+            },
+            recipient_id=whatsapp_business_id,
+            status="received",
+        )
+        return None
 
 def _outbound_media_spec(mime_type: str):
     base_mime = (mime_type or "").lower().split(";", 1)[0].strip()
@@ -359,7 +390,7 @@ def _outbound_media_spec(mime_type: str):
     return "document", "image" if base_mime == "application/pdf" else "raw", False
 
 
-async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> Optional[dict]:
+async def upload_media_to_cloudinary(file: any, platform: str, org_id: str, media_kind: Optional[str] = None) -> Optional[dict]:
     """
     Uploads a media file to Cloudinary under the specified platform folder.
     Returns the secure URL of the uploaded media.
@@ -379,15 +410,18 @@ async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> O
             folder = f"other_media/{org_id}/user"
         mime_type = (file.content_type or "").lower()
         semantic_type, cld_resource_type, convert_audio = _outbound_media_spec(mime_type)
+        if media_kind == "voice_note" and not (mime_type.startswith("audio/ogg") and "opus" in mime_type):
+            convert_audio = True
         safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", file.filename or "attachment")
         unique_name = f"{uuid.uuid4().hex}-{safe_name}"
         public_id = unique_name if cld_resource_type == "raw" else unique_name.rsplit(".", 1)[0]
-        upload_options = _outbound_upload_options(semantic_type, convert_audio)
+        upload_options = _outbound_upload_options(semantic_type, convert_audio, media_kind)
 
         # Upload to Cloudinary
-        result = cloudinary.uploader.upload(
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload,
             file.file,
-            folder=folder, 
+            folder=folder,
             public_id=public_id,
             resource_type=cld_resource_type,
             **upload_options,
@@ -399,8 +433,10 @@ async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> O
             if not eager or not eager[0].get("secure_url"):
                 raise ValueError("Cloudinary did not return the converted audio file")
             secure_url = eager[0]["secure_url"]
-            mime_type = "audio/mpeg"
-            safe_name = f"{safe_name.rsplit('.', 1)[0]}.mp3"
+            voice_note = media_kind == "voice_note"
+            mime_type = "audio/ogg; codecs=opus" if voice_note else "audio/mpeg"
+            extension = "ogg" if voice_note else "mp3"
+            safe_name = f"{safe_name.rsplit('.', 1)[0]}.{extension}"
         logger.success(f"Media uploaded to Cloudinary: {secure_url}")
         return {
             "file_url": secure_url,

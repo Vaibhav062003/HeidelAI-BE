@@ -870,9 +870,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 
                                 return {"status": "ok"}
 
-                            elif message_type in ["image", "video", "document"]:
+                            elif message_type in ["image", "video", "document", "audio"]:
                                 media_data = message[message_type]
-                                media_url = media_data["url"]
+                                media_url = media_data.get("url")
                                 media_id = media_data["id"]
                                 mime_type = media_data["mime_type"]
                                 media_name = media_data.get("filename", f"{message_type}_{media_id}")
@@ -883,29 +883,47 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     content = media_data.get("caption", "Shared a video")
                                 elif message_type == "document":
                                     content = media_data.get("caption", "Shared a document")
+                                elif message_type == "audio":
+                                    content = "Shared an audio"
 
                                 # Make the new conversation and notification durable before the
                                 # external media upload; Cloudinary may be slow or unavailable.
-                                conversation_id = await create_or_update_whatsapp_conversation(
-                                    org_id=org_id,
-                                    recipient_id=whatsapp_business_id,
-                                    customer_phone_no=customer_phone_no,
-                                    customer_name=sender_name2,
-                                    last_message=content,
-                                    last_sender="customer",
-                                    reply_window_expiry=reply_window_expiry_time_utc,
-                                    is_ad_referral=is_ad_referral,
-                                    mode="reply",
-                                )
-                                await schedule_customer_message_push(
-                                    org_id=org_id,
-                                    platform="whatsapp",
-                                    message_id=message_id,
-                                    conversation_id=conversation_id,
-                                    sender_name=sender_name2,
-                                    content=content,
-                                    message_type=message_type,
-                                )
+                                try:
+                                    conversation_id = await create_or_update_whatsapp_conversation(
+                                        org_id=org_id,
+                                        recipient_id=whatsapp_business_id,
+                                        customer_phone_no=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        last_message=content,
+                                        last_sender="customer",
+                                        reply_window_expiry=reply_window_expiry_time_utc,
+                                        is_ad_referral=is_ad_referral,
+                                        mode="reply",
+                                    )
+                                    await store_whatsapp_message(
+                                        org_id=org_id,
+                                        content=content,
+                                        conversation_id=conversation_id,
+                                        customer_phone_no=customer_phone_no,
+                                        type=message_type,
+                                        payload={
+                                            "media_id": media_id,
+                                            "mime_type": mime_type,
+                                            "file_name": media_name,
+                                            "media_status": "processing",
+                                        },
+                                        recipient_id=whatsapp_business_id,
+                                        role=MessageRole.CUSTOMER,
+                                        sender_name=sender_name2,
+                                        message_id=message_id,
+                                        status="received",
+                                        context_type=context_type,
+                                        context=context,
+                                        notify_push=True,
+                                    )
+                                except Exception:
+                                    services.processed_message_ids.pop(message_id, None)
+                                    raise
 
                                 background_tasks.add_task(
                                     upload_and_send_whatsapp_media_background,
@@ -914,17 +932,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     org_id=org_id,
                                     mime_type=mime_type,
                                     access_token=access_token,
-                                    content=content,
                                     message_type=message_type,
                                     whatsapp_business_id=whatsapp_business_id,
-                                    customer_phone_no=customer_phone_no,
-                                    sender_name2=sender_name2,
                                     message_id=message_id,
-                                    conversation_id=conversation_id,
-                                    reply_window_expiry_time_utc=reply_window_expiry_time_utc,
-                                    is_ad_referral=is_ad_referral,
                                     media_name=media_name,
-                                    caption=media_data.get("caption", None)
+                                    caption=media_data.get("caption", None),
+                                    phone_number_id=value.get("metadata", {}).get("phone_number_id") or connection.get("phone_id"),
                                 )
 
                                 contact_data = {
@@ -941,8 +954,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
                                 return {"status": "ok"}
-                            elif message_type == "audio":
-                                content = "Shared an audio"
                             elif message_type == "location":
                                 content = "Shared a location"
                             elif message_type == "button":
