@@ -4,9 +4,10 @@ import httpx
 from typing import Optional
 import requests
 import io
+import re
+import uuid
 import cloudinary
 from datetime import datetime, timedelta
-from apscheduler.schedulers.background import BackgroundScheduler
 
 # Internal modules
 from config.settings import (
@@ -24,6 +25,59 @@ cloudinary.config(
     api_key=CLOUDINARY_API_KEY,
     api_secret=CLOUDINARY_API_SECRET
 )
+
+AUDIO_RETENTION_DAYS = 30
+AUDIO_RETENTION_TAG = "heidelai-audio-note"
+
+
+def _outbound_upload_options(semantic_type: str, convert_audio: bool) -> dict:
+    options = {"eager": [{"format": "mp3"}]} if convert_audio else {}
+    if semantic_type == "audio":
+        options["tags"] = [AUDIO_RETENTION_TAG]
+    return options
+
+
+def _audio_retention_expression(days_threshold: int) -> str:
+    return f"tags={AUDIO_RETENTION_TAG} AND created_at<={days_threshold}d"
+
+
+def _cleanup_expired_audio_notes_sync(days_threshold: int) -> int:
+    total_deleted = 0
+    next_cursor = None
+
+    while True:
+        search = cloudinary.Search().expression(
+            _audio_retention_expression(days_threshold)
+        ).max_results(500)
+        if next_cursor:
+            search = search.next_cursor(next_cursor)
+        result = search.execute()
+
+        resources_by_type = {}
+        for resource in result.get("resources", []):
+            public_id = resource.get("public_id")
+            if public_id:
+                resources_by_type.setdefault(resource.get("resource_type", "video"), []).append(public_id)
+
+        for resource_type, public_ids in resources_by_type.items():
+            response = cloudinary.api.delete_resources(public_ids, resource_type=resource_type)
+            total_deleted += sum(status == "deleted" for status in response.get("deleted", {}).values())
+
+        next_cursor = result.get("next_cursor")
+        if not next_cursor:
+            return total_deleted
+
+
+async def cleanup_expired_audio_notes(days_threshold: int = AUDIO_RETENTION_DAYS) -> int:
+    """Delete tagged Cloudinary audio assets after the retention period."""
+    try:
+        deleted = await asyncio.to_thread(_cleanup_expired_audio_notes_sync, days_threshold)
+        if deleted:
+            logger.info(f"Deleted {deleted} expired audio notes from Cloudinary")
+        return deleted
+    except Exception as exc:
+        logger.error(f"Failed to delete expired audio notes: {exc}")
+        return 0
 
 # @app.get("/api/cloudinary/stats")
 async def get_cloudinary_stats():
@@ -93,7 +147,7 @@ async def cleanup_old_cloudinary_media(days_threshold=30):
             for r_type in resource_types:
                 # 2. Build Search Expression
                 # Syntax: folder:name/* AND resource_type:type AND created_at<=date
-                expression = f"folder:{folder}/* AND resource_type:{r_type} AND created_at<={cutoff_str}"
+                expression = f"folder:{folder}/* AND resource_type:{r_type} AND -tags={AUDIO_RETENTION_TAG} AND created_at<={cutoff_str}"
                 
                 # 3. Search for matching files (Limit 500 per run to be safe)
                 # Note: If you have >500 old files, this runs daily so it will catch up eventually.
@@ -129,25 +183,6 @@ async def cleanup_old_cloudinary_media(days_threshold=30):
     except Exception as e:
         logger.error(f"Error cleaning up Cloudinary resources: {e}")
         return {"status": "error", "message": str(e)}
-
-# @app.on_event("startup")
-async def schedule_cleanup_tasks():
-    """Schedule periodic tasks when the app starts"""
-    # Create scheduler
-    scheduler = BackgroundScheduler()
-    
-    # Schedule daily cleanup of media older than 30 days
-    @scheduler.scheduled_job('cron', hour=3, minute=30)  # Run at 3:30 AM
-    def cleanup_old_media():
-        asyncio.create_task(cleanup_old_cloudinary_media(days_threshold=30))
-    
-    # Schedule weekly check of storage usage
-    @scheduler.scheduled_job('cron', day_of_week='sun', hour=4)  # Run Sundays at 4 AM
-    def check_storage_usage():
-        asyncio.create_task(alert_if_storage_high())
-        
-    # Start the scheduler
-    scheduler.start()
 
 async def alert_if_storage_high():
     """Check storage usage and send alert if approaching limit"""
@@ -311,7 +346,20 @@ async def upload_and_send_whatsapp_media_background(
     except Exception as e:
         logger.error(f"Background Upload Failed: {e}")
 
-async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> str:
+def _outbound_media_spec(mime_type: str):
+    base_mime = (mime_type or "").lower().split(";", 1)[0].strip()
+    if base_mime.startswith("image/"):
+        return "image", "image", False
+    if base_mime.startswith("video/"):
+        return "video", "video", False
+    if base_mime.startswith("audio/"):
+        supported = {"audio/aac", "audio/amr", "audio/mp4", "audio/mpeg", "audio/mp3", "audio/ogg"}
+        is_supported = base_mime in supported and (base_mime != "audio/ogg" or "opus" in mime_type.lower())
+        return "audio", "video", not is_supported
+    return "document", "image" if base_mime == "application/pdf" else "raw", False
+
+
+async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> Optional[dict]:
     """
     Uploads a media file to Cloudinary under the specified platform folder.
     Returns the secure URL of the uploaded media.
@@ -329,30 +377,37 @@ async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> s
             folder = f"instagram_media/{org_id}/user"
         else:
             folder = f"other_media/{org_id}/user"
-        # Determine resource type based on MIME type
-        mime_type = file.content_type
-        cld_resource_type = "raw" 
-
-        if "image" in mime_type:
-            cld_resource_type = "image"
-        elif "video" in mime_type:
-            cld_resource_type = "video"
-        elif "pdf" in mime_type:
-            cld_resource_type = "image"  # PDFs as images for previews
-        else:
-            cld_resource_type = "raw"
+        mime_type = (file.content_type or "").lower()
+        semantic_type, cld_resource_type, convert_audio = _outbound_media_spec(mime_type)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", file.filename or "attachment")
+        unique_name = f"{uuid.uuid4().hex}-{safe_name}"
+        public_id = unique_name if cld_resource_type == "raw" else unique_name.rsplit(".", 1)[0]
+        upload_options = _outbound_upload_options(semantic_type, convert_audio)
 
         # Upload to Cloudinary
         result = cloudinary.uploader.upload(
             file.file,
             folder=folder, 
-            public_id=file.filename.split('.')[0],
-            resource_type=cld_resource_type
+            public_id=public_id,
+            resource_type=cld_resource_type,
+            **upload_options,
         )
 
         secure_url = result.get("secure_url")
+        if convert_audio:
+            eager = result.get("eager") or []
+            if not eager or not eager[0].get("secure_url"):
+                raise ValueError("Cloudinary did not return the converted audio file")
+            secure_url = eager[0]["secure_url"]
+            mime_type = "audio/mpeg"
+            safe_name = f"{safe_name.rsplit('.', 1)[0]}.mp3"
         logger.success(f"Media uploaded to Cloudinary: {secure_url}")
-        return {"file_url": secure_url, "file_type": cld_resource_type}
+        return {
+            "file_url": secure_url,
+            "file_type": semantic_type,
+            "mime_type": mime_type,
+            "file_name": safe_name,
+        }
 
     except Exception as e:
         logger.error(f"Error uploading media to Cloudinary: {e}")

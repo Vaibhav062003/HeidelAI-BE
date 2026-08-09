@@ -740,6 +740,10 @@ async def send_wa_media_message(
         context_type: Optional[str], 
         context: Optional[dict],
         sender_name: Optional[str] = "Agent",
+        media_kind: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        mime_type: Optional[str] = None,
+        file_name: Optional[str] = None,
     ) -> dict:
     """
     Send a media message via WhatsApp Cloud API
@@ -748,18 +752,23 @@ async def send_wa_media_message(
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
 
+        api_media_type = media_type if media_type in {"image", "video", "audio", "document"} else "document"
         media_payload = {
             "link": media_url,
         }
-        if content:
+        if content and api_media_type in {"image", "video", "document"}:
             media_payload["caption"] = content
+        if media_kind == "voice_note" and api_media_type == "audio" and (mime_type or "").startswith("audio/ogg") and "opus" in (mime_type or ""):
+            media_payload["voice"] = True
+        if file_name and api_media_type == "document":
+            media_payload["filename"] = file_name
 
         data = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": recipient_id,
-            "type": media_type,
-            media_type: media_payload
+            "type": api_media_type,
+            api_media_type: media_payload
         }
         if context_type and context:
             data["context"] = {
@@ -799,7 +808,7 @@ async def send_wa_media_message(
         now = datetime.now(timezone.utc)
 
         wa_conversation = {
-            "last_message": f"Private Note: {content if content else 'Shared an image'}" if mode == "private" else f"{sender_name}: {content if content else 'Shared an image'}",
+            "last_message": f"Private Note: {content if content else 'Shared an attachment'}" if mode == "private" else f"{sender_name}: {content if content else ('Sent a voice note' if media_kind == 'voice_note' else 'Shared an attachment')}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
@@ -828,8 +837,15 @@ async def send_wa_media_message(
             content=content,
             conversation_id=f"whatsapp_{recipient_id}",
             customer_phone_no=recipient_id,
-            type=media_type,
-            payload={"url": media_url, "caption": content} if content else {"url": media_url},
+            type="voice" if media_kind == "voice_note" else api_media_type,
+            payload={
+                "url": media_url,
+                "caption": content,
+                "mime_type": mime_type,
+                "file_name": file_name,
+                "duration_ms": duration_ms,
+                "media_kind": media_kind,
+            },
             sender_name=sender_name,
             recipient_id=recipient_id,
             role=MessageRole.AGENT,
@@ -853,7 +869,7 @@ async def send_wa_media_message(
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent") -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent", media_kind: Optional[str] = None, duration_ms: Optional[int] = None) -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
@@ -861,6 +877,8 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
         # Upload media to Cloudinary
         result = await upload_media_to_cloudinary(file, platform="whatsapp", org_id=org_id)
 
+        if not result:
+            return {"error": "Media upload failed", "success": False}
         media_url = result.get("file_url")
         media_type = result.get("file_type")
 
@@ -869,7 +887,11 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode, context_type, context, sender_name)
+        response = await send_wa_media_message(
+            recipient_id, media_url, media_type, wa_id, content, org_id, temp_id,
+            mode, context_type, context, sender_name, media_kind, duration_ms,
+            result.get("mime_type"), result.get("file_name"),
+        )
         
         return response
     except Exception as e:
