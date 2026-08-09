@@ -187,6 +187,8 @@ async def send_message_endpoint(
     timestamp: Optional[str] = Form(None),
     content: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
+    media_kind: Optional[str] = Form(None),
+    duration_ms: Optional[int] = Form(None),
 ):    
     """
     Send a message to a specific conversation.
@@ -196,6 +198,15 @@ async def send_message_endpoint(
     sender_name = user.full_name or "Agent"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    if media_kind not in {None, "voice_note", "audio"}:
+        raise HTTPException(status_code=400, detail="Invalid media kind")
+    if duration_ms is not None and not 0 <= duration_ms <= 300_000:
+        raise HTTPException(status_code=400, detail="Invalid audio duration")
+    if media_kind and (not file or not (file.content_type or "").lower().startswith("audio/")):
+        raise HTTPException(status_code=400, detail="Voice notes require an audio file")
+    if file and (file.content_type or "").lower().startswith("audio/") and file.size is not None and file.size > 16 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio attachment is too large")
 
     context_dict = None
     if context:
@@ -215,7 +226,9 @@ async def send_message_endpoint(
         temp_id if temp_id else None,
         context_type if context_type else None,
         context_dict,
-        timestamp=timestamp
+        timestamp=timestamp,
+        media_kind=media_kind,
+        duration_ms=duration_ms,
     )
 
     return {"message": "Message sent", "details": res}

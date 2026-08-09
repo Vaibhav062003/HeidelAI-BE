@@ -4,6 +4,8 @@ import httpx
 from typing import Optional
 import requests
 import io
+import re
+import uuid
 import cloudinary
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -311,7 +313,20 @@ async def upload_and_send_whatsapp_media_background(
     except Exception as e:
         logger.error(f"Background Upload Failed: {e}")
 
-async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> str:
+def _outbound_media_spec(mime_type: str):
+    base_mime = (mime_type or "").lower().split(";", 1)[0].strip()
+    if base_mime.startswith("image/"):
+        return "image", "image", False
+    if base_mime.startswith("video/"):
+        return "video", "video", False
+    if base_mime.startswith("audio/"):
+        supported = {"audio/aac", "audio/amr", "audio/mp4", "audio/mpeg", "audio/mp3", "audio/ogg"}
+        is_supported = base_mime in supported and (base_mime != "audio/ogg" or "opus" in mime_type.lower())
+        return "audio", "video", not is_supported
+    return "document", "image" if base_mime == "application/pdf" else "raw", False
+
+
+async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> Optional[dict]:
     """
     Uploads a media file to Cloudinary under the specified platform folder.
     Returns the secure URL of the uploaded media.
@@ -329,30 +344,37 @@ async def upload_media_to_cloudinary(file: any, platform: str, org_id: str) -> s
             folder = f"instagram_media/{org_id}/user"
         else:
             folder = f"other_media/{org_id}/user"
-        # Determine resource type based on MIME type
-        mime_type = file.content_type
-        cld_resource_type = "raw" 
-
-        if "image" in mime_type:
-            cld_resource_type = "image"
-        elif "video" in mime_type:
-            cld_resource_type = "video"
-        elif "pdf" in mime_type:
-            cld_resource_type = "image"  # PDFs as images for previews
-        else:
-            cld_resource_type = "raw"
+        mime_type = (file.content_type or "").lower()
+        semantic_type, cld_resource_type, convert_audio = _outbound_media_spec(mime_type)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "-", file.filename or "attachment")
+        unique_name = f"{uuid.uuid4().hex}-{safe_name}"
+        public_id = unique_name if cld_resource_type == "raw" else unique_name.rsplit(".", 1)[0]
+        upload_options = {"eager": [{"format": "mp3"}]} if convert_audio else {}
 
         # Upload to Cloudinary
         result = cloudinary.uploader.upload(
             file.file,
             folder=folder, 
-            public_id=file.filename.split('.')[0],
-            resource_type=cld_resource_type
+            public_id=public_id,
+            resource_type=cld_resource_type,
+            **upload_options,
         )
 
         secure_url = result.get("secure_url")
+        if convert_audio:
+            eager = result.get("eager") or []
+            if not eager or not eager[0].get("secure_url"):
+                raise ValueError("Cloudinary did not return the converted audio file")
+            secure_url = eager[0]["secure_url"]
+            mime_type = "audio/mpeg"
+            safe_name = f"{safe_name.rsplit('.', 1)[0]}.mp3"
         logger.success(f"Media uploaded to Cloudinary: {secure_url}")
-        return {"file_url": secure_url, "file_type": cld_resource_type}
+        return {
+            "file_url": secure_url,
+            "file_type": semantic_type,
+            "mime_type": mime_type,
+            "file_name": safe_name,
+        }
 
     except Exception as e:
         logger.error(f"Error uploading media to Cloudinary: {e}")
