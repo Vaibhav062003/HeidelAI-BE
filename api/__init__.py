@@ -20,6 +20,7 @@ from . import wa_bot_routes
 from . import product_sheets_routes
 from . import team_routes
 from . import push_routes
+from . import quote_routes
 
 router = APIRouter()
 
@@ -43,3 +44,4 @@ router.include_router(wa_bot_routes.router)
 router.include_router(product_sheets_routes.router)
 router.include_router(team_routes.router)
 router.include_router(push_routes.router)
+router.include_router(quote_routes.router)

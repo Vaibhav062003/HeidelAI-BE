@@ -3,7 +3,7 @@ from fastapi import HTTPException
 from .dependencies import CurrentUser
 
 async def admin_required(user: CurrentUser):
-    if user.role != "admin":
+    if user.role not in {"admin", "org:admin"}:
         raise HTTPException(status_code=403, detail="Admins only")
     return user
 
