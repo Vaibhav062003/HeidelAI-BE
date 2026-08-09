@@ -95,7 +95,11 @@ async def get_conversations(
     unread_only: bool = Query(False),
     platform: Optional[str] = None,
     priority: Optional[str] = None,
-    labels: Optional[str] = None
+    labels: Optional[str] = None,
+    attention: Optional[str] = None,
+    handling: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    assigned_agent_id: Optional[str] = None,
 ):
     """
     Get conversations for the current user's organization
@@ -115,7 +119,11 @@ async def get_conversations(
             unread_only=unread_only,
             platform=platform,
             priority=priority,
-            labels=labels
+            labels=labels,
+            attention=attention,
+            handling=handling,
+            status_filter=status_filter,
+            assigned_agent_id=assigned_agent_id,
         )
 
     except HTTPException:

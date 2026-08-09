@@ -24,6 +24,96 @@ from dateutil import parser
 
 db = get_mongo_db()
 
+
+def _escalated_condition() -> Dict:
+    return {
+        "$or": [
+            {"type": "escalated"},
+            {"priority": "urgent"},
+            {"categories": {"$regex": "escalat", "$options": "i"}},
+            {"labels": {"$regex": "escalat", "$options": "i"}},
+        ]
+    }
+
+
+def _queue_filter_conditions(
+    active_tab: str,
+    current_user_id: Optional[str],
+    attention: Optional[str],
+    handling: Optional[str],
+    status_filter: Optional[str],
+    assigned_agent_id: Optional[str],
+) -> List[Dict]:
+    conditions: List[Dict] = []
+    if active_tab == "mine" and current_user_id:
+        conditions.append({"$or": [
+            {"assigned_agent.id": current_user_id},
+            {"assigned_agent_id": current_user_id},
+        ]})
+    elif active_tab == "unassigned":
+        conditions.append({"$and": [
+            {"$or": [
+                {"assigned_agent": None},
+                {"assigned_agent": {}},
+                {"assigned_agent": {"$exists": False}},
+            ]},
+            {"$or": [
+                {"assigned_agent_id": None},
+                {"assigned_agent_id": {"$exists": False}},
+            ]},
+        ]})
+    elif active_tab == "escalated":
+        conditions.append(_escalated_condition())
+    elif active_tab == "open":
+        conditions.append({"status": {"$in": ["open", "follow-up"]}})
+    elif active_tab == "closed":
+        conditions.append({"status": "closed"})
+
+    if attention == "needs_reply":
+        conditions.append({"$and": [
+            {"is_ai_enabled": {"$ne": True}},
+            {"$or": [
+                {"needs_reply": True},
+                {"last_sender": "customer"},
+                {"last_message_role": "customer"},
+            ]},
+        ]})
+    elif attention == "unread":
+        conditions.append({"unread_count": {"$gt": 0}})
+    elif attention == "follow_up":
+        conditions.append({"status": "follow-up"})
+
+    if handling == "ai":
+        conditions.append({"is_ai_enabled": True})
+    elif handling == "human":
+        conditions.append({"is_ai_enabled": {"$ne": True}})
+
+    if status_filter in {"resolved", "closed"}:
+        conditions.append({"status": "closed"})
+    elif status_filter == "follow_up":
+        conditions.append({"status": "follow-up"})
+    elif status_filter == "escalated":
+        conditions.append(_escalated_condition())
+    elif status_filter == "open":
+        conditions.append({"status": {"$in": ["open", None]}})
+
+    if assigned_agent_id:
+        conditions.append({"$or": [
+            {"assigned_agent.id": assigned_agent_id},
+            {"assigned_agent_id": assigned_agent_id},
+        ]})
+    return conditions
+
+
+def _priority_condition(priority: Optional[str]) -> Optional[Dict]:
+    values = [item.strip() for item in (priority or "").split(",") if item.strip()]
+    if not values:
+        return None
+    if "medium" in values:
+        return {"$or": [{"priority": {"$in": values}}, {"priority": None}]}
+    return {"priority": {"$in": values}}
+
+
 async def fetch_conversations_new(
     org_id: str, 
     current_user_id: Optional[str] = None, 
@@ -34,7 +124,11 @@ async def fetch_conversations_new(
     unread_only: bool = False,
     platform: Optional[str] = None,
     priority: Optional[str] = None,
-    labels: Optional[str] = None
+    labels: Optional[str] = None,
+    attention: Optional[str] = None,
+    handling: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    assigned_agent_id: Optional[str] = None,
 ) -> List[Dict]:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -43,7 +137,6 @@ async def fetch_conversations_new(
     projection = {
         "whatsapp_id": 0,
         "instagram_id": 0,
-        "last_sender": 0,
         "next_action_at": 0,
         "reminder_stage": 0,
         "started_at": 0,
@@ -57,6 +150,14 @@ async def fetch_conversations_new(
     base_conditions = [
         {"type": {"$ne": "team"}}
     ]
+    base_conditions.extend(_queue_filter_conditions(
+        active_tab,
+        current_user_id,
+        attention,
+        handling,
+        status_filter,
+        assigned_agent_id,
+    ))
 
     # Labels filter
     if labels:
@@ -75,12 +176,6 @@ async def fetch_conversations_new(
             
             base_conditions.append({"conversation_id": {"$in": matching_ids}})
 
-    # Tab filters
-    if active_tab == "open":
-        base_conditions.append({"status": {"$in": ["open", "follow-up"]}})
-    elif active_tab == "closed":
-        base_conditions.append({"status": "closed"})
-
     # Unread filter
     if unread_only:
         base_conditions.append({"unread_count": {"$gt": 0}})
@@ -92,9 +187,9 @@ async def fetch_conversations_new(
         base_conditions.append({"platform": {"$in": platform_list}})
 
     # Priority Filter
-    if priority:
-        priority_list = [p.strip() for p in priority.split(",")]
-        base_conditions.append({"priority": {"$in": priority_list}})
+    priority_condition = _priority_condition(priority)
+    if priority_condition:
+        base_conditions.append(priority_condition)
 
     # Search filter
     if search:
@@ -141,6 +236,8 @@ async def fetch_conversations_new(
             "customer_name": doc.get("customer_name") or "Unknown",
             "last_message": doc.get("last_message") or "",
             "last_message_is_private_note": doc.get("last_message_is_private_note", False),
+            "last_message_role": doc.get("last_message_role") or doc.get("last_sender"),
+            "needs_reply": doc.get("needs_reply"),
             "timestamp": (
                 doc["last_message_timestamp"].isoformat()
                 if isinstance(doc.get("last_message_timestamp"), datetime)
@@ -152,11 +249,14 @@ async def fetch_conversations_new(
             "priority": doc.get("priority"),
             "sentiment": doc.get("sentiment"),
             "assigned_agent": doc.get("assigned_agent", {}),
+            "assigned_agent_id": doc.get("assigned_agent_id"),
             "is_ai_enabled": doc.get("is_ai_enabled"),
             "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
             "assignment_history": doc.get("assignment_history", []),
             "suggestions": doc.get("suggestions", []),
             "summary": doc.get("summary", []),
+            "categories": doc.get("categories", []),
+            "labels": doc.get("labels", []),
             "participants": doc.get("participants", []),
             "unread": doc.get("unread", {})
         }
