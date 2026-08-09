@@ -373,6 +373,42 @@ async def store_whatsapp_message(
     
     return message_id
 
+
+async def update_whatsapp_media_message(
+    org_id: str,
+    message_id: str,
+    payload: dict,
+    recipient_id: str,
+    status: str = "received",
+) -> Optional[str]:
+    """Complete or fail an already-stored incoming media message."""
+    message = db[f"messages_{org_id}"].find_one_and_update(
+        {"message_id": message_id, "platform": "whatsapp"},
+        {"$set": {"payload": payload, "status": status}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not message:
+        logger.error(f"WhatsApp media placeholder missing: {message_id}")
+        return None
+
+    broadcast_message = {
+        key: message.get(key)
+        for key in (
+            "id", "platform", "conversation_id", "content", "sender_id", "role",
+            "status", "sender_name", "type", "temp_id", "payload", "mode",
+            "context_type", "context",
+        )
+    }
+    timestamp = message.get("timestamp")
+    broadcast_message["timestamp"] = timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp
+    await broadcast_main_ws(
+        platform_id=recipient_id,
+        platform_type="whatsapp",
+        event_type="new_message",
+        payload={"message": broadcast_message},
+    )
+    return message_id
+
 # Function to broadcast to WhatsApp-specific connections
 async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: dict):
     """
@@ -875,7 +911,9 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
     """
     try:
         # Upload media to Cloudinary
-        result = await upload_media_to_cloudinary(file, platform="whatsapp", org_id=org_id)
+        result = await upload_media_to_cloudinary(
+            file, platform="whatsapp", org_id=org_id, media_kind=media_kind
+        )
 
         if not result:
             return {"error": "Media upload failed", "success": False}
