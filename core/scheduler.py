@@ -1,4 +1,4 @@
-from pymongo import UpdateOne
+from pymongo import ReturnDocument, UpdateOne
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from typing import Optional
@@ -27,10 +27,17 @@ messaging_services = {
 
 async def process_scheduled_messages():
     now = datetime.now(timezone.utc)
+    stale_claim = now - timedelta(minutes=5)
 
     pending = list(
         scheduled_collection.find(
-            {"status": "pending", "scheduled_time": {"$lte": now}}
+            {
+                "scheduled_time": {"$lte": now},
+                "$or": [
+                    {"status": "pending"},
+                    {"status": "processing", "claimed_at": {"$lt": stale_claim}},
+                ],
+            }
         ).sort("scheduled_time", 1)
     )
 
@@ -42,6 +49,20 @@ async def process_scheduled_messages():
 
     updates = []
     for msg in pending:
+        claimed = scheduled_collection.find_one_and_update(
+            {
+                "_id": msg["_id"],
+                "$or": [
+                    {"status": "pending"},
+                    {"status": "processing", "claimed_at": {"$lt": stale_claim}},
+                ],
+            },
+            {"$set": {"status": "processing", "claimed_at": now, "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            continue
+        msg = claimed
         platform = msg["platform"]
         sender_id = msg["sender_id"]
         receiver_id = msg["receiver_id"]
@@ -54,7 +75,7 @@ async def process_scheduled_messages():
             logger.error(f"No service found for platform: {platform}")
             updates.append(
                 UpdateOne(
-                    {"_id": msg["_id"]},
+                    {"_id": msg["_id"], "status": "processing"},
                     {
                         "$set": {
                             "status": "failed",
@@ -80,7 +101,7 @@ async def process_scheduled_messages():
 
             updates.append(
                 UpdateOne(
-                    {"_id": msg["_id"]},
+                    {"_id": msg["_id"], "status": "processing"},
                     {
                         "$set": {
                             "status": "sent",
@@ -96,7 +117,7 @@ async def process_scheduled_messages():
             logger.error(f"Failed to send to {receiver_id} on {platform}: {error_msg}")
             updates.append(
                 UpdateOne(
-                    {"_id": msg["_id"]},
+                    {"_id": msg["_id"], "status": "processing"},
                     {
                         "$set": {
                             "status": "failed",
@@ -412,4 +433,3 @@ def start_scheduler():
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
     scheduler.start()
     logger.success("APScheduler started (interval = 6 hours).")
-

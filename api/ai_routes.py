@@ -1,14 +1,18 @@
 # === Third-party Modules ===
+import asyncio
+from typing import Literal, Optional
+
 import dateparser
 from pymongo.errors import PyMongoError
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 # === Internal Modules ===
 from core.limiter import limiter
 from loguru import logger
 from database import get_mongo_db
-from services.scheduler_service import schedule_followup_message
+from services.scheduler_service import list_scheduled_followups, schedule_followup_message, transition_scheduled_followup
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
 from services.ai_chatbot import update_prompt_in_cache, get_prompt
@@ -20,6 +24,15 @@ router = APIRouter(prefix="/api/ai", tags=["AI Routes"])
 
 def _org_metadata_collection():
     return db["organizations_metadata"]
+
+
+class ScheduleFollowUpRequest(BaseModel):
+    source: Literal["manual", "quotation"] = "manual"
+    quote_id: Optional[str] = Field(default=None, max_length=80)
+
+
+class FollowUpStatusRequest(BaseModel):
+    status: Literal["cancelled", "fulfilled"]
 
 def conversation_doc_to_analysis(doc: dict) -> ChatAnalysis:
     return ChatAnalysis(
@@ -77,18 +90,58 @@ async def update_chatbot_prompt(request: Request, payload: ChatbotPromptUpdate, 
 
 @router.post("/schedule-message/{conversation_id}")
 @limiter.limit("100/minute")
-async def schedule_message(request: Request, conversation_id: str, user: CurrentUser):
+async def schedule_message(
+    request: Request,
+    conversation_id: str,
+    user: CurrentUser,
+    payload: Optional[ScheduleFollowUpRequest] = None,
+):
     """
     Schedule a follow-up message for a conversation using an AI agent to determine the content and timing.
     """
     try:
-        return await schedule_followup_message(user.org_id, conversation_id)
+        body = payload or ScheduleFollowUpRequest()
+        if body.source == "quotation" and not body.quote_id:
+            raise HTTPException(status_code=422, detail="A quote is required for quotation follow-ups.")
+        return await schedule_followup_message(
+            user.org_id,
+            conversation_id,
+            source=body.source,
+            quote_id=body.quote_id,
+            requested_by=user.user_id,
+            requested_by_name=user.full_name,
+        )
     except HTTPException as e:
         # Graceful return for API
         raise e
     except Exception as e:
         # Catch anything unexpected that leaked through
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+@router.get("/followups")
+@limiter.limit("60/minute")
+async def get_followups(request: Request, user: CurrentUser, limit: int = Query(200, ge=1, le=500)):
+    return {"followups": await asyncio.to_thread(list_scheduled_followups, user.org_id, limit)}
+
+
+@router.patch("/followups/{followup_id}")
+@limiter.limit("60/minute")
+async def update_followup_status(
+    request: Request,
+    followup_id: str,
+    payload: FollowUpStatusRequest,
+    user: CurrentUser,
+):
+    followup = await asyncio.to_thread(
+        transition_scheduled_followup,
+        user.org_id,
+        followup_id,
+        payload.status,
+        user.user_id,
+        user.full_name or "Team member",
+    )
+    return {"followup": followup}
 
 @router.get("/chat-analysis/{conversation_id}")
 @limiter.limit("20/minute")
