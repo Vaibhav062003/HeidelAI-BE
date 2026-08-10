@@ -74,7 +74,40 @@ async def fetch_dealer_directory(org_id: str, sheet_id: Optional[str] = None, ta
 
 def generate_dealer_message(oos_doc: dict) -> str:
     """Generate the formatted inquiry message to send to dealers."""
-    return oos_doc.get("raw_query_text", "")
+    attrs = oos_doc.get("extracted_attributes", {})
+    parts = []
+    if attrs.get("category"):
+        parts.append(f"Category: {attrs['category'].strip().title()}")
+    if attrs.get("brand"):
+        parts.append(f"Brand: {attrs['brand'].strip().upper()}")
+    if attrs.get("model_name"):
+        parts.append(f"Model: {attrs['model_name'].strip()}")
+
+    specs = attrs.get("specs", {})
+    if specs:
+        for k, v in specs.items():
+            if v is None:
+                continue
+            label = k.replace("_", " ").title()
+            if label.lower() == "ram gb":
+                label, v = "RAM", f"{v}GB"
+            elif label.lower() == "storage gb":
+                label, v = "Storage", f"{v}GB"
+            elif label.lower() == "budget max":
+                label = "Max Budget"
+                try:
+                    v = f"Rs. {float(v):,.0f}"
+                except (ValueError, TypeError):
+                    v = f"Rs. {v}"
+            parts.append(f"{label}: {v}")
+
+    spec_summary = "\n".join(f"  - {p}" for p in parts)
+    raw_query = oos_doc.get("raw_query_text", "")
+
+    message = f"Query: \"{raw_query}\""
+    if parts:
+        message += f"\nSpecifications:\n{spec_summary}"
+    return message
 
 
 async def send_oos_to_dealers(oos_doc: dict, org_id: str):
@@ -113,15 +146,66 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     logger.info(f"[OOS] Fetching dealers from directory for org {org_id}...")
     all_dealers = await fetch_dealer_directory(org_id)
 
-    # Filter by brand if known
+    # Filter by brand if known or detected in raw query
+    raw_query = (oos_doc.get("raw_query_text", "") or "").lower()
+    known_brands = ["lenovo", "asus", "dell", "msi", "hp", "apple", "mac", "macbook", "acer", "samsung", "gigabyte"]
+    detected_brand = None
     if brand:
-        brand_lower = brand.strip().lower()
-        target_dealers = [
-            d for d in all_dealers
-            if brand_lower in [b.strip().lower() for b in d.get("brands", "").split(",")]
-        ]
-        logger.info(f"[OOS] Filtered {len(all_dealers)} dealers down to {len(target_dealers)} dealers matching brand='{brand}'")
+        detected_brand = brand.strip().lower()
+    else:
+        for kb in known_brands:
+            if kb in raw_query:
+                detected_brand = kb
+                break
+
+    if detected_brand in ("mac", "macbook", "apple"):
+        brand_search_terms = ["apple", "mac", "macbook"]
+    else:
+        brand_search_terms = [detected_brand] if detected_brand else []
+
+    if detected_brand:
+        target_dealers = []
+        for d in all_dealers:
+            dealer_brands = [b.strip().lower() for b in d.get("brands", "").split(",")]
+            if any(term in dealer_brands for term in brand_search_terms):
+                target_dealers.append(d)
+        logger.info(f"[OOS] Filtered {len(all_dealers)} dealers down to {len(target_dealers)} dealers matching brand='{detected_brand}' (search terms={brand_search_terms})")
         
+        # Lenovo specific consumer / commercial sub-filtering
+        if detected_brand == "lenovo":
+            model_name = (oos_doc.get("extracted_attributes", {}).get("model_name", "") or "").lower()
+            
+            # Map keywords to their target dealer categories
+            lenovo_category_map = {
+                "v14": "commercial",
+                "v15": "commercial",
+                "thinkbook": "commercial",
+                "thinkpad": "commercial",
+                "x1 carbon": "commercial",
+                "loq": "consumer",
+                "loq essential": "consumer",
+                "legion": "consumer",
+                "legion pro": "consumer",
+                "ideapad slim 1": "consumer",
+                "ideapad slim 3": "consumer",
+                "ideapad slim 5": "consumer",
+                "ideapad": "consumer",
+                "yoga": "consumer",
+            }
+            
+            # Collect unique categories matched by keywords in query or model name
+            matched_categories = {
+                category
+                for kw, category in lenovo_category_map.items()
+                if kw in raw_query or kw in model_name
+            }
+            
+            if len(matched_categories) == 1:
+                category = list(matched_categories)[0]
+                target_dealers = [d for d in target_dealers if d.get("category") == category]
+                logger.info(f"[OOS] Lenovo {category} inquiry detected. Filtered to {len(target_dealers)} dealers.")
+            else:
+                logger.info(f"[OOS] Lenovo inquiry category undetermined or mixed ({matched_categories}). Using all {len(target_dealers)} Lenovo dealers.")
     else:
         target_dealers = all_dealers
         logger.info(f"[OOS] No brand specified. Using all {len(target_dealers)} resolved dealers.")
@@ -129,11 +213,37 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     target_dealers = target_dealers[:MAX_DEALERS_PER_SEND]
 
     if not target_dealers:
-        logger.warning(f"[OOS] No dealers found to contact for query_id={oos_doc['query_id']}. Transitioning status to 'no_dealers'")
+        logger.warning(f"[OOS] No matching dealers found for brand/category in query_id={oos_doc['query_id']}. Creating escalation and setting status to 'no_dealers'")
         await async_db["oos_requests"].update_one(
             {"query_id": oos_doc["query_id"]},
             {"$set": {"status": "no_dealers"}}
         )
+        # Escalation to team when no matching dealer exists in dealer_directory
+        from services.team_service import create_ai_escalation
+        inquiry_time = oos_doc.get("created_at", "")
+        if isinstance(inquiry_time, datetime):
+            inquiry_time = inquiry_time.astimezone(IST).strftime("%H:%M %d-%b-%Y")
+
+        escalation_text = (
+            f"Customer Number: {oos_doc.get('customer_number', 'N/A')}\n"
+            f"Customer Inquiry: {oos_doc.get('raw_query_text', 'N/A')}\n"
+            f"Inquiry Time: {inquiry_time}\n"
+            f"Status: ESCALATED - No dealer found matching brand '{detected_brand or 'N/A'}' or requested category in dealer directory.\n"
+        )
+
+        await create_ai_escalation(org_id, {
+            "user_name": oos_doc.get("customer_name", "Customer"),
+            "customer_number": oos_doc.get("customer_number", ""),
+            "customer_text": escalation_text,
+            "inferred_intent": "no_dealer_found",
+            "status": "pending_human_review",
+            "role": "oos_no_dealer",
+            "sender_name": "OOS System",
+            "metadata": {
+                "oos_query_id": oos_doc.get("query_id"),
+                "detected_brand": detected_brand,
+            }
+        })
         return
 
     # Generate dealer message
@@ -215,7 +325,7 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         logger.error(f"[OOS] Failed to contact any dealers for query_id={oos_doc['query_id']}. Status set to 'send_failed'")
 
 
-async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, message_context: Optional[dict] = None) -> bool:
+async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, message_context: Optional[dict] = None, create_escalation: bool = True) -> bool:
     """
     Check if an incoming WhatsApp message is a dealer replying to an OOS request.
     Handles the case where customer and dealer are the SAME phone number.
@@ -321,10 +431,11 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
         logger.error(f"[OOS] Sheet logging failed: {e}")
 
     # Create AI escalation with full context
-    try:
-        await create_oos_escalation(org_id, oos_doc, reply_entry)
-    except Exception as e:
-        logger.error(f"[OOS] Escalation creation failed: {e}")
+    if create_escalation:
+        try:
+            await create_oos_escalation(org_id, oos_doc, reply_entry)
+        except Exception as e:
+            logger.error(f"[OOS] Escalation creation failed: {e}")
 
     return True
 

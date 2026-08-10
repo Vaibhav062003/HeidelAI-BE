@@ -424,6 +424,7 @@ async def update_ai_status(org_type: str = "all"):
 
 
 def start_scheduler():
+    from services.cloudinary_service import cleanup_expired_audio_notes
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests
     from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
 
@@ -437,5 +438,6 @@ def start_scheduler():
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
     scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_member_device_revocations, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
     scheduler.start()
     logger.success("APScheduler started (interval = 6 hours).")

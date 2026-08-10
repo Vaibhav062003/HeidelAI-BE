@@ -23,7 +23,7 @@ ORG_ID = settings.PMA_ORG_ID
 VEDIC_MATHS_BOOKS_PROMO_VIDEO_URL = ""
 
 # Base URL for the chatbot API
-CHATBOT_BASE_URL = "https://heidelai-chatbot-2.koyeb.app"
+CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app/"
 # CHATBOT_BASE_URL = "http://localhost:8000"  # For local testing with self-signed certs, ensure to disable SSL verification in httpx client
 
 
