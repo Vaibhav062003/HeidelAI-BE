@@ -4,7 +4,16 @@ from services.ig_service import send_ig_message, revoke_instagram_access, archiv
 class InstagramService(BasePlatformService):
     
     async def send_message(self, sender_id: str, recipient_id: str, message: str, **kwargs) -> dict:
-        return await send_ig_message(id=recipient_id, message_text=message,instagram_id=sender_id)
+        response = await send_ig_message(
+            id=recipient_id,
+            message_text=message,
+            instagram_id=sender_id,
+            mode="reply",
+            org_id=kwargs.get("org_id"),
+        )
+        if not isinstance(response, dict) or response.get("error") or response.get("success") is False:
+            raise RuntimeError(response.get("error", "Instagram rejected the follow-up") if isinstance(response, dict) else "Instagram rejected the follow-up")
+        return response
 
     async def disconnect(self, org_id: str, connection_id: str) -> dict:
         await archive_instagram_data(org_id, connection_id)

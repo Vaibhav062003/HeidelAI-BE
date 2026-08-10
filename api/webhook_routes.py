@@ -13,6 +13,7 @@ from core.managers import manager
 from services.automation_service import execute_whatsapp_flow
 from services.pma_chatbot import get_vedic_maths_books_message, process_onboarding_if_needed, send_to_pma_chatbot
 from services.cloudinary_service import upload_and_send_whatsapp_media_background
+from services.followup_service import handle_followup_customer_reply
 from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
 from services.heidelai_bot import send_to_chatbot
@@ -634,6 +635,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         notify_push=True,
                                     )
 
+                                if await handle_followup_customer_reply(org_id, conversation_id, content):
+                                    logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                                    return {"status": "ok"}
+
                                 contact_data = {
                                     "whatsapp_id": whatsapp_business_id,
                                     "full_name": sender_name2,
@@ -940,6 +945,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     phone_number_id=value.get("metadata", {}).get("phone_number_id") or connection.get("phone_id"),
                                 )
 
+                                if await handle_followup_customer_reply(org_id, conversation_id, content):
+                                    logger.info(f"Media reply handled for follow-up {conversation_id}")
+
                                 contact_data = {
                                 "whatsapp_id": whatsapp_business_id,
                                 "full_name": sender_name2,
@@ -1019,6 +1027,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context=context,
                                         notify_push=True,
                                     )
+
+                                if await handle_followup_customer_reply(org_id, conversation_id, content or "Interactive reply"):
+                                    logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                                    return {"status": "ok"}
 
                                 if whatsapp_flow:
                                     automation_response = await execute_whatsapp_flow(
@@ -1354,6 +1366,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 context=context,
                                 notify_push=True,
                             )
+
+                            if await handle_followup_customer_reply(org_id, conversation_id, content):
+                                logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                                return {"status": "ok"}
 
                             # Check if conversation exists
                             existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
@@ -1827,6 +1843,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         context=context,
                         notify_push=not message_echo,
                     )
+
+                    if not message_echo and isinstance(message_text, str) and await handle_followup_customer_reply(
+                        org_id, conversation_id, message_text
+                    ):
+                        logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                        return {"status": "ok"}
                     
                     if not message_echo:
                         # Get conversation doc to check if AI is enabled

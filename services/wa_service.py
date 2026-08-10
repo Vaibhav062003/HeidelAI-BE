@@ -19,7 +19,7 @@ from config.settings import IG_VERSION, VERSION, WA_VERSION, APP_ID
 from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
-from services.scheduler_service import abort_scheduled_message
+from services.followup_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
 from services.utils import normalize_phone
 from services.push_notification_service import schedule_customer_message_push
@@ -123,7 +123,7 @@ async def create_or_update_whatsapp_conversation(
         "last_message_timestamp": now,
         "last_message_is_private_note": mode == "private",
         "last_sender": last_sender,
-        "status": "open",
+        "status": existing_conversation.get("status", "open") if is_auto_followup and existing_conversation else "open",
     }
     
     if extra_updates:
@@ -147,7 +147,7 @@ async def create_or_update_whatsapp_conversation(
     }
 
     # Handle Agent vs Customer logic
-    if existing_conversation:
+    if existing_conversation and not is_auto_followup:
         abort_result = await abort_scheduled_message(org_id, conversation_id)
         logger.success(f"Aborted Scheduled message: {abort_result}")
 
@@ -459,6 +459,7 @@ async def send_whatsapp_message(
         bot_context: Optional[dict] = None,
         raise_on_partial_failure: bool = False,
         sender_name: Optional[str] = "Agent",
+        is_auto_followup: bool = False,
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -525,7 +526,8 @@ async def send_whatsapp_message(
             customer_name=message.get("customer_name") or recipient_id,
             last_message=contents[0],
             last_sender="ai" if mode == "ai" else "agent",
-            mode=mode
+            mode=mode,
+            is_auto_followup=is_auto_followup,
         )
 
         last_stored_id = None
@@ -588,7 +590,7 @@ async def send_whatsapp_message(
                 "last_message_timestamp": now,
                 "last_sender": "ai" if mode == "ai" else "agent" ,
                 "reminder_stage": 0,
-                "next_action_at": now + timedelta(hours=6),
+                "next_action_at": None if is_auto_followup else now + timedelta(hours=6),
                 "last_message_is_private_note": mode == "private"
             }
 

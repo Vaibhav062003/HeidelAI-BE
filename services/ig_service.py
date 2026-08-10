@@ -18,7 +18,7 @@ from core.managers import manager
 from schemas.models import MessageRole
 from database import get_mongo_db, get_mongo_client
 from core.services import services
-from services.scheduler_service import abort_scheduled_message
+from services.followup_service import abort_scheduled_message
 from services.conversation_utils import reopen_conversation
 from services.push_notification_service import schedule_customer_message_push
 
