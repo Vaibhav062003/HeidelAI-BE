@@ -98,6 +98,13 @@ X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making 
 # Google OAuth 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+
+# Google Drive Webhook (push notifications for sheet changes)
+# GOOGLE_WEBHOOK_BASE_URL: Public HTTPS URL where Google sends notifications
+#   e.g. "https://api.yourapp.com" → webhook receives POSTs at /api/google-sheets/webhook
+# GOOGLE_WEBHOOK_SECRET: Arbitrary secret used to generate watch channel tokens for validation
+GOOGLE_WEBHOOK_BASE_URL = os.getenv("GOOGLE_WEBHOOK_BASE_URL", "").strip().strip("'\"")
+GOOGLE_WEBHOOK_SECRET = os.getenv("GOOGLE_WEBHOOK_SECRET", "default-webhook-secret-change-me")
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
