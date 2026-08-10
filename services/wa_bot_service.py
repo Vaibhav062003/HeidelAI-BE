@@ -77,6 +77,18 @@ async def create_wa_bot_flow(
         }
 
         await col.insert_one(doc)
+        
+        # Ensure only 1 active flow per organization if creating as active
+        if status == "active":
+            await col.update_many(
+                {"org_id": org_id, "flow_id": {"$ne": flow_id}},
+                {"$set": {
+                    "status": "draft",
+                    "published_at": None,
+                    "updated_at": now,
+                }}
+            )
+            
         logger.info(f"Created wa_bot_flow {flow_id} for org {org_id}")
         return serialize_mongo(doc)
 
@@ -170,6 +182,15 @@ async def update_wa_bot_flow(
         if "status" in payload:
             if payload["status"] == "active":
                 set_fields["published_at"] = now
+                # Ensure only 1 active flow per organization
+                await col.update_many(
+                    {"org_id": org_id, "flow_id": {"$ne": flow_id}},
+                    {"$set": {
+                        "status": "draft",
+                        "published_at": None,
+                        "updated_at": now,
+                    }}
+                )
             else:
                 set_fields["published_at"] = None
                 
@@ -231,6 +252,16 @@ async def publish_wa_bot_flow(
         col = _col(org_id)
         now = datetime.now(timezone.utc)
 
+        # Ensure only 1 active flow per organization by setting all others to draft
+        await col.update_many(
+            {"org_id": org_id, "flow_id": {"$ne": flow_id}},
+            {"$set": {
+                "status": "draft",
+                "published_at": None,
+                "updated_at": now,
+            }}
+        )
+
         result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
             {"$set": {
@@ -247,7 +278,7 @@ async def publish_wa_bot_flow(
         if not result:
             return None
 
-        logger.info(f"Published wa_bot_flow {flow_id} for org {org_id}")
+        logger.info(f"Published wa_bot_flow {flow_id} for org {org_id} and unpublished all others.")
         return serialize_mongo(result)
 
     except Exception as e:
