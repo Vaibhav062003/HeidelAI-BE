@@ -1,4 +1,3 @@
-from pymongo import ReturnDocument, UpdateOne
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from typing import Optional
@@ -8,6 +7,7 @@ from core.services import services
 from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
+from services.followup_service import process_scheduled_messages as drain_scheduled_followups
 from services.agent_service import send_to_agent
 from services.wa_service import send_whatsapp_message
 # from services.websocket_service import broadcast_on_stats_update
@@ -17,8 +17,6 @@ from config.settings import LEE_DEALER_ORG_ID
 
 
 db = get_mongo_db()
-scheduled_collection = db["scheduled_messages"]
-
 # mapping of platforms -> service instance
 messaging_services = {
     "instagram": instagram_service.InstagramService(),
@@ -26,120 +24,7 @@ messaging_services = {
 }
 
 async def process_scheduled_messages():
-    now = datetime.now(timezone.utc)
-    stale_claim = now - timedelta(minutes=5)
-
-    pending = list(
-        scheduled_collection.find(
-            {
-                "scheduled_time": {"$lte": now},
-                "$or": [
-                    {"status": "pending"},
-                    {"status": "processing", "claimed_at": {"$lt": stale_claim}},
-                ],
-            }
-        ).sort("scheduled_time", 1)
-    )
-
-    if not pending:
-        logger.success("No scheduled messages due.")
-        return
-
-    logger.success(f"Found {len(pending)} messages to send.")
-
-    updates = []
-    for msg in pending:
-        claimed = scheduled_collection.find_one_and_update(
-            {
-                "_id": msg["_id"],
-                "$or": [
-                    {"status": "pending"},
-                    {"status": "processing", "claimed_at": {"$lt": stale_claim}},
-                ],
-            },
-            {"$set": {"status": "processing", "claimed_at": now, "updated_at": now}},
-            return_document=ReturnDocument.AFTER,
-        )
-        if not claimed:
-            continue
-        msg = claimed
-        platform = msg["platform"]
-        sender_id = msg["sender_id"]
-        receiver_id = msg["receiver_id"]
-        message = msg["followup_text"]
-        conversation_id = msg["conversation_id"]
-        org_id = msg["org_id"]
-
-        service = messaging_services.get(platform)
-        if not service:
-            logger.error(f"No service found for platform: {platform}")
-            updates.append(
-                UpdateOne(
-                    {"_id": msg["_id"], "status": "processing"},
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "error": f"No service found for platform: {platform}",
-                            "processed_at": now
-                        }
-                    }
-                )
-            )
-            continue
-
-        try:
-            send_msg_response = await service.send_message(
-                sender_id=sender_id, 
-                recipient_id=receiver_id, 
-                message=message,
-                # These kwargs are vital for WhatsApp, ignored by Instagram
-                org_id=org_id,
-                conversation_id=conversation_id
-            )
-
-            logger.info(f"send_message response for {receiver_id} on {platform}: {send_msg_response}")
-
-            updates.append(
-                UpdateOne(
-                    {"_id": msg["_id"], "status": "processing"},
-                    {
-                        "$set": {
-                            "status": "sent",
-                            "sent_at": now,
-                            "processed_at": now
-                        }
-                    }
-                )
-            )
-            logger.success(f"Sent message to {receiver_id} on {platform}")
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Failed to send to {receiver_id} on {platform}: {error_msg}")
-            updates.append(
-                UpdateOne(
-                    {"_id": msg["_id"], "status": "processing"},
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "error": error_msg,
-                            "processed_at": now
-                        }
-                    }
-                )
-            )
-
-    if updates:
-        try:
-            result = scheduled_collection.bulk_write(updates)
-            logger.success(f"Updated {result.modified_count} message statuses")
-            
-            # Broadcast updates for all affected orgs
-            # org_ids = {msg["org_id"] for msg in pending}
-            # for org_id in org_ids:
-            #     await broadcast_on_stats_update(org_id)
-                
-        except Exception as e:
-            logger.error(f"Error updating message statuses: {e}")
+    await drain_scheduled_followups(messaging_services)
 
 async def process_inactivity_for_org(org_id: str):
     
@@ -226,10 +111,6 @@ async def process_inactivity_for_org(org_id: str):
             continue
 
 async def process_time_based_tasks():
-
-    # Process scheduled messages
-    logger.info("Processing scheduled messages...")
-    await process_scheduled_messages()
 
     logger.info("Cleaning expired archives...")
     await clean_expired_archives()
@@ -425,6 +306,14 @@ def start_scheduler():
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
+    scheduler.add_job(
+        process_scheduled_messages,
+        "interval",
+        seconds=30,
+        next_run_time=datetime.now(timezone.utc),
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.add_job(update_ai_status, "interval", minutes=5, args=["lee"], next_run_time=datetime.now(timezone.utc))
     scheduler.add_job(update_ai_status, "interval", hours=1, args=["others"], next_run_time=datetime.now(timezone.utc))
     # OOS: send pending dealer messages when business hours start (check every 15 min)
@@ -432,4 +321,4 @@ def start_scheduler():
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
     scheduler.start()
-    logger.success("APScheduler started (interval = 6 hours).")
+    logger.success("APScheduler started (follow-ups every 30 seconds).")

@@ -7,6 +7,7 @@ from services.wa_service import ensure_bulk_job_indexes, recover_stale_bulk_jobs
 from services.automation_scheduler import startup_scheduler, shutdown_scheduler
 from services.google_sheets_scheduler import startup_google_scheduler, shutdown_google_scheduler
 from services.oos_service import ensure_oos_indexes
+from services.followup_service import ensure_followup_indexes
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -18,6 +19,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(recover_stale_bulk_jobs)
     load_agents()
     load_prompts_into_cache()
+    await ensure_followup_indexes()
     start_scheduler()
     await startup_scheduler()
     await startup_google_scheduler()

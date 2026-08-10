@@ -31,6 +31,7 @@ from core.services import services
 from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
 from services.automation_trigger_handler import check_and_trigger_automations
+from services.followup_service import handle_followup_customer_reply
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -524,6 +525,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context=context
                                     )
 
+                                if await handle_followup_customer_reply(org_id, conversation_id, content):
+                                    logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                                    return {"status": "ok"}
+
                                 contact_data = {
                                     "whatsapp_id": whatsapp_business_id,
                                     "full_name": sender_name2,
@@ -774,6 +779,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 elif message_type == "document":
                                     content = media_data.get("caption", "Shared a document")
 
+                                conversation_id = await create_or_update_whatsapp_conversation(
+                                    org_id=org_id,
+                                    recipient_id=whatsapp_business_id,
+                                    customer_phone_no=customer_phone_no,
+                                    customer_name=sender_name2,
+                                    last_message=content,
+                                    last_sender="customer",
+                                    reply_window_expiry=reply_window_expiry_time_utc,
+                                    is_ad_referral=is_ad_referral,
+                                    mode="reply",
+                                )
+
                                 background_tasks.add_task(
                                     upload_and_send_whatsapp_media_background,
                                     media_url=media_url,
@@ -788,8 +805,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     sender_name2=sender_name2,
                                     message_id=message_id,
                                     conversation_id=conversation_id,
-                                    reply_window_expiry_time_utc=reply_window_expiry_time_utc,
-                                    is_ad_referral=is_ad_referral,
                                     media_name=media_name,
                                     caption=media_data.get("caption", None)
                                 )
@@ -874,6 +889,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context_type=context_type,
                                         context=context
                                     )
+
+                                if await handle_followup_customer_reply(org_id, conversation_id, content or "Interactive reply"):
+                                    logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                                    return {"status": "ok"}
 
                                 if whatsapp_flow:
                                     automation_response = await execute_whatsapp_flow(
@@ -1170,6 +1189,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 context_type=context_type,
                                 context=context
                             )
+
+                            if await handle_followup_customer_reply(org_id, conversation_id, content):
+                                logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                                return {"status": "ok"}
 
                             # Check if conversation exists
                             existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
@@ -1642,6 +1665,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         context_type=context_type,
                         context=context,
                     )
+
+                    if not message_echo and isinstance(message_text, str) and await handle_followup_customer_reply(
+                        org_id, conversation_id, message_text
+                    ):
+                        logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                        return {"status": "ok"}
                     
                     if not message_echo:
                         # Get conversation doc to check if AI is enabled

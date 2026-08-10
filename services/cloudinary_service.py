@@ -184,15 +184,13 @@ async def upload_and_send_whatsapp_media_background(
     message_id: str,
     conversation_id: str,
     media_name: str,
-    reply_window_expiry_time_utc: datetime,
-    is_ad_referral: bool,
     caption: Optional[str] = None
 ) -> Optional[str]:
     """
     Downloads media from WhatsApp and uploads to Cloudinary.
     This is designed to be run as a BackgroundTask.
     """
-    from services.wa_service import create_or_update_whatsapp_conversation, store_whatsapp_message
+    from services.wa_service import store_whatsapp_message
     logger.success(f"Background Task Started: Processing media {media_id}")
     
     headers = {
@@ -282,18 +280,6 @@ async def upload_and_send_whatsapp_media_background(
         # but the image is not yet uploaded to Cloudinary, so it shows loading.
         # ---------------------------------------------------------
 
-        # Create or update conversation
-        await create_or_update_whatsapp_conversation(
-            org_id=org_id,
-            recipient_id=whatsapp_business_id,
-            customer_phone_no=customer_phone_no,
-            customer_name=sender_name2,
-            last_message=content,
-            reply_window_expiry=reply_window_expiry_time_utc,
-            is_ad_referral=is_ad_referral,
-            last_sender="customer"
-        )
-        
         # Store in WhatsApp-specific collections
         await store_whatsapp_message(
             org_id=org_id,
@@ -306,6 +292,13 @@ async def upload_and_send_whatsapp_media_background(
             recipient_id=whatsapp_business_id,
             role=MessageRole.CUSTOMER,
             message_id=message_id,  # Use the ID from the webhook for deduplication
+        )
+
+        from services.followup_service import handle_followup_customer_reply
+        await handle_followup_customer_reply(
+            org_id,
+            conversation_id,
+            caption or content or f"Shared a {message_type}",
         )
 
     except Exception as e:

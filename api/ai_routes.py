@@ -1,8 +1,6 @@
 # === Third-party Modules ===
-import asyncio
 from typing import Literal, Optional
 
-import dateparser
 from pymongo.errors import PyMongoError
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -12,7 +10,7 @@ from pydantic import BaseModel, Field
 from core.limiter import limiter
 from loguru import logger
 from database import get_mongo_db
-from services.scheduler_service import list_scheduled_followups, schedule_followup_message, transition_scheduled_followup
+from services.followup_service import list_scheduled_followups, schedule_followup_message, transition_scheduled_followup
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
 from services.ai_chatbot import update_prompt_in_cache, get_prompt
@@ -29,6 +27,7 @@ def _org_metadata_collection():
 class ScheduleFollowUpRequest(BaseModel):
     source: Literal["manual", "quotation"] = "manual"
     quote_id: Optional[str] = Field(default=None, max_length=80)
+    scheduled_for: Optional[datetime] = None
 
 
 class FollowUpStatusRequest(BaseModel):
@@ -97,7 +96,7 @@ async def schedule_message(
     payload: Optional[ScheduleFollowUpRequest] = None,
 ):
     """
-    Schedule a follow-up message for a conversation using an AI agent to determine the content and timing.
+    Schedule a follow-up using the customer's timeline or the fixed three-hour default.
     """
     try:
         body = payload or ScheduleFollowUpRequest()
@@ -110,19 +109,20 @@ async def schedule_message(
             quote_id=body.quote_id,
             requested_by=user.user_id,
             requested_by_name=user.full_name,
+            scheduled_for=body.scheduled_for,
         )
     except HTTPException as e:
         # Graceful return for API
         raise e
     except Exception as e:
-        # Catch anything unexpected that leaked through
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        logger.error(f"Unexpected follow-up scheduling error for {conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail="The follow-up could not be scheduled. Try again.")
 
 
 @router.get("/followups")
 @limiter.limit("60/minute")
 async def get_followups(request: Request, user: CurrentUser, limit: int = Query(200, ge=1, le=500)):
-    return {"followups": await asyncio.to_thread(list_scheduled_followups, user.org_id, limit)}
+    return {"followups": await list_scheduled_followups(user.org_id, limit)}
 
 
 @router.patch("/followups/{followup_id}")
@@ -133,8 +133,7 @@ async def update_followup_status(
     payload: FollowUpStatusRequest,
     user: CurrentUser,
 ):
-    followup = await asyncio.to_thread(
-        transition_scheduled_followup,
+    followup = await transition_scheduled_followup(
         user.org_id,
         followup_id,
         payload.status,
