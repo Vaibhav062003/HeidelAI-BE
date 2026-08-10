@@ -24,7 +24,7 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
         assert isinstance(annotations.get("user"), ast.Name)
         assert annotations["user"].id == "CurrentUser"
 
-    service = ast.parse(Path("services/scheduler_service.py").read_text())
+    service = ast.parse(Path("services/followup_service.py").read_text())
     schedule = _function(service, "schedule_followup_message")
     assert {"org_id", "quote_id", "quote_value", "followup_text", "scheduled_time"} <= _strings(schedule)
     assert any(
@@ -43,14 +43,30 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
         for node in ast.walk(transition)
     )
 
-    scheduler = ast.parse(Path("core/scheduler.py").read_text())
-    processor = _function(scheduler, "process_scheduled_messages")
+    processor = _function(service, "process_scheduled_messages")
     assert any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "find_one_and_update"
         for node in ast.walk(processor)
     )
+
+    webhook = ast.parse(Path("api/webhook_routes.py").read_text())
+    followup_calls = [
+        node for node in ast.walk(webhook)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "handle_followup_customer_reply"
+    ]
+    assert len(followup_calls) >= 5
+
+    background_upload = next(
+        node for node in ast.walk(webhook)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "add_task"
+        and node.args
+        and getattr(node.args[0], "id", None) == "upload_and_send_whatsapp_media_background"
+    )
+    assert any(call.lineno > background_upload.lineno for call in followup_calls)
 
 
 if __name__ == "__main__":

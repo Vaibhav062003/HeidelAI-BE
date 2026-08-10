@@ -129,7 +129,16 @@ ENSURED_INDEX_COLLECTIONS = set()
 async def trigger_ai_invocation_after_reenabling(org_id: str, conv: dict, wa_id: Optional[str]):
     conversation_id = conv["conversation_id"]
     try:
-        # Re-verify AI status before invocation to prevent race conditions
+        # Re-verify org-level AI status before invocation (guards against org AI being disabled
+        # after process_single_org passed the org check but before this background task runs)
+        org_doc = await asyncio.to_thread(
+            lambda: db.organizations.find_one({"org_id": org_id}, {"is_ai_enabled": 1})
+        )
+        if not org_doc or not org_doc.get("is_ai_enabled", False):
+            logger.info(f"Skipping AI auto-activation for {conversation_id}: org-level AI is disabled for org {org_id}.")
+            return
+
+        # Re-verify conversation-level AI status to prevent race conditions
         conv_col = db[f"conversations_{org_id}"]
         latest_conv = await asyncio.to_thread(
             lambda: conv_col.find_one({"conversation_id": conversation_id}, {"is_ai_enabled": 1, "persona": 1, "location": 1, "customer_name": 1, "whatsapp_id": 1})
@@ -193,8 +202,10 @@ async def update_ai_status(org_type: str = "all"):
         elif org_type == "all":
             query = {}
             
+        # Also filter for orgs with AI enabled at the org level — no point processing orgs with AI off
+        query["is_ai_enabled"] = True
         org_docs = list(await asyncio.to_thread(
-            lambda: list(db.organizations.find(query, {"org_id": 1, "wa_id": 1}))
+            lambda: list(db.organizations.find(query, {"org_id": 1, "wa_id": 1, "is_ai_enabled": 1}))
         ))
         
         if not org_docs:
@@ -209,6 +220,19 @@ async def update_ai_status(org_type: str = "all"):
 
         async def process_single_org(org_doc: dict):
             org_id = org_doc["org_id"]
+            # is_ai_enabled is already True here because of the DB-level filter above,
+            # but guard defensively in case the doc was fetched before an update.
+            if not org_doc.get("is_ai_enabled", False):
+                logger.info(f"Skipping auto AI status check for org {org_id} because is_ai_enabled is False.")
+                # Clean up any stale auto_ai_disabled flags on conversations for this org
+                conv_col_cleanup = db[f"conversations_{org_id}"]
+                await asyncio.to_thread(
+                    conv_col_cleanup.update_many,
+                    {"auto_ai_disabled": True},
+                    {"$set": {"auto_ai_disabled": False}, "$unset": {"auto_ai_disabled_until": ""}}
+                )
+                return 0
+
             conv_col = db[f"conversations_{org_id}"]
             col_name = conv_col.name
             
@@ -302,7 +326,9 @@ async def update_ai_status(org_type: str = "all"):
 
 
 def start_scheduler():
+    from services.cloudinary_service import cleanup_expired_audio_notes
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests
+    from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
@@ -320,5 +346,8 @@ def start_scheduler():
     scheduler.add_job(process_pending_oos_sends, "interval", minutes=15)
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
+    scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(process_pending_member_device_revocations, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
     scheduler.start()
-    logger.success("APScheduler started (follow-ups every 30 seconds).")
+    logger.success("APScheduler started (interval = 6 hours).")
