@@ -1,4 +1,3 @@
-from pymongo import UpdateOne
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from typing import Optional
@@ -8,6 +7,7 @@ from core.services import services
 from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
+from services.followup_service import process_scheduled_messages as drain_scheduled_followups
 from services.agent_service import send_to_agent
 from services.wa_service import send_whatsapp_message
 # from services.websocket_service import broadcast_on_stats_update
@@ -17,8 +17,6 @@ from config.settings import LEE_DEALER_ORG_ID
 
 
 db = get_mongo_db()
-scheduled_collection = db["scheduled_messages"]
-
 # mapping of platforms -> service instance
 messaging_services = {
     "instagram": instagram_service.InstagramService(),
@@ -26,99 +24,7 @@ messaging_services = {
 }
 
 async def process_scheduled_messages():
-    now = datetime.now(timezone.utc)
-
-    pending = list(
-        scheduled_collection.find(
-            {"status": "pending", "scheduled_time": {"$lte": now}}
-        ).sort("scheduled_time", 1)
-    )
-
-    if not pending:
-        logger.success("No scheduled messages due.")
-        return
-
-    logger.success(f"Found {len(pending)} messages to send.")
-
-    updates = []
-    for msg in pending:
-        platform = msg["platform"]
-        sender_id = msg["sender_id"]
-        receiver_id = msg["receiver_id"]
-        message = msg["followup_text"]
-        conversation_id = msg["conversation_id"]
-        org_id = msg["org_id"]
-
-        service = messaging_services.get(platform)
-        if not service:
-            logger.error(f"No service found for platform: {platform}")
-            updates.append(
-                UpdateOne(
-                    {"_id": msg["_id"]},
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "error": f"No service found for platform: {platform}",
-                            "processed_at": now
-                        }
-                    }
-                )
-            )
-            continue
-
-        try:
-            send_msg_response = await service.send_message(
-                sender_id=sender_id, 
-                recipient_id=receiver_id, 
-                message=message,
-                # These kwargs are vital for WhatsApp, ignored by Instagram
-                org_id=org_id,
-                conversation_id=conversation_id
-            )
-
-            logger.info(f"send_message response for {receiver_id} on {platform}: {send_msg_response}")
-
-            updates.append(
-                UpdateOne(
-                    {"_id": msg["_id"]},
-                    {
-                        "$set": {
-                            "status": "sent",
-                            "sent_at": now,
-                            "processed_at": now
-                        }
-                    }
-                )
-            )
-            logger.success(f"Sent message to {receiver_id} on {platform}")
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Failed to send to {receiver_id} on {platform}: {error_msg}")
-            updates.append(
-                UpdateOne(
-                    {"_id": msg["_id"]},
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "error": error_msg,
-                            "processed_at": now
-                        }
-                    }
-                )
-            )
-
-    if updates:
-        try:
-            result = scheduled_collection.bulk_write(updates)
-            logger.success(f"Updated {result.modified_count} message statuses")
-            
-            # Broadcast updates for all affected orgs
-            # org_ids = {msg["org_id"] for msg in pending}
-            # for org_id in org_ids:
-            #     await broadcast_on_stats_update(org_id)
-                
-        except Exception as e:
-            logger.error(f"Error updating message statuses: {e}")
+    await drain_scheduled_followups(messaging_services)
 
 async def process_inactivity_for_org(org_id: str):
     
@@ -206,10 +112,6 @@ async def process_inactivity_for_org(org_id: str):
 
 async def process_time_based_tasks():
 
-    # Process scheduled messages
-    logger.info("Processing scheduled messages...")
-    await process_scheduled_messages()
-
     logger.info("Cleaning expired archives...")
     await clean_expired_archives()
 
@@ -227,7 +129,16 @@ ENSURED_INDEX_COLLECTIONS = set()
 async def trigger_ai_invocation_after_reenabling(org_id: str, conv: dict, wa_id: Optional[str]):
     conversation_id = conv["conversation_id"]
     try:
-        # Re-verify AI status before invocation to prevent race conditions
+        # Re-verify org-level AI status before invocation (guards against org AI being disabled
+        # after process_single_org passed the org check but before this background task runs)
+        org_doc = await asyncio.to_thread(
+            lambda: db.organizations.find_one({"org_id": org_id}, {"is_ai_enabled": 1})
+        )
+        if not org_doc or not org_doc.get("is_ai_enabled", False):
+            logger.info(f"Skipping AI auto-activation for {conversation_id}: org-level AI is disabled for org {org_id}.")
+            return
+
+        # Re-verify conversation-level AI status to prevent race conditions
         conv_col = db[f"conversations_{org_id}"]
         latest_conv = await asyncio.to_thread(
             lambda: conv_col.find_one({"conversation_id": conversation_id}, {"is_ai_enabled": 1, "persona": 1, "location": 1, "customer_name": 1, "whatsapp_id": 1})
@@ -291,8 +202,10 @@ async def update_ai_status(org_type: str = "all"):
         elif org_type == "all":
             query = {}
             
+        # Also filter for orgs with AI enabled at the org level — no point processing orgs with AI off
+        query["is_ai_enabled"] = True
         org_docs = list(await asyncio.to_thread(
-            lambda: list(db.organizations.find(query, {"org_id": 1, "wa_id": 1}))
+            lambda: list(db.organizations.find(query, {"org_id": 1, "wa_id": 1, "is_ai_enabled": 1}))
         ))
         
         if not org_docs:
@@ -307,6 +220,19 @@ async def update_ai_status(org_type: str = "all"):
 
         async def process_single_org(org_doc: dict):
             org_id = org_doc["org_id"]
+            # is_ai_enabled is already True here because of the DB-level filter above,
+            # but guard defensively in case the doc was fetched before an update.
+            if not org_doc.get("is_ai_enabled", False):
+                logger.info(f"Skipping auto AI status check for org {org_id} because is_ai_enabled is False.")
+                # Clean up any stale auto_ai_disabled flags on conversations for this org
+                conv_col_cleanup = db[f"conversations_{org_id}"]
+                await asyncio.to_thread(
+                    conv_col_cleanup.update_many,
+                    {"auto_ai_disabled": True},
+                    {"$set": {"auto_ai_disabled": False}, "$unset": {"auto_ai_disabled_until": ""}}
+                )
+                return 0
+
             conv_col = db[f"conversations_{org_id}"]
             col_name = conv_col.name
             
@@ -400,16 +326,28 @@ async def update_ai_status(org_type: str = "all"):
 
 
 def start_scheduler():
+    from services.cloudinary_service import cleanup_expired_audio_notes
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests
+    from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
+    scheduler.add_job(
+        process_scheduled_messages,
+        "interval",
+        seconds=30,
+        next_run_time=datetime.now(timezone.utc),
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.add_job(update_ai_status, "interval", minutes=5, args=["lee"], next_run_time=datetime.now(timezone.utc))
     scheduler.add_job(update_ai_status, "interval", hours=1, args=["others"], next_run_time=datetime.now(timezone.utc))
     # OOS: send pending dealer messages when business hours start (check every 15 min)
     scheduler.add_job(process_pending_oos_sends, "interval", minutes=15)
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
+    scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(process_pending_member_device_revocations, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
     scheduler.start()
     logger.success("APScheduler started (interval = 6 hours).")
-

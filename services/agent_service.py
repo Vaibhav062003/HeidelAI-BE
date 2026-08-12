@@ -1,10 +1,10 @@
 import httpx
 from typing import Dict, Optional
 from loguru import logger
-from config.settings import KOMAL_ORG_ID
+
 
 # Base URL for the chatbot API
-CHATBOT_BASE_URL = "https://heidelai-chatbot-2.koyeb.app"
+CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app/"
 #CHATBOT_BASE_URL = "http://localhost:8001"  For local testing with self-signed certs, ensure to disable SSL verification in httpx client
 
 async def send_to_agent(
@@ -17,6 +17,7 @@ async def send_to_agent(
     source: str = "webhook",
     timeout: int = 20,
     reply_context_message_id: str = None,
+    message_id: str = None,
     version: str = None
 ) -> Dict:
 
@@ -45,10 +46,9 @@ async def send_to_agent(
             "source": source
         }
     
-    if org_id == KOMAL_ORG_ID:
-        if reply_context_message_id:
-            payload["reply_context_message_id"] = reply_context_message_id
-            payload["version"] = version or "v2"
+    if message_id:
+        payload["message_id"] = message_id
+
     
     if reply_context_message_id:
         payload["reply_context_message_id"] = reply_context_message_id

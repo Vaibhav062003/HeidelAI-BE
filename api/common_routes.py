@@ -23,6 +23,7 @@ from services.common_service import (
     fetch_conversation,
     send_message,
     fetch_messages,
+    acknowledge_conversation_opened,
     close_conversation, 
     unarchive_data, 
     add_private_note, 
@@ -94,7 +95,11 @@ async def get_conversations(
     unread_only: bool = Query(False),
     platform: Optional[str] = None,
     priority: Optional[str] = None,
-    labels: Optional[str] = None
+    labels: Optional[str] = None,
+    attention: Optional[str] = None,
+    handling: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    assigned_agent_id: Optional[str] = None,
 ):
     """
     Get conversations for the current user's organization
@@ -114,7 +119,11 @@ async def get_conversations(
             unread_only=unread_only,
             platform=platform,
             priority=priority,
-            labels=labels
+            labels=labels,
+            attention=attention,
+            handling=handling,
+            status_filter=status_filter,
+            assigned_agent_id=assigned_agent_id,
         )
 
     except HTTPException:
@@ -161,6 +170,17 @@ async def get_messages(
         before=before, limit=limit
     )
 
+@router.post("/api/conversations/{conversation_id}/acknowledge-open")
+@limiter.limit("60/minute")
+async def acknowledge_open(
+    request: Request,
+    conversation_id: str,
+    user: CurrentUser,
+    observed_counter: int = Query(..., ge=0),
+):
+    """Clear the app's unread counter without sending a platform read receipt."""
+    return await acknowledge_conversation_opened(user.org_id, conversation_id, observed_counter)
+
 @router.post("/api/conversations/send-message")
 @limiter.limit("30/minute")
 async def send_message_endpoint(
@@ -175,6 +195,8 @@ async def send_message_endpoint(
     timestamp: Optional[str] = Form(None),
     content: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
+    media_kind: Optional[str] = Form(None),
+    duration_ms: Optional[int] = Form(None),
 ):    
     """
     Send a message to a specific conversation.
@@ -184,6 +206,15 @@ async def send_message_endpoint(
     sender_name = user.full_name or "Agent"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    if media_kind not in {None, "voice_note", "audio"}:
+        raise HTTPException(status_code=400, detail="Invalid media kind")
+    if duration_ms is not None and not 0 <= duration_ms <= 300_000:
+        raise HTTPException(status_code=400, detail="Invalid audio duration")
+    if media_kind and (not file or not (file.content_type or "").lower().startswith("audio/")):
+        raise HTTPException(status_code=400, detail="Voice notes require an audio file")
+    if file and (file.content_type or "").lower().startswith("audio/") and file.size is not None and file.size > 16 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio attachment is too large")
 
     context_dict = None
     if context:
@@ -203,7 +234,9 @@ async def send_message_endpoint(
         temp_id if temp_id else None,
         context_type if context_type else None,
         context_dict,
-        timestamp=timestamp
+        timestamp=timestamp,
+        media_kind=media_kind,
+        duration_ms=duration_ms,
     )
 
     return {"message": "Message sent", "details": res}
