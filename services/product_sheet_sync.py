@@ -186,7 +186,14 @@ def generate_search_text(product_data: dict) -> str:
 def auto_detect_product_type(columns: list[str]) -> str:
     """Auto-detect whether a sheet contains laptop or component data
     based on the presence of component-specific columns."""
-    normalized = {col.strip().lower().replace(" ", "_") for col in columns}
+    normalized = set()
+    for col in columns:
+        clean_key = col.strip().lower()
+        clean_key = re.sub(r'[^a-z0-9]+', '_', clean_key).strip('_')
+        if clean_key:
+            clean_key = FIELD_NAME_NORMALIZE.get(clean_key, clean_key)
+            normalized.add(clean_key)
+            
     matches = normalized & COMPONENT_INDICATORS
     # If 2+ component-specific columns are present, classify as component
     return "component" if len(matches) >= 2 else "laptop"

@@ -74,8 +74,8 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
         tab_name = request.tab_name
         sheet_id = request.sheet_id
         if not tab_name:
+            access_token = await refresh_google_token(org_id)
             try:
-                access_token = await refresh_google_token(org_id)
                 detected_tabs = await _fetch_sheet_tabs(sheet_id, access_token, org_id)
                 tab_name = detected_tabs[0] if detected_tabs else "Sheet1"
             except HTTPException as e:
@@ -287,6 +287,11 @@ async def get_sheet_tabs(
                 except Exception as conv_err:
                     raise HTTPException(status_code=502, detail=f"Failed to convert Excel to Google Sheet: {conv_err}")
             raise
+        except Exception as e:
+            logger.error(f"Error fetching tabs for sheet {sheet_id} org {user.org_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to fetch tabs: {str(e)}")
+            
+    except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching tabs for sheet {sheet_id} org {user.org_id}: {e}")
@@ -611,6 +616,8 @@ async def _fetch_sheet_tabs(sheet_id: str, access_token: str, org_id: str) -> Li
             raise HTTPException(status_code=403, detail=f"Google Sheets API error: {error_msg}")
         if resp.status_code == 404:
             raise HTTPException(status_code=404, detail=f"Google Sheets API error: {error_msg}")
+        if resp.status_code == 400:
+            raise HTTPException(status_code=400, detail=f"Google Sheets API error: {error_msg}")
         raise HTTPException(status_code=502, detail=f"Google Sheets API error: {error_msg}")
 
     sheets_data = resp.json().get("sheets", [])
