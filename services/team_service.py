@@ -11,7 +11,7 @@ Sending team messages is still handled by common_service.send_message
 WebSocket broadcasting (broadcast_team_message) is unchanged.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 
 from fastapi import HTTPException
@@ -166,6 +166,20 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
 
     async_db = get_async_mongo_db()
     collection = async_db[f"escalations_{org_id}"]
+    metadata = data.get("metadata") or {}
+    if not data.get("id") and metadata.get("reason"):
+        existing = await collection.find_one(
+            {
+                "customer_number": data.get("customer_number"),
+                "status": "pending_human_review",
+                "metadata.sku": metadata.get("sku"),
+                "metadata.reason": metadata["reason"],
+                "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=1)},
+            },
+            {"_id": 0},
+        )
+        if existing:
+            return existing
 
     # Prepare document
     escalation_doc = {
@@ -180,11 +194,17 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
         "role": data.get("role", "ai_agent"),
         "sender_name": data.get("sender_name", "AI Assistant"),
         "is_ai_escalation": True,
-        "metadata": data.get("metadata", {})
+        "metadata": metadata
     }
 
-    # Save to MongoDB
-    await collection.insert_one(escalation_doc.copy())
+    # A deterministic id lets durable retry jobs safely repeat creation.
+    result = await collection.update_one(
+        {"id": escalation_doc["id"]},
+        {"$setOnInsert": escalation_doc.copy()},
+        upsert=True,
+    )
+    if not result.upserted_id:
+        return await collection.find_one({"id": escalation_doc["id"]}, {"_id": 0})
     logger.success(f"[team_service] Created new AI escalation: {escalation_doc['id']} for org {org_id}")
 
     # Broadcast via WebSocket
@@ -256,4 +276,3 @@ async def fetch_team_messages(
             status_code=500,
             detail="Failed to fetch team messages"
         )
-

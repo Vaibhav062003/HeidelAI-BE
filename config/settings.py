@@ -139,3 +139,10 @@ SAHIL_IG_ID=os.getenv("SAHIL_IG_ID")
 
 KOMAL_ORG_ID=os.getenv("KOMAL_ORG_ID")
 KOMAL_ORG_WA_ID=os.getenv("KOMAL_ORG_WA_ID")
+
+PRICING_INTELLIGENCE_ORG_IDS = {
+    org_id.strip()
+    for org_id in os.getenv("PRICING_INTELLIGENCE_ORG_IDS", "").split(",")
+    if org_id.strip()
+}
+PRICING_FLOOR_MAX_AGE_MINUTES = int(os.getenv("PRICING_FLOOR_MAX_AGE_MINUTES", "60"))
