@@ -126,7 +126,7 @@ def is_outbound_offer(text: str, prices: list[float]) -> bool:
         return False
     value = (text or "").strip()
     explicit = _EXPLICIT_OFFER_RE.search(value)
-    if re.search(r"\b(?:pin(?:code)?|postal|zip|call|phone|mobile|contact|order|invoice)\b", value, re.I) and not explicit:
+    if re.search(r"\b(?:pin(?:code)?|postal|zip|address|located|location|call|phone|mobile|contact|order|invoice)\b", value, re.I) and not explicit:
         return False
     if re.search(r"\b(?:your\s+budget|you\s+paid|payment\s+(?:of|received)|refund(?:ed)?|amount\s+received)\b", value, re.I):
         return bool(explicit)

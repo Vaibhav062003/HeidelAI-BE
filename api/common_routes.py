@@ -346,6 +346,21 @@ async def send_message_endpoint(
         except Exception as exc:
             logger.error(f"Failed to record outbound sales offer: {exc}")
 
+    if platform == "whatsapp" and mode == "reply" and content:
+        try:
+            from services.pricing_service import observe_agent_message
+
+            await observe_agent_message(
+                org_id=org_id,
+                conversation_id=conversation_id,
+                content=content,
+                source_message_id=(res or {}).get("message_id"),
+                reply_to_message_id=(context_dict or {}).get("mid"),
+                sender_name=sender_name,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to observe human pricing message: {exc}")
+
     return {"message": "Message sent", "details": res}
 
 @router.post("/api/conversations/send_reaction")

@@ -18,6 +18,7 @@ from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
 from services.heidelai_bot import send_to_chatbot
 from services.agent_service import send_to_agent
+from services.pricing_service import HOLDING_REPLY, is_price_signal, is_pricing_enabled, observe_customer_message
 from services.wa_service import *
 from services.ig_service import *
 from services.utils import normalize_phone
@@ -124,11 +125,25 @@ def remove_expired_message_ids():
     for message_id in expired_ids:
         del services.processed_message_ids[message_id]
 
-async def check_and_handle_dealer_reply(org_id: str, customer_phone_no: str, content: str, message_context: dict | None, create_escalation: bool = True) -> bool:
+async def check_and_handle_dealer_reply(
+    org_id: str,
+    customer_phone_no: str,
+    content: str,
+    message_context: dict | None,
+    create_escalation: bool = True,
+    source_message_id: str | None = None,
+) -> bool:
     """Delegate to oos_service which handles matching, logging to sheet, and escalation."""
     from services.oos_service import handle_dealer_reply
     try:
-        return await handle_dealer_reply(org_id, customer_phone_no, content, message_context, create_escalation=create_escalation)
+        return await handle_dealer_reply(
+            org_id,
+            customer_phone_no,
+            content,
+            message_context,
+            create_escalation=create_escalation,
+            source_message_id=source_message_id,
+        )
     except Exception as e:
         logger.error(f"Error in check_and_handle_dealer_reply: {e}")
         return False
@@ -330,6 +345,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             await update_offer_delivery(connection.get("org_id"), message_id, status_type)
                         except Exception as exc:
                             logger.debug(f"Offer delivery propagation skipped for {message_id}: {exc}")
+
+                        try:
+                            from services.pricing_service import update_ai_pricing_delivery
+
+                            await update_ai_pricing_delivery(connection.get("org_id"), message_id, status_type)
+                        except Exception as exc:
+                            logger.debug(f"AI price delivery propagation skipped for {message_id}: {exc}")
 
                         # Propagate delivery status to Google Sheet automation tracking
                         # (no-op if message_id doesn't exist in the sheet sent collection)
@@ -601,12 +623,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     customer_phone_no=customer_phone_no,
                                     content=content,
                                     message_context=message_context,
-                                    create_escalation=not ai_enabled
+                                    create_escalation=True,
+                                    source_message_id=wa_message_id,
                                 )
-                                if is_dealer_reply and not ai_enabled:
-                                    logger.info(f"Dealer reply processed and intercepted (AI disabled). Skipping normal AI chatbot flow.")
-                                    return {"status": "ok"}
-
                                 # Storing messages from customers in the DB
                                 # Create or update conversation
                                 conversation_id = await create_or_update_whatsapp_conversation(
@@ -641,8 +660,41 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         notify_push=True,
                                     )
 
+                                if is_dealer_reply:
+                                    logger.info("Dealer reply stored and intercepted. Skipping buyer pricing and AI flow.")
+                                    return {"status": "ok"}
+
                                 if await handle_followup_customer_reply(org_id, conversation_id, content):
                                     logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                                    return {"status": "ok"}
+
+                                try:
+                                    pricing_result = await observe_customer_message(
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        content=content,
+                                        source_message_id=wa_message_id,
+                                        reply_to_message_id=replied_message_id,
+                                        customer_name=sender_name2,
+                                    )
+                                except Exception as exc:
+                                    logger.error(f"Pricing guard failed for org={org_id}: {exc}")
+                                    pricing_result = {
+                                        "intercept": is_pricing_enabled(org_id) and is_price_signal(content),
+                                        "reply": HOLDING_REPLY,
+                                    }
+
+                                if pricing_result.get("intercept"):
+                                    if pricing_result.get("reply"):
+                                        await send_whatsapp_message(
+                                            {
+                                                "conversation_id": conversation_id,
+                                                "content": pricing_result["reply"],
+                                                "sender_id": whatsapp_business_id,
+                                            },
+                                            org_id,
+                                            "ai",
+                                        )
                                     return {"status": "ok"}
 
                                 contact_data = {
@@ -719,6 +771,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "conversation_id": conversation_id,
                                             "content": final_response,
                                             "sender_id": whatsapp_business_id,
+                                            "pricing_source_message_id": wa_message_id,
                                         }, org_id, "ai")
                                         await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
@@ -875,6 +928,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "conversation_id": conversation_id,
                                         "content": final_response,
                                         "sender_id": whatsapp_business_id,
+                                        "pricing_source_message_id": wa_message_id,
                                     }, org_id, "ai")
 
                                     return {"status": "ok"}
@@ -953,6 +1007,42 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 if await handle_followup_customer_reply(org_id, conversation_id, content):
                                     logger.info(f"Media reply handled for follow-up {conversation_id}")
+
+                                caption = media_data.get("caption")
+                                if caption and is_price_signal(caption):
+                                    try:
+                                        pricing_result = await observe_customer_message(
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            content=caption,
+                                            source_message_id=wa_message_id,
+                                            reply_to_message_id=replied_message_id,
+                                            customer_name=sender_name2,
+                                        )
+                                        if pricing_result.get("reply"):
+                                            await send_whatsapp_message(
+                                                {
+                                                    "conversation_id": conversation_id,
+                                                    "content": pricing_result["reply"],
+                                                    "sender_id": whatsapp_business_id,
+                                                },
+                                                org_id,
+                                                "ai",
+                                            )
+                                        if pricing_result.get("intercept"):
+                                            return {"status": "ok"}
+                                    except Exception as exc:
+                                        logger.error(f"Media-caption pricing observation failed: {exc}")
+                                        if is_pricing_enabled(org_id):
+                                            await send_whatsapp_message(
+                                                {
+                                                    "conversation_id": conversation_id,
+                                                    "content": HOLDING_REPLY,
+                                                    "sender_id": whatsapp_business_id,
+                                                },
+                                                org_id,
+                                                "ai",
+                                            )
 
                                 contact_data = {
                                 "whatsapp_id": whatsapp_business_id,

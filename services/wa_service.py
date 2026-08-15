@@ -500,6 +500,40 @@ async def send_whatsapp_message(
     try:
         conversation_id = message["conversation_id"]
         original_content = message["content"]
+        pricing_source_message_id = message.get("pricing_source_message_id")
+        pricing_guard_active = False
+
+        if mode == "ai":
+            from services.pricing_service import (
+                HOLDING_REPLY,
+                is_pricing_enabled,
+                validate_ai_pricing_response,
+            )
+
+            pricing_guard_active = is_pricing_enabled(org_id)
+
+            validation_text = (
+                "\n".join(str(part) for part in original_content)
+                if isinstance(original_content, list)
+                else str(original_content)
+            )
+            if pricing_guard_active:
+                try:
+                    valid, reason = await validate_ai_pricing_response(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        source_message_id=pricing_source_message_id,
+                        content=validation_text,
+                    )
+                    if not valid:
+                        logger.warning(
+                            f"Blocked unsafe AI price for org={org_id}, "
+                            f"conversation={conversation_id}, reason={reason}"
+                        )
+                        original_content = HOLDING_REPLY
+                except Exception as exc:
+                    logger.error(f"AI pricing validation failed closed for org={org_id}: {exc}")
+                    original_content = HOLDING_REPLY
         
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
@@ -539,6 +573,22 @@ async def send_whatsapp_message(
 
         # Send each content part as a separate bubble
         for i, content_item in enumerate(contents):
+            stop_after_part = False
+            if pricing_guard_active:
+                try:
+                    valid, reason = await validate_ai_pricing_response(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        source_message_id=pricing_source_message_id,
+                        content=content_item,
+                    )
+                except Exception as exc:
+                    logger.error(f"Final AI pricing revalidation failed closed for org={org_id}: {exc}")
+                    valid, reason = False, "validation_error"
+                if not valid:
+                    content_item = HOLDING_REPLY
+                    stop_after_part = True
+
             data = {
                 "messaging_product": "whatsapp",
                 "to": recipient_id,
@@ -606,6 +656,9 @@ async def send_whatsapp_message(
             )
 
             # Store message in WhatsApp-specific collection
+            stored_bot_context = dict(bot_context or {})
+            if pricing_source_message_id:
+                stored_bot_context["pricing_source_message_id"] = pricing_source_message_id
             last_stored_id = await store_whatsapp_message(
                 org_id=org_id,
                 content=content_item,
@@ -623,8 +676,25 @@ async def send_whatsapp_message(
                 temp_id=temp_id,
                 context=context,
                 context_type=context_type,
-                bot_context=bot_context
+                bot_context=stored_bot_context or None
             )
+
+            if pricing_guard_active:
+                try:
+                    from services.pricing_service import record_accepted_ai_response
+
+                    await record_accepted_ai_response(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        inbound_message_id=pricing_source_message_id,
+                        outbound_message_id=message_id,
+                        content=content_item,
+                    )
+                except Exception as exc:
+                    logger.error(f"Failed to record accepted AI pricing message: {exc}")
+
+            if stop_after_part:
+                break
 
             # Small delay between bubbles to ensure delivery order
             if len(contents) > 1 and i < len(contents) - 1:

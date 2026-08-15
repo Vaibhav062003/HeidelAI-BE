@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import math
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -168,12 +169,15 @@ def transform_row(
             val = False
         else:
             try:
-                if val_str.isdigit() or (val_str.startswith('-') and val_str[1:].isdigit()):
-                    val = int(value)
+                numeric = re.sub(r"(?i)\b(?:inr|rs\.?)\b|₹|,|\s", "", val_str) if clean_key == "price" else val_str
+                if numeric.isdigit() or (numeric.startswith('-') and numeric[1:].isdigit()):
+                    val = int(numeric)
                 else:
-                    val = float(value)
+                    val = float(numeric)
             except ValueError:
                 val = str(value).strip()
+        if clean_key == "price" and isinstance(val, (int, float)) and not isinstance(val, bool) and not math.isfinite(val):
+            return None, "price must be finite"
                 
         doc[clean_key] = val
 
@@ -578,4 +582,3 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
         )
         logger.error(f"Product sheet sync failed for org {org_id} sheet {sheet_id}: {e}")
         raise
-
