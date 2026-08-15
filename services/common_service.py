@@ -25,6 +25,26 @@ from dateutil import parser
 
 db = get_mongo_db()
 
+
+def validate_outbound_attachment(file) -> None:
+    content_type = (file.content_type or "").lower()
+    allowed = content_type.startswith(("image/", "video/", "audio/")) or content_type in {
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "text/plain",
+        "text/csv",
+    }
+    if not allowed:
+        raise HTTPException(status_code=415, detail="Unsupported attachment type")
+    max_size = 5 * 1024 * 1024 if content_type.startswith("image/") else 16 * 1024 * 1024
+    if file.size is not None and file.size > max_size:
+        raise HTTPException(status_code=413, detail="Attachment is too large")
+
 FOCUS_GROUPS = {"needs_now", "high_intent", "waiting", "later"}
 SEARCH_INDEXED_ORGS = set()
 SEARCH_INDEX_LOCKS: Dict[str, asyncio.Lock] = {}
@@ -1162,26 +1182,66 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         return res
     
     elif platform == "instagram":
-        ig_id = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}).get("ig_id")
-
-        recipient = db[f"conversations_{org_id}"].find_one(
-            {"conversation_id": conversation_id},
+        organization = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}) or {}
+        ig_id = organization.get("ig_id")
+        if not ig_id:
+            raise HTTPException(status_code=400, detail="Instagram is not connected for this organization")
+        conversation = db[f"conversations_{org_id}"].find_one(
+            {"conversation_id": conversation_id, "platform": "instagram", "instagram_id": ig_id},
             {"customer_id": 1}
-        ).get("customer_id")
+        )
+        if not conversation or not conversation.get("customer_id"):
+            raise HTTPException(status_code=404, detail="Instagram conversation not found")
+        recipient = conversation["customer_id"]
 
-
+        media_result = None
         if file:
-            res = await upload_and_send_ig_media_message(recipient, file, ig_id, org_id, mode)
+            media_result = await upload_and_send_ig_media_message(
+                recipient,
+                file,
+                ig_id,
+                org_id,
+                mode,
+                temp_id=temp_id,
+                conversation_id=conversation_id,
+                sender_name=sender_name,
+                context_type=context_type,
+                context=context,
+            )
 
-            if res.get("error"):
+            if not isinstance(media_result, dict) or not media_result.get("success") or not media_result.get("message_id"):
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Failed to send media message: {res['error']}"
+                    detail=f"Failed to send media message: {media_result.get('error', 'Instagram did not confirm the message') if isinstance(media_result, dict) else 'Invalid response'}"
                 )
-        
-        if content :
-            res = await send_ig_message(recipient, content, ig_id, mode, org_id)
-        return res
+        if content:
+            text_result = await send_ig_message(
+                recipient,
+                content,
+                ig_id,
+                mode,
+                org_id,
+                temp_id=f"{temp_id}:caption" if file and temp_id else temp_id,
+                conversation_id=conversation_id,
+                sender_name=sender_name,
+                context_type=context_type,
+                context=context,
+            )
+            if not isinstance(text_result, dict) or not text_result.get("success") or not text_result.get("message_id"):
+                if media_result:
+                    return {
+                        **media_result,
+                        "partial_success": True,
+                        "caption_error": text_result.get("error", "Instagram did not confirm the caption") if isinstance(text_result, dict) else "Invalid response",
+                    }
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to send Instagram message: {text_result.get('error', 'Instagram did not confirm the message') if isinstance(text_result, dict) else 'Invalid response'}"
+                )
+            if media_result:
+                return {**media_result, "caption": text_result}
+            return text_result
+        return media_result or res
     
     elif platform == "internal":
         participants = []

@@ -1704,28 +1704,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     # Check for duplicate messages / if the message ID is already processed
                     ig_message_id = message["mid"]
 
-                    if ig_message_id in services.processed_message_ids:
-                        logger.warning("Duplicate message, skipping processing.")
-                        continue
-                    
-                    # Add message ID with the current timestamp
-                    services.processed_message_ids[ig_message_id] = time.time()
-
                     message_echo = message.get("is_echo", False)
                     
                     if message_echo:
                         recipient_id, sender_id = sender_id, recipient_id
 
-                    # Find the corresponding Instagram account in our connections
-                    instagram_connection = db.instagram_connections.find_one(
-                        {"instagram_id": recipient_id, "is_active": True},
-                        sort=[("last_updated", -1)]
-                    )
-
-                    if not instagram_connection:
-                        logger.error(f"No active Instagram connection found for recipient ID: {recipient_id}")
-                        return {"status": "ok"}
-                    
                     org_collection = db.organizations.find_one({"ig_id": recipient_id})
 
                     if not org_collection:
@@ -1736,6 +1719,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     if (not org_id):
                         logger.error(f"No active organization ID found for Instagram ID: {recipient_id}")
+                        return {"status": "ok"}
+
+                    # Resolve credentials only after the account's organization is known.
+                    instagram_connection = db.instagram_connections.find_one(
+                        {"org_id": org_id, "instagram_id": recipient_id, "is_active": True},
+                        sort=[("last_updated", -1)]
+                    )
+
+                    if not instagram_connection:
+                        logger.error(f"No active Instagram connection found for recipient ID: {recipient_id}")
                         return {"status": "ok"}
 
                     # get the page access token
@@ -1812,43 +1805,79 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     logger.info(f"Message Received from {user}, Message: {message_text}")
 
+                    webhook_claim_token = claim_instagram_webhook_message(org_id, ig_message_id)
+                    downstream_claim_token = webhook_claim_token
+                    if not webhook_claim_token:
+                        existing_message = messages_collection.find_one({"id": ig_message_id})
+                        if existing_message and existing_message.get("queue_sync_pending"):
+                            try:
+                                await sync_instagram_outbound_conversation(
+                                    org_id=org_id,
+                                    conversation_id=existing_message["conversation_id"],
+                                    instagram_id=recipient_id,
+                                    message_id=ig_message_id,
+                                )
+                            except Exception:
+                                logger.exception("Could not reconcile duplicate Instagram echo")
+                        downstream_claim_token = claim_instagram_webhook_downstream(org_id, ig_message_id)
+                        if not downstream_claim_token:
+                            logger.info(f"Duplicate Instagram message ignored: {ig_message_id}")
+                            continue
+                        conversation_id = existing_message.get("conversation_id")
+                        message_id = ig_message_id
 
-                    logger.success("Calling function create_or_update_instagram_conversation")
+                    if webhook_claim_token:
+                        logger.success("Calling function create_or_update_instagram_conversation")
 
-                    # Create or update conversation
-                    conversation_id = await create_or_update_instagram_conversation(
-                        org_id=org_id,
-                        recipient_id=recipient_id,
-                        sender_id=sender_id,
-                        customer_name=name,
-                        username=username,
-                        last_message=message_echo and f"You: {message_text}" or message_text,
-                        last_sender= message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
-                    )
-                    
-                    # Store in Instagram-specific collections
-                    message_id = await store_instagram_message(
-                        org_id=org_id,
-                        content=message_text,
-                        type=attachment_type,
-                        payload=attachment_payload,
-                        conversation_id=conversation_id,
-                        sender_id=sender_id,
-                        sender_name=name,
-                        sender_username=username,
-                        recipient_id=recipient_id,
-                        role= message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
-                        message_id=ig_message_id,  # Use the ID from the webhook for deduplication
-                        context_type=context_type,
-                        context=context,
-                        notify_push=not message_echo,
-                    )
+                        # Create or update conversation only for the first delivery.
+                        try:
+                            conversation_id = await create_or_update_instagram_conversation(
+                                org_id=org_id,
+                                recipient_id=recipient_id,
+                                sender_id=sender_id,
+                                customer_name=name,
+                                username=username,
+                                last_message=message_echo and f"You: {message_text}" or message_text,
+                                last_sender=message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
+                            )
 
-                    if not message_echo and isinstance(message_text, str) and await handle_followup_customer_reply(
-                        org_id, conversation_id, message_text
+                            # Store in Instagram-specific collections
+                            message_id = await store_instagram_message(
+                                org_id=org_id,
+                                content=message_text,
+                                type=attachment_type,
+                                payload=attachment_payload,
+                                conversation_id=conversation_id,
+                                sender_id=sender_id,
+                                sender_name=name,
+                                sender_username=username,
+                                recipient_id=recipient_id,
+                                role=message_echo and MessageRole.AGENT or MessageRole.CUSTOMER,
+                                message_id=ig_message_id,
+                                context_type=context_type,
+                                context=context,
+                                notify_push=not message_echo,
+                                claim_token=webhook_claim_token,
+                            )
+                        except Exception:
+                            release_instagram_webhook_claim(org_id, ig_message_id, webhook_claim_token)
+                            raise
+
+                    downstream_state = messages_collection.find_one({"id": ig_message_id}) or {}
+                    if (
+                        not message_echo
+                        and isinstance(message_text, str)
+                        and not downstream_state.get("followup_processed")
                     ):
-                        logger.info(f"Follow-up reply intercepted for {conversation_id}")
-                        return {"status": "ok"}
+                        intercepted = await handle_followup_customer_reply(org_id, conversation_id, message_text)
+                        messages_collection.update_one(
+                            {"id": ig_message_id, "webhook_claim_token": downstream_claim_token},
+                            {"$set": {"followup_processed": True}},
+                        )
+                        if intercepted:
+                            logger.info(f"Follow-up reply intercepted for {conversation_id}")
+                            complete_instagram_webhook_message(org_id, ig_message_id, downstream_claim_token)
+                            return {"status": "ok"}
                     
                     if not message_echo:
                         # Get conversation doc to check if AI is enabled
@@ -1875,7 +1904,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         logger.info(f"is_test: {is_test}")
                         logger.info(f"ai_enabled: {ai_enabled}") 
 
-                        if ai_enabled and is_dev:
+                        if ai_enabled and is_dev and not downstream_state.get("ai_processed"):
                             chatbot_response = await send_to_agent(
                                 conversation_id=conversation_id,
                                 user_input=message_text,
@@ -1887,25 +1916,42 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             )
                             final_response = chatbot_response["final_response"]
 
-                            conversation_id = await create_or_update_instagram_conversation(
-                                org_id=org_id,
-                                recipient_id=sender_id,
-                                sender_id=recipient_id,
-                                customer_name=name,
-                                username=username,
-                                last_message=f"AI: {message_text}",
-                                last_sender= MessageRole.AI,
-                            )
-
-                            await send_ig_message(
+                            ai_result = await send_ig_message(
                                 id=sender_id, 
                                 message_text=final_response, 
                                 instagram_id=recipient_id, 
                                 mode="reply", 
-                                org_id=org_id
+                                org_id=org_id,
+                                temp_id=f"ai:{ig_message_id}",
+                                conversation_id=conversation_id,
+                                sender_name="AI",
+                            )
+                            if not ai_result.get("success"):
+                                from services.team_service import create_ai_escalation
+                                await create_ai_escalation(org_id, {
+                                    "user_name": name or username or "Customer",
+                                    "customer_number": sender_id,
+                                    "customer_text": message_text,
+                                    "inferred_intent": "Instagram AI reply could not be delivered",
+                                    "sender_name": "AI Assistant",
+                                    "role": "system",
+                                    "metadata": {
+                                        "reason": ai_result.get("error"),
+                                        "message_id": ig_message_id,
+                                        "conversation_id": conversation_id,
+                                        "action": "Reply to the customer",
+                                    },
+                                })
+                            messages_collection.update_one(
+                                {"id": ig_message_id, "webhook_claim_token": downstream_claim_token},
+                                {"$set": {"ai_processed": True}},
                             )
 
-                        if background_tasks:
+                        if background_tasks and not downstream_state.get("automation_queued"):
+                            messages_collection.update_one(
+                                {"id": ig_message_id, "webhook_claim_token": downstream_claim_token},
+                                {"$set": {"automation_queued": True}},
+                            )
                             background_tasks.add_task(
                                 check_and_trigger_automations,
                                 org_id=org_id,
@@ -1923,7 +1969,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     "message_id": ig_message_id
                                 }
                             )
-                        else:
+                        elif not background_tasks:
                             logger.warning("No background_tasks provided, skipping automation trigger for message_received.")
 
                     # Check if conversation exists
@@ -1982,7 +2028,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         }
 
                         store_contact_background(background_tasks, org_id, "instagram", contact_data)
-                        
+
+                    complete_instagram_webhook_message(org_id, ig_message_id, downstream_claim_token)
                     return {"status": "ok"}
                     # Broadcast the new message to Instagram-specific clients
                     # await broadcast_instagram_message(recipient_id, "new_message", {

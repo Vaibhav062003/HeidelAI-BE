@@ -628,6 +628,8 @@ async def process_scheduled_messages(messaging_services: dict) -> None:
                 org_id=claimed["org_id"],
                 conversation_id=claimed["conversation_id"],
                 is_auto_followup=True,
+                temp_id=f"followup:{claimed['_id']}",
+                sender_name="AI follow-up",
             )
             update = {
                 "$set": {"status": "sent", "sent_at": datetime.now(timezone.utc), "processed_at": datetime.now(timezone.utc)},

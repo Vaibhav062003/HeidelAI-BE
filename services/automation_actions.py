@@ -139,7 +139,10 @@ async def execute_message_node(context, node_id: str, config: Dict, trigger_data
                     media_type="image",
                     instagram_id=instagram_id,
                     mode="reply",
-                    org_id=context.org_id
+                    org_id=context.org_id,
+                    temp_id=f"automation:{context.execution_id}:{node_id}",
+                    conversation_id=trigger_data.get("conversation_id"),
+                    sender_name="Automation",
                 )
             else:
                 result = await send_ig_message(
@@ -147,7 +150,10 @@ async def execute_message_node(context, node_id: str, config: Dict, trigger_data
                     message_text=text,
                     instagram_id=instagram_id,
                     mode="reply",
-                    org_id=context.org_id
+                    org_id=context.org_id,
+                    temp_id=f"automation:{context.execution_id}:{node_id}",
+                    conversation_id=trigger_data.get("conversation_id"),
+                    sender_name="Automation",
                 )
             
             if result and result.get("message_id"):

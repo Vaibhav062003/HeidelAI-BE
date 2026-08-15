@@ -28,6 +28,7 @@ from services.common_service import (
     acknowledge_conversation_opened,
     search_conversation_messages,
     fetch_message_context,
+    validate_outbound_attachment,
     close_conversation, 
     unarchive_data, 
     add_private_note, 
@@ -202,7 +203,6 @@ async def get_conversation(request: Request, conversation_id: str, user: Current
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
-    
     try:
         conversation = await fetch_conversation(org_id, conversation_id)
         return conversation
@@ -292,7 +292,11 @@ async def send_message_endpoint(
     sender_name = user.full_name or "Agent"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
+    if platform == "instagram" and mode == "reply" and not temp_id:
+        raise HTTPException(status_code=400, detail="temp_id is required for Instagram replies")
 
+    if file:
+        validate_outbound_attachment(file)
     if media_kind not in {None, "voice_note", "audio"}:
         raise HTTPException(status_code=400, detail="Invalid media kind")
     if duration_ms is not None and not 0 <= duration_ms <= 300_000:
