@@ -6,8 +6,7 @@ def _load_filter_helpers():
     tree = ast.parse(Path("services/common_service.py").read_text())
     functions = [
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name in {"_escalated_condition", "_queue_filter_conditions", "_priority_condition"}
+        if isinstance(node, ast.FunctionDef) and node.name in {"_escalated_condition", "_queue_filter_conditions", "_priority_condition"}
     ]
     namespace = {}
     module = ast.Module(

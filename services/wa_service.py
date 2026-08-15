@@ -21,7 +21,7 @@ from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.followup_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
-from services.utils import normalize_phone
+from services.utils import name_search_prefixes, normalize_phone, phone_search_parts
 from services.push_notification_service import schedule_customer_message_push
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from loguru import logger
@@ -70,6 +70,7 @@ async def create_or_update_whatsapp_conversation(
     customer_phone_no = normalize_phone(customer_phone_no)
     
     conversation_id = f"whatsapp_{customer_phone_no}"
+    phone_digits, phone_search_suffixes = phone_search_parts(customer_phone_no)
     now = datetime.now(timezone.utc)
     
     # Get the WhatsApp-specific collection
@@ -118,7 +119,10 @@ async def create_or_update_whatsapp_conversation(
         "conversation_id": conversation_id,
         "whatsapp_id": recipient_id,
         "customer_id": customer_phone_no,
+        "phone_digits": phone_digits,
+        "phone_search_suffixes": phone_search_suffixes,
         "customer_name": final_customer_name,
+        "customer_name_prefixes": name_search_prefixes(final_customer_name),
         "last_message": last_message,
         "last_message_timestamp": now,
         "last_message_is_private_note": mode == "private",

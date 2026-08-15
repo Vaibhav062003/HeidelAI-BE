@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import os
 import base64
 import time
+import re
 
 def serialize_mongo(obj):
     if isinstance(obj, ObjectId):
@@ -93,6 +94,22 @@ def normalize_phone(phone_raw: str, default_country_code: str = "91", is_canonic
         return f"{default_country_code}{clean}"
         
     return clean
+
+def phone_search_parts(phone_raw: str, minimum_suffix_length: int = 6) -> tuple[str, list[str]]:
+    """Return country-agnostic digits and searchable local/full-number suffixes."""
+    digits = re.sub(r"\D", "", str(phone_raw or ""))
+    if not digits:
+        return "", []
+    first_length = min(max(1, minimum_suffix_length), len(digits))
+    return digits, [digits[-length:] for length in range(first_length, len(digits) + 1)]
+
+def name_search_prefixes(name: str, minimum_length: int = 2) -> list[str]:
+    prefixes = {
+        token[:length]
+        for token in re.findall(r"[^\W_]+", str(name or "").casefold())
+        for length in range(minimum_length, len(token) + 1)
+    }
+    return sorted(prefixes)
 
 def get_first_name(full_name: str):
     if not full_name:
