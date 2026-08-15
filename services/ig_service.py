@@ -21,6 +21,7 @@ from core.services import services
 from services.followup_service import abort_scheduled_message
 from services.conversation_utils import reopen_conversation
 from services.push_notification_service import schedule_customer_message_push
+from services.utils import name_search_prefixes
 
 from config.settings import (
     IG_ID, 
@@ -497,6 +498,7 @@ async def create_or_update_instagram_conversation(org_id: str,
             "instagram_id": recipient_id,
             "customer_id": sender_id,
             "customer_name": customer_name,
+            "customer_name_prefixes": name_search_prefixes(customer_name),
             "customer_username": username,
             "last_message": last_message,
             "last_message_timestamp": now,
@@ -526,6 +528,7 @@ async def create_or_update_instagram_conversation(org_id: str,
             "instagram_id": recipient_id,
             "customer_id": sender_id,
             "customer_name": customer_name,
+            "customer_name_prefixes": name_search_prefixes(customer_name),
             "customer_username": username,
             "last_message": last_message,
             "last_message_timestamp": now,
