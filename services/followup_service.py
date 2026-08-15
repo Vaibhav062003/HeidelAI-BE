@@ -23,6 +23,7 @@ from services.utils import serialize_mongo
 
 db = get_async_mongo_db()
 ACTIVE_STATUSES = ["pending", "processing", "sending", "failed", "delivery_unknown"]
+CANCELLABLE_FUTURE_STATUSES = {"pending", "failed"}
 
 
 async def ensure_followup_indexes() -> None:
@@ -52,6 +53,31 @@ def _safe_generated_text(value: str) -> str:
 
 def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+async def _sync_conversation_followup_status(org_id: str, conversation_id: str) -> str:
+    active_query = {
+        "org_id": org_id,
+        "conversation_id": conversation_id,
+        "$or": [
+            {"active_key": {"$exists": True}},
+            {
+                "status": "sent",
+                "sequence_step": 1,
+                "second_claim_id": {"$exists": True},
+                "future_cancelled_at": {"$exists": False},
+            },
+        ],
+    }
+    while True:
+        active = bool(await db.scheduled_messages.find_one(active_query, {"_id": 1}))
+        status = "follow-up" if active else "open"
+        await db[f"conversations_{org_id}"].update_one(
+            {"conversation_id": conversation_id, "status": {"$in": ["open", "follow-up"]}},
+            {"$set": {"status": status}},
+        )
+        if active == bool(await db.scheduled_messages.find_one(active_query, {"_id": 1})):
+            return status
 
 
 async def _timeline_reference(org_id: str, conversation_id: str, expression: str) -> datetime | None:
@@ -251,6 +277,11 @@ async def list_scheduled_followups(org_id: str, limit: int = 200) -> list[dict]:
         {"_id": 0, "conversation_id": 1, "customer_name": 1, "customer_id": 1, "platform": 1},
     ).to_list(length=len(conversation_ids) or 1)
     conversations = {row["conversation_id"]: row for row in rows}
+    children_by_sequence = {
+        item.get("sequence_id"): item
+        for item in followups
+        if item.get("sequence_id") and item.get("sequence_step") == 2
+    }
 
     for followup in followups:
         conversation = conversations.get(followup.get("conversation_id"), {})
@@ -260,7 +291,134 @@ async def list_scheduled_followups(org_id: str, limit: int = 200) -> list[dict]:
             followup.get("fulfilled_at") or followup.get("sent_at")
             or followup.get("cancelled_at") or followup.get("aborted_at")
         )
+        child = children_by_sequence.get(followup.get("sequence_id"))
+        followup["can_cancel_future"] = bool(
+            followup.get("status") == "sent"
+            and followup.get("sequence_step") == 1
+            and followup.get("second_followup_text")
+            and not followup.get("response_handled_at")
+            and not followup.get("second_skipped_at")
+            and (not child or child.get("status") in CANCELLABLE_FUTURE_STATUSES)
+        )
     return serialize_mongo(followups)
+
+
+async def cancel_future_followup(
+    org_id: str,
+    followup_id: str,
+    user_id: str,
+    user_name: str,
+) -> dict:
+    try:
+        object_id = ObjectId(followup_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=404, detail="Follow-up not found.")
+
+    collection = db.scheduled_messages
+    current = await collection.find_one({"_id": object_id, "org_id": org_id})
+    if not current:
+        raise HTTPException(status_code=404, detail="Follow-up not found.")
+    if current.get("future_cancelled_at"):
+        await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
+        return {"message": "The next follow-up was already cancelled."}
+    if current.get("status") != "sent" or current.get("sequence_step") != 1 or not current.get("second_followup_text"):
+        raise HTTPException(status_code=409, detail="This follow-up has no future message to cancel.")
+
+    now = datetime.now(timezone.utc)
+    sequence_id = current.get("sequence_id")
+    if not sequence_id:
+        raise HTTPException(status_code=409, detail="This older follow-up cannot be changed safely.")
+    child = await collection.find_one({"org_id": org_id, "sequence_id": sequence_id, "sequence_step": 2})
+    if child and child.get("status") == "delivery_unknown":
+        raise HTTPException(
+            status_code=409,
+            detail="Delivery is uncertain. Check the chat before changing this follow-up.",
+        )
+    if child and child.get("status") in {"processing", "sending", "sent"}:
+        raise HTTPException(status_code=409, detail="The next follow-up is already being sent or was sent.")
+
+    resolution = {
+        "status": "cancelled",
+        "cancelled_at": now,
+        "updated_at": now,
+        "resolved_by": user_id,
+        "resolved_by_name": user_name or "Team member",
+    }
+    if child and child.get("status") == "cancelled":
+        pass
+    elif child:
+        cancelled = await collection.update_one(
+            {
+                "_id": child["_id"],
+                "org_id": org_id,
+                "status": {"$in": list(CANCELLABLE_FUTURE_STATUSES)},
+            },
+            {"$set": resolution, "$unset": {"active_key": "", "claim_id": "", "claimed_at": ""}},
+        )
+        if not cancelled.modified_count:
+            raise HTTPException(status_code=409, detail="The next follow-up is already being sent or was sent.")
+    else:
+        cancelled_child = {
+            **{key: current.get(key) for key in (
+                "org_id", "platform", "conversation_id", "sender_id", "receiver_id",
+                "sequence_id", "quote_id", "quote_number", "quote_value",
+            )},
+            "followup_text": current["second_followup_text"],
+            "scheduled_time": _as_utc(current.get("sent_at") or now) + SECOND_FOLLOWUP_DELAY,
+            "delivery_mode": current.get("delivery_mode", "auto"),
+            "sequence_step": 2,
+            "parent_followup_id": str(current["_id"]),
+            "parent_sent_at": current.get("sent_at"),
+            "source": "auto_retry",
+            "created_by": "ai-followup",
+            "created_by_name": "AI follow-up",
+            "created_at": now,
+            **resolution,
+        }
+        try:
+            await collection.insert_one(cancelled_child)
+        except DuplicateKeyError:
+            child = await collection.find_one({"org_id": org_id, "sequence_id": sequence_id, "sequence_step": 2})
+            if child and child.get("status") == "delivery_unknown":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Delivery is uncertain. Check the chat before changing this follow-up.",
+                )
+            if not child or child.get("status") not in CANCELLABLE_FUTURE_STATUSES:
+                raise HTTPException(status_code=409, detail="The next follow-up is already being sent or was sent.")
+            cancelled = await collection.update_one(
+                {"_id": child["_id"], "org_id": org_id, "status": child["status"]},
+                {"$set": resolution, "$unset": {"active_key": "", "claim_id": "", "claimed_at": ""}},
+            )
+            if not cancelled.modified_count:
+                raise HTTPException(status_code=409, detail="The next follow-up is already being sent or was sent.")
+
+    updated = await collection.update_one(
+        {
+            "_id": object_id,
+            "org_id": org_id,
+            "status": "sent",
+            "sequence_step": 1,
+            "future_cancelled_at": {"$exists": False},
+        },
+        {
+            "$set": {
+                "second_skipped_at": now,
+                "second_skip_reason": "Cancelled by a team member.",
+                "future_cancelled_at": now,
+                "future_cancelled_by": user_id,
+                "future_cancelled_by_name": user_name or "Team member",
+                "updated_at": now,
+            },
+            "$unset": {"second_claim_id": "", "second_claimed_at": "", "active_key": ""},
+        },
+    )
+    if not updated.modified_count and not (await collection.find_one(
+        {"_id": object_id, "org_id": org_id}, {"future_cancelled_at": 1}
+    ) or {}).get("future_cancelled_at"):
+        raise HTTPException(status_code=409, detail="The follow-up changed. Refresh and try again.")
+    await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
+    return {"message": "The next follow-up was cancelled."}
 
 
 async def transition_scheduled_followup(
@@ -280,7 +438,7 @@ async def transition_scheduled_followup(
     if not current:
         raise HTTPException(status_code=404, detail="Follow-up not found.")
     allowed = {
-        "cancelled": {"pending", "failed", "delivery_unknown"},
+        "cancelled": {"pending", "failed"},
         "fulfilled": {"pending", "sent", "failed", "delivery_unknown"},
     }
     if current.get("status") == status:
@@ -305,15 +463,7 @@ async def transition_scheduled_followup(
     )
     if not updated:
         raise HTTPException(status_code=409, detail="The follow-up changed. Refresh and try again.")
-    if not await collection.find_one({
-        "org_id": org_id,
-        "conversation_id": current.get("conversation_id"),
-        "active_key": {"$exists": True},
-    }):
-        await db[f"conversations_{org_id}"].update_one(
-            {"conversation_id": current.get("conversation_id"), "status": "follow-up"},
-            {"$set": {"status": "open"}},
-        )
+    await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
     return serialize_mongo(updated)
 
 
@@ -457,6 +607,7 @@ async def _create_due_second_followups(now: datetime) -> None:
         "second_followup_text": {"$type": "string", "$ne": ""},
         "second_scheduled_at": {"$exists": False},
         "second_skipped_at": {"$exists": False},
+        "future_cancelled_at": {"$exists": False},
         "response_handled_at": {"$exists": False},
         "sent_at": {"$lte": now - SECOND_FOLLOWUP_DELAY},
         "$or": [
@@ -471,6 +622,7 @@ async def _create_due_second_followups(now: datetime) -> None:
                 "_id": candidate["_id"],
                 "second_scheduled_at": {"$exists": False},
                 "second_skipped_at": {"$exists": False},
+                "future_cancelled_at": {"$exists": False},
                 "response_handled_at": {"$exists": False},
                 "response_claim_id": {"$exists": False},
                 "$or": [
@@ -515,9 +667,20 @@ async def _create_due_second_followups(now: datetime) -> None:
             await collection.insert_one(second)
         except DuplicateKeyError:
             duplicate = await collection.find_one({
+                "org_id": claimed["org_id"],
                 "sequence_id": claimed["sequence_id"],
                 "sequence_step": 2,
             })
+            if duplicate and duplicate.get("status") in {"cancelled", "aborted", "fulfilled"}:
+                await collection.update_one(
+                    {"_id": claimed["_id"], "second_claim_id": claim_id},
+                    {
+                        "$set": {"second_skipped_at": now, "second_skip_reason": "The next follow-up was closed."},
+                        "$unset": {"second_claim_id": "", "second_claimed_at": "", "active_key": ""},
+                    },
+                )
+                await _sync_conversation_followup_status(claimed["org_id"], claimed["conversation_id"])
+                continue
             if not duplicate:
                 await collection.update_one(
                     {"_id": claimed["_id"], "second_claim_id": claim_id},
@@ -530,17 +693,16 @@ async def _create_due_second_followups(now: datetime) -> None:
         except PyMongoError as exc:
             logger.error(f"Could not create second follow-up for {claimed['conversation_id']}: {exc}")
             continue
-        await collection.update_one(
+        scheduled_result = await collection.update_one(
             {"_id": claimed["_id"], "second_claim_id": claim_id},
             {
                 "$set": {"second_scheduled_at": now},
                 "$unset": {"second_claim_id": "", "second_claimed_at": ""},
             },
         )
-        await db[f"conversations_{claimed['org_id']}"].update_one(
-            {"conversation_id": claimed["conversation_id"]},
-            {"$set": {"status": "follow-up"}},
-        )
+        if not scheduled_result.modified_count:
+            continue
+        await _sync_conversation_followup_status(claimed["org_id"], claimed["conversation_id"])
 
 
 async def process_scheduled_messages(messaging_services: dict) -> None:

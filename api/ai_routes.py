@@ -10,7 +10,12 @@ from pydantic import BaseModel, Field
 from core.limiter import limiter
 from loguru import logger
 from database import get_mongo_db
-from services.followup_service import list_scheduled_followups, schedule_followup_message, transition_scheduled_followup
+from services.followup_service import (
+    cancel_future_followup,
+    list_scheduled_followups,
+    schedule_followup_message,
+    transition_scheduled_followup,
+)
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
 from services.ai_chatbot import update_prompt_in_cache, get_prompt
@@ -141,6 +146,22 @@ async def update_followup_status(
         user.full_name or "Team member",
     )
     return {"followup": followup}
+
+
+@router.post("/followups/{followup_id}/cancel-future")
+@limiter.limit("60/minute")
+async def cancel_next_followup(
+    request: Request,
+    followup_id: str,
+    user: CurrentUser,
+):
+    return await cancel_future_followup(
+        user.org_id,
+        followup_id,
+        user.user_id,
+        user.full_name or "Team member",
+    )
+
 
 @router.get("/chat-analysis/{conversation_id}")
 @limiter.limit("20/minute")

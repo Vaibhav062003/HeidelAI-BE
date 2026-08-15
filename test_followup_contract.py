@@ -1,4 +1,5 @@
 import ast
+import asyncio
 from pathlib import Path
 
 
@@ -18,7 +19,7 @@ def _strings(node: ast.AST):
 
 def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
     routes = ast.parse(Path("api/ai_routes.py").read_text())
-    for name in ["schedule_message", "get_followups", "update_followup_status"]:
+    for name in ["schedule_message", "get_followups", "update_followup_status", "cancel_next_followup"]:
         function = _function(routes, name)
         annotations = {argument.arg: argument.annotation for argument in function.args.args}
         assert isinstance(annotations.get("user"), ast.Name)
@@ -42,6 +43,33 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
         and node.func.attr == "find_one_and_update"
         for node in ast.walk(transition)
     )
+
+    cancel_future = _function(service, "cancel_future_followup")
+    assert {
+        "org_id", "sequence_id", "sequence_step", "second_skipped_at",
+        "future_cancelled_at", "cancelled",
+    } <= _strings(cancel_future)
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "insert_one"
+        for node in ast.walk(cancel_future)
+    )
+    scheduler = _function(service, "_create_due_second_followups")
+    for function in (cancel_future, scheduler):
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_sync_conversation_followup_status"
+            for node in ast.walk(function)
+        )
+
+    cancellable = next(
+        node.value for node in service.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "CANCELLABLE_FUTURE_STATUSES" for target in node.targets)
+    )
+    assert ast.literal_eval(cancellable) == {"pending", "failed"}
 
     processor = _function(service, "process_scheduled_messages")
     assert any(
@@ -69,6 +97,68 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
     assert any(call.lineno > background_upload.lineno for call in followup_calls)
 
 
+def test_conversation_status_reconciles_after_cancel_scheduler_race():
+    service = ast.parse(Path("services/followup_service.py").read_text())
+    helper = _function(service, "_sync_conversation_followup_status")
+
+    class Scheduled:
+        active = False
+        block_next_read = False
+
+        def __init__(self):
+            self.snapshot_taken = asyncio.Event()
+            self.release_snapshot = asyncio.Event()
+
+        async def find_one(self, *_args, **_kwargs):
+            snapshot = self.active
+            if self.block_next_read:
+                self.block_next_read = False
+                self.snapshot_taken.set()
+                await self.release_snapshot.wait()
+            return {"_id": "active"} if snapshot else None
+
+    class Conversations:
+        status = "follow-up"
+
+        def __init__(self):
+            self.writes = []
+
+        async def update_one(self, _query, update):
+            self.status = update["$set"]["status"]
+            self.writes.append(self.status)
+
+    class FakeDB:
+        scheduled_messages = Scheduled()
+        conversations = Conversations()
+
+        def __getitem__(self, _name):
+            return self.conversations
+
+    fake_db = FakeDB()
+    namespace = {"db": fake_db}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "<followup-status>", "exec"), namespace)
+
+    async def race():
+        assert await namespace["_sync_conversation_followup_status"]("org", "chat") == "open"
+        fake_db.scheduled_messages.active = True
+        assert await namespace["_sync_conversation_followup_status"]("org", "chat") == "follow-up"
+
+        fake_db.conversations.writes.clear()
+        fake_db.scheduled_messages.block_next_read = True
+        stale_scheduler = asyncio.create_task(namespace["_sync_conversation_followup_status"]("org", "chat"))
+        await fake_db.scheduled_messages.snapshot_taken.wait()
+        fake_db.scheduled_messages.active = False
+        assert await namespace["_sync_conversation_followup_status"]("org", "chat") == "open"
+        fake_db.scheduled_messages.release_snapshot.set()
+        await stale_scheduler
+
+        assert fake_db.conversations.writes[-3:] == ["open", "follow-up", "open"]
+        assert fake_db.conversations.status == "open"
+
+    asyncio.run(race())
+
+
 if __name__ == "__main__":
     test_followup_routes_are_authenticated_and_lifecycle_is_atomic()
+    test_conversation_status_reconciles_after_cancel_scheduler_race()
     print("Follow-up contract check passed.")
