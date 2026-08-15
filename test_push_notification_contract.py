@@ -57,6 +57,34 @@ def test_device_registration_cannot_choose_its_org_or_user() -> None:
     assert fields == {"installation_id", "token", "platform", "app_version"}
 
 
+def test_device_removal_is_user_scoped_across_organization_switches() -> None:
+    tree = ast.parse(Path("services/push_notification_service.py").read_text())
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "deactivate_user_installation"
+    )
+    writes: list[dict] = []
+
+    class Devices:
+        @staticmethod
+        def update_many(query: dict, _update: dict) -> None:
+            writes.append(query)
+
+    class Clock:
+        @staticmethod
+        def now(_timezone):
+            return "now"
+
+    namespace = {
+        "devices": Devices(),
+        "datetime": Clock,
+        "timezone": type("Timezone", (), {"utc": object()})(),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "<push-handoff>", "exec"), namespace)
+    namespace["deactivate_user_installation"](user_id="user-a", installation_id="device-a")
+    assert writes == [{"user_id": "user-a", "installation_id": "device-a"}]
+
+
 def test_only_explicit_token_errors_are_permanent() -> None:
     tree = ast.parse(Path("services/push_notification_service.py").read_text())
     function = next(
@@ -313,14 +341,18 @@ def test_interrupted_claim_is_released_for_immediate_retry() -> None:
 
 def test_media_push_carries_preview_before_background_upload() -> None:
     tree = ast.parse(Path("api/webhook_routes.py").read_text())
-    enqueue = next(
+    stores = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == "schedule_customer_message_push"
-    )
-    keywords = {keyword.arg for keyword in enqueue.keywords}
-    assert {"sender_name", "content", "message_type"} <= keywords
+        and node.func.id == "store_whatsapp_message"
+        and any(
+            keyword.arg == "notify_push"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in node.keywords
+        )
+    ]
     upload = next(
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call)
@@ -330,7 +362,7 @@ def test_media_push_carries_preview_before_background_upload() -> None:
         and isinstance(node.args[0], ast.Name)
         and node.args[0].id == "upload_and_send_whatsapp_media_background"
     )
-    assert enqueue.lineno < upload.lineno
+    assert any(store.lineno < upload.lineno and upload.lineno - store.lineno < 50 for store in stores)
 
 
 def test_async_push_jobs_do_not_call_pymongo_directly() -> None:
@@ -423,6 +455,7 @@ if __name__ == "__main__":
     test_fcm_payload_contains_customer_preview_without_internal_ids()
     test_customer_preview_is_read_from_the_durable_event()
     test_device_registration_cannot_choose_its_org_or_user()
+    test_device_removal_is_user_scoped_across_organization_switches()
     test_only_explicit_token_errors_are_permanent()
     test_clerk_webhook_signature_verification()
     test_registration_checks_durable_membership_revocation_before_and_after_write()
