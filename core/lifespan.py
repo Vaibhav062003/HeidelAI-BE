@@ -8,6 +8,7 @@ from services.automation_scheduler import startup_scheduler, shutdown_scheduler
 from services.google_sheets_scheduler import startup_google_scheduler, shutdown_google_scheduler
 from services.followup_service import ensure_followup_indexes
 from services.oos_service import ensure_oos_indexes
+from services.sales_offer_service import ensure_sales_offer_indexes
 from services.push_notification_service import (
     ensure_push_notification_indexes,
     start_push_notification_workers,
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI):
     await startup_scheduler()
     await startup_google_scheduler()
     await ensure_oos_indexes()
+    await ensure_sales_offer_indexes()
     await start_push_notification_workers()
     yield
     # Shutdown

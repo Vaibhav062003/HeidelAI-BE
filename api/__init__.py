@@ -22,6 +22,7 @@ from . import team_routes
 from . import transfer_routes
 from . import push_routes
 from . import quote_routes
+from . import sales_offer_routes
 
 router = APIRouter()
 
@@ -47,3 +48,4 @@ router.include_router(team_routes.router)
 router.include_router(transfer_routes.router)
 router.include_router(push_routes.router)
 router.include_router(quote_routes.router)
+router.include_router(sales_offer_routes.router)

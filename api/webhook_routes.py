@@ -324,6 +324,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # status_timestamp=status.get("timestamp")
                         )
 
+                        try:
+                            from services.sales_offer_service import update_offer_delivery
+
+                            await update_offer_delivery(connection.get("org_id"), message_id, status_type)
+                        except Exception as exc:
+                            logger.debug(f"Offer delivery propagation skipped for {message_id}: {exc}")
+
                         # Propagate delivery status to Google Sheet automation tracking
                         # (no-op if message_id doesn't exist in the sheet sent collection)
                         try:
@@ -351,7 +358,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 payload={"message": broadcast_message}
                             )
 
-                        return {"status": "ok"}
                     # ============================================================================
                     
                     org_id = connection.get("org_id") 

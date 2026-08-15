@@ -329,6 +329,23 @@ async def send_message_endpoint(
         duration_ms=duration_ms,
     )
 
+    if mode == "reply" and platform in {"whatsapp", "instagram"}:
+        try:
+            from services.sales_offer_service import enqueue_outbound_offer
+
+            await enqueue_outbound_offer(
+                org_id=org_id,
+                agent_id=user.user_id,
+                agent_name=sender_name,
+                conversation_id=conversation_id,
+                platform=platform,
+                content=content or "",
+                result=res,
+                context=context_dict,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to record outbound sales offer: {exc}")
+
     return {"message": "Message sent", "details": res}
 
 @router.post("/api/conversations/send_reaction")

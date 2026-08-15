@@ -329,6 +329,7 @@ def start_scheduler():
     from services.cloudinary_service import cleanup_expired_audio_notes
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests
     from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
+    from services.sales_offer_service import process_pending_sales_offer_audits
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
@@ -344,6 +345,7 @@ def start_scheduler():
     scheduler.add_job(update_ai_status, "interval", hours=1, args=["others"], next_run_time=datetime.now(timezone.utc))
     # OOS: send pending dealer messages when business hours start (check every 15 min)
     scheduler.add_job(process_pending_oos_sends, "interval", minutes=15)
+    scheduler.add_job(process_pending_sales_offer_audits, "interval", minutes=1, max_instances=1, coalesce=True)
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
     scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
