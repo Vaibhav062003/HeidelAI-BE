@@ -171,8 +171,19 @@ async def schedule_message(
 
 @router.get("/followups")
 @limiter.limit("60/minute")
-async def get_followups(request: Request, user: CurrentUser, limit: int = Query(200, ge=1, le=500)):
-    return {"followups": await list_scheduled_followups(user.org_id, limit)}
+async def get_followups(
+    request: Request,
+    user: CurrentUser,
+    limit: int = Query(200, ge=1, le=500),
+    conversation_id: Optional[str] = Query(default=None, min_length=1, max_length=200),
+):
+    return {
+        "followups": await list_scheduled_followups(
+            user.org_id,
+            limit,
+            conversation_id=conversation_id,
+        )
+    }
 
 
 @router.patch("/followups/{followup_id}")
