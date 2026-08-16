@@ -453,6 +453,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "name": phones_data.get("verified_name", "WhatsApp Business"),
             "access_token": access_token,
             "connected_at": datetime.now().isoformat(),
+            "is_active": True,
             "business_info": {
                 "status": "Active"
             }

@@ -1130,13 +1130,27 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
     """
     res = {"status": "no_action"}
 
-    if platform == "whatsapp":
+    conversation = None
+    if platform in {"whatsapp", "instagram"}:
+        conversation = db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+        stored_platform = (conversation or {}).get("platform") or conversation_id.split("_", 1)[0]
+        if not conversation or stored_platform != platform:
+            raise HTTPException(status_code=404, detail="Conversation not found for this organization and channel")
 
-        wa_id = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}).get("wa_id")
+    if platform == "whatsapp":
+        wa_id = conversation.get("whatsapp_id")
+        recipient_id = conversation.get("customer_id")
+        if not wa_id or not recipient_id:
+            raise HTTPException(status_code=422, detail="This WhatsApp conversation has no connected sender or customer")
+        connection = db.whatsapp_connections.find_one({
+            "org_id": org_id,
+            "wa_id": wa_id,
+            "is_active": {"$ne": False},
+        }, {"_id": 1})
+        if not connection:
+            raise HTTPException(status_code=409, detail="The WhatsApp number for this conversation is not connected")
 
         if file:
-            recipient_id = conversation_id.replace("whatsapp_", "")
-            
             res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name, media_kind, duration_ms)
 
             if res.get("error"):
@@ -1151,7 +1165,6 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 import json
                 content_data = json.loads(content)
                 if isinstance(content_data, dict) and "name" in content_data and "language" in content_data:
-                    recipient_id = conversation_id.replace("whatsapp_", "")
                     res = await send_whatsapp_template_message(
                         recipient_id=recipient_id,
                         template=content_data,
@@ -1182,14 +1195,16 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         return res
     
     elif platform == "instagram":
-        organization = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}) or {}
-        ig_id = organization.get("ig_id")
+        ig_id = conversation.get("instagram_id")
         if not ig_id:
-            raise HTTPException(status_code=400, detail="Instagram is not connected for this organization")
-        conversation = db[f"conversations_{org_id}"].find_one(
-            {"conversation_id": conversation_id, "platform": "instagram", "instagram_id": ig_id},
-            {"customer_id": 1}
-        )
+            raise HTTPException(status_code=422, detail="This Instagram conversation has no connected sender")
+        connection = db.instagram_connections.find_one({
+            "org_id": org_id,
+            "instagram_id": ig_id,
+            "is_active": True,
+        }, {"_id": 1})
+        if not connection:
+            raise HTTPException(status_code=409, detail="The Instagram account for this conversation is not connected")
         if not conversation or not conversation.get("customer_id"):
             raise HTTPException(status_code=404, detail="Instagram conversation not found")
         recipient = conversation["customer_id"]

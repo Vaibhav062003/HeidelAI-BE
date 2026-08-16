@@ -485,7 +485,7 @@ async def send_whatsapp_message(
         
     # Query the database to validate the ID
     wa_connection = db.whatsapp_connections.find_one(
-        {"wa_id": whatsapp_id},
+        {"wa_id": whatsapp_id, "org_id": org_id, "is_active": {"$ne": False}},
         {"wa_id": 1, "_id": 0}
     )
     
@@ -536,7 +536,11 @@ async def send_whatsapp_message(
                     original_content = HOLDING_REPLY
         
         # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
+        connection = db.whatsapp_connections.find_one({
+            "wa_id": whatsapp_business_id,
+            "org_id": org_id,
+            "is_active": {"$ne": False},
+        })
         
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
@@ -735,7 +739,11 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
     """
     try:
         # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
+        connection = db.whatsapp_connections.find_one({
+            "wa_id": wa_id,
+            "org_id": org_id,
+            "is_active": {"$ne": False},
+        })
 
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
@@ -862,7 +870,11 @@ async def send_wa_media_message(
     """
     try:
         # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
+        connection = db.whatsapp_connections.find_one({
+            "wa_id": wa_id,
+            "org_id": org_id,
+            "is_active": {"$ne": False},
+        })
 
         api_media_type = media_type if media_type in {"image", "video", "audio", "document"} else "document"
         media_payload = {
