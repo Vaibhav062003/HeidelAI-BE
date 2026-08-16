@@ -31,6 +31,13 @@ def test_transfer_and_reclaim_return_authoritative_conversation():
             for node in ast.walk(function)
         )
 
+    team_agents = _function(tree, "get_team_agents")
+    response_fields = {
+        node.value for node in ast.walk(team_agents)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert {"id", "name", "identifier", "role"} <= response_fields
+
 
 if __name__ == "__main__":
     test_transfer_and_reclaim_return_authoritative_conversation()

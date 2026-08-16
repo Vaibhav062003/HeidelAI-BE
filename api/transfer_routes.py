@@ -677,12 +677,18 @@ async def get_team_agents(
         
         if role and role.lower() != role_name.lower():
             continue
-            
-        first_name = public_data.get("first_name") or "Agent"
-        
+
+        if not user_id:
+            continue
+        identifier = public_data.get("identifier") or ""
+        name = f"{public_data.get('first_name') or ''} {public_data.get('last_name') or ''}".strip()
+        name = name or public_data.get("username") or identifier or "Agent"
+
         result.append({
             "id": user_id,
-            "name": first_name
+            "name": name,
+            "identifier": identifier,
+            "role": role_name,
         })
 
     return result
