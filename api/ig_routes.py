@@ -13,6 +13,7 @@ from services.platforms.instagram_service import InstagramService
 from schemas.models import PlatformDisconnectRequest, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.common_service import validate_outbound_attachment
+from services.ai_policy_service import set_conversation_ai_state
 import requests
 
 
@@ -645,15 +646,11 @@ async def get_instagram_ai_status(request: Request, conversation_id: str, user: 
         # Get the collection
         org_conversations_collection = db[org_conversations_collection_name]
         
-        # Find the conversation
-        organization = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}) or {}
-        if not organization.get("ig_id"):
-            raise HTTPException(status_code=400, detail="Instagram is not connected")
-        conversation = org_conversations_collection.find_one({
-            "conversation_id": conversation_id,
-            "platform": "instagram",
-            "instagram_id": organization.get("ig_id"),
-        })
+        # The conversation owns its sender account; do not force the org default.
+        conversation = org_conversations_collection.find_one({"conversation_id": conversation_id})
+        stored_platform = (conversation or {}).get("platform") or conversation_id.split("_", 1)[0]
+        if stored_platform != "instagram":
+            conversation = None
         
         if conversation:
             is_ai_enabled = conversation.get("is_ai_enabled", True)  # Default to True if not set
@@ -673,6 +670,12 @@ async def get_instagram_ai_status(request: Request, conversation_id: str, user: 
 @limiter.limit("30/minute")
 async def toggle_instagram_ai_status(request: Request, conversation_id: str, body: dict, user: CurrentUser):
     """Toggle AI status for a specific Instagram conversation"""
+    if "enabled" not in body:
+        raise HTTPException(status_code=422, detail="enabled is required.")
+    action = "resume" if body["enabled"] else "pause"
+    return await set_conversation_ai_state(user.org_id, conversation_id, action, body.get("duration_minutes"))
+
+    # Legacy implementation retained below temporarily for rollback context.
     try:
         org_id = user.org_id 
         # Get the enabled status from request body

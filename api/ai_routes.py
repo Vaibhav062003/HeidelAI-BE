@@ -18,8 +18,14 @@ from services.followup_service import (
 )
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
+from auth.auth_utils import admin_required
 from services.ai_chatbot import update_prompt_in_cache, get_prompt
 from services.chat_analysis_service import analyze_and_update_conversation
+from services.ai_policy_service import (
+    get_org_ai_policy,
+    set_conversation_ai_state,
+    update_org_ai_policy,
+)
 
 db = get_mongo_db()
 
@@ -37,6 +43,45 @@ class ScheduleFollowUpRequest(BaseModel):
 
 class FollowUpStatusRequest(BaseModel):
     status: Literal["cancelled", "fulfilled"]
+
+
+class AIPolicyRequest(BaseModel):
+    enabled: bool
+    pause_minutes: int = Field(default=60, ge=5, le=1440)
+
+
+class ConversationAIStateRequest(BaseModel):
+    action: Literal["pause", "resume"]
+    duration_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
+
+
+@router.get("/policy")
+@limiter.limit("60/minute")
+async def get_ai_policy(request: Request, user: CurrentUser):
+    return await get_org_ai_policy(user.org_id)
+
+
+@router.put("/policy")
+@limiter.limit("30/minute")
+async def put_ai_policy(request: Request, payload: AIPolicyRequest, user: CurrentUser):
+    await admin_required(user)
+    return await update_org_ai_policy(user.org_id, payload.enabled, payload.pause_minutes)
+
+
+@router.post("/conversations/{conversation_id}/state")
+@limiter.limit("60/minute")
+async def change_conversation_ai_state(
+    request: Request,
+    conversation_id: str,
+    payload: ConversationAIStateRequest,
+    user: CurrentUser,
+):
+    return await set_conversation_ai_state(
+        user.org_id,
+        conversation_id,
+        payload.action,
+        payload.duration_minutes,
+    )
 
 def conversation_doc_to_analysis(doc: dict) -> ChatAnalysis:
     return ChatAnalysis(

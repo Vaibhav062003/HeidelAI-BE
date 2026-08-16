@@ -10,6 +10,7 @@ from services.scheduler_service import clean_expired_archives
 from services.followup_service import process_scheduled_messages as drain_scheduled_followups
 from services.agent_service import send_to_agent
 from services.wa_service import send_whatsapp_message
+from services.ai_policy_service import resume_expired_ai_pauses
 # from services.websocket_service import broadcast_on_stats_update
 from loguru import logger
 from config.settings import LEE_DEALER_ORG_ID
@@ -183,6 +184,12 @@ _background_tasks = set()
 
 
 async def update_ai_status(org_type: str = "all"):
+    resumed = await resume_expired_ai_pauses()
+    if resumed:
+        logger.info(f"Re-enabled AI for {resumed} expired conversation pause(s); no customer message was sent.")
+    return
+
+    # Legacy auto-invocation flow retained below temporarily for rollback context.
     logger.info(f"processing auto ai status for type: {org_type}")
     try:
         now = datetime.now(timezone.utc)
@@ -342,8 +349,7 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
     )
-    scheduler.add_job(update_ai_status, "interval", minutes=5, args=["lee"], next_run_time=datetime.now(timezone.utc))
-    scheduler.add_job(update_ai_status, "interval", hours=1, args=["others"], next_run_time=datetime.now(timezone.utc))
+    scheduler.add_job(update_ai_status, "interval", minutes=1, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
     # OOS: send pending dealer messages when business hours start (check every 15 min)
     scheduler.add_job(process_pending_oos_sends, "interval", minutes=15)
     scheduler.add_job(process_pending_oos_reply_steps, "interval", minutes=1, max_instances=1, coalesce=True)
