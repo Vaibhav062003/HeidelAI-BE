@@ -40,6 +40,11 @@ def test_quote_routes_are_authenticated_and_store_private_pricing():
         and node.func.id == "admin_required"
         for node in ast.walk(settings_update)
     )
+    settings_strings = {
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert {"logo_url", "seller", "payment_details", "org_name"} <= settings_strings
 
     update_quote = next(function for function in route_functions if function.name == "update_quote")
     update_strings = {
