@@ -52,6 +52,8 @@ from services.contacts_service import (
     )
 
 from services.ig_service import send_instagram_reaction
+from services.ai_policy_service import get_org_ai_policy, update_org_ai_policy
+from auth.auth_utils import admin_required
 from services.products_service import (
     get_products_for_org, 
     bulk_upload_products_from_file, 
@@ -952,28 +954,10 @@ async def delete_whatsapp_template(request: Request, user: CurrentUser, template
 @router.post("/api/organization/toggle_ai")
 @limiter.limit("60/minute")
 async def toggle_whatsapp_ai_status(request: Request, user: CurrentUser, body: dict):
-    """Toggle AI status for a specific organization"""
-    try:
-        org_id = user.org_id 
-        ai_enabled = body.get("enabled")
-        
-        if ai_enabled is None:
-            return {"status": "error", "message": "Incorrect request body"}
-        
-        # Update the organization
-        result = db.organizations.update_one(
-            {"org_id": org_id},
-            {"$set": {"is_ai_enabled": ai_enabled}}
-        )
-        
-        if result.matched_count == 0:
-            return {"status": "error", "message": "Organization not found"}
-        
-        return {"status": "success", "message": f"AI status updated to {ai_enabled}"}
-    
-    except Exception as e:
-        logger.error(f"Error updating WhatsApp AI status: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to update AI status: {str(e)}"
-        )
+    """Compatibility endpoint for the old settings screen."""
+    await admin_required(user)
+    if "enabled" not in body:
+        raise HTTPException(status_code=422, detail="enabled is required.")
+    current = await get_org_ai_policy(user.org_id)
+    updated = await update_org_ai_policy(user.org_id, bool(body["enabled"]), current["pause_minutes"])
+    return {"status": "success", **updated}

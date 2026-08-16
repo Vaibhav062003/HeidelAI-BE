@@ -45,6 +45,7 @@ from config.settings import (
     LEE_DEALER_ORG_ID
 )
 from services.websocket_service import broadcast_main_ws
+from services.ai_policy_service import set_conversation_ai_state
 
 
 cloudinary.config(
@@ -958,6 +959,12 @@ async def get_whatsapp_ai_status(request: Request, conversation_id: str, user: C
 @limiter.limit("30/minute")
 async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body: dict, user: CurrentUser):
     """Toggle AI status for a specific WhatsApp conversation"""
+    if "enabled" not in body:
+        raise HTTPException(status_code=422, detail="enabled is required.")
+    action = "resume" if body["enabled"] else "pause"
+    return await set_conversation_ai_state(user.org_id, conversation_id, action, body.get("duration_minutes"))
+
+    # Legacy implementation retained below temporarily for rollback context.
     try:
         org_id = user.org_id 
         org_document = db.organizations.find_one({"org_id": org_id})
