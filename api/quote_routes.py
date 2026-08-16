@@ -97,7 +97,8 @@ class QuoteBranding(BaseModel):
 
 
 class QuoteSettingsPayload(BaseModel):
-    logo_url: str = Field(..., min_length=1, max_length=2048)
+    logo_url: Optional[str] = Field(default=None, min_length=1, max_length=2048)
+    seller: Optional[QuoteParty] = None
 
 
 class QuotePayload(BaseModel):
@@ -221,9 +222,19 @@ async def create_quote(request: Request, payload: QuotePayload, user: CurrentUse
 @limiter.limit("60/minute")
 async def get_quote_settings(request: Request, user: CurrentUser):
     settings = await _settings_collection(user.org_id).find_one({"_id": "branding"})
+    organization = await db.organizations.find_one({"org_id": user.org_id}, {"org_name": 1})
+    seller = (settings or {}).get("seller") or {}
     return {
         "settings": {
             "logo_url": (settings or {}).get("logo_url", ""),
+            "seller": {
+                "name": seller.get("name") or (organization or {}).get("org_name") or "Organization",
+                "phone": seller.get("phone", ""),
+                "email": seller.get("email", ""),
+                "gstin": seller.get("gstin", ""),
+                "address": seller.get("address", ""),
+                "payment_details": seller.get("payment_details", ""),
+            },
             "can_edit": user.role in {"admin", "org:admin"},
         }
     }
@@ -233,21 +244,28 @@ async def get_quote_settings(request: Request, user: CurrentUser):
 @limiter.limit("10/minute")
 async def update_quote_settings(request: Request, payload: QuoteSettingsPayload, user: CurrentUser):
     await admin_required(user)
-    logo_url = urlparse(payload.logo_url)
-    if logo_url.scheme != "https" or not logo_url.netloc:
-        raise HTTPException(status_code=422, detail="The organisation logo must use a secure URL")
+    updates = {}
+    if payload.logo_url is not None:
+        logo_url = urlparse(payload.logo_url)
+        if logo_url.scheme != "https" or not logo_url.netloc:
+            raise HTTPException(status_code=422, detail="The organisation logo must use a secure URL")
+        updates["logo_url"] = payload.logo_url
+    if payload.seller is not None:
+        updates["seller"] = payload.seller.model_dump()
+    if not updates:
+        raise HTTPException(status_code=422, detail="Add a logo or seller profile to update")
     settings = await _settings_collection(user.org_id).find_one_and_update(
         {"_id": "branding"},
         {"$set": {
             "org_id": user.org_id,
-            "logo_url": payload.logo_url,
+            **updates,
             "updated_at": datetime.now(timezone.utc),
             "updated_by": user.user_id,
         }},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
-    return {"settings": {"logo_url": settings["logo_url"], "can_edit": True}}
+    return {"settings": {"logo_url": settings.get("logo_url", ""), "seller": settings.get("seller", {}), "can_edit": True}}
 
 
 @router.put("/{quote_id}")
