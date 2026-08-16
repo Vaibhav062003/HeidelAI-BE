@@ -78,6 +78,24 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
         and node.func.attr == "find_one_and_update"
         for node in ast.walk(processor)
     )
+    assert "customer_facing" in _strings(processor)
+    assert "Sales agent follow-up reminder" not in _strings(processor)
+
+    customer_reply = _function(service, "handle_followup_customer_reply")
+    assert {"pending", "failed", "processing", "customer_replied_before_followup"} <= _strings(customer_reply)
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_create_escalation"
+        for node in ast.walk(customer_reply)
+    )
+
+    migration = Path("scripts/migrate_active_reminders.py").read_text()
+    assert "python -m scripts.migrate_active_reminders" in migration
+    assert '"customer_facing": False' in migration
+
+    team = ast.parse(Path("services/team_service.py").read_text())
+    assert {"org_id", "priority", "kind"} <= _strings(_function(team, "create_ai_escalation"))
 
     webhook = ast.parse(Path("api/webhook_routes.py").read_text())
     followup_calls = [
@@ -86,6 +104,12 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
         and getattr(node.func, "id", None) == "handle_followup_customer_reply"
     ]
     assert len(followup_calls) >= 5
+    media_call = next(call for call in followup_calls if 980 <= call.lineno <= 1060)
+    media_if = next(
+        node for node in ast.walk(webhook)
+        if isinstance(node, ast.If) and any(child is media_call for child in ast.walk(node.test))
+    )
+    assert any(isinstance(node, ast.Return) for node in media_if.body)
 
     background_upload = next(
         node for node in ast.walk(webhook)

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 import asyncio
 from core.scheduler import start_scheduler
 from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cache
-from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, recover_stale_bulk_jobs
+from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, recover_stale_bulk_jobs
 from services.automation_scheduler import startup_scheduler, shutdown_scheduler
 from services.google_sheets_scheduler import startup_google_scheduler, shutdown_google_scheduler
 from services.followup_service import ensure_followup_indexes
@@ -24,6 +24,7 @@ async def lifespan(app: FastAPI):
     # Startup
     await asyncio.to_thread(ensure_bulk_job_indexes)
     await asyncio.to_thread(ensure_whatsapp_call_indexes)
+    await asyncio.to_thread(ensure_whatsapp_outbound_indexes)
     await asyncio.to_thread(recover_stale_bulk_jobs)
     await asyncio.to_thread(ensure_push_notification_indexes)
     load_agents()
