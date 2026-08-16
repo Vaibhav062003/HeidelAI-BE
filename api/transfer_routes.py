@@ -13,12 +13,14 @@ from cachetools import TTLCache
 from fastapi import APIRouter, HTTPException, Request, status
 from bson import ObjectId
 from pydantic import BaseModel
+from pymongo import ReturnDocument
 
 from auth.dependencies import CurrentUser
 from database import get_mongo_db, get_async_mongo_db
 from config.settings import CLERK_TOKEN
 from core.services import services
 from services.websocket_service import send_to_user
+from services.utils import serialize_mongo
 from core.limiter import limiter
 from loguru import logger
 
@@ -169,8 +171,6 @@ async def transfer_conversation(
 
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{user.org_id}"]
-    users_col = async_db.users
-
     # 1. Verify org ownership (CRITICAL: prevents cross-org access)
     conv = await collection.find_one({"conversation_id": conversation_id})
     if not conv:
@@ -185,7 +185,7 @@ async def transfer_conversation(
             target_member = m
             break
 
-    if not target_member:
+    if not target_member or target_member.get("public_user_data", {}).get("banned"):
         raise HTTPException(400, "Target agent not found or inactive in organization")
 
     # 3. Check transfer loop
@@ -214,7 +214,9 @@ async def transfer_conversation(
     else:
         query["version"] = current_version
 
-    update_result = await collection.update_one(
+    previous_owner_id = conv.get("assigned_agent_id") or conv.get("assigned_agent", {}).get("id")
+    previous_owner_name = conv.get("assigned_agent", {}).get("name") or conv.get("assigned_agent", {}).get("username") or "Unassigned"
+    updated_conversation = await collection.find_one_and_update(
         query,
         {
             "$set": {
@@ -230,8 +232,8 @@ async def transfer_conversation(
             "$push": {
                 "assignment_history": {
                     "from_agent": {
-                        "id": user.user_id,
-                        "name": user.full_name or "Agent"
+                        "id": previous_owner_id,
+                        "name": previous_owner_name,
                     },
                     "to_agent": {
                         "id": payload.target_agent_id,
@@ -241,10 +243,11 @@ async def transfer_conversation(
                     "reason": payload.reason
                 }
             }
-        }
+        },
+        return_document=ReturnDocument.AFTER,
     )
 
-    if update_result.modified_count == 0:
+    if not updated_conversation:
         raise HTTPException(409, "Conversation was modified by another user. Refresh and retry.")
 
     # 6. Audit trail
@@ -252,7 +255,7 @@ async def transfer_conversation(
         conversation_id=conversation_id,
         org_id=user.org_id,
         action="transferred",
-        from_agent_id=user.user_id,
+        from_agent_id=previous_owner_id,
         to_agent_id=payload.target_agent_id,
         performed_by=user.user_id,
         ip_address=request.client.host,
@@ -274,7 +277,11 @@ async def transfer_conversation(
 
     logger.info(f"Conversation {conversation_id} transferred from {user.user_id} to {payload.target_agent_id}")
 
-    return {"status": "success", "message": "Conversation transferred"}
+    return {
+        "status": "success",
+        "message": "Conversation transferred",
+        "conversation": serialize_mongo(updated_conversation),
+    }
 
 
 @router.post("/api/conversations/{conversation_id}/reclaim")
@@ -310,7 +317,7 @@ async def reclaim_conversation(
     # Transfer back to user
     current_assigned = conv.get("assigned_agent_id")
 
-    update_result = await collection.update_one(
+    updated_conversation = await collection.find_one_and_update(
         {"conversation_id": conversation_id},
         {
             "$set": {
@@ -335,10 +342,11 @@ async def reclaim_conversation(
                     "reason": "Reclaimed"
                 }
             }
-        }
+        },
+        return_document=ReturnDocument.AFTER,
     )
 
-    if update_result.modified_count == 0:
+    if not updated_conversation:
         raise HTTPException(500, "Failed to reclaim conversation")
 
     # Audit
@@ -355,7 +363,11 @@ async def reclaim_conversation(
 
     logger.info(f"Conversation {conversation_id} reclaimed by {user.user_id}")
 
-    return {"status": "success", "message": "Conversation reclaimed"}
+    return {
+        "status": "success",
+        "message": "Conversation reclaimed",
+        "conversation": serialize_mongo(updated_conversation),
+    }
 
 
 # === @Mention Pool Endpoints ===

@@ -293,8 +293,15 @@ async def schedule_followup_message(
     }
 
 
-async def list_scheduled_followups(org_id: str, limit: int = 200) -> list[dict]:
-    followups = await db.scheduled_messages.find({"org_id": org_id}).sort("created_at", -1).limit(limit).to_list(length=limit)
+async def list_scheduled_followups(
+    org_id: str,
+    limit: int = 200,
+    conversation_id: str | None = None,
+) -> list[dict]:
+    query = {"org_id": org_id}
+    if conversation_id:
+        query["conversation_id"] = conversation_id
+    followups = await db.scheduled_messages.find(query).sort("created_at", -1).limit(limit).to_list(length=limit)
     conversation_ids = list({item["conversation_id"] for item in followups if item.get("conversation_id")})
     rows = await db[f"conversations_{org_id}"].find(
         {"conversation_id": {"$in": conversation_ids}},
@@ -343,8 +350,8 @@ async def cancel_future_followup(
     if not current:
         raise HTTPException(status_code=404, detail="Follow-up not found.")
     if current.get("future_cancelled_at"):
-        await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
-        return {"message": "The next follow-up was already cancelled."}
+        conversation_status = await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
+        return {"message": "The next follow-up was already cancelled.", "conversation_status": conversation_status}
     if current.get("status") != "sent" or current.get("sequence_step") != 1 or not current.get("second_followup_text"):
         raise HTTPException(status_code=409, detail="This follow-up has no future message to cancel.")
 
@@ -441,8 +448,8 @@ async def cancel_future_followup(
         {"_id": object_id, "org_id": org_id}, {"future_cancelled_at": 1}
     ) or {}).get("future_cancelled_at"):
         raise HTTPException(status_code=409, detail="The follow-up changed. Refresh and try again.")
-    await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
-    return {"message": "The next follow-up was cancelled."}
+    conversation_status = await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
+    return {"message": "The next follow-up was cancelled.", "conversation_status": conversation_status}
 
 
 async def transition_scheduled_followup(
@@ -487,8 +494,8 @@ async def transition_scheduled_followup(
     )
     if not updated:
         raise HTTPException(status_code=409, detail="The follow-up changed. Refresh and try again.")
-    await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
-    return serialize_mongo(updated)
+    conversation_status = await _sync_conversation_followup_status(org_id, current.get("conversation_id"))
+    return {**serialize_mongo(updated), "conversation_status": conversation_status}
 
 
 async def abort_scheduled_message(org_id: str, conversation_id: str) -> dict:

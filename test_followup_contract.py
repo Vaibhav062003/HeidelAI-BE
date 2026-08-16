@@ -25,7 +25,13 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
         assert isinstance(annotations.get("user"), ast.Name)
         assert annotations["user"].id == "CurrentUser"
 
+    get_followups = _function(routes, "get_followups")
+    assert any(argument.arg == "conversation_id" for argument in get_followups.args.args)
+
     service = ast.parse(Path("services/followup_service.py").read_text())
+    list_followups = _function(service, "list_scheduled_followups")
+    assert any(argument.arg == "conversation_id" for argument in list_followups.args.args)
+    assert {"org_id", "conversation_id"} <= _strings(list_followups)
     schedule = _function(service, "schedule_followup_message")
     assert {"org_id", "quote_id", "quote_value", "followup_text", "scheduled_time"} <= _strings(schedule)
     assert any(
