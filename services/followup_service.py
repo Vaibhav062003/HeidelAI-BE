@@ -24,6 +24,7 @@ from services.utils import serialize_mongo
 db = get_async_mongo_db()
 ACTIVE_STATUSES = ["pending", "processing", "sending", "failed", "delivery_unknown"]
 CANCELLABLE_FUTURE_STATUSES = {"pending", "failed"}
+LEGACY_AGENT_REMINDER = "Sales agent follow-up reminder"
 
 
 async def ensure_followup_indexes() -> None:
@@ -49,6 +50,21 @@ def _safe_generated_text(value: str) -> str:
     if any(marker in text.casefold() for marker in unsafe):
         raise ValueError("The generated follow-up did not pass the automatic safety check.")
     return text
+
+
+async def _agent_reminder_copy(org_id: str, conversation_id: str, customer_name: str) -> str:
+    latest = await db[f"messages_{org_id}"].find_one(
+        {"conversation_id": conversation_id, "role": "customer"},
+        {"content": 1},
+        sort=[("timestamp", -1)],
+    )
+    subject = " ".join(str((latest or {}).get("content") or "their latest request").split())[:120]
+    return f"Follow up with {customer_name or 'this customer'} about “{subject}”."
+
+
+def _is_customer_facing_followup(item: dict) -> bool:
+    text = str(item.get("followup_text") or "").strip()
+    return bool(item.get("customer_facing", item.get("delivery_mode") == "auto")) and text != LEGACY_AGENT_REMINDER
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -162,7 +178,7 @@ async def schedule_followup_message(
     if not receiver_id or not sender_id:
         raise HTTPException(status_code=422, detail="This conversation has no connected sender or customer.")
 
-    followup_text = "Sales agent follow-up reminder"
+    followup_text = ""
     second_followup_text = None
     timeline_text = None
     if ai_active:
@@ -204,6 +220,13 @@ async def schedule_followup_message(
         send_time,
         conversation.get("reply_window_ends_at"),
     ) else "agent_reminder"
+    if delivery_mode == "agent_reminder":
+        followup_text = await _agent_reminder_copy(
+            org_id,
+            conversation_id,
+            conversation.get("customer_name") or "Customer",
+        )
+        second_followup_text = None
 
     if parsed_timeline:
         await conversations.update_one(
@@ -225,6 +248,7 @@ async def schedule_followup_message(
         "second_followup_text": second_followup_text,
         "scheduled_time": send_time,
         "delivery_mode": delivery_mode,
+        "customer_facing": delivery_mode == "auto",
         "status": "pending",
         "active_key": active_key,
         "sequence_id": (existing.get("sequence_id") if existing else None) or str(uuid.uuid4()),
@@ -483,21 +507,33 @@ async def abort_scheduled_message(org_id: str, conversation_id: str) -> dict:
     return {"message": f"Aborted {result.modified_count} scheduled follow-up(s)."}
 
 
-async def _create_escalation(org_id: str, conversation_id: str, content: str, followup: dict, reason: str) -> None:
+async def _create_escalation(
+    org_id: str,
+    conversation_id: str,
+    content: str,
+    followup: dict,
+    reason: str,
+    *,
+    pause_ai: bool = True,
+    priority: str = "high",
+    kind: str = "actionable",
+) -> None:
     from services.team_service import create_ai_escalation
+    from services.ai_policy_service import set_conversation_ai_state
 
     conversations = db[f"conversations_{org_id}"]
     conversation = await conversations.find_one({"conversation_id": conversation_id}) or {}
     now = datetime.now(timezone.utc)
-    await conversations.update_one(
-        {"conversation_id": conversation_id},
-        {"$set": {"is_ai_enabled": False, "followup_escalated_at": now}},
-    )
+    if pause_ai:
+        await set_conversation_ai_state(org_id, conversation_id, "pause")
+    await conversations.update_one({"conversation_id": conversation_id}, {"$set": {"followup_escalated_at": now}})
     await create_ai_escalation(org_id, {
         "user_name": conversation.get("customer_name") or "Customer",
         "customer_number": conversation.get("customer_id") or conversation_id,
         "customer_text": content,
         "inferred_intent": "Follow-up reply needs a sales agent",
+        "priority": priority,
+        "kind": kind,
         "metadata": {
             "reason": reason,
             "conversation_id": conversation_id,
@@ -512,6 +548,42 @@ async def handle_followup_customer_reply(org_id: str, conversation_id: str, cont
     claim_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     collection = db.scheduled_messages
+    pending = await collection.find_one_and_update(
+        {
+            "org_id": org_id,
+            "conversation_id": conversation_id,
+            "status": {"$in": ["pending", "failed", "processing"]},
+            "response_handled_at": {"$exists": False},
+        },
+        {
+            "$set": {
+                "status": "aborted",
+                "aborted_at": now,
+                "updated_at": now,
+                "response_handled_at": now,
+                "response_outcome": "customer_replied_before_followup",
+            },
+            "$unset": {"active_key": "", "claim_id": "", "claimed_at": ""},
+        },
+        sort=[("scheduled_time", 1)],
+        return_document=ReturnDocument.AFTER,
+    )
+    if pending:
+        conversation = await db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id}) or {}
+        ai_active = await _ai_is_active(org_id, conversation)
+        await _create_escalation(
+            org_id,
+            conversation_id,
+            content,
+            pending,
+            "Customer replied before the scheduled follow-up. Review the reply now.",
+            pause_ai=not ai_active,
+            priority="low" if ai_active else "high",
+            kind="informational" if ai_active else "actionable",
+        )
+        await _sync_conversation_followup_status(org_id, conversation_id)
+        return not ai_active
+
     followup = await collection.find_one_and_update(
         {
             "org_id": org_id,
@@ -652,6 +724,7 @@ async def _create_due_second_followups(now: datetime) -> None:
             "followup_text": claimed["second_followup_text"],
             "scheduled_time": send_time,
             "delivery_mode": delivery_mode,
+            "customer_facing": delivery_mode == "auto",
             "status": "pending",
             "active_key": f"{claimed['org_id']}:{claimed['conversation_id']}",
             "sequence_step": 2,
@@ -738,6 +811,20 @@ async def process_scheduled_messages(messaging_services: dict) -> None:
         )
         if not claimed:
             continue
+        if not _is_customer_facing_followup(claimed):
+            await collection.update_one(
+                {"_id": claimed["_id"], "claim_id": claim_id},
+                {
+                    "$set": {
+                        "delivery_mode": "agent_reminder",
+                        "customer_facing": False,
+                        "status": "pending",
+                        "updated_at": claim_time,
+                    },
+                    "$unset": {"claim_id": "", "claimed_at": ""},
+                },
+            )
+            continue
         conversation = await db[f"conversations_{claimed['org_id']}"].find_one({"conversation_id": claimed["conversation_id"]}) or {}
         if (
             claimed.get("sequence_step") == 2
@@ -760,7 +847,12 @@ async def process_scheduled_messages(messaging_services: dict) -> None:
             await collection.update_one(
                 {"_id": claimed["_id"], "claim_id": claim_id, "status": "processing"},
                 {
-                    "$set": {"status": "pending", "delivery_mode": "agent_reminder", "updated_at": claim_time},
+                    "$set": {
+                        "status": "pending",
+                        "delivery_mode": "agent_reminder",
+                        "customer_facing": False,
+                        "updated_at": claim_time,
+                    },
                     "$unset": {"claim_id": "", "claimed_at": ""},
                 },
             )

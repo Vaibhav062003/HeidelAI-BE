@@ -1007,6 +1007,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 if await handle_followup_customer_reply(org_id, conversation_id, content):
                                     logger.info(f"Media reply handled for follow-up {conversation_id}")
+                                    return {"status": "ok"}
 
                                 caption = media_data.get("caption")
                                 if caption and is_price_signal(caption):
