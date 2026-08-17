@@ -13,7 +13,7 @@ from core.services import services
 from database import get_mongo_db
 from loguru import logger
 from services.websocket_service import broadcast_on_stats_update
-from services.utils import normalize_phone
+from services.utils import name_search_prefixes, normalize_phone
 
 db = get_mongo_db()
 
@@ -567,7 +567,10 @@ def process_bulk_wa_contact_upload(
                 conversation_bulk_ops.append(
                     UpdateOne(
                         {"conversation_id": conversation_id},
-                        {"$set": {"customer_name": full_name}}
+                        {"$set": {
+                            "customer_name": full_name,
+                            "customer_name_prefixes": name_search_prefixes(full_name),
+                        }}
                     )
                 )
 
@@ -772,4 +775,3 @@ def delete_upload_batch(org_id: str, batch_id: str) -> dict:
         "deleted_count": deleted_count,
         "demoted_count": demoted_count,
     }
-

@@ -16,6 +16,7 @@ from services.push_notification_service import (
     PushConfigurationError,
     PushMembershipRevokedError,
     deactivate_installation,
+    deactivate_user_installation,
     register_device,
     resolve_event,
     process_member_device_revocation,
@@ -97,7 +98,7 @@ def remove_device(request: Request, installation_id: str, user: CurrentUser):
         normalized_id = str(uuid.UUID(installation_id))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid installation ID") from exc
-    deactivate_installation(org_id=user.org_id, user_id=user.user_id, installation_id=normalized_id)
+    deactivate_user_installation(user_id=user.user_id, installation_id=normalized_id)
     return {"status": "success"}
 
 

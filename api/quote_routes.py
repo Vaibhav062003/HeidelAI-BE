@@ -12,11 +12,18 @@ from auth.dependencies import CurrentUser
 from core.limiter import limiter
 from database import get_async_mongo_db
 from services.cloudinary_service import upload_media_to_cloudinary
+from services.quote_math import quote_line_amounts
 from services.utils import serialize_mongo
 
 
 router = APIRouter(prefix="/api/quotes", tags=["Quotes"])
 db = get_async_mongo_db()
+QUOTE_CONTENT_FIELDS = (
+    "conversation_id", "quote_number", "issued_on", "due_date", "valid_until",
+    "seller", "customer", "items", "shipping", "discount", "notes", "terms",
+    "public_options", "branding", "private_subtotal", "private_gst_total",
+    "public_grand_total",
+)
 
 
 class QuoteParty(BaseModel):
@@ -32,10 +39,12 @@ class QuoteParty(BaseModel):
 class QuoteItem(BaseModel):
     id: str = Field(..., min_length=1, max_length=80)
     description: str = Field(..., min_length=1, max_length=240)
+    category: str = Field(default="", max_length=40)
     sku: str = Field(default="", max_length=60)
     quantity: float = Field(default=1, gt=0, le=9999)
     unit_price: float = Field(..., ge=0, le=999_999_999)
     gst_rate: float = Field(default=0, ge=0, le=100)
+    gst_inclusive: bool = False
     image_url: str = Field(default="", max_length=2048)
 
 
@@ -48,15 +57,48 @@ class QuotePublicOptions(BaseModel):
     show_item_images: bool = True
 
 
+class QuoteComponentCategory(BaseModel):
+    id: str = Field(..., min_length=1, max_length=80)
+    label: str = Field(..., min_length=1, max_length=40)
+    enabled: bool = True
+
+
+class QuoteDesign(BaseModel):
+    name: str = Field(default="Custom", min_length=1, max_length=40)
+    headerColor: str = Field(default="#111315", pattern=r"^#[0-9A-Fa-f]{6}$")
+    accentColor: str = Field(default="#F7AD0A", pattern=r"^#[0-9A-Fa-f]{6}$")
+    pageColor: str = Field(default="#FBFAF7", pattern=r"^#[0-9A-Fa-f]{6}$")
+    textColor: str = Field(default="#0E1113", pattern=r"^#[0-9A-Fa-f]{6}$")
+    typography: Literal["modern", "editorial"] = "modern"
+    fontScale: float = Field(default=1, ge=0.9, le=1.15)
+    density: Literal["compact", "comfortable"] = "compact"
+    headerStyle: Literal["solid", "light"] = "solid"
+    tableStyle: Literal["striped", "ruled"] = "striped"
+    totalStyle: Literal["filled", "outline"] = "filled"
+    showCustomerBlock: bool = True
+    showMetadata: bool = True
+    showSellerDetails: bool = True
+    showPaymentDetails: bool = True
+    showNotes: bool = True
+    showTerms: bool = True
+    showPageNumbers: bool = True
+
+
 class QuoteBranding(BaseModel):
     document_title: str = Field(default="Quotation", min_length=1, max_length=60)
+    build_title: str = Field(default="Performance Workstation", max_length=80)
+    build_label: str = Field(default="Custom PC", max_length=30)
+    build_promise: str = Field(default="Manufacturer warranty / GST invoice", max_length=100)
     theme: Literal["slate", "emerald", "blue", "burgundy"] = "slate"
     cover_image_url: str = Field(default="", max_length=2048)
     footer_text: str = Field(default="Thank you for your business.", max_length=240)
+    component_categories: list[QuoteComponentCategory] = Field(default_factory=list, max_length=20)
+    design: Optional[QuoteDesign] = None
 
 
 class QuoteSettingsPayload(BaseModel):
-    logo_url: str = Field(..., min_length=1, max_length=2048)
+    logo_url: Optional[str] = Field(default=None, min_length=1, max_length=2048)
+    seller: Optional[QuoteParty] = None
 
 
 class QuotePayload(BaseModel):
@@ -91,15 +133,16 @@ def _document(payload: QuotePayload, user: CurrentUser) -> dict:
     gst_total = 0.0
     for item in data["items"]:
         unit_price = item.pop("unit_price")
-        base = round(item["quantity"] * unit_price, 2)
-        gst = round(base * item["gst_rate"] / 100, 2)
+        base, gst, line_total = quote_line_amounts(
+            item["quantity"], unit_price, item["gst_rate"], item["gst_inclusive"]
+        )
         subtotal += base
         gst_total += gst
         stored_items.append({
             **item,
             "private_unit_price": round(unit_price, 2),
             "private_line_subtotal": base,
-            "public_line_total": round(base + gst, 2),
+            "public_line_total": line_total,
         })
     subtotal = round(subtotal, 2)
     gst_total = round(gst_total, 2)
@@ -127,6 +170,20 @@ async def _require_conversation(org_id: str, conversation_id: str) -> None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
 
+def _quote_content(document: dict) -> dict:
+    return {key: document.get(key) for key in QUOTE_CONTENT_FIELDS}
+
+
+def _revision_snapshot(document: dict) -> dict:
+    return {
+        **_quote_content(document),
+        "revision_number": int(document.get("revision_number") or 1),
+        "saved_at": document.get("updated_at") or document.get("created_at"),
+        "saved_by": document.get("updated_by") or document.get("created_by"),
+        "saved_by_name": document.get("updated_by_name") or document.get("created_by_name") or "Team member",
+    }
+
+
 @router.get("")
 @limiter.limit("60/minute")
 async def list_quotes(
@@ -135,8 +192,10 @@ async def list_quotes(
     conversation_id: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(10, ge=1, le=50),
 ):
+    await _require_conversation(user.org_id, conversation_id)
     quotes = await _collection(user.org_id).find(
-        {"org_id": user.org_id, "conversation_id": conversation_id}
+        {"org_id": user.org_id, "conversation_id": conversation_id},
+        {"revisions": 0},
     ).sort("created_at", -1).to_list(length=limit)
     return {"quotes": serialize_mongo(quotes)}
 
@@ -152,6 +211,8 @@ async def create_quote(request: Request, payload: QuotePayload, user: CurrentUse
         "created_at": now,
         "created_by": user.user_id,
         "created_by_name": user.full_name or "Team member",
+        "revision_number": 1,
+        "revision_count": 0,
     }
     await _collection(user.org_id).insert_one(document)
     return {"quote": serialize_mongo(document)}
@@ -161,9 +222,19 @@ async def create_quote(request: Request, payload: QuotePayload, user: CurrentUse
 @limiter.limit("60/minute")
 async def get_quote_settings(request: Request, user: CurrentUser):
     settings = await _settings_collection(user.org_id).find_one({"_id": "branding"})
+    organization = await db.organizations.find_one({"org_id": user.org_id}, {"org_name": 1})
+    seller = (settings or {}).get("seller") or {}
     return {
         "settings": {
             "logo_url": (settings or {}).get("logo_url", ""),
+            "seller": {
+                "name": seller.get("name") or (organization or {}).get("org_name") or "Organization",
+                "phone": seller.get("phone", ""),
+                "email": seller.get("email", ""),
+                "gstin": seller.get("gstin", ""),
+                "address": seller.get("address", ""),
+                "payment_details": seller.get("payment_details", ""),
+            },
             "can_edit": user.role in {"admin", "org:admin"},
         }
     }
@@ -173,35 +244,79 @@ async def get_quote_settings(request: Request, user: CurrentUser):
 @limiter.limit("10/minute")
 async def update_quote_settings(request: Request, payload: QuoteSettingsPayload, user: CurrentUser):
     await admin_required(user)
-    logo_url = urlparse(payload.logo_url)
-    if logo_url.scheme != "https" or not logo_url.netloc:
-        raise HTTPException(status_code=422, detail="The organisation logo must use a secure URL")
+    updates = {}
+    if payload.logo_url is not None:
+        logo_url = urlparse(payload.logo_url)
+        if logo_url.scheme != "https" or not logo_url.netloc:
+            raise HTTPException(status_code=422, detail="The organisation logo must use a secure URL")
+        updates["logo_url"] = payload.logo_url
+    if payload.seller is not None:
+        updates["seller"] = payload.seller.model_dump()
+    if not updates:
+        raise HTTPException(status_code=422, detail="Add a logo or seller profile to update")
     settings = await _settings_collection(user.org_id).find_one_and_update(
         {"_id": "branding"},
         {"$set": {
             "org_id": user.org_id,
-            "logo_url": payload.logo_url,
+            **updates,
             "updated_at": datetime.now(timezone.utc),
             "updated_by": user.user_id,
         }},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
-    return {"settings": {"logo_url": settings["logo_url"], "can_edit": True}}
+    return {"settings": {"logo_url": settings.get("logo_url", ""), "seller": settings.get("seller", {}), "can_edit": True}}
 
 
 @router.put("/{quote_id}")
 @limiter.limit("20/minute")
 async def update_quote(request: Request, quote_id: str, payload: QuotePayload, user: CurrentUser):
     await _require_conversation(user.org_id, payload.conversation_id)
-    updated = await _collection(user.org_id).find_one_and_update(
-        {"org_id": user.org_id, "quote_id": quote_id},
-        {"$set": _document(payload, user)},
+    collection = _collection(user.org_id)
+    current = await collection.find_one({"org_id": user.org_id, "quote_id": quote_id})
+    if not current:
+        raise HTTPException(status_code=404, detail="Quote not found")
+    if current.get("conversation_id") != payload.conversation_id:
+        raise HTTPException(status_code=409, detail="A quote cannot be moved to another conversation")
+    replacement = _document(payload, user)
+    if _quote_content(current) == _quote_content(replacement):
+        current.pop("revisions", None)
+        return {"quote": serialize_mongo(current)}
+    version_filter = {"_id": current["_id"], "org_id": user.org_id}
+    version_filter["updated_at"] = current["updated_at"] if current.get("updated_at") else {"$exists": False}
+    updated = await collection.find_one_and_update(
+        version_filter,
+        {
+            "$set": {
+                **replacement,
+                "revision_number": int(current.get("revision_number") or 1) + 1,
+                "revision_count": int(current.get("revision_count") or 0) + 1,
+            },
+            "$push": {"revisions": _revision_snapshot(current)},
+        },
         return_document=ReturnDocument.AFTER,
     )
     if not updated:
-        raise HTTPException(status_code=404, detail="Quote not found")
+        raise HTTPException(status_code=409, detail="This quote was edited by someone else. Reload before saving.")
+    updated.pop("revisions", None)
     return {"quote": serialize_mongo(updated)}
+
+
+@router.get("/{quote_id}/revisions")
+@limiter.limit("60/minute")
+async def get_quote_revisions(request: Request, quote_id: str, user: CurrentUser):
+    quote = await _collection(user.org_id).find_one(
+        {"org_id": user.org_id, "quote_id": quote_id},
+        {"_id": 0, "quote_id": 1, "conversation_id": 1, "revision_number": 1, "revisions": 1},
+    )
+    if not quote:
+        raise HTTPException(status_code=404, detail="Quote not found")
+    await _require_conversation(user.org_id, quote["conversation_id"])
+    return {
+        "quote_id": quote_id,
+        "current_revision": int(quote.get("revision_number") or 1),
+        "revisions": serialize_mongo(list(reversed(quote.get("revisions") or []))),
+    }
 
 
 @router.post("/assets")

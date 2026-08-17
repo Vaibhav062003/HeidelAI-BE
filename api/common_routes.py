@@ -19,11 +19,16 @@ from core.services import services
 from schemas.models import UnarchiveRequest, PrivateNoteRequest, UpdateCategoriesRequest, UpdateLabelsRequest, CannedResponse, SendReactionRequest
 from services.conversation_utils import reopen_conversation
 from services.common_service import (
-    fetch_conversations_new, 
+    fetch_conversations_new,
+    search_conversations,
+    fetch_focus_counts,
     fetch_conversation,
     send_message,
     fetch_messages,
     acknowledge_conversation_opened,
+    search_conversation_messages,
+    fetch_message_context,
+    validate_outbound_attachment,
     close_conversation, 
     unarchive_data, 
     add_private_note, 
@@ -47,6 +52,8 @@ from services.contacts_service import (
     )
 
 from services.ig_service import send_instagram_reaction
+from services.ai_policy_service import get_org_ai_policy, update_org_ai_policy
+from auth.auth_utils import admin_required
 from services.products_service import (
     get_products_for_org, 
     bulk_upload_products_from_file, 
@@ -96,10 +103,12 @@ async def get_conversations(
     platform: Optional[str] = None,
     priority: Optional[str] = None,
     labels: Optional[str] = None,
+    focus_group: Optional[str] = None,
     attention: Optional[str] = None,
     handling: Optional[str] = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     assigned_agent_id: Optional[str] = None,
+    include_meta: bool = Query(False),
 ):
     """
     Get conversations for the current user's organization
@@ -120,10 +129,12 @@ async def get_conversations(
             platform=platform,
             priority=priority,
             labels=labels,
+            focus_group=focus_group,
             attention=attention,
             handling=handling,
             status_filter=status_filter,
             assigned_agent_id=assigned_agent_id,
+            include_meta=include_meta,
         )
 
     except HTTPException:
@@ -131,6 +142,58 @@ async def get_conversations(
     except Exception as e:
         logger.error(f"Error fetching conversations for {user.org_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch conversations")
+
+
+@router.get("/api/conversations/focus-counts")
+@limiter.limit("60/minute")
+async def get_focus_counts(request: Request, user: CurrentUser):
+    if not user.org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+
+    return {
+        "status": "success",
+        "data": await fetch_focus_counts(user.org_id),
+    }
+
+
+@router.get("/api/conversations/search")
+@limiter.limit("60/minute")
+async def search_conversation_queue(
+    request: Request,
+    user: CurrentUser,
+    q: str = Query(..., min_length=2, max_length=120),
+    skip: int = Query(0, ge=0, le=500),
+    limit: int = Query(20, ge=1, le=50),
+    active_tab: str = Query("all"),
+    unread_only: bool = Query(False),
+    platform: Optional[str] = None,
+    priority: Optional[str] = None,
+    labels: Optional[str] = None,
+    focus_group: Optional[str] = None,
+    attention: Optional[str] = None,
+    handling: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
+    assigned_agent_id: Optional[str] = None,
+):
+    if not user.org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    return await search_conversations(
+        org_id=user.org_id,
+        current_user_id=user.user_id,
+        query=q,
+        skip=skip,
+        limit=limit,
+        active_tab=active_tab,
+        unread_only=unread_only,
+        platform=platform,
+        priority=priority,
+        labels=labels,
+        focus_group=focus_group,
+        attention=attention,
+        handling=handling,
+        status_filter=status_filter,
+        assigned_agent_id=assigned_agent_id,
+    )
 
 @router.get("/api/conversations/{conversation_id}")
 @limiter.limit("30/minute")
@@ -142,13 +205,11 @@ async def get_conversation(request: Request, conversation_id: str, user: Current
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
-    
     try:
         conversation = await fetch_conversation(org_id, conversation_id)
         return conversation
-    except HTTPException as e:
-        logger.error(f"Error fetching conversation {conversation_id} for org {org_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch conversation")
+    except HTTPException:
+        raise
 
 @router.get("/api/conversations/{conversation_id}/messages")
 @limiter.limit("30/minute")
@@ -181,6 +242,33 @@ async def acknowledge_open(
     """Clear the app's unread counter without sending a platform read receipt."""
     return await acknowledge_conversation_opened(user.org_id, conversation_id, observed_counter)
 
+@router.get("/api/conversations/{conversation_id}/messages/search")
+@limiter.limit("60/minute")
+async def search_messages_in_conversation(
+    request: Request,
+    conversation_id: str,
+    user: CurrentUser,
+    q: str = Query(..., min_length=3, max_length=120),
+    limit: int = Query(50, ge=1, le=100),
+):
+    if not user.org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    return await search_conversation_messages(user.org_id, conversation_id, q, limit)
+
+
+@router.get("/api/conversations/{conversation_id}/messages/{message_id}/context")
+@limiter.limit("60/minute")
+async def get_message_context(
+    request: Request,
+    conversation_id: str,
+    message_id: str,
+    user: CurrentUser,
+    radius: int = Query(15, ge=5, le=40),
+):
+    if not user.org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    return await fetch_message_context(user.org_id, conversation_id, message_id, radius)
+
 @router.post("/api/conversations/send-message")
 @limiter.limit("30/minute")
 async def send_message_endpoint(
@@ -206,7 +294,11 @@ async def send_message_endpoint(
     sender_name = user.full_name or "Agent"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
+    if platform == "instagram" and mode == "reply" and not temp_id:
+        raise HTTPException(status_code=400, detail="temp_id is required for Instagram replies")
 
+    if file:
+        validate_outbound_attachment(file)
     if media_kind not in {None, "voice_note", "audio"}:
         raise HTTPException(status_code=400, detail="Invalid media kind")
     if duration_ms is not None and not 0 <= duration_ms <= 300_000:
@@ -238,6 +330,38 @@ async def send_message_endpoint(
         media_kind=media_kind,
         duration_ms=duration_ms,
     )
+
+    if mode == "reply" and platform in {"whatsapp", "instagram"}:
+        try:
+            from services.sales_offer_service import enqueue_outbound_offer
+
+            await enqueue_outbound_offer(
+                org_id=org_id,
+                agent_id=user.user_id,
+                agent_name=sender_name,
+                conversation_id=conversation_id,
+                platform=platform,
+                content=content or "",
+                result=res,
+                context=context_dict,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to record outbound sales offer: {exc}")
+
+    if platform == "whatsapp" and mode == "reply" and content:
+        try:
+            from services.pricing_service import observe_agent_message
+
+            await observe_agent_message(
+                org_id=org_id,
+                conversation_id=conversation_id,
+                content=content,
+                source_message_id=(res or {}).get("message_id"),
+                reply_to_message_id=(context_dict or {}).get("mid"),
+                sender_name=sender_name,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to observe human pricing message: {exc}")
 
     return {"message": "Message sent", "details": res}
 
@@ -830,28 +954,10 @@ async def delete_whatsapp_template(request: Request, user: CurrentUser, template
 @router.post("/api/organization/toggle_ai")
 @limiter.limit("60/minute")
 async def toggle_whatsapp_ai_status(request: Request, user: CurrentUser, body: dict):
-    """Toggle AI status for a specific organization"""
-    try:
-        org_id = user.org_id 
-        ai_enabled = body.get("enabled")
-        
-        if ai_enabled is None:
-            return {"status": "error", "message": "Incorrect request body"}
-        
-        # Update the organization
-        result = db.organizations.update_one(
-            {"org_id": org_id},
-            {"$set": {"is_ai_enabled": ai_enabled}}
-        )
-        
-        if result.matched_count == 0:
-            return {"status": "error", "message": "Organization not found"}
-        
-        return {"status": "success", "message": f"AI status updated to {ai_enabled}"}
-    
-    except Exception as e:
-        logger.error(f"Error updating WhatsApp AI status: {e}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to update AI status: {str(e)}"
-        )
+    """Compatibility endpoint for the old settings screen."""
+    await admin_required(user)
+    if "enabled" not in body:
+        raise HTTPException(status_code=422, detail="enabled is required.")
+    current = await get_org_ai_policy(user.org_id)
+    updated = await update_org_ai_policy(user.org_id, bool(body["enabled"]), current["pause_minutes"])
+    return {"status": "success", **updated}

@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+from services.quote_math import quote_line_amounts
+
 
 def test_quote_routes_are_authenticated_and_store_private_pricing():
     tree = ast.parse(Path("api/quote_routes.py").read_text())
@@ -27,6 +29,9 @@ def test_quote_routes_are_authenticated_and_store_private_pricing():
     }
     assert "private_unit_price" in string_values
     assert "public_grand_total" in string_values
+    field_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert {"gst_inclusive", "revision_number"} <= string_values
+    assert {"category", "component_categories", "design"} <= field_names
 
     settings_update = next(function for function in route_functions if function.name == "update_quote_settings")
     assert any(
@@ -35,6 +40,19 @@ def test_quote_routes_are_authenticated_and_store_private_pricing():
         and node.func.id == "admin_required"
         for node in ast.walk(settings_update)
     )
+    settings_strings = {
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert {"logo_url", "seller", "payment_details", "org_name"} <= settings_strings
+
+    update_quote = next(function for function in route_functions if function.name == "update_quote")
+    update_strings = {
+        node.value for node in ast.walk(update_quote)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert {"$push", "revisions", "revision_number", "revision_count"} <= update_strings
+    assert any(function.name == "get_quote_revisions" for function in route_functions)
 
     auth_tree = ast.parse(Path("auth/auth_utils.py").read_text())
     admin_roles = {
@@ -42,3 +60,13 @@ def test_quote_routes_are_authenticated_and_store_private_pricing():
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert {"admin", "org:admin"} <= admin_roles
+
+
+def test_quote_math_handles_inclusive_and_extra_gst():
+    assert quote_line_amounts(1, 118, 18, True) == (100, 18, 118)
+    assert quote_line_amounts(2, 100, 18, False) == (200, 36, 236)
+
+
+if __name__ == "__main__":
+    test_quote_routes_are_authenticated_and_store_private_pricing()
+    test_quote_math_handles_inclusive_and_extra_gst()

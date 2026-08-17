@@ -1,7 +1,7 @@
 import httpx
 from typing import Dict, Optional
 from loguru import logger
-
+from config.settings import X_INTERNAL_SECRET
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app/"
@@ -54,24 +54,30 @@ async def send_to_agent(
         payload["reply_context_message_id"] = reply_context_message_id
 
 
-    # # Authorization headers
-    # headers={
-    #     "Content-Type": "application/json",
-    #     "X-Internal-Secret": X_INTERNAL_SECRET 
-    # }
+    if not X_INTERNAL_SECRET:
+        logger.error("X_INTERNAL_SECRET is required for chatbot service calls")
+        raise RuntimeError("Chatbot service is unavailable: missing internal secret")
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": X_INTERNAL_SECRET,
+    }
     
     # API endpoint
     endpoint = f"{CHATBOT_BASE_URL}/api/v2/chat"
     
     try:
         logger.info(f"Sending message to chatbot for {conversation_id}")
-        logger.debug(f"Payload: {payload}")
+        logger.debug(
+            f"Chatbot payload org={org_id}, conversation=...{conversation_id[-4:]}, "
+            f"input_length={len(user_input or '')}"
+        )
         
         # Make async HTTP request
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 endpoint,
                 json=payload,
+                headers=headers,
             )
             
             # Check if request was successful

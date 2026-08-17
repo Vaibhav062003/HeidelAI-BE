@@ -169,6 +169,15 @@ def deactivate_installation(*, org_id: str, user_id: str, installation_id: str) 
     )
 
 
+def deactivate_user_installation(*, user_id: str, installation_id: str) -> None:
+    """Deactivate this user's physical installation across organization switches."""
+    now = datetime.now(timezone.utc)
+    devices.update_many(
+        {"user_id": user_id, "installation_id": installation_id},
+        {"$set": {"active": False, "updated_at": now, "expires_at": now}},
+    )
+
+
 def deactivate_member_devices(*, org_id: str, user_id: str, event_at: int) -> None:
     now = datetime.now(timezone.utc)
     devices.update_many(

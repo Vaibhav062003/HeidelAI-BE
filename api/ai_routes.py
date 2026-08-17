@@ -10,11 +10,22 @@ from pydantic import BaseModel, Field
 from core.limiter import limiter
 from loguru import logger
 from database import get_mongo_db
-from services.followup_service import list_scheduled_followups, schedule_followup_message, transition_scheduled_followup
+from services.followup_service import (
+    cancel_future_followup,
+    list_scheduled_followups,
+    schedule_followup_message,
+    transition_scheduled_followup,
+)
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
+from auth.auth_utils import admin_required
 from services.ai_chatbot import update_prompt_in_cache, get_prompt
 from services.chat_analysis_service import analyze_and_update_conversation
+from services.ai_policy_service import (
+    get_org_ai_policy,
+    set_conversation_ai_state,
+    update_org_ai_policy,
+)
 
 db = get_mongo_db()
 
@@ -32,6 +43,45 @@ class ScheduleFollowUpRequest(BaseModel):
 
 class FollowUpStatusRequest(BaseModel):
     status: Literal["cancelled", "fulfilled"]
+
+
+class AIPolicyRequest(BaseModel):
+    enabled: bool
+    pause_minutes: int = Field(default=60, ge=5, le=1440)
+
+
+class ConversationAIStateRequest(BaseModel):
+    action: Literal["pause", "resume"]
+    duration_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
+
+
+@router.get("/policy")
+@limiter.limit("60/minute")
+async def get_ai_policy(request: Request, user: CurrentUser):
+    return await get_org_ai_policy(user.org_id)
+
+
+@router.put("/policy")
+@limiter.limit("30/minute")
+async def put_ai_policy(request: Request, payload: AIPolicyRequest, user: CurrentUser):
+    await admin_required(user)
+    return await update_org_ai_policy(user.org_id, payload.enabled, payload.pause_minutes)
+
+
+@router.post("/conversations/{conversation_id}/state")
+@limiter.limit("60/minute")
+async def change_conversation_ai_state(
+    request: Request,
+    conversation_id: str,
+    payload: ConversationAIStateRequest,
+    user: CurrentUser,
+):
+    return await set_conversation_ai_state(
+        user.org_id,
+        conversation_id,
+        payload.action,
+        payload.duration_minutes,
+    )
 
 def conversation_doc_to_analysis(doc: dict) -> ChatAnalysis:
     return ChatAnalysis(
@@ -121,8 +171,19 @@ async def schedule_message(
 
 @router.get("/followups")
 @limiter.limit("60/minute")
-async def get_followups(request: Request, user: CurrentUser, limit: int = Query(200, ge=1, le=500)):
-    return {"followups": await list_scheduled_followups(user.org_id, limit)}
+async def get_followups(
+    request: Request,
+    user: CurrentUser,
+    limit: int = Query(200, ge=1, le=500),
+    conversation_id: Optional[str] = Query(default=None, min_length=1, max_length=200),
+):
+    return {
+        "followups": await list_scheduled_followups(
+            user.org_id,
+            limit,
+            conversation_id=conversation_id,
+        )
+    }
 
 
 @router.patch("/followups/{followup_id}")
@@ -141,6 +202,22 @@ async def update_followup_status(
         user.full_name or "Team member",
     )
     return {"followup": followup}
+
+
+@router.post("/followups/{followup_id}/cancel-future")
+@limiter.limit("60/minute")
+async def cancel_next_followup(
+    request: Request,
+    followup_id: str,
+    user: CurrentUser,
+):
+    return await cancel_future_followup(
+        user.org_id,
+        followup_id,
+        user.user_id,
+        user.full_name or "Team member",
+    )
+
 
 @router.get("/chat-analysis/{conversation_id}")
 @limiter.limit("20/minute")
