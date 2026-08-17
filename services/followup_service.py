@@ -297,10 +297,13 @@ async def list_scheduled_followups(
     org_id: str,
     limit: int = 200,
     conversation_id: str | None = None,
+    conversation_ids: list[str] | None = None,
 ) -> list[dict]:
     query = {"org_id": org_id}
     if conversation_id:
         query["conversation_id"] = conversation_id
+    elif conversation_ids is not None:
+        query["conversation_id"] = {"$in": conversation_ids}
     followups = await db.scheduled_messages.find(query).sort("created_at", -1).limit(limit).to_list(length=limit)
     conversation_ids = list({item["conversation_id"] for item in followups if item.get("conversation_id")})
     rows = await db[f"conversations_{org_id}"].find(

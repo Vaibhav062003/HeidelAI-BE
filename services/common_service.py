@@ -16,6 +16,12 @@ from services.ig_service import send_ig_message, upload_and_send_ig_media_messag
 from services.utils import serialize_mongo, phone_search_parts
 # from services.websocket_service import broadcast_on_stats_update
 from services.websocket_service import broadcast_team_message
+from services.work_team_service import (
+    can_claim_conversation_ownership,
+    conversation_access_condition,
+    require_conversation_access,
+    team_queue_condition,
+)
 
 from database import get_mongo_db, get_async_mongo_db
 
@@ -99,13 +105,14 @@ def build_focus_group_condition(
     return {"$and": [*conditions, {"status": "open"}]}
 
 
-async def fetch_focus_counts(org_id: str) -> Dict[str, int]:
+async def fetch_focus_counts(org_id: str, user_id: str, role: str) -> Dict[str, int]:
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{org_id}"]
     now = datetime.now(timezone.utc)
+    access = await conversation_access_condition(org_id, user_id, role)
     facets = {
         group: [
-            {"$match": build_focus_group_condition(group, now)},
+            {"$match": {"$and": [build_focus_group_condition(group, now), access]} if access else build_focus_group_condition(group, now)},
             {"$count": "count"},
         ]
         for group in FOCUS_GROUPS
@@ -185,13 +192,23 @@ def _queue_filter_conditions(
     handling: Optional[str],
     status_filter: Optional[str],
     assigned_agent_id: Optional[str],
+    team_id: Optional[str] = None,
 ) -> List[Dict]:
     conditions: List[Dict] = []
     if active_tab == "mine" and current_user_id:
         conditions.append({"$or": [
             {"assigned_agent.id": current_user_id},
             {"assigned_agent_id": current_user_id},
+            {"active_work": {"$elemMatch": {
+                "assigned_agent_id": current_user_id,
+                "status": {"$in": ["pending", "in_progress", "needs_review"]},
+            }}},
         ]})
+    elif active_tab == "team" and team_id:
+        conditions.append({"active_work": {"$elemMatch": {
+                "team_id": team_id,
+                "status": {"$in": ["pending", "in_progress", "needs_review"]},
+            }}})
     elif active_tab == "unassigned":
         conditions.append({"$and": [
             {"$or": [
@@ -202,6 +219,10 @@ def _queue_filter_conditions(
             {"$or": [
                 {"assigned_agent_id": None},
                 {"assigned_agent_id": {"$exists": False}},
+            ]},
+            {"$or": [
+                {"owner_team_id": None},
+                {"owner_team_id": {"$exists": False}},
             ]},
         ]})
     elif active_tab == "escalated":
@@ -272,6 +293,8 @@ async def search_conversations(
     handling: Optional[str] = None,
     status_filter: Optional[str] = None,
     assigned_agent_id: Optional[str] = None,
+    current_user_role: str = "org:member",
+    team_id: Optional[str] = None,
 ) -> Dict:
     clean_query = query.strip()
     if len(clean_query) < 2:
@@ -282,9 +305,14 @@ async def search_conversations(
     conversations = async_db[f"conversations_{org_id}"]
     messages = async_db[f"messages_{org_id}"]
     conditions: List[Dict] = [{"type": {"$ne": "team"}}]
+    access = await conversation_access_condition(org_id, current_user_id or "", current_user_role)
+    if access:
+        conditions.append(access)
+    if active_tab == "team" and team_id:
+        await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
 
     conditions.extend(_queue_filter_conditions(
-        active_tab, current_user_id, attention, handling, status_filter, assigned_agent_id
+        active_tab, current_user_id, attention, handling, status_filter, assigned_agent_id, team_id
     ))
 
     if focus_group:
@@ -439,6 +467,8 @@ async def fetch_conversations_new(
     status_filter: Optional[str] = None,
     assigned_agent_id: Optional[str] = None,
     include_meta: bool = False,
+    current_user_role: str = "org:member",
+    team_id: Optional[str] = None,
 ) -> object:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -460,6 +490,11 @@ async def fetch_conversations_new(
     base_conditions = [
         {"type": {"$ne": "team"}}
     ]
+    access = await conversation_access_condition(org_id, current_user_id or "", current_user_role)
+    if access:
+        base_conditions.append(access)
+    if active_tab == "team" and team_id:
+        await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
     base_conditions.extend(_queue_filter_conditions(
         active_tab,
         current_user_id,
@@ -467,6 +502,7 @@ async def fetch_conversations_new(
         handling,
         status_filter,
         assigned_agent_id,
+        team_id,
     ))
 
     if focus_group:
@@ -564,6 +600,9 @@ async def fetch_conversations_new(
             "sentiment": doc.get("sentiment"),
             "assigned_agent": doc.get("assigned_agent", {}),
             "assigned_agent_id": doc.get("assigned_agent_id"),
+            "owner_team_id": doc.get("owner_team_id"),
+            "owner_team_name": doc.get("owner_team_name"),
+            "active_work": doc.get("active_work", []),
             "is_ai_enabled": doc.get("is_ai_enabled"),
             "auto_ai_disabled": doc.get("auto_ai_disabled", False),
             "auto_ai_disabled_until": (
@@ -590,10 +629,15 @@ async def fetch_conversations_new(
     if not include_meta:
         return result
 
-    count_scope = {"type": {"$ne": "team"}}
+    count_scope_parts = [{"type": {"$ne": "team"}}]
+    if access:
+        count_scope_parts.append(access)
+    count_scope = {"$and": count_scope_parts} if len(count_scope_parts) > 1 else count_scope_parts[0]
+    team_conditions = _queue_filter_conditions("team", current_user_id, None, None, None, None, team_id)
     facets = {
         "all": [{"$match": count_scope}, {"$count": "value"}],
         "mine": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("mine", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
+        "team": [{"$match": {"$and": [count_scope, *team_conditions]}} if team_conditions else {"$match": {"_id": None}}, {"$count": "value"}],
         "unassigned": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("unassigned", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
         "escalated": [{"$match": {"$and": [count_scope, _escalated_condition()]}}, {"$count": "value"}],
     }
@@ -611,7 +655,7 @@ async def fetch_conversations_new(
     }
 
 
-async def fetch_conversation(org_id: str, conversation_id: str):
+async def fetch_conversation(org_id: str, conversation_id: str, user_id: str, role: str):
     """
     Fetch a specific conversation by its ID for a given organization.
     """
@@ -624,10 +668,11 @@ async def fetch_conversation(org_id: str, conversation_id: str):
         # Get the collection
         org_conversations_collection = async_db[org_conversations_collection_name]
 
-        conversation = await org_conversations_collection.find_one(
-            {"conversation_id": conversation_id},
-            {"_id": 0}  
-        )
+        access = await conversation_access_condition(org_id, user_id, role)
+        query = {"conversation_id": conversation_id}
+        if access:
+            query = {"$and": [query, access]}
+        conversation = await org_conversations_collection.find_one(query, {"_id": 0})
         
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -655,7 +700,8 @@ async def fetch_messages(
     agent_id: str,
     agent_username: str,
     before: Optional[str] = None,      # ISO timestamp cursor
-    limit: int = 30
+    limit: int = 30,
+    role: str = "org:member",
 ):
     """
     Fetch messages and private notes for a specific conversation with cursor-based pagination.
@@ -676,40 +722,43 @@ async def fetch_messages(
         - 'next_cursor': ISO timestamp to pass as `before` in the next request
     """
     try:
+        await require_conversation_access(org_id, conversation_id, agent_id, role)
         org_messages_collection_name = f"messages_{org_id}"
         private_note_collection_name = f"private_notes_{org_id}"
         org_conversations_collection_name = f"conversations_{org_id}"
 
         convo_collection = db[org_conversations_collection_name]
         now = datetime.now(timezone.utc)
-        assigned_convo = convo_collection.find_one_and_update(
-            {
-                "conversation_id": conversation_id,
-                "$or": [
-                    {"assigned_agent": {"$exists": False}},
-                    {"assigned_agent": None}
-                ],
-                "status": "open"
-            },
-            {
-                "$set": {
-                    "assigned_agent": {
-                        "id": agent_id,
-                        "username": agent_username,
-                        "assigned_at": now
+        assigned_convo = None
+        if await can_claim_conversation_ownership(org_id, agent_id, role):
+            assigned_convo = convo_collection.find_one_and_update(
+                {
+                    "conversation_id": conversation_id,
+                    "$or": [
+                        {"assigned_agent": {"$exists": False}},
+                        {"assigned_agent": None}
+                    ],
+                    "status": "open"
+                },
+                {
+                    "$set": {
+                        "assigned_agent": {
+                            "id": agent_id,
+                            "username": agent_username,
+                            "assigned_at": now
+                        }
+                    },
+                    "$push": {
+                        "assignment_history": {
+                            "id": agent_id,
+                            "username": agent_username,
+                            "assigned_at": now
+                        }
                     }
                 },
-                "$push": {
-                    "assignment_history": {
-                        "id": agent_id,
-                        "username": agent_username,
-                        "assigned_at": now
-                    }
-                }
-            },
-            projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0},
-            return_document=ReturnDocument.AFTER
-        )
+                projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0},
+                return_document=ReturnDocument.AFTER
+            )
 
         if assigned_convo is None:
             assigned_convo = convo_collection.find_one(

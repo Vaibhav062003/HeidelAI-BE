@@ -9,6 +9,7 @@ from core.limiter import limiter
 from database import get_async_mongo_db
 from services.sales_offer_policy import is_admin, report_query
 from services.utils import serialize_mongo
+from services.work_team_service import require_conversation_access
 
 
 router = APIRouter(prefix="/api/offers", tags=["Sales offers"])
@@ -127,12 +128,7 @@ async def conversation_offers(
     source: Optional[str] = Query(None, pattern="^(formal_quote|chat_price)$"),
     limit: int = Query(50, ge=1, le=100),
 ):
-    exists = await db[f"conversations_{user.org_id}"].find_one(
-        {"conversation_id": conversation_id},
-        {"_id": 1},
-    )
-    if not exists:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     query = {
         "org_id": user.org_id,
         "conversation_id": conversation_id,

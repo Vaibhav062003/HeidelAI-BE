@@ -46,6 +46,7 @@ from config.settings import (
 )
 from services.websocket_service import broadcast_main_ws
 from services.ai_policy_service import set_conversation_ai_state
+from services.work_team_service import conversation_access_condition, require_conversation_access
 
 
 cloudinary.config(
@@ -155,6 +156,7 @@ def _validated_call_session(body: dict, expected_type: str):
 @router.get("/conversations/{conversation_id}/call-permission")
 @limiter.limit("30/minute")
 async def get_call_permission(request: Request, conversation_id: str, user: CurrentUser):
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     connection, _, phone = _calling_context(user.org_id, conversation_id=conversation_id)
     try:
         return await _meta_call_request(connection, "GET", "call_permissions", params={"user_wa_id": phone})
@@ -169,6 +171,7 @@ async def get_call_permission(request: Request, conversation_id: str, user: Curr
 @router.post("/conversations/{conversation_id}/call-permission")
 @limiter.limit("5/minute")
 async def request_call_permission(request: Request, conversation_id: str, user: CurrentUser):
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     connection, conversation, phone = _calling_context(user.org_id, conversation_id=conversation_id)
     window_end = conversation.get("reply_window_ends_at")
     if isinstance(window_end, datetime) and window_end.tzinfo is None:
@@ -212,6 +215,7 @@ async def request_call_permission(request: Request, conversation_id: str, user: 
 @router.post("/conversations/{conversation_id}/calls")
 @limiter.limit("10/minute")
 async def start_whatsapp_call(request: Request, conversation_id: str, body: dict, user: CurrentUser):
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     if body.get("action") != "connect":
         raise HTTPException(status_code=422, detail="Only the connect action can start a call")
     session = _validated_call_session(body, "offer")
@@ -769,7 +773,8 @@ async def get_whatsapp_conversations(request: Request, user: CurrentUser):
     Returns them in the standard conversation format for compatibility with the frontend
     """
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        access = await conversation_access_condition(org_id, user.user_id, user.role)
 
         # Get the WhatsApp-specific collection name
         conversations_collection_name = f"conversations_{org_id}"
@@ -782,8 +787,10 @@ async def get_whatsapp_conversations(request: Request, user: CurrentUser):
         conversations_collection = db[conversations_collection_name]
         
         # Fetch conversations and sort by last_message_timestamp
+        platform_query = {"platform": "whatsapp"}
+        query = {"$and": [platform_query, access]} if access else platform_query
         raw_conversations = list(conversations_collection.find(
-            {}, 
+            query,
             {"_id": 0}  # Exclude _id field
         ).sort("last_message_timestamp", -1))
         
@@ -829,7 +836,8 @@ async def get_whatsapp_conversation(request: Request, conversation_id: str, user
     Returns the conversation in the standard format for compatibility with the frontend
     """
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
 
         conversations_collection_name = f"conversations_{org_id}"
         
@@ -857,6 +865,8 @@ async def get_whatsapp_conversation(request: Request, conversation_id: str, user
         
         return conversation
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching Instagram conversation {conversation_id}: {e}")
         raise HTTPException(
@@ -869,7 +879,8 @@ async def get_whatsapp_conversation(request: Request, conversation_id: str, user
 async def get_whatsapp_messages(request: Request, conversation_id: str, user: CurrentUser):
     """Fetch messages for a specific WhatsApp conversation"""
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
 
         # Get the WhatsApp-specific collection name
         messages_collection_name = f"messages_{org_id}"
@@ -894,6 +905,8 @@ async def get_whatsapp_messages(request: Request, conversation_id: str, user: Cu
         
         return messages
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching WhatsApp messages for {conversation_id}: {e}")
         raise HTTPException(
@@ -935,7 +948,8 @@ async def get_whatsapp_ai_status(request: Request, conversation_id: str, user: C
     """Get AI status for a specific WhatsApp conversation"""
     try:
 
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
         
@@ -948,6 +962,8 @@ async def get_whatsapp_ai_status(request: Request, conversation_id: str, user: C
         
         return {"status": "Error", "message": "No conversation found"}
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error checking WhatsApp AI status: {e}")
         raise HTTPException(
@@ -961,6 +977,7 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
     """Toggle AI status for a specific WhatsApp conversation"""
     if "enabled" not in body:
         raise HTTPException(status_code=422, detail="enabled is required.")
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     action = "resume" if body["enabled"] else "pause"
     return await set_conversation_ai_state(user.org_id, conversation_id, action, body.get("duration_minutes"))
 
@@ -1122,6 +1139,7 @@ async def process_whatsapp_message(request: Request, message: dict, user: Curren
     """Send a message to a WhatsApp conversation"""
     # Get Instagram-specific collections
     org_id = user.org_id
+    await require_conversation_access(org_id, message["conversation_id"], user.user_id, user.role)
     org_conversations_collection = db[f"conversations_{org_id}"]
     
     # Check if conversation exists

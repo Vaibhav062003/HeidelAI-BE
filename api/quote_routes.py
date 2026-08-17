@@ -14,6 +14,7 @@ from database import get_async_mongo_db
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.quote_math import quote_line_amounts
 from services.utils import serialize_mongo
+from services.work_team_service import require_conversation_access
 
 
 router = APIRouter(prefix="/api/quotes", tags=["Quotes"])
@@ -161,13 +162,8 @@ def _document(payload: QuotePayload, user: CurrentUser) -> dict:
     }
 
 
-async def _require_conversation(org_id: str, conversation_id: str) -> None:
-    exists = await db[f"conversations_{org_id}"].find_one(
-        {"conversation_id": conversation_id},
-        {"_id": 1},
-    )
-    if not exists:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+async def _require_conversation(user: CurrentUser, conversation_id: str) -> None:
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
 
 
 def _quote_content(document: dict) -> dict:
@@ -192,7 +188,7 @@ async def list_quotes(
     conversation_id: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(10, ge=1, le=50),
 ):
-    await _require_conversation(user.org_id, conversation_id)
+    await _require_conversation(user, conversation_id)
     quotes = await _collection(user.org_id).find(
         {"org_id": user.org_id, "conversation_id": conversation_id},
         {"revisions": 0},
@@ -203,7 +199,7 @@ async def list_quotes(
 @router.post("", status_code=201)
 @limiter.limit("20/minute")
 async def create_quote(request: Request, payload: QuotePayload, user: CurrentUser):
-    await _require_conversation(user.org_id, payload.conversation_id)
+    await _require_conversation(user, payload.conversation_id)
     now = datetime.now(timezone.utc)
     document = {
         **_document(payload, user),
@@ -271,7 +267,7 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
 @router.put("/{quote_id}")
 @limiter.limit("20/minute")
 async def update_quote(request: Request, quote_id: str, payload: QuotePayload, user: CurrentUser):
-    await _require_conversation(user.org_id, payload.conversation_id)
+    await _require_conversation(user, payload.conversation_id)
     collection = _collection(user.org_id)
     current = await collection.find_one({"org_id": user.org_id, "quote_id": quote_id})
     if not current:
@@ -311,7 +307,7 @@ async def get_quote_revisions(request: Request, quote_id: str, user: CurrentUser
     )
     if not quote:
         raise HTTPException(status_code=404, detail="Quote not found")
-    await _require_conversation(user.org_id, quote["conversation_id"])
+    await _require_conversation(user, quote["conversation_id"])
     return {
         "quote_id": quote_id,
         "current_revision": int(quote.get("revision_number") or 1),

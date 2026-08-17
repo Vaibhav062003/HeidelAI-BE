@@ -2,6 +2,8 @@
 from typing import Literal, Optional
 
 from pymongo.errors import PyMongoError
+from bson import ObjectId
+from bson.errors import InvalidId
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -9,7 +11,7 @@ from pydantic import BaseModel, Field
 # === Internal Modules ===
 from core.limiter import limiter
 from loguru import logger
-from database import get_mongo_db
+from database import get_mongo_db, get_async_mongo_db
 from services.followup_service import (
     cancel_future_followup,
     list_scheduled_followups,
@@ -26,10 +28,18 @@ from services.ai_policy_service import (
     set_conversation_ai_state,
     update_org_ai_policy,
 )
+from services.work_team_service import conversation_access_condition, require_conversation_access
 
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/ai", tags=["AI Routes"])
+
+
+def _followup_object_id(value: str) -> ObjectId:
+    try:
+        return ObjectId(value)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=404, detail="Follow-up not found.")
 
 def _org_metadata_collection():
     return db["organizations_metadata"]
@@ -76,6 +86,7 @@ async def change_conversation_ai_state(
     payload: ConversationAIStateRequest,
     user: CurrentUser,
 ):
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     return await set_conversation_ai_state(
         user.org_id,
         conversation_id,
@@ -150,6 +161,7 @@ async def schedule_message(
     """
     try:
         body = payload or ScheduleFollowUpRequest()
+        await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
         if body.source == "quotation" and not body.quote_id:
             raise HTTPException(status_code=422, detail="A quote is required for quotation follow-ups.")
         return await schedule_followup_message(
@@ -177,11 +189,19 @@ async def get_followups(
     limit: int = Query(200, ge=1, le=500),
     conversation_id: Optional[str] = Query(default=None, min_length=1, max_length=200),
 ):
+    allowed_ids = None
+    if conversation_id:
+        await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
+    else:
+        access = await conversation_access_condition(user.org_id, user.user_id, user.role)
+        if access:
+            allowed_ids = await get_async_mongo_db()[f"conversations_{user.org_id}"].distinct("conversation_id", access)
     return {
         "followups": await list_scheduled_followups(
             user.org_id,
             limit,
             conversation_id=conversation_id,
+            conversation_ids=allowed_ids,
         )
     }
 
@@ -194,6 +214,13 @@ async def update_followup_status(
     payload: FollowUpStatusRequest,
     user: CurrentUser,
 ):
+    existing = await get_async_mongo_db().scheduled_messages.find_one(
+        {"_id": _followup_object_id(followup_id), "org_id": user.org_id},
+        {"conversation_id": 1},
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Follow-up not found.")
+    await require_conversation_access(user.org_id, existing["conversation_id"], user.user_id, user.role)
     followup = await transition_scheduled_followup(
         user.org_id,
         followup_id,
@@ -211,6 +238,13 @@ async def cancel_next_followup(
     followup_id: str,
     user: CurrentUser,
 ):
+    existing = await get_async_mongo_db().scheduled_messages.find_one(
+        {"_id": _followup_object_id(followup_id), "org_id": user.org_id},
+        {"conversation_id": 1},
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Follow-up not found.")
+    await require_conversation_access(user.org_id, existing["conversation_id"], user.user_id, user.role)
     return await cancel_future_followup(
         user.org_id,
         followup_id,
@@ -229,6 +263,7 @@ async def run_chat_analysis(request: Request, conversation_id: str, user: Curren
     org_id = user.org_id
     if not org_id:
         raise HTTPException(status_code=400, detail="Organization ID not found.")
+    await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
     
     try:
         # get conversation from DB
