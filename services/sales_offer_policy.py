@@ -2,6 +2,8 @@
 
 import re
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from math import isfinite
 from typing import Optional
 
 
@@ -42,6 +44,58 @@ _NON_OFFER_AMOUNT_RE = re.compile(
 
 def is_admin(role: str) -> bool:
     return role in {"admin", "org:admin"}
+
+
+def structured_offer_snapshot(context: Optional[dict]) -> Optional[dict]:
+    """Validate the explicit offer payload produced by the Quote composer."""
+    offer = context.get("offer") if isinstance(context, dict) else None
+    if not isinstance(offer, dict):
+        return None
+    raw_items = offer.get("items")
+    if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= 50:
+        raise ValueError("A chat offer must contain between 1 and 50 products")
+
+    items = []
+    grand_total = Decimal("0")
+    tax_modes = set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise ValueError("Every chat-offer item must be an object")
+        description = str(raw.get("description") or "").strip()
+        if not description or len(description) > 240:
+            raise ValueError("Every chat-offer item needs a product name")
+        try:
+            quantity = Decimal(str(raw.get("quantity", 1)))
+            unit_price = Decimal(str(raw.get("unit_price")))
+            gst_rate = Decimal(str(raw.get("gst_rate", 18)))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("Chat-offer quantities, prices and GST must be numbers") from exc
+        if not all(isfinite(float(value)) for value in (quantity, unit_price, gst_rate)):
+            raise ValueError("Chat-offer numbers must be finite")
+        if quantity <= 0 or quantity > 1000 or unit_price <= 0 or unit_price > 999_999_999 or gst_rate < 0 or gst_rate > 100:
+            raise ValueError("Chat-offer values are outside the supported range")
+
+        gst_inclusive = raw.get("gst_inclusive") is True
+        entered_total = quantity * unit_price
+        line_total = entered_total if gst_inclusive else entered_total * (Decimal("1") + gst_rate / Decimal("100"))
+        line_total = line_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        grand_total += line_total
+        tax_modes.add("included" if gst_inclusive else "extra")
+        items.append({
+            "description": description,
+            "quantity": float(quantity),
+            "unit_price": float(unit_price),
+            "gst_rate": float(gst_rate),
+            "gst_inclusive": gst_inclusive,
+            "line_total": float(line_total),
+        })
+
+    return {
+        "items": items,
+        "amounts": [item["line_total"] for item in items],
+        "total_amount": float(grand_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        "tax_basis": next(iter(tax_modes)) if len(tax_modes) == 1 else "mixed",
+    }
 
 
 def report_query(

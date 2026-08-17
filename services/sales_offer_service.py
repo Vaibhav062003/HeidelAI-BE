@@ -14,6 +14,7 @@ from services.sales_offer_policy import (
     next_delivery_status,
     offer_prices,
     quote_revision_snapshot,
+    structured_offer_snapshot,
     tax_basis,
 )
 
@@ -49,6 +50,17 @@ def _message_id(result: Optional[dict]) -> Optional[str]:
     nested = result.get("response")
     value = result.get("message_id") or (nested.get("message_id") if isinstance(nested, dict) else None)
     return str(value) if value else None
+
+
+async def _broadcast_offer(org_id: str, offer: dict, action: str = "updated") -> None:
+    from services.websocket_service import broadcast_org_ws
+
+    await broadcast_org_ws(org_id, "sales_offer_updated", {
+        "org_id": org_id,
+        "conversation_id": offer.get("conversation_id"),
+        "offer_id": str(offer.get("_id") or ""),
+        "action": action,
+    })
 
 
 async def _supersede_older_formal_quotes(org_id: str, current: dict) -> None:
@@ -96,6 +108,7 @@ async def record_outbound_offer(
     now = datetime.now(timezone.utc)
     context = context or {}
     quote_context = context.get("quote") if isinstance(context.get("quote"), dict) else None
+    structured_offer = structured_offer_snapshot(context)
     conversation = await db[f"conversations_{org_id}"].find_one(
         {"conversation_id": conversation_id},
         {"customer_name": 1, "customer_phone_no": 1, "phone": 1, "username": 1},
@@ -140,6 +153,15 @@ async def record_outbound_offer(
             "tax_basis": "documented",
             "message_preview": (content or "Please find your quotation attached.")[:240],
         })
+    elif structured_offer:
+        document.update({
+            "source_type": "chat_price",
+            "amounts": structured_offer["amounts"],
+            "total_amount": structured_offer["total_amount"],
+            "tax_basis": structured_offer["tax_basis"],
+            "line_items": structured_offer["items"],
+            "message_preview": (content or "")[:240],
+        })
     else:
         prices = offer_prices(content or "", extract_quoted_prices(content or ""))
         if not is_outbound_offer(content, prices):
@@ -161,6 +183,7 @@ async def record_outbound_offer(
         if platform == "whatsapp":
             await update_offer_delivery(org_id, source_message_id, "sent")
         return await _collection(org_id).find_one({"_id": event_id})
+    await _broadcast_offer(org_id, document, "created")
     if receipt:
         await _delivery_collection(org_id).delete_one({"_id": source_message_id})
     if platform == "whatsapp":
@@ -179,7 +202,8 @@ async def enqueue_outbound_offer(**payload) -> Optional[dict]:
         return None
     context = payload.get("context")
     quote_context = context.get("quote") if isinstance(context, dict) else None
-    if not isinstance(quote_context, dict):
+    structured_offer = context.get("offer") if isinstance(context, dict) else None
+    if not isinstance(quote_context, dict) and not isinstance(structured_offer, dict):
         content = str(payload.get("content") or "")
         prices = offer_prices(content, extract_quoted_prices(content))
         if not is_outbound_offer(content, prices):
@@ -188,7 +212,11 @@ async def enqueue_outbound_offer(**payload) -> Optional[dict]:
     event_id = f"{payload.get('platform')}:{source_message_id}"
     retry_payload = {key: value for key, value in payload.items() if key not in {"result", "context"}}
     retry_payload["result"] = {"message_id": source_message_id}
-    retry_payload["context"] = {"quote": quote_context} if isinstance(quote_context, dict) else None
+    retry_payload["context"] = (
+        {"quote": quote_context} if isinstance(quote_context, dict)
+        else {"offer": structured_offer} if isinstance(structured_offer, dict)
+        else None
+    )
     await _outbox_collection(org_id).update_one(
         {"_id": event_id},
         {"$setOnInsert": {
@@ -268,3 +296,5 @@ async def update_offer_delivery(org_id: str, message_id: str, status: str) -> No
             await _supersede_older_formal_quotes(org_id, offer)
         elif delivery_status == "failed":
             await _restore_superseded_formal_quotes(org_id, offer)
+    if delivery_status != offer.get("delivery_status"):
+        await _broadcast_offer(org_id, {**offer, "delivery_status": delivery_status}, "delivery")

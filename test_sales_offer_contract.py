@@ -10,11 +10,25 @@ from services.sales_offer_policy import (
     offer_prices,
     quote_revision_snapshot,
     report_query,
+    structured_offer_snapshot,
     tax_basis,
 )
 
 
 class SalesOfferContractTest(unittest.TestCase):
+    def test_structured_chat_offer_totals_and_validation(self):
+        snapshot = structured_offer_snapshot({"offer": {"items": [
+            {"description": "Ryzen 7 9700X", "quantity": 1, "unit_price": 32_000, "gst_rate": 18, "gst_inclusive": True},
+            {"description": "RTX 5060", "quantity": 1, "unit_price": 45_000, "gst_rate": 18, "gst_inclusive": False},
+        ]}})
+        self.assertEqual(snapshot["amounts"], [32_000, 53_100])
+        self.assertEqual(snapshot["total_amount"], 85_100)
+        self.assertEqual(snapshot["tax_basis"], "mixed")
+        with self.assertRaises(ValueError):
+            structured_offer_snapshot({"offer": {"items": []}})
+        with self.assertRaises(ValueError):
+            structured_offer_snapshot({"offer": {"items": [{"description": "RTX 5060", "unit_price": "NaN"}]}})
+
     def test_scope_money_and_delivery_rules(self):
         member = report_query(
             org_id="org-1", user_id="agent-1", role="org:member", start=None, end=None,
