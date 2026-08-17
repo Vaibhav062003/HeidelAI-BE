@@ -34,9 +34,31 @@ from loguru import logger
 from services.webhook_service import calculate_whatsapp_reply_window
 from services.automation_trigger_handler import check_and_trigger_automations
 from services.push_notification_service import schedule_customer_message_push
+from services.whatsapp_call_history import (
+    call_lifecycle_fields,
+    meta_datetime,
+    provider_lifecycle_filter,
+)
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
+
+
+def _apply_call_lifecycle(collection, org_id: str, call_id: str, existing: dict, **kwargs) -> dict:
+    current = existing
+    for _ in range(2):
+        fields = call_lifecycle_fields(current, **kwargs)
+        provider_time = fields.get("provider_updated_at")
+        if not provider_time:
+            return current
+        result = collection.update_one(
+            provider_lifecycle_filter(org_id, call_id, provider_time, fields["state"]),
+            {"$set": fields},
+        )
+        current = collection.find_one({"call_id": call_id, "org_id": org_id}) or current
+        if result.matched_count:
+            return current
+    return current
 
 async def forward_webhook_to_dev(body: bytes, headers: dict):
     """
@@ -263,6 +285,43 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 ]
                             }) if phone else None
                             conversation_id = (conversation or {}).get("conversation_id") or existing.get("conversation_id")
+                            now = datetime.now(timezone.utc)
+                            provider_time = meta_datetime(call.get("timestamp"), now)
+                            metadata_fields = {
+                                "wa_id": whatsapp_business_id,
+                                "direction": direction,
+                                "conversation_id": conversation_id,
+                                "contact_name": (conversation or {}).get("customer_name") or contact_name,
+                                "phone": phone,
+                            }
+                            calls_collection.update_one(
+                                {"call_id": call_id, "org_id": org_id},
+                                {
+                                    "$setOnInsert": {
+                                        "call_id": call_id,
+                                        "org_id": org_id,
+                                        "created_at": provider_time,
+                                        "started_at": meta_datetime(call.get("start_time"), provider_time),
+                                    },
+                                    "$set": metadata_fields,
+                                },
+                                upsert=True,
+                            )
+                            existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or metadata_fields
+                            stored = _apply_call_lifecycle(
+                                calls_collection,
+                                org_id,
+                                call_id,
+                                existing,
+                                raw_state=call.get("status") or call.get("event"),
+                                direction=direction,
+                                now=now,
+                                provider_time=provider_time,
+                                start_time=meta_datetime(call.get("start_time")),
+                                end_time=meta_datetime(call.get("end_time")),
+                                duration_seconds=call.get("duration"),
+                                connected_event=False,
+                            )
                             safe_call = dict(call)
                             sdp = session.get("sdp") if isinstance(session, dict) else None
                             if session is not None and (not isinstance(session, dict) or not isinstance(sdp, str) or len(sdp) > 100_000):
@@ -272,28 +331,23 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 **safe_call,
                                 "id": call_id,
                                 "call_id": call_id,
-                                "errors": value.get("errors") or safe_call.get("errors"),
+                                "errors": safe_call.get("errors") or value.get("errors"),
+                                "webhook_errors": value.get("errors"),
                                 "direction": direction,
                                 "conversation_id": conversation_id,
-                                "contact_name": (conversation or {}).get("customer_name") or contact_name,
+                                "contact_name": stored.get("contact_name"),
                                 "phone": phone,
-                                "agent_id": existing.get("agent_id"),
+                                "status": stored.get("state"),
+                                "agent_id": stored.get("agent_id"),
+                                "agent_name": stored.get("agent_name"),
+                                "agent_device_id": stored.get("agent_device_id"),
+                                "handled_by": stored.get("handled_by"),
+                                "created_at": stored.get("created_at"),
+                                "started_at": stored.get("started_at"),
+                                "connected_at": stored.get("connected_at"),
+                                "ended_at": stored.get("ended_at"),
+                                "duration_seconds": stored.get("duration_seconds"),
                             }
-                            calls_collection.update_one(
-                                {"call_id": call_id, "org_id": org_id},
-                                {"$set": {
-                                    "call_id": call_id,
-                                    "org_id": org_id,
-                                    "wa_id": whatsapp_business_id,
-                                    "direction": direction,
-                                    "conversation_id": conversation_id,
-                                    "contact_name": call_payload["contact_name"],
-                                    "phone": phone,
-                                    "state": call.get("status") or call.get("event") or existing.get("state"),
-                                    "updated_at": datetime.now(timezone.utc),
-                                }},
-                                upsert=True,
-                            )
                             await broadcast_main_ws(whatsapp_business_id, "whatsapp", "whatsapp_call", call_payload)
 
                         for status in value.get("statuses") or []:
@@ -301,20 +355,64 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             if not call_id:
                                 continue
                             existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or {}
+                            now = datetime.now(timezone.utc)
+                            status_value = status.get("status")
+                            connected_event = str(status_value or "").upper() == "ACCEPTED"
+                            provider_time = meta_datetime(status.get("timestamp"), now)
                             calls_collection.update_one(
                                 {"call_id": call_id, "org_id": org_id},
-                                {"$set": {"state": status.get("status"), "updated_at": datetime.now(timezone.utc)}},
+                                {
+                                    "$setOnInsert": {
+                                        "call_id": call_id,
+                                        "org_id": org_id,
+                                        "created_at": provider_time,
+                                        "started_at": provider_time,
+                                    },
+                                },
+                                upsert=True,
                             )
+                            existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or existing
+                            stored = _apply_call_lifecycle(
+                                calls_collection,
+                                org_id,
+                                call_id,
+                                existing,
+                                raw_state=status_value,
+                                direction=existing.get("direction") or "USER_INITIATED",
+                                now=now,
+                                provider_time=provider_time,
+                                connected_event=connected_event,
+                            )
+                            if connected_event and not stored.get("agent_id"):
+                                calls_collection.update_one(
+                                    {
+                                        "call_id": call_id,
+                                        "org_id": org_id,
+                                        "state": "connected",
+                                        "$or": [{"agent_id": None}, {"agent_id": {"$exists": False}}],
+                                    },
+                                    {"$set": {"handled_by": "linked_device"}},
+                                )
+                                stored = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or stored
                             await broadcast_main_ws(whatsapp_business_id, "whatsapp", "whatsapp_call", {
                                 **status,
                                 "id": call_id,
                                 "call_id": call_id,
                                 "event": "status",
-                                "direction": existing.get("direction"),
-                                "conversation_id": existing.get("conversation_id"),
-                                "contact_name": existing.get("contact_name"),
-                                "phone": existing.get("phone"),
-                                "agent_id": existing.get("agent_id"),
+                                "status": stored.get("state") or status_value,
+                                "direction": stored.get("direction"),
+                                "conversation_id": stored.get("conversation_id"),
+                                "contact_name": stored.get("contact_name"),
+                                "phone": stored.get("phone"),
+                                "agent_id": stored.get("agent_id"),
+                                "agent_name": stored.get("agent_name"),
+                                "agent_device_id": stored.get("agent_device_id"),
+                                "handled_by": stored.get("handled_by"),
+                                "created_at": stored.get("created_at"),
+                                "started_at": stored.get("started_at"),
+                                "connected_at": stored.get("connected_at"),
+                                "ended_at": stored.get("ended_at"),
+                                "duration_seconds": stored.get("duration_seconds"),
                             })
                         continue
 

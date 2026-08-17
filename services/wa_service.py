@@ -1969,6 +1969,14 @@ def ensure_whatsapp_call_indexes() -> None:
             name="org_id_call_id_unique",
             partialFilterExpression={"org_id": {"$type": "string"}, "call_id": {"$type": "string"}},
         )
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("updated_at", -1), ("call_id", -1)],
+            name="org_call_history",
+        )
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("conversation_id", 1), ("updated_at", -1), ("call_id", -1)],
+            name="org_conversation_call_history",
+        )
     except Exception as e:
         logger.warning(f"Failed to create WhatsApp call index: {e}")
 
