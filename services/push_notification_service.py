@@ -108,7 +108,7 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def register_device(*, org_id: str, user_id: str, installation_id: str, token: str, app_version: str | None) -> None:
+def register_device(*, org_id: str, user_id: str, role: str, installation_id: str, token: str, app_version: str | None) -> None:
     now = datetime.now(timezone.utc)
     member_filter = {"org_id": org_id, "user_id": user_id}
     membership = revoked_members.find_one(member_filter, {"_id": 0, "revoked": 1, "event_at": 1}) or {}
@@ -122,6 +122,7 @@ def register_device(*, org_id: str, user_id: str, installation_id: str, token: s
         "$set": {
             "org_id": org_id,
             "user_id": user_id,
+            "role": role,
             "installation_id": installation_id,
             "encrypted_token": encrypted_token,
             "token_hash": token_hash,
@@ -542,14 +543,31 @@ async def _process_push_event(event_id: str) -> None:
 
     title, body = notification_content(event)
     completed = set(event.get("completed_token_hashes", []))
+    conversation = await asyncio.to_thread(
+        db[f"conversations_{event['org_id']}"].find_one,
+        {"conversation_id": event.get("conversation_id")},
+    )
+    teams = await asyncio.to_thread(
+        lambda: list(db[f"work_teams_{event['org_id']}"].find({"active": {"$ne": False}}, {"_id": 0}))
+    )
+    from services.work_team_service import can_user_access_conversation
     active_devices = await asyncio.to_thread(
         lambda: list(
             devices.find(
                 {"org_id": event["org_id"], "active": True, "expires_at": {"$gt": now}},
-                {"encrypted_token": 1, "token_hash": 1},
+                {"encrypted_token": 1, "token_hash": 1, "user_id": 1, "role": 1},
             )
         )
     )
+    if conversation:
+        active_devices = [
+            device for device in active_devices
+            if can_user_access_conversation(
+                device.get("user_id") or "", device.get("role") or "org:member", conversation, teams
+            )
+        ]
+    else:
+        active_devices = []
     retry_needed = False
 
     async with httpx.AsyncClient(timeout=12) as client:

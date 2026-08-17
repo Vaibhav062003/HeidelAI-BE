@@ -8,6 +8,33 @@ from loguru import logger
 db = get_mongo_db()
 
 
+async def _eligible_conversation_clients(client_ids, conversation_id: str | None):
+    if not conversation_id:
+        return set(client_ids)
+    from services.work_team_service import can_user_access_conversation, list_work_teams
+    allowed_clients = set()
+    clients_by_org = {}
+    for client_id in client_ids:
+        org_id = services.client_metadata.get(client_id, {}).get("org_id")
+        if org_id:
+            clients_by_org.setdefault(org_id, []).append(client_id)
+    async_db = get_async_mongo_db()
+    for org_id, org_client_ids in clients_by_org.items():
+        conversation = await async_db[f"conversations_{org_id}"].find_one(
+            {"conversation_id": conversation_id}
+        )
+        if not conversation:
+            continue
+        teams = await list_work_teams(org_id)
+        for client_id in org_client_ids:
+            meta = services.client_metadata.get(client_id, {})
+            if can_user_access_conversation(
+                meta.get("user_id") or "", meta.get("role") or "org:member", conversation, teams
+            ):
+                allowed_clients.add(client_id)
+    return allowed_clients
+
+
 async def latest_unread_whatsapp_message_id(org_id: str, conversation_id: str) -> str | None:
     async_db = get_async_mongo_db()
     message = await async_db[f"messages_{org_id}"].find_one(
@@ -95,6 +122,12 @@ async def handle_typing_event(client_id: str, data: dict):
 
     conversation_id = data.get("conversation_id")
     org_id = meta.get("org_id")
+    if not conversation_id or not org_id:
+        return
+    from services.work_team_service import require_conversation_access
+    await require_conversation_access(
+        org_id, conversation_id, meta.get("user_id") or "", meta.get("role") or "org:member"
+    )
     is_active_viewer = services.client_convo_map.get(client_id) == (org_id, conversation_id)
     message_id = None
     if platform == "whatsapp" and wa_id and data.get("is_typing") is True and is_active_viewer:
@@ -145,6 +178,10 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
         target_map = services.whatsapp_clients
 
     client_ids = target_map.get(platform_id, [])
+    if not client_ids:
+        return
+
+    client_ids = await _eligible_conversation_clients(client_ids, payload.get("conversation_id"))
     if not client_ids:
         return
 
@@ -219,6 +256,11 @@ async def handle_unread_event(org_id: str, client_id: str, data: dict):
     if not conversation_id or not event_type:
         logger.error(f"Invalid unread event data from {client_id}: {data}")
         return
+
+    from services.work_team_service import require_conversation_access
+    await require_conversation_access(
+        org_id, conversation_id, meta.get("user_id") or "", meta.get("role") or "org:member"
+    )
 
     if event_type == "join_conversation":
         join_conversation_presence(org_id, conversation_id, client_id)
@@ -301,7 +343,9 @@ async def broadcast_org_ws(org_id: str, event_type: str, payload: dict, exclude_
     """
     Broadcast an event to every client connected under the same org, excluding the sender.
     """
-    client_ids = services.org_clients.get(org_id, set())
+    client_ids = await _eligible_conversation_clients(
+        services.org_clients.get(org_id, set()), payload.get("conversation_id")
+    )
 
     disconnected_clients = []
 
@@ -461,7 +505,7 @@ async def broadcast_ai_escalation(org_id: str, payload: dict):
         else:
             logger.warning(f"WebSocket not found for active client {client_id}")
 
-async def send_to_user(user_id: str, payload: dict):
+async def send_to_user(user_id: str, payload: dict, org_id: str | None = None):
     """
     Sends a WebSocket notification payload directly to all active connection channels of a user.
     """
@@ -476,6 +520,8 @@ async def send_to_user(user_id: str, payload: dict):
 
         safe_payload = jsonable_encoder(ws_payload)
         for client_id in list(services.agent_clients[user_id]):
+            if org_id and services.client_metadata.get(client_id, {}).get("org_id") != org_id:
+                continue
             ws = services.active_clients.get(client_id)
             if ws:
                 try:

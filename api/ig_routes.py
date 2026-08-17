@@ -14,6 +14,7 @@ from schemas.models import PlatformDisconnectRequest, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.common_service import validate_outbound_attachment
 from services.ai_policy_service import set_conversation_ai_state
+from services.work_team_service import conversation_access_condition, require_conversation_access
 import requests
 
 
@@ -447,7 +448,8 @@ async def get_instagram_conversation(request: Request, conversation_id: str, use
     Returns the conversation in the standard format for compatibility with the frontend
     """
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
 
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
@@ -476,6 +478,8 @@ async def get_instagram_conversation(request: Request, conversation_id: str, use
         
         return conversation
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching Instagram conversation {conversation_id} for {org_id}: {e}")
         raise HTTPException(
@@ -491,7 +495,8 @@ async def get_instagram_conversations(request: Request, user: CurrentUser):
     Returns them in the standard conversation format for compatibility with the frontend
     """
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        access = await conversation_access_condition(org_id, user.user_id, user.role)
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
         
@@ -503,8 +508,10 @@ async def get_instagram_conversations(request: Request, user: CurrentUser):
         org_conversations_collection = db[org_conversations_collection_name]
 
         # Fetch conversations and sort by last_message_timestamp
+        platform_query = {"platform": "instagram"}
+        query = {"$and": [platform_query, access]} if access else platform_query
         raw_conversations = list(org_conversations_collection.find(
-            {"platform": "instagram"}, 
+            query,
             {"_id": 0}  # Exclude _id field
         ).sort("last_message_timestamp", -1))
         
@@ -552,7 +559,8 @@ async def get_instagram_messages(request: Request, conversation_id: str,
                                  ):
     """Fetch messages for a specific Instagram conversation"""
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
         org_messages_collection_name = f"messages_{org_id}"
         private_note_collection_name = f"private_notes_{org_id}"
 
@@ -626,6 +634,8 @@ async def get_instagram_messages(request: Request, conversation_id: str,
         
         return {"messages": combined, "assignment": assigned_convo}
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching Instagram messages or private notes for {conversation_id} of org {org_id}: {e}")
         raise HTTPException(
@@ -639,7 +649,8 @@ async def get_instagram_messages(request: Request, conversation_id: str,
 async def get_instagram_ai_status(request: Request, conversation_id: str, user: CurrentUser):
     """Get AI status for a specific Instagram conversation"""
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
         # organization specific collection name for conversations
         org_conversations_collection_name = f"conversations_{org_id}"
         
@@ -658,6 +669,8 @@ async def get_instagram_ai_status(request: Request, conversation_id: str, user: 
         
         return {"status": "Error", "message": "No conversation found"}
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error checking Instagram AI status for conversation {conversation_id}: {e}")
         raise HTTPException(
@@ -672,6 +685,7 @@ async def toggle_instagram_ai_status(request: Request, conversation_id: str, bod
     """Toggle AI status for a specific Instagram conversation"""
     if "enabled" not in body:
         raise HTTPException(status_code=422, detail="enabled is required.")
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     action = "resume" if body["enabled"] else "pause"
     return await set_conversation_ai_state(user.org_id, conversation_id, action, body.get("duration_minutes"))
 
@@ -762,6 +776,7 @@ async def send_instagram_message(request: Request, message: dict, user: CurrentU
     try:
         org_id = user.org_id 
         conversation_id = message["conversation_id"]
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
         content = message["content"]
         sender_id = message["sender_id"]
         temp_id = message.get("temp_id")
@@ -984,6 +999,7 @@ async def upload_and_send_instagram_media(
 
     try:
         org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
         agent_user_id = user.user_id
         validate_outbound_attachment(file)
 

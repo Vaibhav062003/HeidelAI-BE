@@ -22,7 +22,9 @@ myenv/
 test.ipynb
 defines.py
 temp.py
-tests/
+tests/*
+!tests/contracts/
+!tests/contracts/test_team_routing_contract.py
 
 \export_mongo_conversations.py
 conversation_export.jsonl

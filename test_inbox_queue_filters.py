@@ -19,15 +19,21 @@ def _load_filter_helpers():
 
 def test_queue_filters_are_server_scoped():
     filters, priority = _load_filter_helpers()
-    assert filters("mine", "agent-1", None, None, None, None) == [
-        {"$or": [{"assigned_agent.id": "agent-1"}, {"assigned_agent_id": "agent-1"}]}
-    ]
+    mine = filters("mine", "agent-1", None, None, None, None)
+    assert mine[0]["$or"][:2] == [{"assigned_agent.id": "agent-1"}, {"assigned_agent_id": "agent-1"}]
+    assert mine[0]["$or"][2]["active_work"]["$elemMatch"]["assigned_agent_id"] == "agent-1"
     assert filters("all", None, "unread", "ai", "closed", None) == [
         {"unread_count": {"$gt": 0}},
         {"is_ai_enabled": True},
         {"status": "closed"},
     ]
     assert filters("unassigned", None, None, None, None, None)[0]["$and"][0]["$or"][1] == {"assigned_agent": {}}
+    assert filters("unassigned", None, None, None, None, None)[0]["$and"][2]["$or"][0] == {"owner_team_id": None}
+    team_filter = filters("team", "agent-1", None, None, None, None, "billing")[0]
+    assert team_filter["active_work"]["$elemMatch"] == {
+        "team_id": "billing",
+        "status": {"$in": ["pending", "in_progress", "needs_review"]},
+    }
     assert priority("medium") == {"$or": [{"priority": {"$in": ["medium"]}}, {"priority": None}]}
     assert priority("high,low") == {"priority": {"$in": ["high", "low"]}}
 
@@ -38,7 +44,7 @@ def test_queue_filters_are_server_scoped():
         if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "fetch_conversations_new"
         for keyword in node.keywords
     }
-    assert {"attention", "handling", "status_filter", "assigned_agent_id"} <= forwarded
+    assert {"attention", "handling", "status_filter", "assigned_agent_id", "current_user_role", "team_id"} <= forwarded
 
 
 if __name__ == "__main__":
