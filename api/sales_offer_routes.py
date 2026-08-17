@@ -169,4 +169,13 @@ async def update_offer_outcome(
         }},
     })
     updated = await _collection(user.org_id).find_one(query, {"org_id": 0, "outcome_history": 0})
+    if updated:
+        from services.websocket_service import broadcast_org_ws
+
+        await broadcast_org_ws(user.org_id, "sales_offer_updated", {
+            "org_id": user.org_id,
+            "conversation_id": updated.get("conversation_id"),
+            "offer_id": str(updated.get("_id") or ""),
+            "action": "outcome",
+        })
     return {"offer": serialize_mongo(updated)}

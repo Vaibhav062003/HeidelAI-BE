@@ -326,6 +326,13 @@ async def send_message_endpoint(
             context_dict = json.loads(context)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON format in context field")
+    if isinstance(context_dict, dict) and "offer" in context_dict:
+        try:
+            from services.sales_offer_policy import structured_offer_snapshot
+
+            structured_offer_snapshot(context_dict)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     res = await send_message(
         org_id, 
@@ -343,11 +350,12 @@ async def send_message_endpoint(
         duration_ms=duration_ms,
     )
 
+    offer_tracking = "not_detected"
     if mode == "reply" and platform in {"whatsapp", "instagram"}:
         try:
             from services.sales_offer_service import enqueue_outbound_offer
 
-            await enqueue_outbound_offer(
+            recorded_offer = await enqueue_outbound_offer(
                 org_id=org_id,
                 agent_id=user.user_id,
                 agent_name=sender_name,
@@ -357,8 +365,11 @@ async def send_message_endpoint(
                 result=res,
                 context=context_dict,
             )
+            if recorded_offer:
+                offer_tracking = "recorded"
         except Exception as exc:
             logger.error(f"Failed to record outbound sales offer: {exc}")
+            offer_tracking = "pending"
 
     if platform == "whatsapp" and mode == "reply" and content:
         try:
@@ -375,7 +386,7 @@ async def send_message_endpoint(
         except Exception as exc:
             logger.error(f"Failed to observe human pricing message: {exc}")
 
-    return {"message": "Message sent", "details": res}
+    return {"message": "Message sent", "details": res, "offer_tracking": offer_tracking}
 
 @router.post("/api/conversations/send_reaction")
 @limiter.limit("30/minute")
