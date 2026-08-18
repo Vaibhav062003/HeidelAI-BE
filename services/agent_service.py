@@ -4,7 +4,7 @@ from loguru import logger
 
 
 # Base URL for the chatbot API
-CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app/"
+CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app"
 #CHATBOT_BASE_URL = "http://localhost:8001"  For local testing with self-signed certs, ensure to disable SSL verification in httpx client
 
 async def send_to_agent(
