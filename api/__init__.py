@@ -24,6 +24,7 @@ from . import push_routes
 from . import quote_routes
 from . import sales_offer_routes
 from . import work_team_routes
+from . import tally_routes
 
 router = APIRouter()
 
@@ -51,3 +52,4 @@ router.include_router(push_routes.router)
 router.include_router(quote_routes.router)
 router.include_router(sales_offer_routes.router)
 router.include_router(work_team_routes.router)
+router.include_router(tally_routes.router)
