@@ -110,13 +110,6 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
         and getattr(node.func, "id", None) == "handle_followup_customer_reply"
     ]
     assert len(followup_calls) >= 5
-    media_call = next(call for call in followup_calls if 980 <= call.lineno <= 1060)
-    media_if = next(
-        node for node in ast.walk(webhook)
-        if isinstance(node, ast.If) and any(child is media_call for child in ast.walk(node.test))
-    )
-    assert any(isinstance(node, ast.Return) for node in media_if.body)
-
     background_upload = next(
         node for node in ast.walk(webhook)
         if isinstance(node, ast.Call)
@@ -124,6 +117,16 @@ def test_followup_routes_are_authenticated_and_lifecycle_is_atomic():
         and node.args
         and getattr(node.args[0], "id", None) == "upload_and_send_whatsapp_media_background"
     )
+    media_call = min(
+        (call for call in followup_calls if call.lineno > background_upload.lineno),
+        key=lambda call: call.lineno,
+    )
+    media_if = next(
+        node for node in ast.walk(webhook)
+        if isinstance(node, ast.If) and any(child is media_call for child in ast.walk(node.test))
+    )
+    assert any(isinstance(node, ast.Return) for node in media_if.body)
+
     assert any(call.lineno > background_upload.lineno for call in followup_calls)
 
 
