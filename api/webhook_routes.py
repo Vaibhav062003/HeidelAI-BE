@@ -18,7 +18,9 @@ from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
 from services.heidelai_bot import send_to_chatbot
 from services.agent_service import send_to_agent
-from services.pricing_service import HOLDING_REPLY, is_price_signal, is_pricing_enabled, observe_customer_message
+from services.ai_policy_service import is_effective_ai_enabled
+from services.ai_reply_guard import AIProviderUnavailable, log_ai_failure
+from services.pricing_service import is_price_signal, is_pricing_enabled, observe_customer_message, validate_ai_pricing_response
 from services.wa_service import *
 from services.ig_service import *
 from services.utils import normalize_phone
@@ -169,6 +171,154 @@ async def check_and_handle_dealer_reply(
     except Exception as e:
         logger.error(f"Error in check_and_handle_dealer_reply: {e}")
         return False
+
+
+async def _handle_ai_provider_failure(
+    error: AIProviderUnavailable,
+    *,
+    org_id: str,
+    conversation_id: str,
+    platform: str,
+    customer_name: str | None,
+    customer_number: str,
+    source_message_id: str | None,
+    state_already_checked: bool = False,
+    resume_pending: bool = False,
+) -> None:
+    log_ai_failure(error, org_id=org_id, conversation_id=conversation_id)
+    if not error.escalation_required:
+        return
+    if not state_already_checked and not await is_effective_ai_enabled(org_id, conversation_id):
+        return
+
+    def mark_whatsapp_retry_pending() -> None:
+        if platform == "whatsapp" and source_message_id:
+            result = db[f"messages_{org_id}"].update_one(
+                {"message_id": source_message_id},
+                {
+                    "$set": {
+                        "ai_failure_pending": True,
+                        "ai_failure_category": error.category,
+                        "ai_failure_status": error.upstream_status,
+                    }
+                },
+            )
+            if not result.matched_count:
+                raise RuntimeError("AI failure retry state could not be persisted")
+            services.processed_message_ids.pop(source_message_id, None)
+
+    now = datetime.now(timezone.utc)
+    dedupe_id = "ai-provider:" + hashlib.sha256(
+        f"{org_id}\0{platform}\0{conversation_id}\0ai_provider_unavailable".encode()
+    ).hexdigest()[:32]
+    escalation_id = f"{dedupe_id}:{int(now.timestamp())}"
+    try:
+        try:
+            marker = db.ai_escalation_dedup.find_one_and_update(
+                {
+                    "_id": dedupe_id,
+                    "$or": [
+                        {"expires_at": {"$lte": now}},
+                        {"expires_at": {"$exists": False}},
+                    ],
+                },
+                {
+                    "$set": {
+                        "org_id": org_id,
+                        "escalation_id": escalation_id,
+                        "expires_at": now + timedelta(hours=1),
+                    }
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+        except DuplicateKeyError:
+            marker = db.ai_escalation_dedup.find_one({"_id": dedupe_id})
+    except Exception:
+        mark_whatsapp_retry_pending()
+        raise
+    if not marker or not marker.get("escalation_id"):
+        mark_whatsapp_retry_pending()
+        raise RuntimeError("AI escalation deduplication could not be persisted")
+    escalation_id = marker["escalation_id"]
+    try:
+        for _ in range(2):
+            renewed = db.ai_escalation_dedup.update_one(
+                {"_id": dedupe_id, "escalation_id": escalation_id},
+                {"$max": {"expires_at": now + timedelta(hours=1)}},
+            )
+            if renewed.matched_count:
+                break
+            marker = db.ai_escalation_dedup.find_one({"_id": dedupe_id})
+            if not marker or not marker.get("escalation_id"):
+                raise RuntimeError("AI escalation marker disappeared during renewal")
+            escalation_id = marker["escalation_id"]
+        else:
+            raise RuntimeError("AI escalation marker changed repeatedly during renewal")
+    except Exception:
+        mark_whatsapp_retry_pending()
+        raise
+    try:
+        from services.team_service import create_ai_escalation
+
+        await create_ai_escalation(org_id, {
+            "id": escalation_id,
+            "user_name": customer_name or "Customer",
+            "customer_number": customer_number,
+            "customer_text": "AI could not prepare a reply. Open this conversation and respond.",
+            "inferred_intent": "AI provider unavailable",
+            "priority": "high",
+            "kind": "actionable",
+            "role": "system",
+            "sender_name": "AI Assistant",
+            "metadata": {
+                "reason": "ai_provider_unavailable",
+                "failure_category": error.category,
+                "conversation_id": conversation_id,
+                "message_id": source_message_id,
+                "platform": platform,
+                "action": "Open the conversation and reply",
+            },
+        })
+    except Exception as exc:
+        try:
+            persisted = db[f"escalations_{org_id}"].find_one({"id": escalation_id}, {"_id": 1})
+        except Exception:
+            persisted = None
+        if not persisted:
+            mark_whatsapp_retry_pending()
+            raise exc
+        logger.error(
+            "AI escalation persisted but live broadcast failed org={} conversation=...{}",
+            org_id,
+            conversation_id[-6:],
+        )
+    if platform == "whatsapp" and source_message_id:
+        result = db[f"messages_{org_id}"].update_one(
+            {
+                "message_id": source_message_id,
+                **({"ai_failure_pending": True} if resume_pending else {}),
+            },
+            {
+                "$set": {"ai_failure_processed_at": datetime.now(timezone.utc)},
+                "$unset": {
+                    "ai_failure_pending": "",
+                    "ai_failure_category": "",
+                    "ai_failure_status": "",
+                },
+            },
+        )
+        if resume_pending and not result.matched_count:
+            completed = db[f"messages_{org_id}"].find_one(
+                {
+                    "message_id": source_message_id,
+                    "ai_failure_pending": {"$exists": False},
+                    "ai_failure_processed_at": {"$exists": True},
+                },
+                {"_id": 1},
+            )
+            if not completed:
+                raise RuntimeError("AI failure retry state changed before completion")
 
 @router.get("")
 async def verify_webhook(request: Request):
@@ -657,6 +807,32 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     context = {
                                         "mid": replied_message_id
                                     }
+
+                            pending_ai_failure = messages_collection.find_one(
+                                {"message_id": wa_message_id, "ai_failure_pending": True},
+                                {
+                                    "conversation_id": 1,
+                                    "ai_failure_category": 1,
+                                    "ai_failure_status": 1,
+                                },
+                            )
+                            if pending_ai_failure:
+                                conversation_id = pending_ai_failure.get("conversation_id") or conversation_id
+                                await _handle_ai_provider_failure(
+                                    AIProviderUnavailable(
+                                        pending_ai_failure.get("ai_failure_category") or "unexpected_error",
+                                        upstream_status=pending_ai_failure.get("ai_failure_status"),
+                                    ),
+                                    org_id=org_id,
+                                    conversation_id=conversation_id,
+                                    platform="whatsapp",
+                                    customer_name=sender_name2,
+                                    customer_number=customer_phone_no,
+                                    source_message_id=wa_message_id,
+                                    state_already_checked=True,
+                                    resume_pending=True,
+                                )
+                                return {"status": "ok"}
                                     
                             # Get conversation doc to check if AI is enabled
                             convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
@@ -777,22 +953,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     )
                                 except Exception as exc:
                                     logger.error(f"Pricing guard failed for org={org_id}: {exc}")
-                                    pricing_result = {
-                                        "intercept": is_pricing_enabled(org_id) and is_price_signal(content),
-                                        "reply": HOLDING_REPLY,
-                                    }
+                                    pricing_result = {"intercept": is_pricing_enabled(org_id) and is_price_signal(content)}
+                                    if pricing_result["intercept"]:
+                                        await _handle_ai_provider_failure(
+                                            AIProviderUnavailable("catalogue_unavailable"),
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            platform="whatsapp",
+                                            customer_name=sender_name2,
+                                            customer_number=customer_phone_no,
+                                            source_message_id=wa_message_id,
+                                        )
 
                                 if pricing_result.get("intercept"):
-                                    if pricing_result.get("reply"):
-                                        await send_whatsapp_message(
-                                            {
-                                                "conversation_id": conversation_id,
-                                                "content": pricing_result["reply"],
-                                                "sender_id": whatsapp_business_id,
-                                            },
-                                            org_id,
-                                            "ai",
-                                        )
                                     return {"status": "ok"}
 
                                 contact_data = {
@@ -833,44 +1006,43 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             return {"status": "ok"}
 
                                     # Fallback to AI Agent (only if AI is enabled for this org+conversation)
-                                    if ai_enabled:
+                                    if ai_enabled and await is_effective_ai_enabled(org_id, conversation_id):
 
                                         if not convo_doc:
                                             convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
 
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
-                                        chatbot_response = await send_to_agent(
-                                            conversation_id=conversation_id,
-                                            user_input=content,
-                                            persona=convo_doc.get("persona", "fallback"),
-                                            location=convo_doc.get("location", "india"),
-                                            customer_name=sender_name2,
-                                            org_id=org_id,
-                                            source="webhook",
-                                            reply_context_message_id=replied_message_id,
-                                            message_id=wa_message_id,
-                                        )
-
-                                        final_response = chatbot_response["final_response"]
-
-                                        # Update the database with the agent's response
-                                        conversation_id = await create_or_update_whatsapp_conversation(
-                                            org_id=org_id,
-                                            recipient_id=whatsapp_business_id,
-                                            customer_phone_no=customer_phone_no,
-                                            customer_name=sender_name2,
-                                            last_message=final_response,
-                                            last_sender="ai",
-                                            mode="ai",
-                                        )
-
-                                        # Send the WhatsApp message
-                                        res = await send_whatsapp_message({
-                                            "conversation_id": conversation_id,
-                                            "content": final_response,
-                                            "sender_id": whatsapp_business_id,
-                                            "pricing_source_message_id": wa_message_id,
-                                        }, org_id, "ai")
+                                        try:
+                                            chatbot_response = await send_to_agent(
+                                                conversation_id=conversation_id,
+                                                user_input=content,
+                                                persona=convo_doc.get("persona", "fallback"),
+                                                location=convo_doc.get("location", "india"),
+                                                customer_name=sender_name2,
+                                                org_id=org_id,
+                                                source="webhook",
+                                                reply_context_message_id=replied_message_id,
+                                                message_id=wa_message_id,
+                                            )
+                                            if not await is_effective_ai_enabled(org_id, conversation_id):
+                                                return {"status": "ok"}
+                                            await send_whatsapp_message({
+                                                "conversation_id": conversation_id,
+                                                "content": chatbot_response["final_response"],
+                                                "sender_id": whatsapp_business_id,
+                                                "pricing_source_message_id": wa_message_id,
+                                            }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
+                                        except AIProviderUnavailable as exc:
+                                            await _handle_ai_provider_failure(
+                                                exc,
+                                                org_id=org_id,
+                                                conversation_id=conversation_id,
+                                                platform="whatsapp",
+                                                customer_name=sender_name2,
+                                                customer_number=customer_phone_no,
+                                                source_message_id=wa_message_id,
+                                            )
+                                            return {"status": "ok"}
                                         await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
                                     # Check and send OOS dealer messages if a recent request was logged
@@ -895,52 +1067,41 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 # Handling messages received on HeidelAI's whatsapp number
                                 if is_heidelai and ai_enabled and is_production:
-
-                                    chatbot_response = await send_to_chatbot(
-                                        customer_phone_no=customer_phone_no,
-                                        message_content=content,
-                                        message_id=wa_message_id
-                                    )
-                                
-                                    if not chatbot_response:
+                                    if not await is_effective_ai_enabled(org_id, conversation_id):
                                         return {"status": "ok"}
-
-                                    # Extract data preserving backward compatibility
-                                    if isinstance(chatbot_response, dict):
-                                        response_text = chatbot_response.get("response", "")
+                                    try:
+                                        chatbot_response = await send_to_chatbot(
+                                            customer_phone_no=customer_phone_no,
+                                            message_content=content,
+                                            message_id=wa_message_id,
+                                        )
+                                        if not await is_effective_ai_enabled(org_id, conversation_id):
+                                            return {"status": "ok"}
+                                        msg_kwargs = {
+                                            "message": {
+                                                "conversation_id": conversation_id,
+                                                "content": chatbot_response["response"],
+                                                "sender_id": HEIDELAI_ORG_WA_ID,
+                                            },
+                                            "org_id": org_id,
+                                            "mode": "ai",
+                                            "temp_id": f"ai:{wa_message_id}",
+                                        }
                                         reply_to_message_id = chatbot_response.get("reply_to_message_id")
-                                    else:
-                                        response_text = chatbot_response
-                                        reply_to_message_id = None
-
-                                    # Storing chatbot response in the DB
-                                    # Create or update conversation
-                                    conversation_id = await create_or_update_whatsapp_conversation(
-                                        org_id=org_id,
-                                        recipient_id=whatsapp_business_id,
-                                        customer_phone_no=customer_phone_no,
-                                        customer_name=sender_name2,
-                                        last_message=response_text,
-                                        last_sender="ai",
-                                        mode="reply"
-                                    )
-                                    
-                                    msg_kwargs = {
-                                        "message": {
-                                            "conversation_id": conversation_id,
-                                            "content": response_text,
-                                            "sender_id": HEIDELAI_ORG_WA_ID,
-                                        },
-                                        "org_id": org_id,
-                                        "mode": "ai"
-                                    }
-                                    
-                                    if reply_to_message_id:
-                                        msg_kwargs["context_type"] = "message_reply"
-                                        msg_kwargs["context"] = {"mid": reply_to_message_id}
-
-                                    # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
-                                    res = await send_whatsapp_message(**msg_kwargs)
+                                        if reply_to_message_id:
+                                            msg_kwargs["context_type"] = "message_reply"
+                                            msg_kwargs["context"] = {"mid": reply_to_message_id}
+                                        await send_whatsapp_message(**msg_kwargs)
+                                    except AIProviderUnavailable as exc:
+                                        await _handle_ai_provider_failure(
+                                            exc,
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            platform="whatsapp",
+                                            customer_name=sender_name2,
+                                            customer_number=customer_phone_no,
+                                            source_message_id=wa_message_id,
+                                        )
 
                                     return {"status": "ok"}
 
@@ -958,76 +1119,74 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     
                                         return {"status": "ok"}
 
-                                    chatbot_response = await send_to_pma_chatbot(
+                                    if not await is_effective_ai_enabled(org_id, conversation_id):
+                                        return {"status": "ok"}
+                                    try:
+                                        chatbot_response = await send_to_pma_chatbot(
+                                                conversation_id=conversation_id,
+                                                user_input=content,
+                                                persona=convo_doc.get("persona", "fallback"),
+                                                location=convo_doc.get("location", "india"),
+                                                customer_name=sender_name2,
+                                                org_id=org_id,
+                                                source="webhook",
+                                                reply_context_message_id=replied_message_id,
+                                                message_id=wa_message_id,
+                                        )
+                                        if not await is_effective_ai_enabled(org_id, conversation_id):
+                                            return {"status": "ok"}
+                                        await send_whatsapp_message({
+                                            "conversation_id": conversation_id,
+                                            "content": chatbot_response["final_response"],
+                                            "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                            }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
+                                    except AIProviderUnavailable as exc:
+                                        await _handle_ai_provider_failure(
+                                            exc,
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            platform="whatsapp",
+                                            customer_name=sender_name2,
+                                            customer_number=customer_phone_no,
+                                            source_message_id=wa_message_id,
+                                        )
+                                        return {"status": "ok"}
+
+                                elif ai_enabled and is_production and is_lee_dealer_wa:
+                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
+
+                                    if not await is_effective_ai_enabled(org_id, conversation_id):
+                                        return {"status": "ok"}
+                                    try:
+                                        chatbot_response = await send_to_agent(
                                             conversation_id=conversation_id,
                                             user_input=content,
-                                            persona=convo_doc.get("persona", "fallback"),
+                                            persona="dealers",
                                             location=convo_doc.get("location", "india"),
                                             customer_name=sender_name2,
                                             org_id=org_id,
                                             source="webhook",
                                             reply_context_message_id=replied_message_id,
                                             message_id=wa_message_id,
-                                    )
-
-                                    final_response = chatbot_response["final_response"]
-
-                                    # Storing chatbot response in the DB
-                                    # Create or update conversation
-                                    conversation_id = await create_or_update_whatsapp_conversation(
-                                        org_id=org_id,
-                                        recipient_id=whatsapp_business_id,
-                                        customer_phone_no=customer_phone_no,
-                                        customer_name=sender_name2,
-                                        last_message=final_response,
-                                        last_sender="ai",
-                                        mode="ai",
-                                    )
-
-                                    # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
-                                    res = await send_whatsapp_message({
-                                        "conversation_id": conversation_id,
-                                        "content": final_response,
-                                        "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
-                                        }, org_id, "ai")
-
-                                elif ai_enabled and is_production and is_lee_dealer_wa:
-                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
-
-                                    print("*" * 80 )
-                                    print("Calling agent for Lee Dealer WhatsApp")
-                                    chatbot_response = await send_to_agent(
-                                        conversation_id=conversation_id,
-                                        user_input=content,
-                                        persona="dealers",
-                                        location=convo_doc.get("location", "india"),
-                                        customer_name=sender_name2,
-                                        org_id=org_id,
-                                        source="webhook",
-                                        reply_context_message_id=replied_message_id,
-                                        message_id=wa_message_id,
-                                    )
-
-                                    final_response = chatbot_response["final_response"]
-
-                                    # Update the database with the agent's response
-                                    conversation_id = await create_or_update_whatsapp_conversation(
-                                        org_id=org_id,
-                                        recipient_id=whatsapp_business_id,
-                                        customer_phone_no=customer_phone_no,
-                                        customer_name=sender_name2,
-                                        last_message=final_response,
-                                        last_sender="ai",
-                                        mode="ai",
-                                    )
-
-                                    # Send the WhatsApp message
-                                    res = await send_whatsapp_message({
-                                        "conversation_id": conversation_id,
-                                        "content": final_response,
-                                        "sender_id": whatsapp_business_id,
-                                        "pricing_source_message_id": wa_message_id,
-                                    }, org_id, "ai")
+                                        )
+                                        if not await is_effective_ai_enabled(org_id, conversation_id):
+                                            return {"status": "ok"}
+                                        await send_whatsapp_message({
+                                            "conversation_id": conversation_id,
+                                            "content": chatbot_response["final_response"],
+                                            "sender_id": whatsapp_business_id,
+                                            "pricing_source_message_id": wa_message_id,
+                                        }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
+                                    except AIProviderUnavailable as exc:
+                                        await _handle_ai_provider_failure(
+                                            exc,
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            platform="whatsapp",
+                                            customer_name=sender_name2,
+                                            customer_number=customer_phone_no,
+                                            source_message_id=wa_message_id,
+                                        )
 
                                     return {"status": "ok"}
                                 
@@ -1118,29 +1277,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             reply_to_message_id=replied_message_id,
                                             customer_name=sender_name2,
                                         )
-                                        if pricing_result.get("reply"):
-                                            await send_whatsapp_message(
-                                                {
-                                                    "conversation_id": conversation_id,
-                                                    "content": pricing_result["reply"],
-                                                    "sender_id": whatsapp_business_id,
-                                                },
-                                                org_id,
-                                                "ai",
-                                            )
                                         if pricing_result.get("intercept"):
                                             return {"status": "ok"}
                                     except Exception as exc:
                                         logger.error(f"Media-caption pricing observation failed: {exc}")
                                         if is_pricing_enabled(org_id):
-                                            await send_whatsapp_message(
-                                                {
-                                                    "conversation_id": conversation_id,
-                                                    "content": HOLDING_REPLY,
-                                                    "sender_id": whatsapp_business_id,
-                                                },
-                                                org_id,
-                                                "ai",
+                                            await _handle_ai_provider_failure(
+                                                AIProviderUnavailable("catalogue_unavailable"),
+                                                org_id=org_id,
+                                                conversation_id=conversation_id,
+                                                platform="whatsapp",
+                                                customer_name=sender_name2,
+                                                customer_number=customer_phone_no,
+                                                source_message_id=wa_message_id,
                                             )
 
                                 contact_data = {
@@ -1488,36 +1637,37 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                             # --- Fallback for unknown IDs ---
                                             case _:
-                                                chatbot_response = await send_to_pma_chatbot(
-                                                    conversation_id=conversation_id,
-                                                    user_input=content,
-                                                    persona="fallback",
-                                                    location="india",
-                                                    customer_name=sender_name2,
-                                                    org_id=org_id,
-                                                    source="webhook",
-                                                )
-
-                                                final_response = chatbot_response["final_response"]
-
-                                                # Storing chatbot response in the DB
-                                                # Create or update conversation
-                                                conversation_id = await create_or_update_whatsapp_conversation(
-                                                    org_id=org_id,
-                                                    recipient_id=whatsapp_business_id,
-                                                    customer_phone_no=customer_phone_no,
-                                                    customer_name=sender_name2,
-                                                    last_message=final_response,
-                                                    last_sender="ai",
-                                                    mode="ai",
-                                                )
-
-                                                # Storing in WhatsApp messages collection is handled by send_whatsapp_message()
-                                                res = await send_whatsapp_message({
-                                                    "conversation_id": conversation_id,
-                                                    "content": final_response,
-                                                    "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
-                                                    }, org_id, "ai")
+                                                if not await is_effective_ai_enabled(org_id, conversation_id):
+                                                    return {"status": "ok"}
+                                                try:
+                                                    chatbot_response = await send_to_pma_chatbot(
+                                                        conversation_id=conversation_id,
+                                                        user_input=content,
+                                                        persona="fallback",
+                                                        location="india",
+                                                        customer_name=sender_name2,
+                                                        org_id=org_id,
+                                                        source="webhook",
+                                                        message_id=wa_message_id,
+                                                    )
+                                                    if not await is_effective_ai_enabled(org_id, conversation_id):
+                                                        return {"status": "ok"}
+                                                    await send_whatsapp_message({
+                                                        "conversation_id": conversation_id,
+                                                        "content": chatbot_response["final_response"],
+                                                        "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                                        }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
+                                                except AIProviderUnavailable as exc:
+                                                    await _handle_ai_provider_failure(
+                                                        exc,
+                                                        org_id=org_id,
+                                                        conversation_id=conversation_id,
+                                                        platform="whatsapp",
+                                                        customer_name=sender_name2,
+                                                        customer_number=customer_phone_no,
+                                                        source_message_id=wa_message_id,
+                                                    )
+                                                    return {"status": "ok"}
 
                                 return {"status":"ok"}
                                 
@@ -2100,47 +2250,82 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         logger.info(f"ai_enabled: {ai_enabled}") 
 
                         if ai_enabled and is_dev and not downstream_state.get("ai_processed"):
-                            chatbot_response = await send_to_agent(
-                                conversation_id=conversation_id,
-                                user_input=message_text,
-                                persona=convo_doc.get("persona", "fallback") if convo_doc else "fallback",
-                                location=convo_doc.get("location", "india") if convo_doc else "india",
-                                customer_name=name,
-                                org_id=org_id,
-                                source="webhook",
-                            )
-                            final_response = chatbot_response["final_response"]
-
-                            ai_result = await send_ig_message(
-                                id=sender_id, 
-                                message_text=final_response, 
-                                instagram_id=recipient_id, 
-                                mode="reply", 
-                                org_id=org_id,
-                                temp_id=f"ai:{ig_message_id}",
-                                conversation_id=conversation_id,
-                                sender_name="AI",
-                            )
-                            if not ai_result.get("success"):
-                                from services.team_service import create_ai_escalation
-                                await create_ai_escalation(org_id, {
-                                    "user_name": name or username or "Customer",
-                                    "customer_number": sender_id,
-                                    "customer_text": message_text,
-                                    "inferred_intent": "Instagram AI reply could not be delivered",
-                                    "sender_name": "AI Assistant",
-                                    "role": "system",
-                                    "metadata": {
-                                        "reason": ai_result.get("error"),
-                                        "message_id": ig_message_id,
-                                        "conversation_id": conversation_id,
-                                        "action": "Reply to the customer",
-                                    },
-                                })
-                            messages_collection.update_one(
-                                {"id": ig_message_id, "webhook_claim_token": downstream_claim_token},
-                                {"$set": {"ai_processed": True}},
-                            )
+                            ai_processing_complete = False
+                            try:
+                                if await is_effective_ai_enabled(org_id, conversation_id):
+                                    chatbot_response = await send_to_agent(
+                                        conversation_id=conversation_id,
+                                        user_input=message_text,
+                                        persona=convo_doc.get("persona", "fallback") if convo_doc else "fallback",
+                                        location=convo_doc.get("location", "india") if convo_doc else "india",
+                                        customer_name=name,
+                                        org_id=org_id,
+                                        source="webhook",
+                                        message_id=ig_message_id,
+                                    )
+                                    if await is_effective_ai_enabled(org_id, conversation_id):
+                                        if is_pricing_enabled(org_id):
+                                            try:
+                                                valid, reason = await validate_ai_pricing_response(
+                                                    org_id=org_id,
+                                                    conversation_id=conversation_id,
+                                                    source_message_id=ig_message_id,
+                                                    content=chatbot_response["final_response"],
+                                                )
+                                            except Exception as exc:
+                                                raise AIProviderUnavailable("catalogue_unavailable") from exc
+                                            if not valid:
+                                                raise AIProviderUnavailable(reason, escalation_required=False)
+                                        ai_result = await send_ig_message(
+                                            id=sender_id,
+                                            message_text=chatbot_response["final_response"],
+                                            instagram_id=recipient_id,
+                                            mode="reply",
+                                            org_id=org_id,
+                                            temp_id=f"ai:{ig_message_id}",
+                                            conversation_id=conversation_id,
+                                            sender_name="AI",
+                                            enforce_ai_state=True,
+                                        )
+                                        if not ai_result.get("success"):
+                                            raise AIProviderUnavailable("delivery_error")
+                                ai_processing_complete = True
+                            except AIProviderUnavailable as exc:
+                                try:
+                                    await _handle_ai_provider_failure(
+                                        exc,
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        platform="instagram",
+                                        customer_name=name or username,
+                                        customer_number=sender_id,
+                                        source_message_id=ig_message_id,
+                                    )
+                                except Exception:
+                                    release_instagram_webhook_downstream(
+                                        org_id, ig_message_id, downstream_claim_token
+                                    )
+                                    raise
+                                ai_processing_complete = True
+                            except Exception:
+                                release_instagram_webhook_downstream(
+                                    org_id, ig_message_id, downstream_claim_token
+                                )
+                                raise
+                            finally:
+                                if ai_processing_complete:
+                                    try:
+                                        finalized = messages_collection.update_one(
+                                            {"id": ig_message_id, "webhook_claim_token": downstream_claim_token},
+                                            {"$set": {"ai_processed": True}},
+                                        )
+                                        if not finalized.matched_count:
+                                            raise RuntimeError("Instagram AI downstream claim was replaced")
+                                    except Exception:
+                                        release_instagram_webhook_downstream(
+                                            org_id, ig_message_id, downstream_claim_token
+                                        )
+                                        raise
 
                         if background_tasks and not downstream_state.get("automation_queued"):
                             messages_collection.update_one(
