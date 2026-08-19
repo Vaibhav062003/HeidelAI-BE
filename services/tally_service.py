@@ -62,6 +62,91 @@ def normalized_settings(value: dict | None) -> dict:
     return settings
 
 
+def _customer_snapshot(quote: dict, conversation: dict | None = None) -> dict:
+    customer = quote.get("customer") or {}
+    conversation = conversation or {}
+    values = {
+        "name": customer.get("name") or conversation.get("customer_name"),
+        "phone": customer.get("phone") or conversation.get("customer_id"),
+        "email": customer.get("email"),
+        "gstin": customer.get("gstin"),
+        "address": customer.get("address"),
+    }
+    return {key: str(value).strip() for key, value in values.items() if value}
+
+
+def _tally_escalation_payload(job: dict, status: str, error: str | None) -> dict:
+    customer = job.get("customer") or {}
+    uncertain = status == "delivery_unknown"
+    reason = "Tally invoice delivery needs verification" if uncertain else "Tally invoice creation failed"
+    action = "Verify Tally Day Book before retrying" if uncertain else "Fix the missing Tally master or mapping, then retry"
+    quote_number = job.get("quote_number") or job.get("quote_id") or "quotation"
+    detail = error or "Tally did not confirm this invoice"
+    return {
+        "id": f"tally:{job['job_id']}",
+        "user_name": customer.get("name") or "Customer",
+        "customer_number": customer.get("phone") or job.get("conversation_id"),
+        "customer_text": f"Invoice {quote_number} was not created in Tally. {detail}",
+        "inferred_intent": "Tally invoice needs billing review",
+        "priority": "high",
+        "kind": "actionable",
+        "metadata": {
+            "reason": reason,
+            "action": action,
+            "conversation_id": job.get("conversation_id"),
+            "tally_job_id": job.get("job_id"),
+            "quote_id": job.get("quote_id"),
+            "quote_number": quote_number,
+            "party_ledger": job.get("party_ledger"),
+            "amount": job.get("amount"),
+            "error": detail,
+            "customer": customer,
+        },
+    }
+
+
+async def _sync_tally_escalation(org_id: str, job: dict) -> None:
+    from services.team_service import create_ai_escalation, update_escalation_status
+
+    if job.get("status") == "completed" and int(job.get("attempts") or 0) > 1:
+        await update_escalation_status(org_id, f"tally:{job['job_id']}", "reviewed")
+    elif job.get("status") in {"failed", "delivery_unknown"}:
+        await create_ai_escalation(
+            org_id,
+            _tally_escalation_payload(job, job["status"], job.get("error")),
+        )
+
+
+async def _remember_customer_mapping(org_id: str, job: dict) -> None:
+    mapping = {
+        "party_ledger": job["party_ledger"],
+        "customer": job.get("customer") or {},
+        "updated_at": datetime.now(timezone.utc),
+    }
+    query = {"conversation_id": job["conversation_id"]}
+    update = {"$set": {"tally_customer_mapping": mapping}}
+    await db[f"conversations_{org_id}"].update_one(query, update)
+    await db[f"contacts_{org_id}"].update_one(query, update)
+
+
+async def get_customer_mapping(org_id: str, conversation_id: str) -> dict:
+    conversation = await db[f"conversations_{org_id}"].find_one(
+        {"conversation_id": conversation_id}, {"_id": 0, "tally_customer_mapping": 1}
+    )
+    mapping = (conversation or {}).get("tally_customer_mapping")
+    if mapping:
+        return serialize_mongo(mapping)
+    latest = await db.tally_bill_jobs.find_one(
+        {"org_id": org_id, "conversation_id": conversation_id, "status": "completed"},
+        {"_id": 0, "party_ledger": 1, "customer": 1},
+        sort=[("created_at", -1)],
+    )
+    return serialize_mongo({
+        "party_ledger": (latest or {}).get("party_ledger", ""),
+        "customer": (latest or {}).get("customer", {}),
+    })
+
+
 def _ledger(
     name: str,
     amount: Decimal,
@@ -243,7 +328,7 @@ async def queue_bill(org_id: str, user_id: str, user_name: str, role: str, quote
     quote = await db[f"quotes_{org_id}"].find_one({"org_id": org_id, "quote_id": quote_id})
     if not quote:
         raise HTTPException(status_code=404, detail="Quotation not found")
-    await require_conversation_access(org_id, quote["conversation_id"], user_id, role)
+    conversation = await require_conversation_access(org_id, quote["conversation_id"], user_id, role)
     integration = await get_integration(org_id)
     settings = normalized_settings(integration)
     if not settings["company_name"].strip():
@@ -260,6 +345,7 @@ async def queue_bill(org_id: str, user_id: str, user_name: str, role: str, quote
         "quote_revision": int(quote.get("revision_number") or 1),
         "quote_number": quote.get("quote_number") or quote_id,
         "amount": float(_money(quote.get("public_grand_total"))),
+        "customer": _customer_snapshot(quote, conversation),
         "party_ledger": payload["party_ledger"],
         "tax_mode": payload["tax_mode"],
         "status": "pending",
@@ -275,14 +361,15 @@ async def queue_bill(org_id: str, user_id: str, user_name: str, role: str, quote
     }
     try:
         await db.tally_bill_jobs.insert_one(job)
-        return serialize_mongo(job), True
+        stored, created = job, True
     except DuplicateKeyError:
-        existing = await db.tally_bill_jobs.find_one({
+        stored = await db.tally_bill_jobs.find_one({
             "org_id": org_id,
             "quote_id": quote_id,
             "quote_revision": job["quote_revision"],
         })
-        return serialize_mongo(existing), False
+        created = False
+    return serialize_mongo(stored), created
 
 
 async def list_bills(org_id: str, conversation_id: str, user_id: str, role: str) -> list[dict]:
@@ -354,12 +441,18 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
             {"_id": 0, "request_xml": 0, "tally_response": 0},
         )
         if existing and existing.get("status") == status:
+            if status == "completed":
+                await _remember_customer_mapping(integration["org_id"], existing)
+            await _sync_tally_escalation(integration["org_id"], existing)
             return serialize_mongo(existing)
         raise HTTPException(status_code=409, detail="This Tally claim is no longer active")
     await db.tally_integrations.update_one(
         {"org_id": integration["org_id"]},
         {"$set": {"last_error": error, "last_result_at": now}},
     )
+    if status == "completed":
+        await _remember_customer_mapping(integration["org_id"], updated)
+    await _sync_tally_escalation(integration["org_id"], updated)
     return serialize_mongo(updated)
 
 
