@@ -192,15 +192,19 @@ async def get_tally_integration(request: Request, user: CurrentUser):
     last_seen = integration.get("last_seen_at")
     connected = bool(last_seen and _utc(last_seen) >= datetime.now(timezone.utc) - timedelta(seconds=90))
     capabilities = integration.get("connector_capabilities") or []
+    connector_version = str(integration.get("connector_version") or "")
+    connector_version_number = int(connector_version) if connector_version.isdigit() else 0
     return {
         "configured": bool(settings["company_name"].strip()),
         "connector_created": bool(integration.get("connector_key_hash")),
         "connected": connected,
         "last_seen_at": serialize_mongo(last_seen),
         "last_error": integration.get("last_error"),
-        "connector_version": integration.get("connector_version", ""),
+        "connector_version": connector_version,
         "connector_capabilities": capabilities,
-        "connector_update_required": connected and not {"reports", "pdf"}.issubset(set(capabilities)),
+        "connector_update_required": connected and (
+            connector_version_number < 3 or not {"reports", "pdf"}.issubset(set(capabilities))
+        ),
         "can_edit": user.role in {"admin", "org:admin"},
         "settings": settings,
     }
