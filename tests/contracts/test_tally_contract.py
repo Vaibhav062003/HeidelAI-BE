@@ -80,6 +80,8 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn("<BILLALLOCATIONS.LIST><NAME>Q-100</NAME><BILLTYPE>New Ref</BILLTYPE>", xml)
         self.assertEqual(xml.count("<BILLALLOCATIONS.LIST>"), 1)
         self.assertEqual(xml.count("REMOTEID="), 1)
+        self.assertNotIn("<VOUCHERNUMBER>", xml)
+        self.assertIn("<REFERENCE>Q-100</REFERENCE>", xml)
         self.assertNotIn("Buyer & Sons", xml)
 
     def test_mismatched_money_fails_before_connector(self):
@@ -111,6 +113,7 @@ class TallyContractTests(unittest.TestCase):
         self.assertEqual(payload["metadata"]["conversation_id"], "whatsapp_919999999999")
         self.assertEqual(payload["metadata"]["customer"]["gstin"], "27ABCDE1234F1Z5")
         self.assertEqual(payload["metadata"]["party_ledger"], "Buyer Ledger")
+        self.assertIn("Quotation Q-100", payload["customer_text"])
         self.assertIn("Ledger does not exist", payload["customer_text"])
 
 

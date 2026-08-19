@@ -86,7 +86,7 @@ def _tally_escalation_payload(job: dict, status: str, error: str | None) -> dict
         "id": f"tally:{job['job_id']}",
         "user_name": customer.get("name") or "Customer",
         "customer_number": customer.get("phone") or job.get("conversation_id"),
-        "customer_text": f"Invoice {quote_number} was not created in Tally. {detail}",
+        "customer_text": f"Quotation {quote_number} could not be invoiced in Tally. {detail}",
         "inferred_intent": "Tally invoice needs billing review",
         "priority": "high",
         "kind": "actionable",
@@ -260,7 +260,6 @@ def build_sales_voucher_xml(quote: dict, settings: dict, party_ledger: str, tax_
         "<TALLYMESSAGE xmlns:UDF=\"TallyUDF\">"
         f"<VOUCHER REMOTEID=\"{remote_id}\" VCHTYPE=\"{_xml(settings['voucher_type'])}\" ACTION=\"Create\">"
         f"<DATE>{issued}</DATE><VOUCHERTYPENAME>{_xml(settings['voucher_type'])}</VOUCHERTYPENAME>"
-        f"<VOUCHERNUMBER>{_xml(quote.get('quote_number'))}</VOUCHERNUMBER>"
         f"<PARTYLEDGERNAME>{_xml(party_ledger)}</PARTYLEDGERNAME>"
         f"<REFERENCE>{_xml(quote.get('quote_number'))}</REFERENCE>"
         "<PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW><ISINVOICE>Yes</ISINVOICE>"
