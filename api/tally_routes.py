@@ -12,16 +12,26 @@ from services.tally_service import (
     authenticate_connector,
     claim_next_job,
     create_connector_key,
+    create_tally_invoice_draft,
     finish_job,
     get_customer_mapping,
     get_integration,
     list_bills,
+    list_tally_invoices,
+    list_tally_ledgers,
+    list_tally_stock_items,
+    list_tally_units,
     normalized_settings,
-    queue_bill,
+    queue_tally_master,
+    queue_tally_sync,
+    review_tally_invoice_draft,
     retry_bill,
     save_integration,
+    submit_tally_invoice_draft,
+    tally_overview,
 )
 from services.utils import serialize_mongo
+from services.work_team_service import list_work_teams
 
 
 router = APIRouter(tags=["Tally"])
@@ -57,17 +67,9 @@ class TallySettingsPayload(BaseModel):
         return sorted(set(value))
 
 
-class QueueBillPayload(BaseModel):
-    party_ledger: str = Field(min_length=1, max_length=120)
-    tax_mode: Literal["none", "cgst_sgst", "igst"]
-
-    @field_validator("party_ledger")
-    @classmethod
-    def strip_party(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("Tally party ledger is required")
-        return value
+class ConnectorResponsePayload(BaseModel):
+    key: Literal["ledgers", "stock_items", "units", "invoices", "master", "invoice"]
+    xml: str = Field(max_length=10_000_000)
 
 
 class ConnectorResultPayload(BaseModel):
@@ -76,10 +78,65 @@ class ConnectorResultPayload(BaseModel):
     master_id: Optional[str] = Field(default=None, max_length=120)
     error: Optional[str] = Field(default=None, max_length=500)
     tally_response: Optional[str] = Field(default=None, max_length=4000)
+    responses: list[ConnectorResponsePayload] = Field(default_factory=list, max_length=10)
+
+
+class TallyMasterPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    state: str = Field(default="", max_length=80)
+    gstin: str = Field(default="", max_length=20)
+    registration_type: str = Field(default="Regular", max_length=40)
+    phone: str = Field(default="", max_length=30)
+    email: str = Field(default="", max_length=200)
+    address: str = Field(default="", max_length=500)
+    gst_applicable: str = Field(default="Applicable", max_length=40)
+    tax_type: str = Field(default="", max_length=10)
+    parent: str = Field(default="", max_length=80)
+    ledger_type: str = Field(default="", max_length=80)
+    formal_name: str = Field(default="", max_length=80)
+    uqc: str = Field(default="", max_length=20)
+    model_number: str = Field(default="", max_length=120)
+    unit: str = Field(default="Nos", max_length=30)
+    hsn: str = Field(default="", max_length=30)
+    standard_rate: float = Field(default=0, ge=0, le=1000000000)
+
+    @field_validator("name")
+    @classmethod
+    def strip_master_name(cls, value: str) -> str:
+        return value.strip()
+
+
+class InvoiceDraftCreatePayload(BaseModel):
+    source: Literal["command", "quote"]
+    command: str = Field(default="", max_length=500)
+    quote_id: str = Field(default="", max_length=120)
+
+
+class InvoiceDraftItemPayload(BaseModel):
+    master_id: str = Field(min_length=1, max_length=120)
+    quantity: float = Field(gt=0, le=10000)
+    rate: float = Field(gt=0, le=1000000000)
+    gst_rate: float = Field(default=0, ge=0, le=100)
+    gst_inclusive: bool = False
+
+
+class InvoiceDraftReviewPayload(BaseModel):
+    party_master_id: str = Field(min_length=1, max_length=120)
+    sales_ledger: str = Field(min_length=1, max_length=120)
+    tax_mode: Literal["none", "cgst_sgst", "igst"]
+    items: list[InvoiceDraftItemPayload] = Field(min_length=1, max_length=100)
 
 
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+async def _require_accounting_access(user: CurrentUser) -> None:
+    if user.role in {"admin", "org:admin"}:
+        return
+    teams = await list_work_teams(user.org_id)
+    if not any(team.get("type") == "billing" and user.user_id in team.get("member_ids", []) for team in teams):
+        raise HTTPException(status_code=403, detail="Tally accounting is available to admins and Billing team members")
 
 
 @router.get("/api/integrations/tally")
@@ -132,16 +189,23 @@ async def delete_tally_connector_key(request: Request, user: CurrentUser):
 
 @router.post("/api/quotes/{quote_id}/tally", status_code=201)
 @limiter.limit("20/minute")
-async def post_quote_to_tally(request: Request, quote_id: str, payload: QueueBillPayload, user: CurrentUser):
-    job, created = await queue_bill(
-        user.org_id, user.user_id, user.full_name or "Team member", user.role, quote_id, payload.model_dump()
+async def post_quote_to_tally(request: Request, quote_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
+    quote = await db[f"quotes_{user.org_id}"].find_one(
+        {"org_id": user.org_id, "quote_id": quote_id}, {"_id": 0, "conversation_id": 1}
     )
-    return {"bill": job, "created": created}
+    if not quote:
+        raise HTTPException(status_code=404, detail="Quotation not found")
+    draft = await create_tally_invoice_draft(
+        user.org_id, user.user_id, user.role, quote["conversation_id"], {"source": "quote", "quote_id": quote_id}
+    )
+    return {"draft": draft, "created": True, "review_required": True}
 
 
 @router.get("/api/conversations/{conversation_id}/tally-bills")
 @limiter.limit("60/minute")
 async def get_tally_bills(request: Request, conversation_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
     return {
         "bills": await list_bills(user.org_id, conversation_id, user.user_id, user.role),
         "customer_mapping": await get_customer_mapping(user.org_id, conversation_id),
@@ -151,7 +215,109 @@ async def get_tally_bills(request: Request, conversation_id: str, user: CurrentU
 @router.post("/api/tally-bills/{job_id}/retry")
 @limiter.limit("10/minute")
 async def post_tally_retry(request: Request, job_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
     return {"bill": await retry_bill(user.org_id, job_id, user.user_id, user.role)}
+
+
+@router.get("/api/tally/overview")
+@limiter.limit("60/minute")
+async def get_tally_overview(request: Request, user: CurrentUser):
+    await _require_accounting_access(user)
+    return {"overview": await tally_overview(user.org_id)}
+
+
+@router.post("/api/tally/sync", status_code=202)
+@limiter.limit("10/minute")
+async def post_tally_sync(request: Request, user: CurrentUser):
+    await _require_accounting_access(user)
+    job, created = await queue_tally_sync(user.org_id, user.user_id, force=True)
+    return {"job": job, "created": created}
+
+
+@router.get("/api/tally/ledgers")
+@limiter.limit("60/minute")
+async def get_tally_ledgers(request: Request, user: CurrentUser, kind: str = "", q: str = ""):
+    await _require_accounting_access(user)
+    return {"ledgers": await list_tally_ledgers(user.org_id, kind, q)}
+
+
+@router.get("/api/tally/stock-items")
+@limiter.limit("60/minute")
+async def get_tally_stock_items(request: Request, user: CurrentUser, q: str = ""):
+    return {"stock_items": await list_tally_stock_items(user.org_id, q)}
+
+
+@router.get("/api/tally/invoices")
+@limiter.limit("60/minute")
+async def get_tally_invoices(request: Request, user: CurrentUser):
+    await _require_accounting_access(user)
+    return {"invoices": await list_tally_invoices(user.org_id)}
+
+
+@router.get("/api/tally/units")
+@limiter.limit("60/minute")
+async def get_tally_units(request: Request, user: CurrentUser):
+    await _require_accounting_access(user)
+    return {"units": await list_tally_units(user.org_id)}
+
+
+@router.post("/api/tally/masters/{kind}", status_code=202)
+@limiter.limit("20/minute")
+async def post_tally_master(
+    request: Request,
+    kind: Literal["party", "sales", "tax", "charge", "unit", "stock_item"],
+    payload: TallyMasterPayload,
+    user: CurrentUser,
+):
+    await admin_required(user)
+    return {"job": await queue_tally_master(user.org_id, user.user_id, kind, payload.model_dump())}
+
+
+@router.put("/api/tally/masters/{kind}/{master_id}", status_code=202)
+@limiter.limit("20/minute")
+async def put_tally_master(
+    request: Request,
+    kind: Literal["party", "sales", "tax", "charge", "unit", "stock_item"],
+    master_id: str,
+    payload: TallyMasterPayload,
+    user: CurrentUser,
+):
+    await admin_required(user)
+    return {"job": await queue_tally_master(
+        user.org_id, user.user_id, kind, payload.model_dump(), master_id=master_id
+    )}
+
+
+@router.post("/api/conversations/{conversation_id}/tally-invoice-drafts", status_code=201)
+@limiter.limit("20/minute")
+async def post_tally_invoice_draft(
+    request: Request, conversation_id: str, payload: InvoiceDraftCreatePayload, user: CurrentUser,
+):
+    await _require_accounting_access(user)
+    return {"draft": await create_tally_invoice_draft(
+        user.org_id, user.user_id, user.role, conversation_id, payload.model_dump()
+    )}
+
+
+@router.patch("/api/tally-invoice-drafts/{draft_id}")
+@limiter.limit("30/minute")
+async def patch_tally_invoice_draft(
+    request: Request, draft_id: str, payload: InvoiceDraftReviewPayload, user: CurrentUser,
+):
+    await _require_accounting_access(user)
+    return {"draft": await review_tally_invoice_draft(
+        user.org_id, user.user_id, user.role, draft_id, payload.model_dump()
+    )}
+
+
+@router.post("/api/tally-invoice-drafts/{draft_id}/submit", status_code=202)
+@limiter.limit("20/minute")
+async def post_tally_invoice_draft_submit(request: Request, draft_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
+    job, created = await submit_tally_invoice_draft(
+        user.org_id, user.user_id, user.full_name or "Team member", user.role, draft_id
+    )
+    return {"bill": job, "created": created}
 
 
 @router.get("/api/tally-connector/jobs/next")
@@ -174,4 +340,4 @@ async def post_tally_connector_result(
     claim_id: Optional[str] = Header(default=None, alias="X-Tally-Claim-Id"),
 ):
     integration = await authenticate_connector(connector_key)
-    return {"bill": await finish_job(integration, job_id, claim_id, payload.model_dump())}
+    return {"result": await finish_job(integration, job_id, claim_id, payload.model_dump())}
