@@ -99,6 +99,12 @@ assert complete_reply(collection, resumed, result, now=now + timedelta(minutes=3
 replayed = claim_reply(collection, *args, now=now + timedelta(minutes=3, seconds=1))
 assert replayed["action"] == "replay" and replayed["result"] == result
 
+# AI replies use the same durable claim and are one provider message per inbound message.
+ai_args = ("org-a", "ai:wamid.1", "whatsapp_919999999999", "ai", ["AI reply"])
+ai_collection = FakeCollection()
+assert claim_reply(ai_collection, *ai_args, now=now)["action"] == "claimed"
+expect_conflict(lambda: claim_reply(ai_collection, *ai_args, now=now))
+
 lifespan = Path("core/lifespan.py").read_text()
 service = Path("services/wa_service.py").read_text()
 assert "ensure_whatsapp_outbound_indexes" in lifespan

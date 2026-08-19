@@ -44,7 +44,12 @@ assert '"POST", "settings"' in wa_routes
 assert '"srtp_key_exchange_protocol": "DTLS"' in wa_routes
 assert 'error_data.get("details")' in wa_routes
 assert "window_end.tzinfo is None" in wa_routes
-assert '"errors": value.get("errors")' in webhook_routes
+assert '"errors": safe_call.get("errors") or value.get("errors")' in webhook_routes
 assert 'call.get("status") or call.get("event")' in webhook_routes
+assert '@router.get("/calls")' in wa_routes
+assert '@router.get("/calls/{call_id}")' in wa_routes
+assert 'CALL_HISTORY_PROJECTION' in wa_routes
+assert '"state": {"$nin": list(STORED_TERMINAL_CALL_STATES)}' in wa_routes
+assert "provider_lifecycle_filter" in webhook_routes
 
 print("WhatsApp call backend contract check passed.")

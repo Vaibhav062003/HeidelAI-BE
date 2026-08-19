@@ -23,6 +23,7 @@ from core.services import services
 from services.followup_service import abort_scheduled_message
 from services.conversation_utils import reopen_conversation
 from services.push_notification_service import schedule_customer_message_push
+from services.ai_reply_guard import AIProviderUnavailable
 from services.utils import name_search_prefixes, serialize_mongo
 
 from config.settings import (
@@ -257,6 +258,7 @@ async def send_ig_message(
     context_type: Optional[str] = None,
     context: Optional[dict] = None,
     is_auto_followup: bool = False,
+    enforce_ai_state: bool = False,
 ) -> dict:
     """
     Send a message to an Instagram user using the appropriate access token
@@ -309,6 +311,16 @@ async def send_ig_message(
             }
 
             # Send the message
+            if enforce_ai_state:
+                from services.ai_policy_service import is_effective_ai_enabled
+
+                if not await is_effective_ai_enabled(org_id, conversation_id):
+                    db[f"instagram_outbox_{org_id}"].delete_one({
+                        "_id": request_id,
+                        "claim_token": claim_token,
+                        "status": "sending",
+                    })
+                    raise AIProviderUnavailable("ai_disabled", escalation_required=False)
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(url, headers=headers, json=data)
             response.raise_for_status()
@@ -367,6 +379,8 @@ async def send_ig_message(
 
             return {"message_id": message_id, "success": True, "status": "sent"}
         
+    except AIProviderUnavailable:
+        raise
     except Exception as e:
         logger.error(f"Error sending Instagram message: {e}")
         # Return an error response that can be handled by the caller
@@ -716,6 +730,20 @@ def complete_instagram_webhook_message(org_id: str, message_id: str, claim_token
     db[f"messages_{org_id}"].update_one(
         {"id": message_id, "webhook_claim_token": claim_token},
         {"$set": {"webhook_status": "complete", "webhook_completed_at": datetime.now(timezone.utc)}},
+    )
+
+
+def release_instagram_webhook_downstream(org_id: str, message_id: str, claim_token: str) -> None:
+    db[f"messages_{org_id}"].update_one(
+        {
+            "id": message_id,
+            "webhook_status": "processing",
+            "webhook_claim_token": claim_token,
+        },
+        {
+            "$set": {"webhook_status": "pending"},
+            "$unset": {"webhook_claim_token": "", "webhook_claimed_at": ""},
+        },
     )
 
 async def store_instagram_message(

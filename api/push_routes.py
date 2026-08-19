@@ -80,6 +80,7 @@ def add_device(request: Request, registration: DeviceRegistration, user: Current
         register_device(
             org_id=user.org_id,
             user_id=user.user_id,
+            role=user.role,
             installation_id=registration.installation_id,
             token=registration.token,
             app_version=registration.app_version,

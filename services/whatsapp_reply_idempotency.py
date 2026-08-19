@@ -10,7 +10,7 @@ class ReplyOperationConflict(Exception):
 
 
 def claim_reply(collection, org_id: str, temp_id: Optional[str], conversation_id: str, mode: str, contents: list[str], now: Optional[datetime] = None) -> Optional[dict]:
-    if mode != "reply" or not temp_id or len(contents) != 1:
+    if mode not in {"reply", "ai"} or not temp_id or len(contents) != 1:
         return None
     now = now or datetime.now(timezone.utc)
     operation_id = f"{org_id}:{temp_id}"

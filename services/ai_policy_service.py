@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Literal
 
 from fastapi import HTTPException
@@ -10,6 +11,7 @@ from services.websocket_service import broadcast_org_ws
 
 
 db = get_async_mongo_db()
+logger = logging.getLogger(__name__)
 DEFAULT_PAUSE_MINUTES = 60
 MIN_PAUSE_MINUTES = 5
 MAX_PAUSE_MINUTES = 24 * 60
@@ -48,6 +50,35 @@ async def update_org_ai_policy(org_id: str, enabled: bool, pause_minutes: int) -
     if not result.matched_count:
         raise HTTPException(status_code=404, detail="Organization not found.")
     return {"enabled": enabled, "pause_minutes": pause_minutes}
+
+
+async def is_effective_ai_enabled(org_id: str, conversation_id: str) -> bool:
+    try:
+        organization = await db.organizations.find_one(
+            {"org_id": org_id},
+            {"_id": 0, "is_ai_enabled": 1},
+        )
+        if not organization or not organization.get("is_ai_enabled", False):
+            return False
+        conversation = await db[f"conversations_{org_id}"].find_one(
+            {"conversation_id": conversation_id},
+            {"_id": 0, "is_ai_enabled": 1, "auto_ai_disabled": 1, "auto_ai_disabled_until": 1},
+        )
+        if not conversation or not conversation.get("is_ai_enabled", True):
+            return False
+        paused_until = conversation.get("auto_ai_disabled_until")
+        if conversation.get("auto_ai_disabled") and paused_until:
+            if paused_until.tzinfo is None:
+                paused_until = paused_until.replace(tzinfo=timezone.utc)
+            return paused_until <= datetime.now(timezone.utc)
+        return not conversation.get("auto_ai_disabled", False)
+    except Exception:
+        logger.exception(
+            "AI policy check failed closed org=%s conversation=...%s",
+            org_id,
+            conversation_id[-6:],
+        )
+        return False
 
 
 async def set_conversation_ai_state(

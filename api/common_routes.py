@@ -54,6 +54,7 @@ from services.contacts_service import (
 from services.ig_service import send_instagram_reaction
 from services.ai_policy_service import get_org_ai_policy, update_org_ai_policy
 from auth.auth_utils import admin_required
+from services.work_team_service import require_conversation_access
 from services.products_service import (
     get_products_for_org, 
     bulk_upload_products_from_file, 
@@ -108,6 +109,7 @@ async def get_conversations(
     handling: Optional[str] = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     assigned_agent_id: Optional[str] = None,
+    team_id: Optional[str] = None,
     include_meta: bool = Query(False),
 ):
     """
@@ -135,6 +137,8 @@ async def get_conversations(
             status_filter=status_filter,
             assigned_agent_id=assigned_agent_id,
             include_meta=include_meta,
+            current_user_role=user.role,
+            team_id=team_id,
         )
 
     except HTTPException:
@@ -152,7 +156,7 @@ async def get_focus_counts(request: Request, user: CurrentUser):
 
     return {
         "status": "success",
-        "data": await fetch_focus_counts(user.org_id),
+        "data": await fetch_focus_counts(user.org_id, user.user_id, user.role),
     }
 
 
@@ -174,6 +178,7 @@ async def search_conversation_queue(
     handling: Optional[str] = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     assigned_agent_id: Optional[str] = None,
+    team_id: Optional[str] = None,
 ):
     if not user.org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
@@ -193,6 +198,8 @@ async def search_conversation_queue(
         handling=handling,
         status_filter=status_filter,
         assigned_agent_id=assigned_agent_id,
+        current_user_role=user.role,
+        team_id=team_id,
     )
 
 @router.get("/api/conversations/{conversation_id}")
@@ -206,7 +213,7 @@ async def get_conversation(request: Request, conversation_id: str, user: Current
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
     try:
-        conversation = await fetch_conversation(org_id, conversation_id)
+        conversation = await fetch_conversation(org_id, conversation_id, user.user_id, user.role)
         return conversation
     except HTTPException:
         raise
@@ -228,7 +235,7 @@ async def get_messages(
 
     return await fetch_messages(
         org_id, conversation_id, user.user_id, agent_username,
-        before=before, limit=limit
+        before=before, limit=limit, role=user.role
     )
 
 @router.post("/api/conversations/{conversation_id}/acknowledge-open")
@@ -240,6 +247,7 @@ async def acknowledge_open(
     observed_counter: int = Query(..., ge=0),
 ):
     """Clear the app's unread counter without sending a platform read receipt."""
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     return await acknowledge_conversation_opened(user.org_id, conversation_id, observed_counter)
 
 @router.get("/api/conversations/{conversation_id}/messages/search")
@@ -253,6 +261,7 @@ async def search_messages_in_conversation(
 ):
     if not user.org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     return await search_conversation_messages(user.org_id, conversation_id, q, limit)
 
 
@@ -267,6 +276,7 @@ async def get_message_context(
 ):
     if not user.org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     return await fetch_message_context(user.org_id, conversation_id, message_id, radius)
 
 @router.post("/api/conversations/send-message")
@@ -294,6 +304,8 @@ async def send_message_endpoint(
     sender_name = user.full_name or "Agent"
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
+    if platform in {"whatsapp", "instagram"}:
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
     if platform == "instagram" and mode == "reply" and not temp_id:
         raise HTTPException(status_code=400, detail="temp_id is required for Instagram replies")
 
@@ -314,6 +326,13 @@ async def send_message_endpoint(
             context_dict = json.loads(context)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON format in context field")
+    if isinstance(context_dict, dict) and "offer" in context_dict:
+        try:
+            from services.sales_offer_policy import structured_offer_snapshot
+
+            structured_offer_snapshot(context_dict)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     res = await send_message(
         org_id, 
@@ -331,11 +350,12 @@ async def send_message_endpoint(
         duration_ms=duration_ms,
     )
 
+    offer_tracking = "not_detected"
     if mode == "reply" and platform in {"whatsapp", "instagram"}:
         try:
             from services.sales_offer_service import enqueue_outbound_offer
 
-            await enqueue_outbound_offer(
+            recorded_offer = await enqueue_outbound_offer(
                 org_id=org_id,
                 agent_id=user.user_id,
                 agent_name=sender_name,
@@ -345,8 +365,11 @@ async def send_message_endpoint(
                 result=res,
                 context=context_dict,
             )
+            if recorded_offer:
+                offer_tracking = "recorded"
         except Exception as exc:
             logger.error(f"Failed to record outbound sales offer: {exc}")
+            offer_tracking = "pending"
 
     if platform == "whatsapp" and mode == "reply" and content:
         try:
@@ -363,7 +386,7 @@ async def send_message_endpoint(
         except Exception as exc:
             logger.error(f"Failed to observe human pricing message: {exc}")
 
-    return {"message": "Message sent", "details": res}
+    return {"message": "Message sent", "details": res, "offer_tracking": offer_tracking}
 
 @router.post("/api/conversations/send_reaction")
 @limiter.limit("30/minute")
@@ -409,6 +432,7 @@ async def reopen_conversation_endpoint(request: Request, user: CurrentUser, conv
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
+    await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
     return await reopen_conversation(org_id, conversation_id)
 
 @router.post("/api/conversations/{conversation_id}/close")
@@ -418,6 +442,7 @@ async def close_conversation_endpoint(request: Request, user: CurrentUser, conve
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
+    await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
     return await close_conversation(org_id, conversation_id, "Closed by agent")
 
 @router.post("/api/unarchive-data/{platform}")
@@ -452,6 +477,7 @@ async def post_private_note(request: Request, user: CurrentUser, conversation_id
 
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
+    await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
     
     try:
         res = await add_private_note(org_id, conversation_id, note, posted_by, role, platform, connection_id)

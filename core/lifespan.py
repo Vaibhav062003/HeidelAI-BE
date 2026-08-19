@@ -10,6 +10,7 @@ from services.followup_service import ensure_followup_indexes
 from services.oos_service import ensure_oos_indexes
 from services.pricing_service import ensure_pricing_indexes
 from services.sales_offer_service import ensure_sales_offer_indexes
+from services.tally_service import ensure_tally_indexes
 from services.push_notification_service import (
     ensure_push_notification_indexes,
     start_push_notification_workers,
@@ -36,6 +37,7 @@ async def lifespan(app: FastAPI):
     await ensure_oos_indexes()
     await ensure_pricing_indexes()
     await ensure_sales_offer_indexes()
+    await ensure_tally_indexes()
     await start_push_notification_workers()
     yield
     # Shutdown

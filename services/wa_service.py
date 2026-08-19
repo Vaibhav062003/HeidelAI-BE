@@ -23,6 +23,7 @@ from services.followup_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
 from services.utils import name_search_prefixes, normalize_phone, phone_search_parts
 from services.push_notification_service import schedule_customer_message_push
+from services.ai_reply_guard import AIProviderUnavailable
 from services.whatsapp_reply_idempotency import ReplyOperationConflict, claim_reply, complete_reply, mark_unknown, record_acceptance, release_claim, start_provider
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from loguru import logger
@@ -508,7 +509,6 @@ async def send_whatsapp_message(
 
         if mode == "ai":
             from services.pricing_service import (
-                HOLDING_REPLY,
                 is_pricing_enabled,
                 validate_ai_pricing_response,
             )
@@ -531,12 +531,14 @@ async def send_whatsapp_message(
                     if not valid:
                         logger.warning(
                             f"Blocked unsafe AI price for org={org_id}, "
-                            f"conversation={conversation_id}, reason={reason}"
+                            f"conversation=...{conversation_id[-6:]}, reason={reason}"
                         )
-                        original_content = HOLDING_REPLY
+                        raise AIProviderUnavailable(reason, escalation_required=False)
+                except AIProviderUnavailable:
+                    raise
                 except Exception as exc:
                     logger.error(f"AI pricing validation failed closed for org={org_id}: {exc}")
-                    original_content = HOLDING_REPLY
+                    raise AIProviderUnavailable("catalogue_unavailable") from exc
         
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({
@@ -559,6 +561,15 @@ async def send_whatsapp_message(
         else:
             contents = [str(original_content)]
 
+        # One bounded provider message lets the existing durable reply claim make AI retries safe.
+        if mode == "ai":
+            joined_content = "\n\n".join(contents)
+            if not joined_content.strip():
+                raise AIProviderUnavailable("empty_response")
+            if len(joined_content) > 4096:
+                raise AIProviderUnavailable("response_too_long")
+            contents = [joined_content]
+
         if not contents:
             logger.warning(f"Empty content provided for WhatsApp message to {recipient_id}")
             return {"message": "No content to send"}
@@ -571,23 +582,23 @@ async def send_whatsapp_message(
             return outbound_operation["result"]
 
         # Ensure the conversation document exists in the database
-        await create_or_update_whatsapp_conversation(
-            org_id=org_id,
-            recipient_id=whatsapp_business_id,
-            customer_phone_no=recipient_id,
-            customer_name=message.get("customer_name") or recipient_id,
-            last_message=contents[0],
-            last_sender="ai" if mode == "ai" else "agent",
-            mode=mode,
-            is_auto_followup=is_auto_followup,
-        )
+        if mode != "ai":
+            await create_or_update_whatsapp_conversation(
+                org_id=org_id,
+                recipient_id=whatsapp_business_id,
+                customer_phone_no=recipient_id,
+                customer_name=message.get("customer_name") or recipient_id,
+                last_message=contents[0],
+                last_sender="agent",
+                mode=mode,
+                is_auto_followup=is_auto_followup,
+            )
 
         last_stored_id = None
         all_message_ids = []
 
         # Send each content part as a separate bubble
         for i, content_item in enumerate(contents):
-            stop_after_part = False
             if pricing_guard_active:
                 try:
                     valid, reason = await validate_ai_pricing_response(
@@ -598,10 +609,9 @@ async def send_whatsapp_message(
                     )
                 except Exception as exc:
                     logger.error(f"Final AI pricing revalidation failed closed for org={org_id}: {exc}")
-                    valid, reason = False, "validation_error"
+                    raise AIProviderUnavailable("catalogue_unavailable") from exc
                 if not valid:
-                    content_item = HOLDING_REPLY
-                    stop_after_part = True
+                    raise AIProviderUnavailable(reason, escalation_required=False)
 
             data = {
                 "messaging_product": "whatsapp",
@@ -631,6 +641,11 @@ async def send_whatsapp_message(
                     response_data = outbound_operation.get("response_data") or {}
                     message_id = outbound_operation.get("provider_message_id")
                 else:
+                    if mode == "ai":
+                        from services.ai_policy_service import is_effective_ai_enabled
+
+                        if not await is_effective_ai_enabled(org_id, conversation_id):
+                            raise AIProviderUnavailable("ai_disabled", escalation_required=False)
                     if not start_provider(db.whatsapp_outbound_sends, outbound_operation):
                         raise HTTPException(status_code=409, detail="This reply is already being sent")
                     provider_started = True
@@ -739,9 +754,6 @@ async def send_whatsapp_message(
                 except Exception as exc:
                     logger.error(f"Failed to record accepted AI pricing message: {exc}")
 
-            if stop_after_part:
-                break
-
             # Small delay between bubbles to ensure delivery order
             if len(contents) > 1 and i < len(contents) - 1:
                 await asyncio.sleep(0.5)
@@ -772,6 +784,12 @@ async def send_whatsapp_message(
             raise HTTPException(status_code=409, detail="The reply was delivered and is still being synchronized. Refresh the conversation.")
         return result
 
+    except AIProviderUnavailable:
+        if provider_started:
+            mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
+        else:
+            release_claim(db.whatsapp_outbound_sends, outbound_operation)
+        raise
     except asyncio.CancelledError:
         if provider_started:
             mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
@@ -1968,6 +1986,14 @@ def ensure_whatsapp_call_indexes() -> None:
             unique=True,
             name="org_id_call_id_unique",
             partialFilterExpression={"org_id": {"$type": "string"}, "call_id": {"$type": "string"}},
+        )
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("updated_at", -1), ("call_id", -1)],
+            name="org_call_history",
+        )
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("conversation_id", 1), ("updated_at", -1), ("call_id", -1)],
+            name="org_conversation_call_history",
         )
     except Exception as e:
         logger.warning(f"Failed to create WhatsApp call index: {e}")

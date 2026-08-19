@@ -15,6 +15,7 @@ from fastapi import (
     File,
     Depends,
     Request,
+    Query,
     APIRouter,
     UploadFile,
     HTTPException,
@@ -29,7 +30,7 @@ from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectR
 from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, run_bulk_send_job
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
-from database import get_mongo_db
+from database import get_async_mongo_db, get_mongo_db
 from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required, require_auth
 from config.settings import (
@@ -46,6 +47,15 @@ from config.settings import (
 )
 from services.websocket_service import broadcast_main_ws
 from services.ai_policy_service import set_conversation_ai_state
+from services.work_team_service import conversation_access_condition, require_conversation_access
+from services.whatsapp_call_history import (
+    CALL_HISTORY_PROJECTION,
+    STORED_TERMINAL_CALL_STATES,
+    canonical_call_state,
+    decode_call_cursor,
+    encode_call_cursor,
+    meta_datetime,
+)
 
 
 cloudinary.config(
@@ -155,6 +165,7 @@ def _validated_call_session(body: dict, expected_type: str):
 @router.get("/conversations/{conversation_id}/call-permission")
 @limiter.limit("30/minute")
 async def get_call_permission(request: Request, conversation_id: str, user: CurrentUser):
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     connection, _, phone = _calling_context(user.org_id, conversation_id=conversation_id)
     try:
         return await _meta_call_request(connection, "GET", "call_permissions", params={"user_wa_id": phone})
@@ -169,6 +180,7 @@ async def get_call_permission(request: Request, conversation_id: str, user: Curr
 @router.post("/conversations/{conversation_id}/call-permission")
 @limiter.limit("5/minute")
 async def request_call_permission(request: Request, conversation_id: str, user: CurrentUser):
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     connection, conversation, phone = _calling_context(user.org_id, conversation_id=conversation_id)
     window_end = conversation.get("reply_window_ends_at")
     if isinstance(window_end, datetime) and window_end.tzinfo is None:
@@ -212,6 +224,7 @@ async def request_call_permission(request: Request, conversation_id: str, user: 
 @router.post("/conversations/{conversation_id}/calls")
 @limiter.limit("10/minute")
 async def start_whatsapp_call(request: Request, conversation_id: str, body: dict, user: CurrentUser):
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     if body.get("action") != "connect":
         raise HTTPException(status_code=422, detail="Only the connect action can start a call")
     session = _validated_call_session(body, "offer")
@@ -226,33 +239,103 @@ async def start_whatsapp_call(request: Request, conversation_id: str, body: dict
     if not call_id:
         raise HTTPException(status_code=502, detail="Meta did not return a WhatsApp call ID")
     now = datetime.now(timezone.utc)
+    device_id = body.get("device_id") if isinstance(body.get("device_id"), str) else None
     db.whatsapp_calls.update_one(
         {"org_id": user.org_id, "call_id": call_id},
-        {"$set": {
-            "call_id": call_id,
-            "org_id": user.org_id,
-            "wa_id": connection["wa_id"],
-            "conversation_id": conversation_id,
-            "phone": phone,
-            "contact_name": conversation.get("customer_name") or phone,
-            "direction": "BUSINESS_INITIATED",
-            "agent_id": user.user_id,
-            "state": "ringing",
-            "updated_at": now,
-        }},
+        {
+            "$setOnInsert": {
+                "call_id": call_id,
+                "org_id": user.org_id,
+                "state": "ringing",
+                "created_at": now,
+                "started_at": now,
+            },
+            "$set": {
+                "wa_id": connection["wa_id"],
+                "conversation_id": conversation_id,
+                "phone": phone,
+                "contact_name": conversation.get("customer_name") or phone,
+                "direction": "BUSINESS_INITIATED",
+                "agent_id": user.user_id,
+                "agent_name": user.full_name or "Agent",
+                "agent_device_id": device_id,
+                "handled_by": "human",
+                "updated_at": now,
+            },
+        },
         upsert=True,
     )
+    call = db.whatsapp_calls.find_one({"org_id": user.org_id, "call_id": call_id}, CALL_HISTORY_PROJECTION) or {}
     await broadcast_main_ws(connection["wa_id"], "whatsapp", "whatsapp_call", {
         "id": call_id,
         "call_id": call_id,
         "event": "started",
+        "status": call.get("state") or "ringing",
         "direction": "BUSINESS_INITIATED",
         "conversation_id": conversation_id,
         "contact_name": conversation.get("customer_name") or phone,
         "phone": phone,
         "agent_id": user.user_id,
+        "agent_name": user.full_name or "Agent",
+        "agent_device_id": device_id,
+        "handled_by": "human",
+        "created_at": call.get("created_at"),
+        "started_at": call.get("started_at"),
+        "connected_at": call.get("connected_at"),
     })
     return {"call_id": call_id}
+
+
+@router.get("/calls")
+@limiter.limit("60/minute")
+async def list_whatsapp_calls(
+    request: Request,
+    user: CurrentUser,
+    conversation_id: str | None = None,
+    before: str | None = None,
+    limit: int = Query(30, ge=1, le=100),
+):
+    query: dict = {"org_id": user.org_id}
+    if conversation_id:
+        await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
+        query["conversation_id"] = conversation_id
+    else:
+        access = await conversation_access_condition(user.org_id, user.user_id, user.role)
+        if access:
+            allowed = await get_async_mongo_db()[f"conversations_{user.org_id}"].distinct("conversation_id", access)
+            query["conversation_id"] = {"$in": allowed}
+    if before:
+        try:
+            cursor_time, cursor_call_id = decode_call_cursor(before)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid call-history cursor") from exc
+        query["$or"] = [
+            {"updated_at": {"$lt": cursor_time}},
+            {"updated_at": cursor_time, "call_id": {"$lt": cursor_call_id}},
+        ]
+
+    rows = await get_async_mongo_db().whatsapp_calls.find(
+        query, CALL_HISTORY_PROJECTION
+    ).sort([("updated_at", -1), ("call_id", -1)]).limit(limit + 1).to_list(length=limit + 1)
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_before = encode_call_cursor(rows[-1]["updated_at"], rows[-1]["call_id"]) if has_more and rows else None
+    return {"items": serialize_mongo(rows), "next_before": next_before}
+
+
+@router.get("/calls/{call_id}")
+@limiter.limit("60/minute")
+async def get_whatsapp_call(request: Request, call_id: str, user: CurrentUser):
+    call = await get_async_mongo_db().whatsapp_calls.find_one(
+        {"org_id": user.org_id, "call_id": call_id}, CALL_HISTORY_PROJECTION
+    )
+    if not call:
+        raise HTTPException(status_code=404, detail="This WhatsApp call is no longer available")
+    if call.get("conversation_id") and call.get("agent_id") != user.user_id:
+        await require_conversation_access(
+            user.org_id, call["conversation_id"], user.user_id, user.role
+        )
+    return serialize_mongo(call)
 
 
 @router.post("/calls")
@@ -266,15 +349,34 @@ async def update_whatsapp_call(request: Request, body: dict, user: CurrentUser):
     connection, _, _ = _calling_context(user.org_id, call_id=call_id)
     calls = db.whatsapp_calls
     call = calls.find_one({"call_id": call_id, "org_id": user.org_id})
+    if canonical_call_state((call or {}).get("state")) in {"completed", "declined", "missed", "failed"}:
+        raise HTTPException(status_code=409, detail="This WhatsApp call has already ended")
     owner = call.get("agent_id") if call else None
     if owner and owner != user.user_id:
         raise HTTPException(status_code=409, detail="Another teammate is already handling this call")
 
     claimed_now = not owner
+    claim_token = uuid.uuid4().hex if claimed_now else None
+    device_id = body.get("device_id") if isinstance(body.get("device_id"), str) else None
     if claimed_now:
+        claim_fields = {
+            "agent_id": user.user_id,
+            "agent_name": user.full_name or "Agent",
+            "handled_by": "human",
+            "claim_operation_id": claim_token,
+            "state": "connecting",
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if device_id:
+            claim_fields["agent_device_id"] = device_id
         claimed = calls.find_one_and_update(
-            {"call_id": call_id, "org_id": user.org_id, "$or": [{"agent_id": None}, {"agent_id": user.user_id}, {"agent_id": {"$exists": False}}]},
-            {"$set": {"agent_id": user.user_id, "state": "connecting", "updated_at": datetime.now(timezone.utc)}},
+            {
+                "call_id": call_id,
+                "org_id": user.org_id,
+                "state": {"$in": ["ringing", "connect", "started"]},
+                "$or": [{"agent_id": None}, {"agent_id": user.user_id}, {"agent_id": {"$exists": False}}],
+            },
+            {"$set": claim_fields},
             return_document=ReturnDocument.AFTER,
         )
         if not claimed:
@@ -288,21 +390,81 @@ async def update_whatsapp_call(request: Request, body: dict, user: CurrentUser):
     except Exception:
         if claimed_now:
             calls.update_one(
-                {"call_id": call_id, "org_id": user.org_id, "agent_id": user.user_id},
-                {"$unset": {"agent_id": ""}, "$set": {"state": "ringing", "updated_at": datetime.now(timezone.utc)}},
+                {
+                    "call_id": call_id,
+                    "org_id": user.org_id,
+                    "agent_id": user.user_id,
+                    "claim_operation_id": claim_token,
+                    "state": "connecting",
+                },
+                {
+                    "$unset": {"agent_id": "", "agent_name": "", "agent_device_id": "", "handled_by": "", "claim_operation_id": ""},
+                    "$set": {"state": "ringing", "updated_at": datetime.now(timezone.utc)},
+                },
             )
         raise
-    state = {"pre_accept": "connecting", "accept": "connected", "reject": "rejected", "terminate": "ended"}[action]
-    calls.update_one(
-        {"call_id": call_id, "org_id": user.org_id},
-        {"$set": {"agent_id": user.user_id, "state": state, "updated_at": datetime.now(timezone.utc)}},
+    now = datetime.now(timezone.utc)
+    current = calls.find_one({"call_id": call_id, "org_id": user.org_id}) or call or {}
+    was_connected = bool(current.get("connected_at")) or canonical_call_state(current.get("state")) == "connected"
+    state = {
+        "pre_accept": "connecting",
+        "accept": "connected",
+        "reject": "declined",
+        "terminate": "completed" if was_connected else ("missed" if current.get("direction") == "USER_INITIATED" else "failed"),
+    }[action]
+    fields = {
+        "agent_id": user.user_id,
+        "agent_name": user.full_name or "Agent",
+        "handled_by": "human",
+        "state": state,
+        "updated_at": now,
+    }
+    if device_id:
+        fields["agent_device_id"] = device_id
+    if action == "accept":
+        fields["connected_at"] = current.get("connected_at") or now
+    if action in {"reject", "terminate"}:
+        fields["ended_at"] = now
+        connected_at = meta_datetime(current.get("connected_at"))
+        if was_connected and connected_at:
+            fields["duration_seconds"] = max(0, round((now - connected_at).total_seconds()))
+    transition_filter = {
+        "call_id": call_id,
+        "org_id": user.org_id,
+        "agent_id": user.user_id,
+        "state": {"$nin": list(STORED_TERMINAL_CALL_STATES)},
+    }
+    if action == "pre_accept":
+        transition_filter["state"] = "connecting"
+        if claim_token:
+            transition_filter["claim_operation_id"] = claim_token
+    transition = calls.update_one(
+        transition_filter,
+        {"$set": fields, "$unset": {"claim_operation_id": ""}},
     )
+    updated = calls.find_one({"call_id": call_id, "org_id": user.org_id}, CALL_HISTORY_PROJECTION) or fields
+    actual_state = canonical_call_state(updated.get("state"))
+    event_name = "terminate" if actual_state in {"completed", "declined", "missed", "failed"} else "accepted" if actual_state == "connected" else "claimed"
     await broadcast_main_ws(connection["wa_id"], "whatsapp", "whatsapp_call", {
         "id": call_id,
         "call_id": call_id,
-        "event": "claimed" if action == "pre_accept" else "terminate" if action in {"reject", "terminate"} else "accepted",
-        "agent_id": user.user_id,
+        "event": event_name,
+        "status": actual_state,
+        "agent_id": updated.get("agent_id"),
+        "agent_name": updated.get("agent_name"),
+        "agent_device_id": updated.get("agent_device_id"),
+        "handled_by": updated.get("handled_by"),
+        "direction": updated.get("direction"),
+        "conversation_id": updated.get("conversation_id"),
+        "contact_name": updated.get("contact_name"),
+        "phone": updated.get("phone"),
+        "started_at": updated.get("started_at"),
+        "connected_at": updated.get("connected_at"),
+        "ended_at": updated.get("ended_at"),
+        "duration_seconds": updated.get("duration_seconds"),
     })
+    if action in {"pre_accept", "accept"} and not transition.matched_count and actual_state in {"completed", "declined", "missed", "failed"}:
+        raise HTTPException(status_code=409, detail="This WhatsApp call has already ended")
     return result
 
 
@@ -769,7 +931,8 @@ async def get_whatsapp_conversations(request: Request, user: CurrentUser):
     Returns them in the standard conversation format for compatibility with the frontend
     """
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        access = await conversation_access_condition(org_id, user.user_id, user.role)
 
         # Get the WhatsApp-specific collection name
         conversations_collection_name = f"conversations_{org_id}"
@@ -782,8 +945,10 @@ async def get_whatsapp_conversations(request: Request, user: CurrentUser):
         conversations_collection = db[conversations_collection_name]
         
         # Fetch conversations and sort by last_message_timestamp
+        platform_query = {"platform": "whatsapp"}
+        query = {"$and": [platform_query, access]} if access else platform_query
         raw_conversations = list(conversations_collection.find(
-            {}, 
+            query,
             {"_id": 0}  # Exclude _id field
         ).sort("last_message_timestamp", -1))
         
@@ -829,7 +994,8 @@ async def get_whatsapp_conversation(request: Request, conversation_id: str, user
     Returns the conversation in the standard format for compatibility with the frontend
     """
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
 
         conversations_collection_name = f"conversations_{org_id}"
         
@@ -857,6 +1023,8 @@ async def get_whatsapp_conversation(request: Request, conversation_id: str, user
         
         return conversation
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching Instagram conversation {conversation_id}: {e}")
         raise HTTPException(
@@ -869,7 +1037,8 @@ async def get_whatsapp_conversation(request: Request, conversation_id: str, user
 async def get_whatsapp_messages(request: Request, conversation_id: str, user: CurrentUser):
     """Fetch messages for a specific WhatsApp conversation"""
     try:
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
 
         # Get the WhatsApp-specific collection name
         messages_collection_name = f"messages_{org_id}"
@@ -894,6 +1063,8 @@ async def get_whatsapp_messages(request: Request, conversation_id: str, user: Cu
         
         return messages
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching WhatsApp messages for {conversation_id}: {e}")
         raise HTTPException(
@@ -935,7 +1106,8 @@ async def get_whatsapp_ai_status(request: Request, conversation_id: str, user: C
     """Get AI status for a specific WhatsApp conversation"""
     try:
 
-        org_id = user.org_id 
+        org_id = user.org_id
+        await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
         # Get the WhatsApp-specific collection
         conversations_collection = db[f"conversations_{org_id}"]
         
@@ -948,6 +1120,8 @@ async def get_whatsapp_ai_status(request: Request, conversation_id: str, user: C
         
         return {"status": "Error", "message": "No conversation found"}
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error checking WhatsApp AI status: {e}")
         raise HTTPException(
@@ -961,6 +1135,7 @@ async def toggle_whatsapp_ai_status(request: Request, conversation_id: str, body
     """Toggle AI status for a specific WhatsApp conversation"""
     if "enabled" not in body:
         raise HTTPException(status_code=422, detail="enabled is required.")
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     action = "resume" if body["enabled"] else "pause"
     return await set_conversation_ai_state(user.org_id, conversation_id, action, body.get("duration_minutes"))
 
@@ -1122,6 +1297,7 @@ async def process_whatsapp_message(request: Request, message: dict, user: Curren
     """Send a message to a WhatsApp conversation"""
     # Get Instagram-specific collections
     org_id = user.org_id
+    await require_conversation_access(org_id, message["conversation_id"], user.user_id, user.role)
     org_conversations_collection = db[f"conversations_{org_id}"]
     
     # Check if conversation exists

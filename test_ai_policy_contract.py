@@ -27,9 +27,7 @@ def test_ai_policy_contract() -> None:
     assert any(isinstance(node, ast.Name) and node.id == "admin_required" for node in ast.walk(put_policy))
 
     scheduler = function_node("core/scheduler.py", "update_ai_status")
-    first_return = next(i for i, statement in enumerate(scheduler.body) if isinstance(statement, ast.Return))
-    active_path = ast.Module(body=scheduler.body[: first_return + 1], type_ignores=[])
-    names = {node.id for node in ast.walk(active_path) if isinstance(node, ast.Name)}
+    names = {node.id for node in ast.walk(scheduler) if isinstance(node, ast.Name)}
     assert "resume_expired_ai_pauses" in names
     assert "send_to_agent" not in names
     assert "send_whatsapp_message" not in names

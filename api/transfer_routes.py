@@ -21,6 +21,7 @@ from config.settings import CLERK_TOKEN
 from core.services import services
 from services.websocket_service import send_to_user
 from services.utils import serialize_mongo
+from services.work_team_service import create_conversation_work, list_work_teams, record_team_presence, require_conversation_access, require_team
 from core.limiter import limiter
 from loguru import logger
 
@@ -64,7 +65,8 @@ async def get_org_memberships(org_id: str) -> list:
 # === Request Models ===
 
 class TransferRequest(BaseModel):
-    target_agent_id: str
+    target_agent_id: Optional[str] = None
+    target_team_id: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -121,7 +123,8 @@ async def check_transfer_loop(conversation_id: str, target_agent_id: str, org_id
     for entry in history:
         # Support both new format (to_agent.id) and legacy format (id field directly)
         entry_agent_id = (
-            entry.get("to_agent", {}).get("id")
+            entry.get("to_team", {}).get("id")
+            or entry.get("to_agent", {}).get("id")
             or entry.get("id")
         )
         if entry_agent_id != target_agent_id:
@@ -169,38 +172,74 @@ async def transfer_conversation(
     - Emits WebSocket event
     """
 
+    if not payload.target_agent_id and not payload.target_team_id:
+        raise HTTPException(422, "Choose a team or team member")
+
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{user.org_id}"]
-    # 1. Verify org ownership (CRITICAL: prevents cross-org access)
-    conv = await collection.find_one({"conversation_id": conversation_id})
-    if not conv:
-        raise HTTPException(404, "Conversation not found")
-
-    # 2. Validate target agent exists in same org via Clerk
-    memberships_data = await get_org_memberships(user.org_id)
+    conv = await require_conversation_access(
+        user.org_id, conversation_id, user.user_id, user.role
+    )
+    team = await require_team(user.org_id, payload.target_team_id) if payload.target_team_id else None
 
     target_member = None
-    for m in memberships_data:
-        if m.get("public_user_data", {}).get("user_id") == payload.target_agent_id:
-            target_member = m
-            break
-
-    if not target_member or target_member.get("public_user_data", {}).get("banned"):
-        raise HTTPException(400, "Target agent not found or inactive in organization")
-
-    # 3. Check transfer loop
-    is_loop = await check_transfer_loop(conversation_id, payload.target_agent_id, user.org_id)
-    if is_loop:
-        raise HTTPException(
-            400,
-            "Transfer loop detected. This conversation was recently handled by the target agent."
+    target_name = None
+    if payload.target_agent_id:
+        memberships_data = await get_org_memberships(user.org_id)
+        target_member = next((
+            membership for membership in memberships_data
+            if membership.get("public_user_data", {}).get("user_id") == payload.target_agent_id
+        ), None)
+        if not target_member or target_member.get("public_user_data", {}).get("banned"):
+            raise HTTPException(400, "Target team member was not found or is inactive")
+        if team and payload.target_agent_id not in team.get("member_ids", []):
+            raise HTTPException(422, "That person is not a member of the selected team")
+        public_data = target_member.get("public_user_data", {})
+        target_name = (
+            f"{public_data.get('first_name', '')} {public_data.get('last_name', '')}".strip()
+            or public_data.get("identifier")
+            or "Team member"
         )
 
-    # 4. Get target agent name
-    public_data = target_member.get("public_user_data", {})
-    target_name = f"{public_data.get('first_name', '')} {public_data.get('last_name', '')}".strip() or public_data.get("identifier") or "Agent"
+    teams = await list_work_teams(user.org_id)
+    if payload.target_agent_id and not team and teams:
+        member_teams = [item for item in teams if payload.target_agent_id in item.get("member_ids", [])]
+        if not any(item.get("type") == "sales" for item in member_teams):
+            if len(member_teams) == 1:
+                team = member_teams[0]
+            elif len(member_teams) > 1:
+                raise HTTPException(422, "Choose which team should receive this work")
+            else:
+                raise HTTPException(422, "Add this person to a team before assigning work")
 
-    # 5. Optimistic locking update
+    if team:
+        work, created = await create_conversation_work(
+            user.org_id,
+            conversation_id,
+            user.user_id,
+            user.full_name or "Team member",
+            user.role,
+            {
+                "team_id": team["team_id"],
+                "assigned_agent_id": payload.target_agent_id,
+                "assigned_agent_name": target_name,
+                "type": "pricing" if team.get("type") == "sales" else team.get("type"),
+                "note": payload.reason,
+            },
+        )
+        updated_conversation = await collection.find_one({"conversation_id": conversation_id})
+        return {
+            "status": "success",
+            "message": "Work assigned",
+            "conversation": serialize_mongo(updated_conversation),
+            "work_item": work,
+            "created": created,
+        }
+
+    target_key = payload.target_agent_id
+    if await check_transfer_loop(conversation_id, target_key, user.org_id):
+        raise HTTPException(400, "This chat was transferred to the same destination recently")
+
     current_version = conv.get("version")
 
     # Build query to match current version OR missing version field if current_version is None/0
@@ -214,35 +253,37 @@ async def transfer_conversation(
     else:
         query["version"] = current_version
 
-    previous_owner_id = conv.get("assigned_agent_id") or conv.get("assigned_agent", {}).get("id")
-    previous_owner_name = conv.get("assigned_agent", {}).get("name") or conv.get("assigned_agent", {}).get("username") or "Unassigned"
+    previous_owner_id = conv.get("assigned_agent_id") or (conv.get("assigned_agent") or {}).get("id")
+    previous_owner_name = (
+        (conv.get("assigned_agent") or {}).get("name")
+        or (conv.get("assigned_agent") or {}).get("username")
+        or "Unassigned"
+    )
+    now = datetime.utcnow().isoformat()
+    updates = {
+        "owner_team_id": None,
+        "owner_team_name": None,
+        "assigned_agent_id": payload.target_agent_id,
+        "assigned_agent": ({
+            "id": payload.target_agent_id,
+            "name": target_name,
+            "username": target_name,
+            "assigned_at": now,
+        } if payload.target_agent_id else None),
+    }
+    history = {
+        "from_agent": {"id": previous_owner_id, "name": previous_owner_name},
+        "to_agent": ({"id": payload.target_agent_id, "name": target_name} if payload.target_agent_id else None),
+        "to_team": None,
+        "timestamp": now,
+        "reason": payload.reason,
+    }
     updated_conversation = await collection.find_one_and_update(
         query,
         {
-            "$set": {
-                "assigned_agent_id": payload.target_agent_id,
-                "assigned_agent": {
-                    "id": payload.target_agent_id,
-                    "name": target_name,
-                    "username": target_name,   # kept for downstream consumers using .username
-                    "assigned_at": datetime.utcnow().isoformat()
-                }
-            },
+            "$set": updates,
             "$inc": {"version": 1},
-            "$push": {
-                "assignment_history": {
-                    "from_agent": {
-                        "id": previous_owner_id,
-                        "name": previous_owner_name,
-                    },
-                    "to_agent": {
-                        "id": payload.target_agent_id,
-                        "name": target_name
-                    },
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "reason": payload.reason
-                }
-            }
+            "$push": {"assignment_history": history},
         },
         return_document=ReturnDocument.AFTER,
     )
@@ -256,26 +297,38 @@ async def transfer_conversation(
         org_id=user.org_id,
         action="transferred",
         from_agent_id=previous_owner_id,
-        to_agent_id=payload.target_agent_id,
+        to_agent_id=target_key,
         performed_by=user.user_id,
         ip_address=request.client.host,
         reason=payload.reason
     )
 
     # 7. WebSocket notification
-    try:
-        await send_to_user(payload.target_agent_id, {
-            "type": "conversation_transferred",
-            "conversation_id": conversation_id,
-            "from_agent": user.full_name or "Agent",
-            "to_agent": target_name,
-            "customer_name": conv.get("customer_name") or "Customer",
-            "reason": payload.reason
-        })
-    except Exception as e:
-        logger.warning(f"Failed to send WebSocket notification: {e}")
+    sales_member_ids = [
+        member_id
+        for sales_team in await list_work_teams(user.org_id)
+        if sales_team.get("type") == "sales"
+        for member_id in sales_team.get("member_ids", [])
+    ]
+    recipients = [
+        *sales_member_ids,
+        payload.target_agent_id,
+    ]
+    for recipient_id in dict.fromkeys(recipient for recipient in recipients if recipient):
+        try:
+            await send_to_user(recipient_id, {
+                "type": "conversation_transferred",
+                "conversation_id": conversation_id,
+                "from_agent": user.full_name or "Team member",
+                "to_agent": target_name,
+                "to_team": None,
+                "customer_name": conv.get("customer_name") or "Customer",
+                "reason": payload.reason,
+            }, org_id=user.org_id)
+        except Exception as error:
+            logger.warning(f"Failed to notify transferred conversation recipient: {error}")
 
-    logger.info(f"Conversation {conversation_id} transferred from {user.user_id} to {payload.target_agent_id}")
+    logger.info(f"Conversation {conversation_id} transferred from {user.user_id} to {target_key}")
 
     return {
         "status": "success",
@@ -299,10 +352,9 @@ async def reclaim_conversation(
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{user.org_id}"]
 
-    # Verify org ownership
-    conv = await collection.find_one({"conversation_id": conversation_id})
-    if not conv:
-        raise HTTPException(404, "Conversation not found")
+    conv = await require_conversation_access(
+        user.org_id, conversation_id, user.user_id, user.role
+    )
 
     # Check user was previous owner
     history = conv.get("assignment_history", [])
@@ -392,6 +444,9 @@ async def create_mentions(
     async_db = get_async_mongo_db()
     users_col = async_db.users
     mentions_col = async_db.conversation_mentions
+    await require_conversation_access(
+        user.org_id, conversation_id, user.user_id, user.role
+    )
 
     # Dedupe
     unique_usernames = list(set(payload.mentioned_usernames))
@@ -452,7 +507,7 @@ async def create_mentions(
                 "conversation_id": conversation_id,
                 "from_agent": user.full_name or "Agent",
                 "message_content": payload.message_content[:100]
-            })
+            }, org_id=user.org_id)
         except Exception as e:
             logger.warning(f"Failed to send WebSocket mention notification: {e}")
 
@@ -589,7 +644,7 @@ async def accept_mention(
             "type": "mention_accepted",
             "conversation_id": conversation_id,
             "accepted_by": user.full_name or "Agent"
-        })
+        }, org_id=user.org_id)
     except Exception as e:
         logger.warning(f"Failed to send mention_accepted notification: {e}")
 
@@ -642,7 +697,7 @@ async def reject_mention(
             "type": "mention_rejected",
             "conversation_id": mention["conversation_id"],
             "rejected_by": user.full_name or "Agent"
-        })
+        }, org_id=user.org_id)
     except Exception as e:
         logger.warning(f"Failed to send mention_rejected notification: {e}")
 
@@ -663,6 +718,13 @@ async def get_team_agents(
     """
 
     memberships_data = await get_org_memberships(user.org_id)
+    await record_team_presence(user.org_id, user.user_id)
+    teams = await list_work_teams(user.org_id)
+    active_today_ids = {
+        member_id
+        for team in teams
+        for member_id in team.get("active_today_member_ids", [])
+    }
 
     result = []
     for m in memberships_data:
@@ -689,6 +751,12 @@ async def get_team_agents(
             "name": name,
             "identifier": identifier,
             "role": role_name,
+            "active_today": user_id in active_today_ids,
+            "teams": [
+                {"id": team["team_id"], "name": team["name"], "type": team["type"]}
+                for team in teams
+                if user_id in team.get("member_ids", [])
+            ],
         })
 
     return result

@@ -2,6 +2,7 @@ import httpx
 from typing import Dict, Optional
 from loguru import logger
 from config.settings import X_INTERNAL_SECRET
+from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app/"
@@ -55,8 +56,7 @@ async def send_to_agent(
 
 
     if not X_INTERNAL_SECRET:
-        logger.error("X_INTERNAL_SECRET is required for chatbot service calls")
-        raise RuntimeError("Chatbot service is unavailable: missing internal secret")
+        raise AIProviderUnavailable("configuration_error")
     headers = {
         "Content-Type": "application/json",
         "X-Internal-Secret": X_INTERNAL_SECRET,
@@ -66,7 +66,7 @@ async def send_to_agent(
     endpoint = f"{CHATBOT_BASE_URL}/api/v2/chat"
     
     try:
-        logger.info(f"Sending message to chatbot for {conversation_id}")
+        logger.info(f"Sending message to chatbot for ...{conversation_id[-6:]}")
         logger.debug(
             f"Chatbot payload org={org_id}, conversation=...{conversation_id[-4:]}, "
             f"input_length={len(user_input or '')}"
@@ -84,27 +84,28 @@ async def send_to_agent(
             response.raise_for_status()
             
             # Parse response
-            response_data = response.json()
+            try:
+                response_data = response.json()
+            except ValueError as exc:
+                raise AIProviderUnavailable("malformed_response") from exc
+            if not isinstance(response_data, dict):
+                raise AIProviderUnavailable("malformed_response")
             
             # Extract the chatbot's response
-            final_response = response_data.get("response")
-            
-            if final_response:
-                logger.info(f"Received response from chatbot for {conversation_id}")
-                return { "final_response" : final_response }
-            else:
-                logger.warning(f"Chatbot response missing 'response' field for {conversation_id}: {response_data}")
-                return { "final_response" : "I apologize, but I'm having trouble generating a response right now. Please try again later."}
+            final_response = validate_ai_reply(response_data.get("response"))
+            logger.info(f"Received response from chatbot for ...{conversation_id[-6:]}")
+            return {"final_response": final_response}
 
-    except httpx.TimeoutException:
-        logger.error(f"Timeout while calling chatbot for {conversation_id}")
-        return { "final_response" : "I apologize, but I'm taking longer than usual to respond. Please try again in a moment."} 
+    except AIProviderUnavailable:
+        raise
+    except httpx.TimeoutException as exc:
+        raise AIProviderUnavailable("timeout") from exc
         
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error from chatbot: {e.response.status_code} - {e.response.text}")
-        return { "final_response" : "I apologize, but I'm experiencing technical difficulties. Please try again later."}  
+        raise AIProviderUnavailable("http_error", upstream_status=e.response.status_code) from e
+    except httpx.RequestError as exc:
+        raise AIProviderUnavailable("network_error") from exc
         
     except Exception as e:
-        logger.error(f"Unexpected error calling chatbot: {str(e)}", exc_info=True)
-        return { "final_response" : "I apologize, but something went wrong. Please try again later."}  
+        raise AIProviderUnavailable("unexpected_error") from e
     
