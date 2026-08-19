@@ -41,6 +41,7 @@ from services.whatsapp_call_history import (
     meta_datetime,
     provider_lifecycle_filter,
 )
+from services.intent_queue_worker import enqueue_intent_check
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -933,6 +934,21 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context=context,
                                         notify_push=True,
                                     )
+
+                                # === Purchase Intent Background Check ===
+                                # Queue this message for background AI analysis.
+                                # Non-blocking, non-critical — failure here MUST NOT affect the webhook.
+                                try:
+                                    await asyncio.to_thread(
+                                        enqueue_intent_check,
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        customer_phone=customer_phone_no,
+                                        customer_name=sender_name2,
+                                        message_content=content,
+                                    )
+                                except Exception:
+                                    pass  # silently ignore — intent extraction is best-effort
 
                                 if is_dealer_reply:
                                     logger.info("Dealer reply stored and intercepted. Skipping buyer pricing and AI flow.")

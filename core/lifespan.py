@@ -6,6 +6,7 @@ from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cac
 from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, recover_stale_bulk_jobs
 from services.automation_scheduler import startup_scheduler, shutdown_scheduler
 from services.google_sheets_scheduler import startup_google_scheduler, shutdown_google_scheduler
+from services.intent_queue_worker import startup_intent_worker, shutdown_intent_worker
 from services.followup_service import ensure_followup_indexes
 from services.oos_service import ensure_oos_indexes
 from services.pricing_service import ensure_pricing_indexes
@@ -39,9 +40,11 @@ async def lifespan(app: FastAPI):
     await ensure_sales_offer_indexes()
     await ensure_tally_indexes()
     await start_push_notification_workers()
+    await startup_intent_worker()
     yield
     # Shutdown
     await stop_push_notification_workers()
+    await shutdown_intent_worker()
     await shutdown_scheduler()
     await shutdown_google_scheduler()
     clear_agents()
