@@ -116,6 +116,7 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn('alias="X-Tally-Connector-Key"', source)
         self.assertIn('alias="X-Tally-Claim-Id"', source)
         self.assertIn('await admin_required(user)', source)
+        self.assertIn('connector_version_number < 3', source)
         self.assertNotIn('"connector_key_hash": integration', source)
 
     def test_failure_escalation_connects_customer_and_tally_context(self):
