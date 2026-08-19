@@ -13,6 +13,7 @@ from services.tally_service import (
     claim_next_job,
     create_connector_key,
     finish_job,
+    get_customer_mapping,
     get_integration,
     list_bills,
     normalized_settings,
@@ -141,7 +142,10 @@ async def post_quote_to_tally(request: Request, quote_id: str, payload: QueueBil
 @router.get("/api/conversations/{conversation_id}/tally-bills")
 @limiter.limit("60/minute")
 async def get_tally_bills(request: Request, conversation_id: str, user: CurrentUser):
-    return {"bills": await list_bills(user.org_id, conversation_id, user.user_id, user.role)}
+    return {
+        "bills": await list_bills(user.org_id, conversation_id, user.user_id, user.role),
+        "customer_mapping": await get_customer_mapping(user.org_id, conversation_id),
+    }
 
 
 @router.post("/api/tally-bills/{job_id}/retry")

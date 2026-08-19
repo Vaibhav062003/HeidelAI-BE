@@ -15,7 +15,10 @@ class HTTPException(Exception):
 
 source = pathlib.Path("services/tally_service.py").read_text()
 tree = ast.parse(source)
-wanted = {"connector_key_hash", "stable_remote_id", "normalized_settings", "_money", "_number", "_xml", "_ledger", "build_sales_voucher_xml"}
+wanted = {
+    "connector_key_hash", "stable_remote_id", "normalized_settings", "_money", "_number", "_xml", "_ledger",
+    "_customer_snapshot", "_tally_escalation_payload", "build_sales_voucher_xml",
+}
 nodes = [
     node for node in tree.body
     if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted)
@@ -29,6 +32,8 @@ exec(compile(ast.Module(body=nodes, type_ignores=[]), "services/tally_service.py
 build_sales_voucher_xml = namespace["build_sales_voucher_xml"]
 connector_key_hash = namespace["connector_key_hash"]
 normalized_settings = namespace["normalized_settings"]
+customer_snapshot = namespace["_customer_snapshot"]
+tally_escalation_payload = namespace["_tally_escalation_payload"]
 
 
 class TallyContractTests(unittest.TestCase):
@@ -44,6 +49,10 @@ class TallyContractTests(unittest.TestCase):
             "shipping": 10,
             "discount": 5,
             "public_grand_total": 123,
+            "customer": {
+                "name": "Buyer & Sons", "phone": "+919999999999", "email": "buyer@example.com",
+                "gstin": "27ABCDE1234F1Z5", "address": "Pune",
+            },
             "items": [{
                 "description": "RTX <5060> & build",
                 "quantity": 1,
@@ -90,6 +99,19 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn('alias="X-Tally-Claim-Id"', source)
         self.assertIn('await admin_required(user)', source)
         self.assertNotIn('"connector_key_hash": integration', source)
+
+    def test_failure_escalation_connects_customer_and_tally_context(self):
+        customer = customer_snapshot(self.quote)
+        payload = tally_escalation_payload({
+            "job_id": "job-1", "conversation_id": "whatsapp_919999999999",
+            "quote_id": "quote_test", "quote_number": "Q-100", "party_ledger": "Buyer Ledger",
+            "amount": 123, "customer": customer,
+        }, "failed", "Ledger does not exist")
+        self.assertEqual(payload["id"], "tally:job-1")
+        self.assertEqual(payload["metadata"]["conversation_id"], "whatsapp_919999999999")
+        self.assertEqual(payload["metadata"]["customer"]["gstin"], "27ABCDE1234F1Z5")
+        self.assertEqual(payload["metadata"]["party_ledger"], "Buyer Ledger")
+        self.assertIn("Ledger does not exist", payload["customer_text"])
 
 
 if __name__ == "__main__":
