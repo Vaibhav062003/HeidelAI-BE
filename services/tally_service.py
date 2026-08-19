@@ -4,9 +4,10 @@ import secrets
 import shlex
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from html import escape
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException
 from pymongo import ReturnDocument
@@ -32,7 +33,13 @@ DEFAULT_SETTINGS = {
     "shipping_ledger": "",
     "discount_ledger": "",
     "reminder_days_after": [0, 3, 7],
+    "reminders_enabled": False,
+    "reminder_time": "10:00",
+    "reminder_timezone": "Asia/Kolkata",
+    "reminder_template_name": "",
+    "reminder_template_language": "en",
 }
+GSTIN_PATTERN = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 
 
 def _money(value) -> Decimal:
@@ -64,6 +71,26 @@ def normalized_settings(value: dict | None) -> dict:
         if isinstance(day, int) and 0 <= day <= 365
     })[:10]
     return settings
+
+
+def valid_gstin_format(value: str) -> bool:
+    return bool(GSTIN_PATTERN.fullmatch((value or "").strip().upper()))
+
+
+def _tally_date(value: str) -> str:
+    text = (value or "").strip()
+    for pattern in ("%Y%m%d", "%d-%b-%Y", "%d-%b-%y", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, pattern).date().isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
+def _financial_year_period(today: date | None = None) -> tuple[str, str]:
+    current = today or date.today()
+    start_year = current.year if current.month >= 4 else current.year - 1
+    return date(start_year, 4, 1).isoformat(), current.isoformat()
 
 
 def parse_invoice_command(command: str) -> dict:
@@ -114,11 +141,40 @@ def _export_collection_xml(settings: dict, collection: str, fetch: list[str], *,
     )
 
 
+def build_report_xml(settings: dict, report: str, from_date: str, to_date: str, export_format: str = "XML") -> str:
+    settings = normalized_settings(settings)
+    return (
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>"
+        f"<TYPE>Data</TYPE><ID>{_xml(report)}</ID></HEADER><BODY><DESC><STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{_xml(settings['company_name'])}</SVCURRENTCOMPANY>"
+        f"<SVFROMDATE>{_xml(from_date.replace('-', ''))}</SVFROMDATE>"
+        f"<SVTODATE>{_xml(to_date.replace('-', ''))}</SVTODATE>"
+        f"<SVEXPORTFORMAT>$$SysName:{_xml(export_format)}</SVEXPORTFORMAT>"
+        "</STATICVARIABLES></DESC></BODY></ENVELOPE>"
+    )
+
+
+def build_invoice_pdf_request(settings: dict, invoice: dict) -> str:
+    settings = normalized_settings(settings)
+    return (
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Data</TYPE><ID>Voucher</ID></HEADER><BODY><DESC><STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{_xml(settings['company_name'])}</SVCURRENTCOMPANY>"
+        "<SVEXPORTFORMAT>$$SysName:PDF</SVEXPORTFORMAT>"
+        f"<SVVOUCHERTYPENAME>{_xml(invoice.get('voucher_type') or settings['voucher_type'])}</SVVOUCHERTYPENAME>"
+        f"<SVVOUCHERNO>{_xml(invoice.get('voucher_number'))}</SVVOUCHERNO>"
+        f"<SVFROMDATE>{_xml(str(invoice.get('date') or '').replace('-', ''))}</SVFROMDATE>"
+        f"<SVTODATE>{_xml(str(invoice.get('date') or '').replace('-', ''))}</SVTODATE>"
+        "</STATICVARIABLES></DESC></BODY></ENVELOPE>"
+    )
+
+
 def build_snapshot_requests(settings: dict) -> list[dict]:
+    fy_from, fy_to = _financial_year_period()
     return [
         {"key": "ledgers", "xml": _export_collection_xml(settings, "Ledger", [
             "Name", "Parent", "GUID", "MasterID", "AlterID", "ClosingBalance", "OpeningBalance",
-            "LedgerMobile", "LedgerPhone", "Email", "PartyGSTIN", "LedgerStateName", "GSTRegistrationType",
+            "LedgerMobile", "LedgerPhone", "Email", "PartyGSTIN", "LedgerStateName", "GSTRegistrationType", "IsBillWiseOn",
         ])},
         {"key": "stock_items", "xml": _export_collection_xml(settings, "StockItem", [
             "Name", "Alias", "Parent", "GUID", "MasterID", "AlterID", "BaseUnits", "ClosingBalance",
@@ -128,9 +184,11 @@ def build_snapshot_requests(settings: dict) -> list[dict]:
             "Name", "GUID", "MasterID", "AlterID", "OriginalName", "GSTRepUOM",
         ])},
         {"key": "invoices", "xml": _export_collection_xml(settings, "Voucher", [
-            "Date", "VoucherNumber", "Reference", "VoucherTypeName", "PartyLedgerName", "GUID", "MasterID",
+            "Date", "EffectiveDate", "VoucherNumber", "Reference", "VoucherTypeName", "PartyLedgerName", "GUID", "MasterID",
             "AlterID", "Amount", "AllLedgerEntries", "AllInventoryEntries",
         ], filters="HeidelAISalesVoucher")},
+        {"key": "outstandings", "xml": build_report_xml(settings, "Bills Receivable", "1970-01-01", fy_to)},
+        {"key": "profit_loss", "xml": build_report_xml(settings, "Profit and Loss", fy_from, fy_to)},
     ]
 
 
@@ -148,11 +206,90 @@ def _decimal_text(value: str) -> Decimal:
     return Decimal(match.group(0).replace(",", "")) if match else Decimal("0")
 
 
+def _tag(node: ET.Element) -> str:
+    return node.tag.rsplit("}", 1)[-1].upper()
+
+
+def _direct_text(node: ET.Element, *names: str) -> str:
+    wanted = {name.upper() for name in names}
+    for child in node:
+        if _tag(child) in wanted and child.text:
+            return child.text.strip()
+    return ""
+
+
+def parse_outstanding_response(xml: str) -> list[dict]:
+    try:
+        root = ET.fromstring(xml or "")
+    except ET.ParseError as exc:
+        raise HTTPException(status_code=502, detail="Tally returned invalid outstandings XML") from exc
+    fixed = [node for node in root.iter() if _tag(node) in {"BILLFIXED", "BILLOUTSTANDING"}]
+    closing = ["".join(node.itertext()).strip() for node in root.iter() if _tag(node) in {"BILLCL", "PENDINGAMOUNT"}]
+    rows = []
+    for index, node in enumerate(fixed):
+        reference = _node_text(node, "BILLREF", "REFERENCE", "NAME")
+        party = _node_text(node, "BILLPARTY", "PARTYLEDGERNAME", "LEDGERNAME")
+        amount_text = _node_text(node, "BILLCL", "PENDINGAMOUNT", "CLOSINGBALANCE")
+        if not amount_text and index < len(closing):
+            amount_text = closing[index]
+        amount = float(abs(_decimal_text(amount_text)))
+        if reference and party and amount > 0:
+            rows.append({
+                "bill_reference": reference,
+                "party_ledger": party,
+                "date": _tally_date(_node_text(node, "BILLDATE", "DATE")),
+                "due_date": _tally_date(_node_text(node, "BILLDUE", "DUEDATE")),
+                "outstanding_amount": amount,
+            })
+    return rows
+
+
+def parse_profit_loss_response(xml: str) -> dict:
+    try:
+        root = ET.fromstring(xml or "")
+    except ET.ParseError as exc:
+        raise HTTPException(status_code=502, detail="Tally returned invalid Profit & Loss XML") from exc
+    names = [
+        " ".join((_node_text(node, "DSPDISPNAME") or "".join(node.itertext())).split())
+        for node in root.iter() if _tag(node) == "DSPACCNAME"
+    ]
+    debits = [
+        float(abs(_decimal_text("".join(node.itertext()))))
+        for node in root.iter() if _tag(node) in {"DSPCLAMT", "DSPCLDRAMT"}
+    ]
+    credits = [
+        float(abs(_decimal_text("".join(node.itertext()))))
+        for node in root.iter() if _tag(node) in {"DSPCRAMT", "DSPCLCRAMT"}
+    ]
+    rows = []
+    for index, label in enumerate(names):
+        debit = debits[index] if index < len(debits) else 0.0
+        credit = credits[index] if index < len(credits) else 0.0
+        rows.append({"label": label, "debit": debit, "credit": credit, "amount": credit - debit})
+    summary = {"sales": 0.0, "gross_profit": 0.0, "net_profit": 0.0}
+    for row in rows:
+        label = row["label"].casefold()
+        value = row["credit"] or row["debit"] or abs(row["amount"])
+        if not summary["sales"] and (label == "sales accounts" or label.startswith("sales")):
+            summary["sales"] = value
+        if "gross profit" in label or "gross loss" in label:
+            summary["gross_profit"] = value if "profit" in label else -value
+        if "net profit" in label or "nett profit" in label or "net loss" in label or "nett loss" in label:
+            summary["net_profit"] = value if "profit" in label else -value
+    return {"rows": rows, **summary}
+
+
 def parse_snapshot_responses(responses: list[dict]) -> dict:
-    parsed = {"ledgers": [], "stock_items": [], "units": [], "invoices": []}
+    parsed = {"ledgers": [], "stock_items": [], "units": [], "invoices": [], "outstandings": [], "profit_loss": {}}
     tags = {"ledgers": "LEDGER", "stock_items": "STOCKITEM", "units": "UNIT", "invoices": "VOUCHER"}
     for response in responses or []:
         key = response.get("key")
+        if key == "outstandings":
+            parsed[key] = parse_outstanding_response(response.get("xml") or "")
+            continue
+        if key == "profit_loss":
+            parsed[key] = parse_profit_loss_response(response.get("xml") or "")
+            continue
         if key not in tags:
             continue
         try:
@@ -185,6 +322,7 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                     "gstin": _node_text(node, "PARTYGSTIN"),
                     "state": _node_text(node, "LEDGERSTATENAME", "LEDSTATENAME"),
                     "registration_type": _node_text(node, "GSTREGISTRATIONTYPE"),
+                    "billwise": _node_text(node, "ISBILLWISEON").casefold() == "yes",
                 })
             elif key == "stock_items":
                 aliases = [value.strip() for value in _node_text(node, "ALIAS").split(",") if value.strip()]
@@ -206,14 +344,32 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                     "uqc": _node_text(node, "GSTREPUOM"),
                 })
             else:
-                amount = _decimal_text(_node_text(node, "AMOUNT"))
+                amount = _decimal_text(_direct_text(node, "AMOUNT"))
+                items = []
+                bill_reference = ""
+                due_date = ""
+                for child in node.iter():
+                    if _tag(child) == "ALLINVENTORYENTRIES.LIST":
+                        items.append({
+                            "name": _node_text(child, "STOCKITEMNAME"),
+                            "quantity": float(abs(_decimal_text(_node_text(child, "BILLEDQTY", "ACTUALQTY")))),
+                            "rate": float(abs(_decimal_text(_node_text(child, "RATE")))),
+                            "amount": float(abs(_decimal_text(_direct_text(child, "AMOUNT")))),
+                        })
+                    elif _tag(child) == "BILLALLOCATIONS.LIST" and not bill_reference:
+                        bill_reference = _node_text(child, "NAME")
+                        due_date = _tally_date(_node_text(child, "BILLDUE", "DUEDATE"))
+                invoice_date = _tally_date(_node_text(node, "EFFECTIVEDATE", "DATE"))
                 parsed[key].append({**common,
                     "voucher_number": _node_text(node, "VOUCHERNUMBER"),
-                    "date": _node_text(node, "DATE"),
+                    "date": invoice_date,
                     "reference": _node_text(node, "REFERENCE"),
+                    "bill_reference": bill_reference or _node_text(node, "REFERENCE") or _node_text(node, "VOUCHERNUMBER"),
+                    "due_date": due_date or invoice_date,
                     "voucher_type": _node_text(node, "VOUCHERTYPENAME"),
                     "party_ledger": _node_text(node, "PARTYLEDGERNAME"),
                     "amount": float(abs(amount)),
+                    "items": items,
                 })
     return parsed
 
@@ -283,6 +439,19 @@ async def _remember_customer_mapping(org_id: str, job: dict) -> None:
     update = {"$set": {"tally_customer_mapping": mapping}}
     await db[f"conversations_{org_id}"].update_one(query, update)
     await db[f"contacts_{org_id}"].update_one(query, update)
+    ledger = await db.tally_ledgers.find_one({
+        "org_id": org_id, "name": {"$regex": f"^{re.escape(job['party_ledger'])}$", "$options": "i"},
+    }, {"master_id": 1})
+    if ledger and ledger.get("master_id") and job.get("conversation_id", "").startswith("whatsapp_"):
+        await db.tally_customer_links.update_one(
+            {"org_id": org_id, "party_master_id": ledger["master_id"]},
+            {"$set": {
+                "party_ledger": job["party_ledger"], "conversation_id": job["conversation_id"],
+                "phone": job["conversation_id"].removeprefix("whatsapp_"), "updated_at": datetime.now(timezone.utc),
+                "updated_by": job.get("created_by") or "invoice",
+            }},
+            upsert=True,
+        )
 
 
 async def get_customer_mapping(org_id: str, conversation_id: str) -> dict:
@@ -534,6 +703,10 @@ async def queue_tally_master(org_id: str, user_id: str, kind: str, value: dict, 
     integration = await get_integration(org_id)
     if not normalized_settings(integration)["company_name"].strip() or not integration.get("connector_key_hash"):
         raise HTTPException(status_code=409, detail="Configure and connect TallyPrime first")
+    if kind == "party" and value.get("gstin"):
+        value["gstin"] = str(value["gstin"]).strip().upper()
+        if not valid_gstin_format(value["gstin"]):
+            raise HTTPException(status_code=422, detail="Enter a valid 15-character GSTIN format")
     collection = {
         "stock_item": db.tally_stock_items,
         "unit": db.tally_units,
@@ -566,18 +739,50 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
     parsed = parse_snapshot_responses(responses)
     sync_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
-    for key, collection in (
-        ("ledgers", db.tally_ledgers), ("stock_items", db.tally_stock_items),
-        ("units", db.tally_units), ("invoices", db.tally_invoices),
+    previous_pdfs = {}
+    async for row in db.tally_invoices.find(
+        {"org_id": org_id, "pdf.url": {"$type": "string"}}, {"master_id": 1, "pdf": 1}
     ):
+        if row.get("master_id"):
+            previous_pdfs[row["master_id"]] = row.get("pdf")
+    outstanding = {
+        (row["party_ledger"].casefold(), row["bill_reference"].casefold()): row
+        for row in parsed["outstandings"]
+    }
+    ledger_ids = {row["name"].casefold(): row.get("master_id", "") for row in parsed["ledgers"]}
+    billwise_ledgers = {row["name"].casefold(): row.get("billwise") is True for row in parsed["ledgers"]}
+    for invoice in parsed["invoices"]:
+        invoice["invoice_id"] = invoice.get("master_id") or invoice.get("guid") or f"{invoice['voucher_number']}:{invoice['date']}"
+        invoice["party_master_id"] = ledger_ids.get(invoice.get("party_ledger", "").casefold(), "")
+        due = outstanding.get((invoice.get("party_ledger", "").casefold(), invoice.get("bill_reference", "").casefold()))
+        invoice["outstanding_amount"] = float((due or {}).get("outstanding_amount") or 0)
+        invoice["due_date"] = (due or {}).get("due_date") or invoice.get("due_date") or invoice.get("date")
+        invoice["payment_status"] = (
+            "overdue" if due and invoice["due_date"] and invoice["due_date"] < date.today().isoformat()
+            else "outstanding" if due
+            else "paid" if billwise_ledgers.get(invoice.get("party_ledger", "").casefold())
+            else "unknown"
+        )
+        pdf = previous_pdfs.get(invoice.get("master_id"))
+        if pdf and str(pdf.get("alter_id")) == str(invoice.get("alter_id")):
+            invoice["pdf"] = pdf
+    for key, collection in (("ledgers", db.tally_ledgers), ("stock_items", db.tally_stock_items), ("units", db.tally_units), ("invoices", db.tally_invoices), ("outstandings", db.tally_outstandings)):
         rows = [{**row, "org_id": org_id, "sync_id": sync_id, "synced_at": now} for row in parsed[key]]
         if rows:
             await collection.insert_many(rows)
         await collection.delete_many({"org_id": org_id, "sync_id": {"$ne": sync_id}})
+    fy_from, fy_to = _financial_year_period()
+    if parsed["profit_loss"].get("rows"):
+        await db.tally_profit_loss_reports.update_one(
+            {"org_id": org_id, "from_date": fy_from, "to_date": fy_to},
+            {"$set": {**parsed["profit_loss"], "synced_at": now}},
+            upsert=True,
+        )
     await db.tally_integrations.update_one(
         {"org_id": org_id}, {"$set": {"last_sync_at": now, "last_sync_error": None}}
     )
-    return {"counts": {key: len(value) for key, value in parsed.items()}, "last_sync_at": now}
+    await reconcile_default_payment_reminders(org_id)
+    return {"counts": {key: len(value) for key, value in parsed.items() if isinstance(value, list)}, "last_sync_at": now}
 
 
 async def list_tally_ledgers(org_id: str, kind: str = "", query: str = "") -> list[dict]:
@@ -610,32 +815,146 @@ async def list_tally_units(org_id: str) -> list[dict]:
     return serialize_mongo(rows)
 
 
-async def list_tally_invoices(org_id: str) -> list[dict]:
-    rows = await db.tally_invoices.find({"org_id": org_id}, {"_id": 0, "sync_id": 0}).sort("date", -1).to_list(length=500)
-    return serialize_mongo(rows)
+async def list_tally_invoices(
+    org_id: str, page: int = 1, page_size: int = 50, query: str = "", status: str = "",
+    from_date: str = "", to_date: str = "",
+) -> dict:
+    match: dict = {"org_id": org_id}
+    if query.strip():
+        pattern = {"$regex": re.escape(query.strip()), "$options": "i"}
+        match["$or"] = [{"voucher_number": pattern}, {"party_ledger": pattern}, {"reference": pattern}]
+    if status in {"paid", "outstanding", "overdue", "unknown"}:
+        match["payment_status"] = status
+    if from_date or to_date:
+        match["date"] = {}
+        if from_date:
+            match["date"]["$gte"] = from_date
+        if to_date:
+            match["date"]["$lte"] = to_date
+    total = await db.tally_invoices.count_documents(match)
+    rows = await db.tally_invoices.find(match, {"_id": 0, "sync_id": 0}).sort([("date", -1), ("voucher_number", -1)]).skip((page - 1) * page_size).limit(page_size).to_list(length=page_size)
+    invoice_ids = [row.get("invoice_id") for row in rows if row.get("invoice_id")]
+    links = {row["party_master_id"]: row for row in await db.tally_customer_links.find(
+        {"org_id": org_id, "party_master_id": {"$in": [row.get("party_master_id") for row in rows]}}, {"_id": 0}
+    ).to_list(length=page_size)}
+    reminders = {}
+    async for reminder in db.tally_payment_reminders.find(
+        {"org_id": org_id, "invoice_id": {"$in": invoice_ids}, "status": {"$in": ["pending", "needs_review"]}}, {"_id": 0}
+    ).sort("scheduled_at", 1):
+        reminders.setdefault(reminder["invoice_id"], reminder)
+    for row in rows:
+        row["customer_link"] = links.get(row.get("party_master_id"))
+        row["next_reminder"] = reminders.get(row.get("invoice_id"))
+    return serialize_mongo({"invoices": rows, "total": total, "page": page, "page_size": page_size})
 
 
-async def tally_overview(org_id: str) -> dict:
+async def tally_overview(org_id: str, include_financials: bool = False) -> dict:
     integration = await get_integration(org_id)
-    party_ledgers = await db.tally_ledgers.find(
-        {"org_id": org_id, "parent": "Sundry Debtors"}, {"_id": 0, "closing_balance": 1}
-    ).to_list(length=5000)
-    stock = await db.tally_stock_items.find(
-        {"org_id": org_id}, {"_id": 0, "closing_quantity": 1}
-    ).to_list(length=5000)
+    customers = await db.tally_ledgers.count_documents({"org_id": org_id, "parent": "Sundry Debtors"})
+    products = await db.tally_stock_items.count_documents({"org_id": org_id})
+    low_stock = await db.tally_stock_items.count_documents({"org_id": org_id, "closing_quantity": {"$lte": 1}})
+    fy_from, fy_to = _financial_year_period()
+    report = await db.tally_profit_loss_reports.find_one({"org_id": org_id, "from_date": fy_from, "to_date": fy_to}, {"_id": 0}) or {}
     now = datetime.now(timezone.utc)
     last_seen = integration.get("last_seen_at")
     connected = isinstance(last_seen, datetime) and (
         last_seen.replace(tzinfo=timezone.utc) if last_seen.tzinfo is None else last_seen
     ) >= now - timedelta(seconds=90)
-    return serialize_mongo({
+    receivable_totals = await db.tally_invoices.aggregate([
+        {"$match": {"org_id": org_id, "payment_status": {"$in": ["outstanding", "overdue"]}}},
+        {"$group": {"_id": None, "total": {"$sum": "$outstanding_amount"}}},
+    ]).to_list(length=1)
+    overview = {
         "connected": connected, "last_seen_at": last_seen, "last_sync_at": integration.get("last_sync_at"),
         "stale": _snapshot_is_stale(integration, now), "last_error": integration.get("last_sync_error") or integration.get("last_error"),
-        "receivables": sum(abs(float(row.get("closing_balance") or 0)) for row in party_ledgers),
-        "customers": len(party_ledgers), "products": len(stock),
-        "low_stock": sum(1 for row in stock if float(row.get("closing_quantity") or 0) <= 1),
+        "receivables": float((receivable_totals[0] if receivable_totals else {}).get("total") or 0),
+        "customers": customers, "products": products, "low_stock": low_stock,
         "invoices": await db.tally_invoices.count_documents({"org_id": org_id}),
+    }
+    if include_financials:
+        overview.update({
+            "sales": report.get("sales", 0), "gross_profit": report.get("gross_profit", 0),
+            "net_profit": report.get("net_profit", 0), "report_from": fy_from, "report_to": fy_to,
+        })
+    return serialize_mongo(overview)
+
+
+async def get_profit_loss_report(org_id: str, from_date: str, to_date: str) -> dict | None:
+    row = await db.tally_profit_loss_reports.find_one(
+        {"org_id": org_id, "from_date": from_date, "to_date": to_date}, {"_id": 0}
+    )
+    return serialize_mongo(row) if row else None
+
+
+async def queue_profit_loss_report(org_id: str, user_id: str, from_date: str, to_date: str) -> tuple[dict, bool]:
+    integration = await get_integration(org_id)
+    if "reports" not in (integration.get("connector_capabilities") or []):
+        raise HTTPException(status_code=409, detail="Download and restart the latest Tally connector to refresh reports")
+    active = await db.tally_command_jobs.find_one({
+        "org_id": org_id, "job_type": "profit_loss_report", "from_date": from_date, "to_date": to_date,
+        "status": {"$in": ["pending", "processing"]},
+    }, {"_id": 0, "requests": 0})
+    if active:
+        return serialize_mongo(active), False
+    now = datetime.now(timezone.utc)
+    job = {
+        "job_id": str(uuid.uuid4()), "job_type": "profit_loss_report", "org_id": org_id,
+        "from_date": from_date, "to_date": to_date, "status": "pending", "attempts": 0,
+        "requests": [{"key": "profit_loss", "xml": build_report_xml(integration, "Profit and Loss", from_date, to_date)}],
+        "created_at": now, "updated_at": now, "created_by": user_id,
+    }
+    await db.tally_command_jobs.insert_one(job)
+    return serialize_mongo({key: value for key, value in job.items() if key != "requests"}), True
+
+
+async def get_tally_command_job(org_id: str, job_id: str) -> dict:
+    job = await db.tally_command_jobs.find_one({"org_id": org_id, "job_id": job_id}, {"_id": 0, "requests": 0, "responses": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Tally job not found")
+    return serialize_mongo(job)
+
+
+async def queue_invoice_pdf(org_id: str, user_id: str, invoice_id: str) -> tuple[dict, bool]:
+    invoice = await db.tally_invoices.find_one({"org_id": org_id, "invoice_id": invoice_id})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Tally invoice not found")
+    pdf = invoice.get("pdf") or {}
+    if pdf.get("url") and str(pdf.get("alter_id")) == str(invoice.get("alter_id")):
+        return {"status": "completed", "pdf": pdf}, False
+    active = await db.tally_command_jobs.find_one({
+        "org_id": org_id, "job_type": "invoice_pdf", "invoice_id": invoice_id,
+        "status": {"$in": ["pending", "processing"]},
+    }, {"_id": 0, "requests": 0})
+    if active:
+        return serialize_mongo(active), False
+    integration = await get_integration(org_id)
+    if "pdf" not in (integration.get("connector_capabilities") or []):
+        raise HTTPException(status_code=409, detail="Download and restart the latest Tally connector to export invoice PDFs")
+    now = datetime.now(timezone.utc)
+    job = {
+        "job_id": str(uuid.uuid4()), "job_type": "invoice_pdf", "org_id": org_id,
+        "invoice_id": invoice_id, "invoice_alter_id": invoice.get("alter_id", ""), "status": "pending", "attempts": 0,
+        "requests": [{"key": "invoice_pdf", "xml": build_invoice_pdf_request(integration, invoice), "binary": True}],
+        "created_at": now, "updated_at": now, "created_by": user_id,
+    }
+    await db.tally_command_jobs.insert_one(job)
+    return serialize_mongo({key: value for key, value in job.items() if key != "requests"}), True
+
+
+async def store_tally_pdf_artifact(org_id: str, job_id: str, claim_id: str, data: bytes) -> dict:
+    if len(data) > 10_000_000 or not data.startswith(b"%PDF"):
+        raise HTTPException(status_code=422, detail="Tally did not return a valid PDF under 10 MB")
+    job = await db.tally_command_jobs.find_one({
+        "org_id": org_id, "job_id": job_id, "job_type": "invoice_pdf", "status": "processing", "claim_id": claim_id,
     })
+    if not job:
+        raise HTTPException(status_code=409, detail="This Tally PDF claim is no longer active")
+    from services.cloudinary_service import upload_tally_invoice_pdf
+    url = await upload_tally_invoice_pdf(data, org_id, job["invoice_id"], str(job.get("invoice_alter_id") or "current"))
+    pdf = {"url": url, "alter_id": job.get("invoice_alter_id", ""), "generated_at": datetime.now(timezone.utc)}
+    await db.tally_invoices.update_one({"org_id": org_id, "invoice_id": job["invoice_id"]}, {"$set": {"pdf": pdf}})
+    await db.tally_command_jobs.update_one({"_id": job["_id"], "claim_id": claim_id}, {"$set": {"pdf": pdf}})
+    return serialize_mongo(pdf)
 
 
 async def _product_candidates(org_id: str, term: str) -> list[dict]:
@@ -654,6 +973,15 @@ async def _product_candidates(org_id: str, term: str) -> list[dict]:
         *(str(alias).casefold() for alias in row.get("aliases") or []),
     } else 1)
     return serialize_mongo(rows)
+
+
+def _exact_product_master_id(candidates: list[dict], term: str) -> str:
+    requested = term.casefold().strip()
+    matches = [row for row in candidates if requested in {
+        str(row.get("name") or "").casefold(), str(row.get("model_number") or "").casefold(),
+        *(str(alias).casefold() for alias in row.get("aliases") or []),
+    }]
+    return str(matches[0].get("master_id") or "") if len(matches) == 1 else ""
 
 
 async def _party_candidates(org_id: str, customer: dict, mapped_ledger: str = "") -> list[dict]:
@@ -686,9 +1014,10 @@ async def create_tally_invoice_draft(
     quote = None
     if source == "command":
         request = parse_invoice_command(payload.get("command") or "")
+        candidates = await _product_candidates(org_id, request["model"])
         items.append({
             "requested": request["model"], "quantity": request["quantity"],
-            "candidates": await _product_candidates(org_id, request["model"]), "selected_master_id": "",
+            "candidates": candidates, "selected_master_id": _exact_product_master_id(candidates, request["model"]),
         })
         reference = f"HDL-{uuid.uuid4().hex[:8].upper()}"
     elif source == "quote":
@@ -700,7 +1029,7 @@ async def create_tally_invoice_draft(
         for item in quote.get("items") or []:
             term = item.get("sku") or item.get("description") or ""
             candidates = await _product_candidates(org_id, term)
-            selected_master_id = item.get("tally_master_id") or ""
+            selected_master_id = item.get("tally_master_id") or _exact_product_master_id(candidates, term)
             if selected_master_id and not any(row.get("master_id") == selected_master_id for row in candidates):
                 selected = await db.tally_stock_items.find_one(
                     {"org_id": org_id, "master_id": selected_master_id}, {"_id": 0, "sync_id": 0}
@@ -885,6 +1214,240 @@ async def submit_tally_invoice_draft(
     return serialize_mongo(stored), created
 
 
+def _default_reminder_time(due_date: str, days_after: int, settings: dict) -> datetime:
+    try:
+        zone = ZoneInfo(settings.get("reminder_timezone") or "Asia/Kolkata")
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(status_code=422, detail="Choose a valid reminder timezone") from exc
+    try:
+        hour, minute = map(int, str(settings.get("reminder_time") or "10:00").split(":"))
+        local = datetime.combine(date.fromisoformat(due_date) + timedelta(days=days_after), dt_time(hour, minute), zone)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Choose a valid reminder date and time") from exc
+    return local.astimezone(timezone.utc)
+
+
+async def link_tally_customer(org_id: str, user_id: str, party_master_id: str, conversation_id: str) -> dict:
+    party = await db.tally_ledgers.find_one({"org_id": org_id, "master_id": party_master_id, "parent": "Sundry Debtors"})
+    conversation = await db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+    if not party:
+        raise HTTPException(status_code=404, detail="Tally customer ledger not found")
+    if not conversation or not conversation_id.startswith("whatsapp_"):
+        raise HTTPException(status_code=422, detail="Choose an existing WhatsApp customer")
+    link = {
+        "org_id": org_id, "party_master_id": party_master_id, "party_ledger": party["name"],
+        "conversation_id": conversation_id, "phone": conversation_id.removeprefix("whatsapp_"),
+        "updated_at": datetime.now(timezone.utc), "updated_by": user_id,
+    }
+    await db.tally_customer_links.update_one(
+        {"org_id": org_id, "party_master_id": party_master_id}, {"$set": link}, upsert=True,
+    )
+    return serialize_mongo(link)
+
+
+async def reconcile_default_payment_reminders(org_id: str) -> int:
+    settings = normalized_settings(await get_integration(org_id))
+    if not settings["reminders_enabled"] or not settings["reminder_template_name"]:
+        await db.tally_payment_reminders.update_many(
+            {"org_id": org_id, "source": "default", "status": "pending"},
+            {"$set": {"status": "cancelled", "cancel_reason": "Default reminders disabled", "updated_at": datetime.now(timezone.utc)}},
+        )
+        return 0
+    now = datetime.now(timezone.utc)
+    await db.tally_payment_reminders.update_many(
+        {"org_id": org_id, "source": "default", "status": "pending", "days_after": {"$nin": settings["reminder_days_after"]}},
+        {"$set": {"status": "cancelled", "cancel_reason": "Default reminder rule changed", "updated_at": now}},
+    )
+    created = 0
+    invoices = db.tally_invoices.find({
+        "org_id": org_id, "payment_status": {"$in": ["outstanding", "overdue"]},
+        "due_date": {"$type": "string", "$ne": ""}, "party_master_id": {"$type": "string", "$ne": ""},
+    }, {"_id": 0})
+    linked_ids = set(await db.tally_customer_links.distinct("party_master_id", {"org_id": org_id}))
+    async for invoice in invoices:
+        if invoice.get("party_master_id") not in linked_ids:
+            continue
+        for day in settings["reminder_days_after"]:
+            try:
+                scheduled_at = _default_reminder_time(invoice["due_date"], day, settings)
+            except HTTPException:
+                continue
+            if scheduled_at <= now:
+                continue
+            key = f"{org_id}:{invoice['invoice_id']}:default:{day}"
+            existing = await db.tally_payment_reminders.find_one({"default_key": key}, {"status": 1, "cancel_reason": 1})
+            if existing:
+                if existing.get("status") == "pending" or (
+                    existing.get("status") == "cancelled" and str(existing.get("cancel_reason") or "").startswith("Default reminder")
+                ):
+                    await db.tally_payment_reminders.update_one(
+                        {"_id": existing["_id"]},
+                        {"$set": {"scheduled_at": scheduled_at, "status": "pending", "updated_at": now}, "$unset": {"cancel_reason": "", "cancelled_at": ""}},
+                    )
+                continue
+            try:
+                await db.tally_payment_reminders.insert_one({
+                    "reminder_id": str(uuid.uuid4()), "default_key": key, "org_id": org_id,
+                    "invoice_id": invoice["invoice_id"], "source": "default", "days_after": day,
+                    "scheduled_at": scheduled_at, "status": "pending", "created_at": now,
+                    "created_by": "default-rule", "updated_at": now,
+                })
+                created += 1
+            except DuplicateKeyError:
+                pass
+    return created
+
+
+async def list_payment_reminders(org_id: str, invoice_id: str) -> list[dict]:
+    rows = await db.tally_payment_reminders.find(
+        {"org_id": org_id, "invoice_id": invoice_id}, {"_id": 0}
+    ).sort("scheduled_at", 1).to_list(length=100)
+    return serialize_mongo(rows)
+
+
+async def create_payment_reminder(org_id: str, user_id: str, user_name: str, invoice_id: str, scheduled_at: datetime) -> dict:
+    invoice = await db.tally_invoices.find_one({"org_id": org_id, "invoice_id": invoice_id})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Tally invoice not found")
+    if invoice.get("payment_status") == "unknown":
+        raise HTTPException(status_code=409, detail="Enable bill-by-bill tracking for this Tally customer and sync again")
+    if invoice.get("payment_status") == "paid" or float(invoice.get("outstanding_amount") or 0) <= 0:
+        raise HTTPException(status_code=409, detail="This Tally invoice is already paid")
+    if not await db.tally_customer_links.find_one({"org_id": org_id, "party_master_id": invoice.get("party_master_id")}):
+        raise HTTPException(status_code=409, detail="Link this Tally party to a WhatsApp customer first")
+    settings = normalized_settings(await get_integration(org_id))
+    if not settings["reminder_template_name"]:
+        raise HTTPException(status_code=409, detail="An admin must configure the payment reminder template first")
+    scheduled_at = scheduled_at.replace(tzinfo=timezone.utc) if scheduled_at.tzinfo is None else scheduled_at.astimezone(timezone.utc)
+    if scheduled_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=422, detail="Choose a reminder time in the future")
+    now = datetime.now(timezone.utc)
+    reminder = {
+        "reminder_id": str(uuid.uuid4()), "org_id": org_id, "invoice_id": invoice_id,
+        "source": "one_off", "scheduled_at": scheduled_at, "status": "pending",
+        "created_at": now, "created_by": user_id, "created_by_name": user_name, "updated_at": now,
+    }
+    await queue_invoice_pdf(org_id, user_id, invoice_id)
+    await db.tally_payment_reminders.insert_one(reminder)
+    reminder.pop("_id", None)
+    return serialize_mongo(reminder)
+
+
+async def reschedule_payment_reminder(org_id: str, reminder_id: str, user_id: str, scheduled_at: datetime) -> dict:
+    scheduled_at = scheduled_at.replace(tzinfo=timezone.utc) if scheduled_at.tzinfo is None else scheduled_at.astimezone(timezone.utc)
+    if scheduled_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=422, detail="Choose a reminder time in the future")
+    row = await db.tally_payment_reminders.find_one_and_update(
+        {"org_id": org_id, "reminder_id": reminder_id, "status": {"$in": ["pending", "needs_review", "failed"]}},
+        {"$set": {"scheduled_at": scheduled_at, "status": "pending", "updated_at": datetime.now(timezone.utc), "updated_by": user_id}, "$unset": {"error": "", "claim_id": "", "claimed_at": ""}},
+        return_document=ReturnDocument.AFTER, projection={"_id": 0},
+    )
+    if not row:
+        raise HTTPException(status_code=409, detail="Only an unsent reminder can be rescheduled")
+    return serialize_mongo(row)
+
+
+async def cancel_payment_reminder(org_id: str, reminder_id: str, user_id: str) -> dict:
+    row = await db.tally_payment_reminders.find_one_and_update(
+        {"org_id": org_id, "reminder_id": reminder_id, "status": {"$in": ["pending", "needs_review", "failed"]}},
+        {"$set": {"status": "cancelled", "cancelled_at": datetime.now(timezone.utc), "cancelled_by": user_id, "updated_at": datetime.now(timezone.utc)}},
+        return_document=ReturnDocument.AFTER, projection={"_id": 0},
+    )
+    if not row:
+        raise HTTPException(status_code=409, detail="Only an unsent reminder can be cancelled")
+    return serialize_mongo(row)
+
+
+async def process_tally_payment_reminders() -> int:
+    now = datetime.now(timezone.utc)
+    due = await db.tally_payment_reminders.find({"status": "pending", "scheduled_at": {"$lte": now}}).sort("scheduled_at", 1).limit(50).to_list(length=50)
+    processed = 0
+    for item in due:
+        claim_id = str(uuid.uuid4())
+        claimed = await db.tally_payment_reminders.find_one_and_update(
+            {"_id": item["_id"], "status": "pending"},
+            {"$set": {"status": "processing", "claim_id": claim_id, "claimed_at": now, "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            continue
+        invoice = await db.tally_invoices.find_one({"org_id": claimed["org_id"], "invoice_id": claimed["invoice_id"]})
+        integration = await get_integration(claimed["org_id"])
+        error = None
+        if not invoice:
+            error = "The Tally invoice is no longer in the latest snapshot"
+        elif invoice.get("payment_status") == "unknown":
+            error = "Enable bill-by-bill tracking for this Tally customer and sync again"
+        elif invoice.get("payment_status") == "paid" or float(invoice.get("outstanding_amount") or 0) <= 0:
+            await db.tally_payment_reminders.update_one(
+                {"_id": claimed["_id"], "claim_id": claim_id},
+                {"$set": {"status": "cancelled", "cancelled_at": now, "cancel_reason": "Paid in Tally", "updated_at": now}, "$unset": {"claim_id": "", "claimed_at": ""}},
+            )
+            processed += 1
+            continue
+        elif _snapshot_is_stale(integration, now):
+            error = "Tally payment status is stale; sync before sending"
+        link = await db.tally_customer_links.find_one({"org_id": claimed["org_id"], "party_master_id": (invoice or {}).get("party_master_id")}) if invoice else None
+        if not error and not link:
+            error = "The Tally party is not linked to a WhatsApp customer"
+        settings = normalized_settings(integration)
+        if not error and not settings["reminder_template_name"]:
+            error = "Payment reminders are not configured"
+        elif not error and claimed.get("source") == "default" and not settings["reminders_enabled"]:
+            error = "Automatic payment reminders are disabled"
+        pdf = (invoice or {}).get("pdf") or {}
+        if not error and (not pdf.get("url") or str(pdf.get("alter_id")) != str(invoice.get("alter_id"))):
+            try:
+                await queue_invoice_pdf(claimed["org_id"], "payment-reminder", claimed["invoice_id"])
+                waits = int(claimed.get("pdf_waits") or 0) + 1
+                if waits <= 6:
+                    await db.tally_payment_reminders.update_one(
+                        {"_id": claimed["_id"], "claim_id": claim_id},
+                        {"$set": {"status": "pending", "scheduled_at": now + timedelta(minutes=5), "pdf_waits": waits, "updated_at": now}, "$unset": {"claim_id": "", "claimed_at": ""}},
+                    )
+                    continue
+            except HTTPException:
+                pass
+            error = "The Tally invoice PDF is not available"
+        if error:
+            await db.tally_payment_reminders.update_one(
+                {"_id": claimed["_id"], "claim_id": claim_id},
+                {"$set": {"status": "needs_review", "error": error, "updated_at": now}, "$unset": {"claim_id": "", "claimed_at": ""}},
+            )
+            processed += 1
+            continue
+        organization = await db.organizations.find_one({"org_id": claimed["org_id"]}, {"wa_id": 1}) or {}
+        template = {
+            "name": settings["reminder_template_name"], "language": {"code": settings["reminder_template_language"]},
+            "components": [
+                {"type": "header", "parameters": [{"type": "document", "document": {"link": pdf["url"], "filename": f"Invoice-{invoice['voucher_number']}.pdf"}}]},
+                {"type": "body", "parameters": [
+                    {"type": "text", "parameter_name": "customer_name", "text": invoice.get("party_ledger") or "Customer"},
+                    {"type": "text", "parameter_name": "invoice_number", "text": invoice.get("voucher_number") or invoice["invoice_id"]},
+                    {"type": "text", "parameter_name": "outstanding_amount", "text": f"INR {float(invoice.get('outstanding_amount') or 0):,.2f}"},
+                    {"type": "text", "parameter_name": "due_date", "text": invoice.get("due_date") or invoice.get("date") or ""},
+                ]},
+            ],
+        }
+        try:
+            from services.wa_service import send_whatsapp_template_message
+            response = await send_whatsapp_template_message(
+                link["phone"], template, organization.get("wa_id"), claimed["org_id"],
+                f"tally-reminder:{claimed['reminder_id']}", "reply", None, None, "Payment reminder",
+            )
+            await db.tally_payment_reminders.update_one(
+                {"_id": claimed["_id"], "claim_id": claim_id},
+                {"$set": {"status": "sent", "sent_at": datetime.now(timezone.utc), "message_id": response.get("message_id"), "updated_at": datetime.now(timezone.utc)}, "$unset": {"claim_id": "", "claimed_at": "", "error": ""}},
+            )
+        except Exception as exc:
+            await db.tally_payment_reminders.update_one(
+                {"_id": claimed["_id"], "claim_id": claim_id},
+                {"$set": {"status": "failed", "error": str(exc)[:500], "updated_at": datetime.now(timezone.utc)}, "$unset": {"claim_id": "", "claimed_at": ""}},
+            )
+        processed += 1
+    return processed
+
+
 async def ensure_tally_indexes() -> None:
     await db.tally_integrations.create_index("org_id", unique=True)
     await db.tally_integrations.create_index("connector_key_hash", unique=True, sparse=True)
@@ -901,7 +1464,14 @@ async def ensure_tally_indexes() -> None:
     await db.tally_ledgers.create_index([("org_id", 1), ("name", 1)])
     await db.tally_stock_items.create_index([("org_id", 1), ("name", 1)])
     await db.tally_units.create_index([("org_id", 1), ("name", 1)])
+    await db.tally_invoices.create_index([("org_id", 1), ("invoice_id", 1)])
     await db.tally_invoices.create_index([("org_id", 1), ("date", -1)])
+    await db.tally_invoices.create_index([("org_id", 1), ("payment_status", 1), ("due_date", 1)])
+    await db.tally_customer_links.create_index([("org_id", 1), ("party_master_id", 1)], unique=True)
+    await db.tally_payment_reminders.create_index("reminder_id", unique=True)
+    await db.tally_payment_reminders.create_index("default_key", unique=True, sparse=True)
+    await db.tally_payment_reminders.create_index([("status", 1), ("scheduled_at", 1)])
+    await db.tally_profit_loss_reports.create_index([("org_id", 1), ("from_date", 1), ("to_date", 1)], unique=True)
     await db.tally_invoice_drafts.create_index("draft_id", unique=True)
     await db.tally_invoice_drafts.create_index([("org_id", 1), ("conversation_id", 1), ("created_at", -1)])
 
@@ -912,12 +1482,14 @@ async def get_integration(org_id: str) -> dict:
 
 async def save_integration(org_id: str, user_id: str, settings: dict) -> dict:
     settings = normalized_settings(settings)
-    return await db.tally_integrations.find_one_and_update(
+    saved = await db.tally_integrations.find_one_and_update(
         {"org_id": org_id},
         {"$set": {**settings, "updated_at": datetime.now(timezone.utc), "updated_by": user_id}},
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
+    await reconcile_default_payment_reminders(org_id)
+    return saved
 
 
 async def create_connector_key(org_id: str, user_id: str) -> str:
@@ -935,7 +1507,7 @@ async def create_connector_key(org_id: str, user_id: str) -> str:
     return raw
 
 
-async def authenticate_connector(raw_key: str | None) -> dict:
+async def authenticate_connector(raw_key: str | None, capabilities: str = "", version: str = "") -> dict:
     if not raw_key or len(raw_key) > 200:
         raise HTTPException(status_code=401, detail="Invalid Tally connector key")
     integration = await db.tally_integrations.find_one({"connector_key_hash": connector_key_hash(raw_key)})
@@ -944,7 +1516,10 @@ async def authenticate_connector(raw_key: str | None) -> dict:
     now = datetime.now(timezone.utc)
     await db.tally_integrations.update_one(
         {"_id": integration["_id"], "connector_key_hash": integration["connector_key_hash"]},
-        {"$set": {"last_seen_at": now}},
+        {"$set": {
+            "last_seen_at": now, "connector_version": version[:40],
+            "connector_capabilities": sorted({item.strip() for item in capabilities.split(",") if item.strip()}),
+        }},
     )
     integration["last_seen_at"] = now
     if _snapshot_is_stale(integration, now):
@@ -1035,6 +1610,31 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                 await db.tally_command_jobs.update_one(
                     {"org_id": integration["org_id"], "job_id": job_id},
                     {"$set": {"status": status, "error": error, "updated_at": now}},
+                )
+                command.update({"status": status, "error": error})
+        elif status == "completed" and command["job_type"] == "profit_loss_report":
+            response = next((item for item in result.get("responses") or [] if item.get("key") == "profit_loss"), None)
+            try:
+                report = parse_profit_loss_response((response or {}).get("xml") or "")
+            except HTTPException:
+                report = {}
+            if not report.get("rows"):
+                status, error = "failed", "Tally returned an empty Profit & Loss report"
+                await db.tally_command_jobs.update_one(
+                    {"org_id": integration["org_id"], "job_id": job_id}, {"$set": {"status": status, "error": error, "updated_at": now}}
+                )
+                command.update({"status": status, "error": error})
+            else:
+                await db.tally_profit_loss_reports.update_one(
+                    {"org_id": integration["org_id"], "from_date": command["from_date"], "to_date": command["to_date"]},
+                    {"$set": {**report, "synced_at": now}}, upsert=True,
+                )
+        elif status == "completed" and command["job_type"] == "invoice_pdf":
+            stored = await db.tally_command_jobs.find_one({"org_id": integration["org_id"], "job_id": job_id}, {"pdf": 1})
+            if not (stored or {}).get("pdf", {}).get("url"):
+                status, error = "failed", "Tally PDF upload was not confirmed"
+                await db.tally_command_jobs.update_one(
+                    {"org_id": integration["org_id"], "job_id": job_id}, {"$set": {"status": status, "error": error, "updated_at": now}}
                 )
                 command.update({"status": status, "error": error})
         elif status == "completed" and command["job_type"] in {"master_create", "master_update"}:

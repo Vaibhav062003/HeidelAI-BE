@@ -112,6 +112,26 @@ async def cleanup_expired_audio_notes(days_threshold: int = AUDIO_RETENTION_DAYS
         logger.error(f"Failed to delete expired audio notes: {exc}")
         return 0
 
+
+async def upload_tally_invoice_pdf(data: bytes, org_id: str, invoice_id: str, alter_id: str) -> str:
+    """Store an exact Tally export at a stable, versioned URL for downloads and WhatsApp."""
+    safe_invoice = re.sub(r"[^A-Za-z0-9_-]", "-", invoice_id)[:100] or uuid.uuid4().hex
+    safe_alter = re.sub(r"[^A-Za-z0-9_-]", "-", alter_id)[:40] or "current"
+    file_obj = io.BytesIO(data)
+    file_obj.name = f"{safe_invoice}-{safe_alter}.pdf"
+    result = await asyncio.to_thread(
+        cloudinary.uploader.upload,
+        file_obj,
+        folder=f"tally_invoices/{org_id}",
+        public_id=file_obj.name,
+        resource_type="raw",
+        overwrite=True,
+    )
+    secure_url = result.get("secure_url")
+    if not secure_url:
+        raise RuntimeError("Cloudinary did not return a Tally invoice PDF URL")
+    return secure_url
+
 # @app.get("/api/cloudinary/stats")
 async def get_cloudinary_stats():
     """
