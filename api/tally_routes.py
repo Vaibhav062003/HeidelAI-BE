@@ -1,8 +1,9 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Header, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Header, HTTPException, Query, Request
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from auth.auth_utils import admin_required
 from auth.dependencies import CurrentUser
@@ -13,20 +14,30 @@ from services.tally_service import (
     claim_next_job,
     create_connector_key,
     create_tally_invoice_draft,
+    create_payment_reminder,
+    cancel_payment_reminder,
     finish_job,
     get_customer_mapping,
     get_integration,
+    get_profit_loss_report,
+    get_tally_command_job,
+    link_tally_customer,
     list_bills,
+    list_payment_reminders,
     list_tally_invoices,
     list_tally_ledgers,
     list_tally_stock_items,
     list_tally_units,
     normalized_settings,
+    queue_invoice_pdf,
+    queue_profit_loss_report,
     queue_tally_master,
     queue_tally_sync,
     review_tally_invoice_draft,
     retry_bill,
+    reschedule_payment_reminder,
     save_integration,
+    store_tally_pdf_artifact,
     submit_tally_invoice_draft,
     tally_overview,
 )
@@ -50,10 +61,16 @@ class TallySettingsPayload(BaseModel):
     shipping_ledger: str = Field(default="", max_length=120)
     discount_ledger: str = Field(default="", max_length=120)
     reminder_days_after: list[int] = Field(default_factory=lambda: [0, 3, 7], max_length=10)
+    reminders_enabled: bool = False
+    reminder_time: str = Field(default="10:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    reminder_timezone: str = Field(default="Asia/Kolkata", min_length=1, max_length=80)
+    reminder_template_name: str = Field(default="", max_length=512)
+    reminder_template_language: str = Field(default="en", min_length=1, max_length=20)
 
     @field_validator(
         "company_name", "voucher_type", "sales_ledger", "stock_unit", "cgst_ledger",
-        "sgst_ledger", "igst_ledger", "shipping_ledger", "discount_ledger",
+        "sgst_ledger", "igst_ledger", "shipping_ledger", "discount_ledger", "reminder_timezone",
+        "reminder_template_name", "reminder_template_language",
     )
     @classmethod
     def strip_text(cls, value: str) -> str:
@@ -66,9 +83,24 @@ class TallySettingsPayload(BaseModel):
             raise ValueError("Reminder days must be between 0 and 365")
         return sorted(set(value))
 
+    @field_validator("reminder_timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Choose a valid reminder timezone") from exc
+        return value
+
+    @model_validator(mode="after")
+    def validate_reminder_setup(self):
+        if self.reminders_enabled and not self.reminder_template_name:
+            raise ValueError("Choose an approved WhatsApp payment template before enabling reminders")
+        return self
+
 
 class ConnectorResponsePayload(BaseModel):
-    key: Literal["ledgers", "stock_items", "units", "invoices", "master", "invoice"]
+    key: Literal["ledgers", "stock_items", "units", "invoices", "outstandings", "profit_loss", "master", "invoice"]
     xml: str = Field(max_length=10_000_000)
 
 
@@ -127,6 +159,19 @@ class InvoiceDraftReviewPayload(BaseModel):
     items: list[InvoiceDraftItemPayload] = Field(min_length=1, max_length=100)
 
 
+class ProfitLossPayload(BaseModel):
+    from_date: date
+    to_date: date
+
+
+class CustomerLinkPayload(BaseModel):
+    conversation_id: str = Field(min_length=1, max_length=200)
+
+
+class ReminderPayload(BaseModel):
+    scheduled_at: datetime
+
+
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
@@ -146,12 +191,16 @@ async def get_tally_integration(request: Request, user: CurrentUser):
     settings = normalized_settings(integration)
     last_seen = integration.get("last_seen_at")
     connected = bool(last_seen and _utc(last_seen) >= datetime.now(timezone.utc) - timedelta(seconds=90))
+    capabilities = integration.get("connector_capabilities") or []
     return {
         "configured": bool(settings["company_name"].strip()),
         "connector_created": bool(integration.get("connector_key_hash")),
         "connected": connected,
         "last_seen_at": serialize_mongo(last_seen),
         "last_error": integration.get("last_error"),
+        "connector_version": integration.get("connector_version", ""),
+        "connector_capabilities": capabilities,
+        "connector_update_required": connected and not {"reports", "pdf"}.issubset(set(capabilities)),
         "can_edit": user.role in {"admin", "org:admin"},
         "settings": settings,
     }
@@ -223,7 +272,7 @@ async def post_tally_retry(request: Request, job_id: str, user: CurrentUser):
 @limiter.limit("60/minute")
 async def get_tally_overview(request: Request, user: CurrentUser):
     await _require_accounting_access(user)
-    return {"overview": await tally_overview(user.org_id)}
+    return {"overview": await tally_overview(user.org_id, user.role in {"admin", "org:admin"})}
 
 
 @router.post("/api/tally/sync", status_code=202)
@@ -244,14 +293,99 @@ async def get_tally_ledgers(request: Request, user: CurrentUser, kind: str = "",
 @router.get("/api/tally/stock-items")
 @limiter.limit("60/minute")
 async def get_tally_stock_items(request: Request, user: CurrentUser, q: str = ""):
+    await _require_accounting_access(user)
     return {"stock_items": await list_tally_stock_items(user.org_id, q)}
 
 
 @router.get("/api/tally/invoices")
 @limiter.limit("60/minute")
-async def get_tally_invoices(request: Request, user: CurrentUser):
+async def get_tally_invoices(
+    request: Request, user: CurrentUser, page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=100),
+    q: str = Query("", max_length=120), status: str = Query("", max_length=20),
+    from_date: Optional[date] = Query(None), to_date: Optional[date] = Query(None),
+):
     await _require_accounting_access(user)
-    return {"invoices": await list_tally_invoices(user.org_id)}
+    return await list_tally_invoices(
+        user.org_id, page, page_size, q, status,
+        from_date.isoformat() if from_date else "", to_date.isoformat() if to_date else "",
+    )
+
+
+@router.get("/api/tally/profit-loss")
+@limiter.limit("60/minute")
+async def get_tally_profit_loss(
+    request: Request, user: CurrentUser, from_date: date = Query(...), to_date: date = Query(...),
+):
+    await admin_required(user)
+    if from_date > to_date:
+        raise HTTPException(status_code=422, detail="Profit & Loss start date must be before the end date")
+    return {"report": await get_profit_loss_report(user.org_id, from_date.isoformat(), to_date.isoformat())}
+
+
+@router.post("/api/tally/profit-loss", status_code=202)
+@limiter.limit("10/minute")
+async def post_tally_profit_loss(request: Request, payload: ProfitLossPayload, user: CurrentUser):
+    await admin_required(user)
+    if payload.from_date > payload.to_date:
+        raise HTTPException(status_code=422, detail="Profit & Loss start date must be before the end date")
+    job, created = await queue_profit_loss_report(
+        user.org_id, user.user_id, payload.from_date.isoformat(), payload.to_date.isoformat()
+    )
+    return {"job": job, "created": created}
+
+
+@router.get("/api/tally/jobs/{job_id}")
+@limiter.limit("60/minute")
+async def get_tally_job(request: Request, job_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
+    return {"job": await get_tally_command_job(user.org_id, job_id)}
+
+
+@router.post("/api/tally/invoices/{invoice_id}/pdf", status_code=202)
+@limiter.limit("20/minute")
+async def post_tally_invoice_pdf(request: Request, invoice_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
+    job, created = await queue_invoice_pdf(user.org_id, user.user_id, invoice_id)
+    return {"job": job, "created": created}
+
+
+@router.put("/api/tally/customers/{party_master_id}/link")
+@limiter.limit("20/minute")
+async def put_tally_customer_link(
+    request: Request, party_master_id: str, payload: CustomerLinkPayload, user: CurrentUser,
+):
+    await _require_accounting_access(user)
+    return {"link": await link_tally_customer(user.org_id, user.user_id, party_master_id, payload.conversation_id)}
+
+
+@router.get("/api/tally/invoices/{invoice_id}/reminders")
+@limiter.limit("60/minute")
+async def get_invoice_reminders(request: Request, invoice_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
+    return {"reminders": await list_payment_reminders(user.org_id, invoice_id)}
+
+
+@router.post("/api/tally/invoices/{invoice_id}/reminders", status_code=201)
+@limiter.limit("20/minute")
+async def post_invoice_reminder(request: Request, invoice_id: str, payload: ReminderPayload, user: CurrentUser):
+    await _require_accounting_access(user)
+    return {"reminder": await create_payment_reminder(
+        user.org_id, user.user_id, user.full_name or "Team member", invoice_id, payload.scheduled_at
+    )}
+
+
+@router.patch("/api/tally/reminders/{reminder_id}")
+@limiter.limit("20/minute")
+async def patch_invoice_reminder(request: Request, reminder_id: str, payload: ReminderPayload, user: CurrentUser):
+    await _require_accounting_access(user)
+    return {"reminder": await reschedule_payment_reminder(user.org_id, reminder_id, user.user_id, payload.scheduled_at)}
+
+
+@router.delete("/api/tally/reminders/{reminder_id}")
+@limiter.limit("20/minute")
+async def delete_invoice_reminder(request: Request, reminder_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
+    return {"reminder": await cancel_payment_reminder(user.org_id, reminder_id, user.user_id)}
 
 
 @router.get("/api/tally/units")
@@ -325,8 +459,10 @@ async def post_tally_invoice_draft_submit(request: Request, draft_id: str, user:
 async def get_tally_connector_job(
     request: Request,
     connector_key: Optional[str] = Header(default=None, alias="X-Tally-Connector-Key"),
+    connector_capabilities: str = Header(default="", alias="X-Tally-Connector-Capabilities"),
+    connector_version: str = Header(default="", alias="X-Tally-Connector-Version"),
 ):
-    integration = await authenticate_connector(connector_key)
+    integration = await authenticate_connector(connector_key, connector_capabilities, connector_version)
     return {"job": await claim_next_job(integration)}
 
 
@@ -338,6 +474,26 @@ async def post_tally_connector_result(
     payload: ConnectorResultPayload,
     connector_key: Optional[str] = Header(default=None, alias="X-Tally-Connector-Key"),
     claim_id: Optional[str] = Header(default=None, alias="X-Tally-Claim-Id"),
+    connector_capabilities: str = Header(default="", alias="X-Tally-Connector-Capabilities"),
+    connector_version: str = Header(default="", alias="X-Tally-Connector-Version"),
 ):
-    integration = await authenticate_connector(connector_key)
+    integration = await authenticate_connector(connector_key, connector_capabilities, connector_version)
     return {"result": await finish_job(integration, job_id, claim_id, payload.model_dump())}
+
+
+@router.post("/api/tally-connector/jobs/{job_id}/artifact")
+@limiter.limit("20/minute")
+async def post_tally_connector_artifact(
+    request: Request,
+    job_id: str,
+    connector_key: Optional[str] = Header(default=None, alias="X-Tally-Connector-Key"),
+    claim_id: Optional[str] = Header(default=None, alias="X-Tally-Claim-Id"),
+    connector_capabilities: str = Header(default="", alias="X-Tally-Connector-Capabilities"),
+    connector_version: str = Header(default="", alias="X-Tally-Connector-Version"),
+):
+    integration = await authenticate_connector(connector_key, connector_capabilities, connector_version)
+    if not claim_id:
+        raise HTTPException(status_code=409, detail="Missing Tally claim")
+    if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/pdf":
+        raise HTTPException(status_code=415, detail="Tally artifacts must be PDF")
+    return {"pdf": await store_tally_pdf_artifact(integration["org_id"], job_id, claim_id, await request.body())}
