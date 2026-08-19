@@ -278,12 +278,26 @@ async def disconnect_product_sheet(sheet_id: str, user: CurrentUser):
             {"org_id": org_id, "sheet_id": sheet_id}
         )
 
-        # Delete all products from this sheet
+        # 1. Unlink: Remove this sheet from all products' source arrays
         products_col = db[f"products_{org_id}"]
+        await asyncio.to_thread(
+            lambda: products_col.update_many(
+                {"source_sheet_ids": sheet_id},
+                {"$pull": {"source_sheet_ids": sheet_id}}
+            )
+        )
+
+        # 2. Garbage Collect: Delete products that are now orphaned (no active sources)
         delete_result = await asyncio.to_thread(
+            lambda: products_col.delete_many({"source_sheet_ids": {"$size": 0}})
+        )
+        
+        # 3. Clean up any legacy products that still use the scalar field
+        legacy_delete_result = await asyncio.to_thread(
             lambda: products_col.delete_many({"source_sheet_id": sheet_id})
         )
-        products_removed = delete_result.deleted_count
+        
+        products_removed = delete_result.deleted_count + legacy_delete_result.deleted_count
 
         # Update org metadata product count
         total_all_products = await asyncio.to_thread(
