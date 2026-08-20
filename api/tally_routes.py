@@ -38,6 +38,7 @@ from services.tally_service import (
     retry_bill,
     reschedule_payment_reminder,
     save_integration,
+    store_uploaded_tally_pdf,
     store_tally_pdf_artifact,
     submit_tally_invoice_draft,
     tally_overview,
@@ -112,6 +113,11 @@ class ConnectorResultPayload(BaseModel):
     error: Optional[str] = Field(default=None, max_length=500)
     tally_response: Optional[str] = Field(default=None, max_length=4000)
     responses: list[ConnectorResponsePayload] = Field(default_factory=list, max_length=10)
+
+    @field_validator("responses", mode="before")
+    @classmethod
+    def remove_empty_responses(cls, value):
+        return [item for item in (value or []) if item]
 
 
 class TallyMasterPayload(BaseModel):
@@ -204,9 +210,9 @@ async def get_tally_integration(request: Request, user: CurrentUser):
         "connector_version": connector_version,
         "connector_capabilities": capabilities,
         "connector_update_required": connected and (
-            connector_version_number < 3 or not {"reports", "pdf"}.issubset(set(capabilities))
+            connector_version_number < 6 or "reports" not in capabilities
         ),
-        "connector_update_available": connected and connector_version_number < 4,
+        "connector_update_available": connected and connector_version_number < 6,
         "can_edit": user.role in {"admin", "org:admin"},
         "settings": settings,
     }
@@ -360,6 +366,15 @@ async def post_tally_invoice_pdf(request: Request, invoice_id: str, user: Curren
     await _require_accounting_access(user)
     job, created = await queue_invoice_pdf(user.org_id, user.user_id, invoice_id)
     return {"job": job, "created": created}
+
+
+@router.put("/api/tally/invoices/{invoice_id}/pdf")
+@limiter.limit("10/minute")
+async def put_tally_invoice_pdf(request: Request, invoice_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
+    if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/pdf":
+        raise HTTPException(status_code=415, detail="Choose a PDF exported from TallyPrime")
+    return {"pdf": await store_uploaded_tally_pdf(user.org_id, invoice_id, await request.body())}
 
 
 @router.put("/api/tally/customers/{party_master_id}/link")

@@ -23,8 +23,9 @@ wanted = {
     "_customer_snapshot", "_tally_escalation_payload", "build_sales_voucher_xml", "parse_invoice_command",
     "_node_text", "_decimal_text", "_tag", "_direct_text", "_parse_tally_xml", "_tally_date", "parse_snapshot_responses", "validate_snapshot_responses", "build_master_xml",
     "valid_gstin_format", "parse_outstanding_response", "parse_profit_loss_response", "build_report_xml",
-    "build_invoice_pdf_request", "_export_collection_xml",
+    "_export_collection_xml",
     "_exact_product_master_id", "_job_phase",
+    "_validate_tally_pdf",
 }
 nodes = [
     node for node in tree.body
@@ -49,10 +50,10 @@ valid_gstin_format = namespace["valid_gstin_format"]
 parse_outstanding_response = namespace["parse_outstanding_response"]
 parse_profit_loss_response = namespace["parse_profit_loss_response"]
 build_report_xml = namespace["build_report_xml"]
-build_invoice_pdf_request = namespace["build_invoice_pdf_request"]
 exact_product_master_id = namespace["_exact_product_master_id"]
 job_phase = namespace["_job_phase"]
 export_collection_xml = namespace["_export_collection_xml"]
+validate_tally_pdf = namespace["_validate_tally_pdf"]
 
 
 class TallyContractTests(unittest.TestCase):
@@ -121,7 +122,7 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn('alias="X-Tally-Claim-Id"', source)
         self.assertIn('await admin_required(user)', source)
         self.assertIn('/api/tally/operations', source)
-        self.assertIn('connector_version_number < 3', source)
+        self.assertIn('connector_version_number < 6', source)
         self.assertNotIn('"connector_key_hash": integration', source)
         self.assertIn('"response_meta": response_meta', service)
         self.assertNotIn('"responses": result.get("responses")', service)
@@ -207,7 +208,7 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn('ACTION="Alter"', altered)
         self.assertNotIn('ACTION="Delete"', altered)
 
-    def test_gstin_reports_outstandings_and_pdf_requests_are_explicit(self):
+    def test_gstin_reports_and_outstandings_are_explicit(self):
         self.assertTrue(valid_gstin_format("27abcde1234f1z5"))
         self.assertFalse(valid_gstin_format("27ABCDE1234F1Z"))
         outstanding = parse_outstanding_response(
@@ -233,11 +234,6 @@ class TallyContractTests(unittest.TestCase):
         self.assertEqual(report["net_profit"], 18000.0)
         report_xml = build_report_xml(self.settings, "Profit and Loss", "2026-04-01", "2026-08-20")
         self.assertIn("<SVFROMDATE>20260401</SVFROMDATE>", report_xml)
-        pdf_xml = build_invoice_pdf_request(self.settings, {
-            "voucher_number": "S-10", "voucher_type": "Sales", "date": "2026-08-20",
-        })
-        self.assertIn("$$SysName:PDF", pdf_xml)
-        self.assertIn("<SVVOUCHERNO>S-10</SVVOUCHERNO>", pdf_xml)
 
     def test_only_one_exact_tally_product_is_preselected(self):
         rows = [
@@ -252,9 +248,20 @@ class TallyContractTests(unittest.TestCase):
         routes = pathlib.Path("api/tally_routes.py").read_text()
         self.assertIn('"/api/tally/profit-loss"', routes)
         self.assertIn('"/api/tally/invoices/{invoice_id}/pdf"', routes)
+        self.assertIn("store_uploaded_tally_pdf", routes)
         self.assertIn('"/api/tally/customers/{party_master_id}/link"', routes)
         self.assertIn('"/api/tally/invoices/{invoice_id}/reminders"', routes)
         self.assertIn('"/api/tally-connector/jobs/{job_id}/artifact"', routes)
+
+    def test_connector_result_ignores_v5_null_response_placeholder(self):
+        routes = pathlib.Path("api/tally_routes.py").read_text()
+        self.assertIn('field_validator("responses", mode="before")', routes)
+        self.assertIn("if item", routes)
+
+    def test_uploaded_tally_pdf_must_be_a_pdf_under_ten_mb(self):
+        validate_tally_pdf(b"%PDF-1.7\n")
+        with self.assertRaises(HTTPException):
+            validate_tally_pdf(b"<ENVELOPE></ENVELOPE>")
 
 
 if __name__ == "__main__":
