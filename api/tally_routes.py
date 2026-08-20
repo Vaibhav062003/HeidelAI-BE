@@ -210,9 +210,9 @@ async def get_tally_integration(request: Request, user: CurrentUser):
         "connector_version": connector_version,
         "connector_capabilities": capabilities,
         "connector_update_required": connected and (
-            connector_version_number < 6 or "reports" not in capabilities
+            connector_version_number < 7 or "reports" not in capabilities or "invoice_pdf" not in capabilities
         ),
-        "connector_update_available": connected and connector_version_number < 6,
+        "connector_update_available": connected and connector_version_number < 7,
         "can_edit": user.role in {"admin", "org:admin"},
         "settings": settings,
     }
