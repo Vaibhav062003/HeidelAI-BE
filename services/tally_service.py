@@ -205,6 +205,36 @@ def build_report_xml(settings: dict, report: str, from_date: str, to_date: str, 
     )
 
 
+def build_invoice_export_xml(settings: dict, master_id: str, invoice_date: str = "") -> str:
+    settings = normalized_settings(settings)
+    if not re.fullmatch(r"\d+", str(master_id or "").strip()):
+        raise HTTPException(status_code=422, detail="Tally invoice is missing a numeric Master ID")
+    fetch = [
+        "Date", "EffectiveDate", "VoucherNumber", "Reference", "VoucherTypeName", "PartyLedgerName",
+        "PartyGSTIN", "StateName", "PlaceOfSupply", "BasicBuyerName", "BuyerName", "BasicBuyerAddress",
+        "Address", "BuyerPinNumber", "Narration", "GUID", "MasterID", "AlterID", "Amount",
+        "AllLedgerEntries", "AllInventoryEntries",
+    ]
+    native_methods = "".join(f"<NATIVEMETHOD>{field}</NATIVEMETHOD>" for field in fetch)
+    fetch_list = "".join(f"<FETCH>{field}</FETCH>" for field in fetch)
+    tally_date = (invoice_date or "").replace("-", "")
+    period = (
+        f"<SVFROMDATE>{_xml(tally_date)}</SVFROMDATE><SVTODATE>{_xml(tally_date)}</SVTODATE>"
+        if re.fullmatch(r"\d{8}", tally_date) else ""
+    )
+    return (
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>COLLECTION</TYPE><ID>HeidelAIInvoice</ID></HEADER><BODY><DESC><STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{_xml(settings['company_name'])}</SVCURRENTCOMPANY>{period}"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT></STATICVARIABLES>"
+        f"<FETCHLIST>{fetch_list}</FETCHLIST><TDL><TDLMESSAGE>"
+        f"<COLLECTION NAME=\"HeidelAIInvoice\" ISINITIALIZE=\"Yes\"><TYPE>Voucher</TYPE>"
+        f"<FILTER>HeidelAIInvoiceMaster</FILTER>{native_methods}</COLLECTION>"
+        f"<SYSTEM TYPE=\"Formulae\" NAME=\"HeidelAIInvoiceMaster\">$MasterID = {int(master_id)}</SYSTEM>"
+        "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
+    )
+
+
 def build_snapshot_requests(settings: dict) -> list[dict]:
     fy_from, fy_to = _financial_year_period()
     return [
@@ -423,6 +453,132 @@ def validate_snapshot_responses(responses: list[dict], parsed: dict) -> None:
     # collection request was not fulfilled and must not erase the last good cache.
     if not parsed.get("ledgers"):
         raise HTTPException(status_code=502, detail="Tally returned an empty ledger export; existing HeidelAI data was kept")
+
+
+def parse_invoice_export_response(xml: str, master_id: str) -> dict:
+    invoices = parse_snapshot_responses([{"key": "invoices", "xml": xml}])["invoices"]
+    invoice = next((row for row in invoices if str(row.get("master_id")) == str(master_id)), None)
+    if not invoice:
+        raise HTTPException(status_code=502, detail="Tally did not return the requested invoice voucher")
+    root = _parse_tally_xml(xml)
+    voucher = next((node for node in root.iter() if _tag(node) == "VOUCHER" and _node_text(node, "MASTERID") == str(master_id)), None)
+    if voucher is None:
+        raise HTTPException(status_code=502, detail="Tally did not return the requested invoice voucher")
+    addresses = []
+    ledger_entries = []
+    seen_ledgers = set()
+    for node in voucher.iter():
+        tag = _tag(node)
+        if tag in {"ADDRESS", "BASICBUYERADDRESS"} and node.text and node.text.strip() not in addresses:
+            addresses.append(node.text.strip())
+        if tag in {"ALLLEDGERENTRIES.LIST", "LEDGERENTRIES.LIST"}:
+            name = _node_text(node, "LEDGERNAME")
+            amount = float(abs(_decimal_text(_direct_text(node, "AMOUNT"))))
+            identity = (name.casefold(), amount)
+            if name and identity not in seen_ledgers:
+                seen_ledgers.add(identity)
+                ledger_entries.append({"name": name, "amount": amount})
+    invoice.update({
+        "party_name": _node_text(voucher, "BASICBUYERNAME", "BUYERNAME", "PARTYNAME") or invoice.get("party_ledger"),
+        "party_gstin": _node_text(voucher, "PARTYGSTIN"),
+        "party_state": _node_text(voucher, "PLACEOFSUPPLY", "STATENAME"),
+        "party_address": ", ".join(addresses),
+        "narration": _node_text(voucher, "NARRATION"),
+        "ledger_entries": ledger_entries,
+    })
+    return invoice
+
+
+def _pdf_document(lines: list[str]) -> bytes:
+    pages = [lines[index:index + 50] for index in range(0, len(lines), 50)] or [[""]]
+    font_id = 3 + len(pages) * 2
+    objects = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: f"<< /Type /Pages /Count {len(pages)} /Kids [{' '.join(f'{3 + index * 2} 0 R' for index in range(len(pages)))}] >>".encode(),
+        font_id: b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+    }
+    for index, page_lines in enumerate(pages):
+        page_id, content_id = 3 + index * 2, 4 + index * 2
+        commands = ["q 1 1 1 rg 0 0 595 842 re f Q"]
+        if index == 0:
+            commands.append("q 0.94 0.97 1 rg 32 750 531 60 re f Q")
+        commands.append("BT /F1 9 Tf 42 800 Td 14 TL")
+        for line_index, line in enumerate(page_lines):
+            if index == 0 and line_index == 0:
+                commands.append("/F1 12 Tf")
+            elif index == 0 and line_index == 1:
+                commands.append("/F1 15 Tf")
+            elif index == 0 and line_index == 2:
+                commands.append("/F1 9 Tf")
+            # ponytail: built-in PDF font is Latin-1; embed a Unicode font if non-Latin Tally names are required.
+            safe = str(line).encode("latin-1", "replace").decode("latin-1").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            commands.append(f"({safe}) Tj T*")
+        commands.extend(["ET", f"BT /F1 8 Tf 500 24 Td (Page {index + 1} of {len(pages)}) Tj ET"])
+        stream = "\n".join(commands).encode("latin-1")
+        objects[page_id] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 {font_id} 0 R >> >> "
+            f"/Contents {content_id} 0 R >>"
+        ).encode()
+        objects[content_id] = f"<< /Length {len(stream)} >>\nstream\n".encode() + stream + b"\nendstream"
+    output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for object_id in range(1, font_id + 1):
+        offsets.append(len(output))
+        output.extend(f"{object_id} 0 obj\n".encode() + objects[object_id] + b"\nendobj\n")
+    xref = len(output)
+    output.extend(f"xref\n0 {font_id + 1}\n0000000000 65535 f \n".encode())
+    output.extend("".join(f"{offset:010d} 00000 n \n" for offset in offsets[1:]).encode())
+    output.extend(f"trailer\n<< /Size {font_id + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(output)
+
+
+def render_invoice_pdf(invoice: dict, company_name: str, sales_ledger: str = "Sales") -> bytes:
+    def amount(value) -> str:
+        return f"INR {float(value or 0):,.2f}"
+
+    def wrap(value, width=88) -> list[str]:
+        words, rows, current = str(value or "").split(), [], ""
+        for word in words:
+            if current and len(current) + len(word) + 1 > width:
+                rows.append(current)
+                current = word
+            else:
+                current = f"{current} {word}".strip()
+        return rows + ([current] if current else [])
+
+    lines = [
+        str(company_name or "Tally company").upper()[:80], "TAX INVOICE", "=" * 88,
+        f"Invoice: {invoice.get('voucher_number') or '-'}    Date: {invoice.get('date') or '-'}",
+        *wrap(f"Reference: {invoice.get('reference') or '-'}"), "",
+        *wrap(f"Bill to: {invoice.get('party_name') or invoice.get('party_ledger') or '-'}"),
+    ]
+    if invoice.get("party_address"):
+        lines.extend(wrap(f"Address: {invoice['party_address']}"))
+    if invoice.get("party_gstin"):
+        lines.append(f"GSTIN: {invoice['party_gstin']}")
+    if invoice.get("party_state"):
+        lines.append(f"State / place of supply: {invoice['party_state']}")
+    lines.extend(["", f"{'Product':<48}{'Qty':>8}{'Rate':>15}{'Amount':>17}", "-" * 88])
+    subtotal = 0.0
+    for item in invoice.get("items") or []:
+        item_amount = float(item.get("amount") or 0)
+        subtotal += item_amount
+        descriptions = wrap(item.get("name") or "Item", 46) or ["Item"]
+        quantity = f"{float(item.get('quantity') or 0):g}"
+        lines.append(f"{descriptions[0]:<48}{quantity:>8}{amount(item.get('rate')):>15}{amount(item_amount):>17}")
+        lines.extend(f"  {description}" for description in descriptions[1:])
+    lines.extend(["-" * 88, f"{'Items subtotal':<71}{amount(subtotal):>17}"])
+    excluded = {str(invoice.get("party_ledger") or "").casefold(), str(sales_ledger or "").casefold()}
+    for entry in invoice.get("ledger_entries") or []:
+        if entry.get("name", "").casefold() not in excluded and float(entry.get("amount") or 0):
+            labels = wrap(entry["name"], 69) or ["Charge / tax"]
+            lines.append(f"{labels[0]:<71}{amount(entry['amount']):>17}")
+            lines.extend(f"  {label}" for label in labels[1:])
+    lines.extend([f"{'GRAND TOTAL':<71}{amount(invoice.get('amount')):>17}", "=" * 88])
+    if invoice.get("narration"):
+        lines.extend(["", *wrap(f"Narration: {invoice['narration']}")])
+    lines.extend(["", "Generated from live TallyPrime voucher data via HeidelAI."])
+    return _pdf_document(lines)
 
 
 def _customer_snapshot(quote: dict, conversation: dict | None = None) -> dict:
@@ -1081,10 +1237,27 @@ async def queue_invoice_pdf(org_id: str, user_id: str, invoice_id: str) -> tuple
     pdf = invoice.get("pdf") or {}
     if pdf.get("url") and str(pdf.get("alter_id")) == str(invoice.get("alter_id")):
         return {"status": "completed", "pdf": pdf}, False
-    raise HTTPException(
-        status_code=409,
-        detail="Export this invoice as PDF in TallyPrime, then upload it from HeidelAI's Invoices tab",
-    )
+    integration = await get_integration(org_id)
+    if "invoice_pdf" not in (integration.get("connector_capabilities") or []):
+        raise HTTPException(status_code=409, detail="Download and restart the latest Tally connector to pull invoice PDFs")
+    active = await db.tally_command_jobs.find_one({
+        "org_id": org_id, "job_type": "invoice_pdf", "invoice_id": invoice_id,
+        "invoice_alter_id": invoice.get("alter_id", ""), "status": {"$in": ["pending", "processing"]},
+    }, {"_id": 0, "requests": 0})
+    if active:
+        return serialize_mongo(active), False
+    now = datetime.now(timezone.utc)
+    job = {
+        "job_id": str(uuid.uuid4()), "job_type": "invoice_pdf", "org_id": org_id,
+        "invoice_id": invoice_id, "invoice_master_id": invoice.get("master_id"),
+        "invoice_alter_id": invoice.get("alter_id", ""), "status": "pending", "attempts": 0,
+        "requests": [{"key": "invoice", "xml": build_invoice_export_xml(
+            integration, str(invoice.get("master_id") or ""), invoice.get("date") or "",
+        )}],
+        "created_at": now, "updated_at": now, "created_by": user_id,
+    }
+    await db.tally_command_jobs.insert_one(job)
+    return serialize_mongo({key: value for key, value in job.items() if key != "requests"}), True
 
 
 def _validate_tally_pdf(data: bytes) -> None:
@@ -1805,9 +1978,29 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                     {"$set": {**report, "synced_at": now}}, upsert=True,
                 )
         elif status == "completed" and command["job_type"] == "invoice_pdf":
-            stored = await db.tally_command_jobs.find_one({"org_id": integration["org_id"], "job_id": job_id}, {"pdf": 1})
-            if not (stored or {}).get("pdf", {}).get("url"):
-                status, error = "failed", "Tally PDF upload was not confirmed"
+            response = next((item for item in result.get("responses") or [] if item.get("key") == "invoice"), None)
+            try:
+                invoice = parse_invoice_export_response((response or {}).get("xml") or "", command["invoice_master_id"])
+                settings = normalized_settings(integration)
+                data = render_invoice_pdf(invoice, settings["company_name"], settings["sales_ledger"])
+                _validate_tally_pdf(data)
+                from services.cloudinary_service import upload_tally_invoice_pdf
+                pdf = {
+                    "url": await upload_tally_invoice_pdf(
+                        data, integration["org_id"], command["invoice_id"], str(command.get("invoice_alter_id") or "current"),
+                    ),
+                    "alter_id": command.get("invoice_alter_id", ""), "generated_at": now,
+                }
+                await db.tally_invoices.update_one(
+                    {"org_id": integration["org_id"], "invoice_id": command["invoice_id"]}, {"$set": {"pdf": pdf}},
+                )
+                await db.tally_command_jobs.update_one(
+                    {"org_id": integration["org_id"], "job_id": job_id}, {"$set": {"pdf": pdf, "updated_at": now}},
+                )
+                command["pdf"] = serialize_mongo(pdf)
+            except Exception as exc:
+                status = "failed"
+                error = str(exc.detail) if isinstance(exc, HTTPException) else f"HeidelAI could not generate the Tally invoice PDF: {type(exc).__name__}"
                 await db.tally_command_jobs.update_one(
                     {"org_id": integration["org_id"], "job_id": job_id}, {"$set": {"status": status, "error": error, "updated_at": now}}
                 )

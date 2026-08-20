@@ -23,7 +23,7 @@ wanted = {
     "_customer_snapshot", "_tally_escalation_payload", "build_sales_voucher_xml", "parse_invoice_command",
     "_node_text", "_decimal_text", "_tag", "_direct_text", "_parse_tally_xml", "_tally_date", "parse_snapshot_responses", "validate_snapshot_responses", "build_master_xml",
     "valid_gstin_format", "parse_outstanding_response", "parse_profit_loss_response", "build_report_xml",
-    "_export_collection_xml",
+    "_export_collection_xml", "build_invoice_export_xml", "parse_invoice_export_response", "_pdf_document", "render_invoice_pdf",
     "_exact_product_master_id", "_job_phase",
     "_validate_tally_pdf",
 }
@@ -53,6 +53,9 @@ build_report_xml = namespace["build_report_xml"]
 exact_product_master_id = namespace["_exact_product_master_id"]
 job_phase = namespace["_job_phase"]
 export_collection_xml = namespace["_export_collection_xml"]
+build_invoice_export_xml = namespace["build_invoice_export_xml"]
+parse_invoice_export_response = namespace["parse_invoice_export_response"]
+render_invoice_pdf = namespace["render_invoice_pdf"]
 validate_tally_pdf = namespace["_validate_tally_pdf"]
 
 
@@ -122,7 +125,7 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn('alias="X-Tally-Claim-Id"', source)
         self.assertIn('await admin_required(user)', source)
         self.assertIn('/api/tally/operations', source)
-        self.assertIn('connector_version_number < 6', source)
+        self.assertIn('connector_version_number < 7', source)
         self.assertNotIn('"connector_key_hash": integration', source)
         self.assertIn('"response_meta": response_meta', service)
         self.assertNotIn('"responses": result.get("responses")', service)
@@ -207,6 +210,31 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn("<TYPE>Ledger</TYPE>", xml)
         self.assertIn("<NATIVEMETHOD>Name</NATIVEMETHOD>", xml)
         self.assertIn("<NATIVEMETHOD>Parent</NATIVEMETHOD>", xml)
+
+    def test_invoice_pdf_is_built_from_the_requested_tally_voucher(self):
+        request = build_invoice_export_xml(self.settings, "99", "2026-08-20")
+        self.assertIn("<ID>HeidelAIInvoice</ID>", request)
+        self.assertIn("$MasterID = 99", request)
+        self.assertIn("<SVFROMDATE>20260820</SVFROMDATE>", request)
+        response = (
+            "<ENVELOPE><VOUCHER><MASTERID>99</MASTERID><ALTERID>4</ALTERID><DATE>20260820</DATE>"
+            "<VOUCHERNUMBER>INV-99</VOUCHERNUMBER><REFERENCE>Q-99</REFERENCE>"
+            "<PARTYLEDGERNAME>Lee Computers</PARTYLEDGERNAME><PARTYGSTIN>27ABCDE1234F1Z5</PARTYGSTIN>"
+            "<BASICBUYERADDRESS.LIST><BASICBUYERADDRESS>Pune</BASICBUYERADDRESS></BASICBUYERADDRESS.LIST>"
+            "<AMOUNT>-106200</AMOUNT><ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>RTX 5090</STOCKITEMNAME>"
+            "<BILLEDQTY>2 Nos</BILLEDQTY><RATE>45000/Nos</RATE><AMOUNT>90000</AMOUNT>"
+            "</ALLINVENTORYENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>CGST</LEDGERNAME>"
+            "<AMOUNT>8100</AMOUNT></ALLLEDGERENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>SGST</LEDGERNAME>"
+            "<AMOUNT>8100</AMOUNT></ALLLEDGERENTRIES.LIST></VOUCHER></ENVELOPE>"
+        )
+        invoice = parse_invoice_export_response(response, "99")
+        self.assertEqual(invoice["voucher_number"], "INV-99")
+        self.assertEqual(invoice["items"][0]["name"], "RTX 5090")
+        pdf = render_invoice_pdf(invoice, "Derivative AI", "Sales")
+        self.assertTrue(pdf.startswith(b"%PDF-1.4"))
+        self.assertIn(b"INV-99", pdf)
+        self.assertIn(b"CGST", pdf)
+        self.assertTrue(pdf.endswith(b"%%EOF\n"))
 
     def test_master_operation_waits_for_linked_readback(self):
         master = {"status": "completed", "job_type": "master_create", "readback_job_id": "sync-1", "master": {"name": "Lee Computers"}}
