@@ -19,7 +19,7 @@ POLL_INTERVAL_SECONDS = 15
 STUCK_JOB_THRESHOLD_MINUTES = 10
 MAX_BATCH_SIZE = 20
 MAX_CONCURRENT = 5
-MESSAGE_CONTEXT_LIMIT = 10
+MESSAGE_CONTEXT_LIMIT = 30
 
 _polling_task: Optional[asyncio.Task] = None
 
@@ -189,7 +189,28 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                 return
                 
             docs.reverse()
-            messages_str = "\n".join([f"{d.get('role', 'unknown')}: {d.get('content', '')}" for d in docs])
+            
+            # Hybrid Context: Split the last 10 messages (recent) from the older ones (context)
+            recent_cutoff = 10
+            if len(docs) > recent_cutoff:
+                older_docs = docs[:-recent_cutoff]
+                recent_docs = docs[-recent_cutoff:]
+                
+                older_str = "\n".join([f"{d.get('role', 'unknown')}: {d.get('content', '')}" for d in older_docs])
+                recent_str = "\n".join([f"{d.get('role', 'unknown')}: {d.get('content', '')}" for d in recent_docs])
+                
+                messages_str = (
+                    "--- OLDER CONTEXT (For product reference only) ---\n"
+                    f"{older_str}\n\n"
+                    "--- RECENT MESSAGES (Determine intent and timeline ONLY from these) ---\n"
+                    f"{recent_str}"
+                )
+            else:
+                recent_str = "\n".join([f"{d.get('role', 'unknown')}: {d.get('content', '')}" for d in docs])
+                messages_str = (
+                    "--- RECENT MESSAGES (Determine intent and timeline ONLY from these) ---\n"
+                    f"{recent_str}"
+                )
             
             ist_now = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
             

@@ -30,16 +30,16 @@ most recent messages) shows a concrete intention to buy a specific product at a 
 RULES — Follow these in strict priority order
 ═══════════════════════════════════════════
 
-R1. RECENCY WINS — IGNORE HISTORY
-    - Only the LAST 3–5 customer messages determine intent.
-    - If an earlier message says "I'll buy MacBook" but a later message says
+R1. RECENCY WINS — USE HYBRID CONTEXT
+    - You will receive the chat in two parts: OLDER CONTEXT and RECENT MESSAGES.
+    - If the product was mentioned in the OLDER CONTEXT (e.g., they discussed specs
+      20 messages ago) and the RECENT MESSAGES say "I'll buy it tomorrow", that
+      is VALID INTENT. Extract the product from the older context.
+    - HOWEVER, the actual INTENT and TIMELINE must come from the RECENT MESSAGES.
+    - If an older message says "I'll buy MacBook" but recent messages say
       "Actually I want Galaxy Book", the answer is Galaxy Book ONLY.
-    - Old products/dates mentioned earlier in the conversation are DEAD — ignore them.
     - DO NOT penalize the customer for switching products multiple times.
-      Prior switches are irrelevant. The ONLY thing that matters is the
-      customer's LATEST stated product and LATEST stated timeline.
-    - DO NOT judge the customer as "indecisive" or "unclear" based on history.
-      Treat the last few messages as if the conversation just started.
+    - DO NOT judge the customer as "indecisive" based on older messages.
 
 R2. BOTH PRODUCT + SPECIFIC TIME REQUIRED (across recent messages)
     - has_intent = True ONLY when the customer's RECENT messages collectively state:
