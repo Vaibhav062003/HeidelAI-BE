@@ -5,7 +5,7 @@ import re
 import shlex
 import unittest
 import xml.etree.ElementTree as ET
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from html import escape
 
@@ -20,10 +20,13 @@ source = pathlib.Path("services/tally_service.py").read_text()
 tree = ast.parse(source)
 wanted = {
     "connector_key_hash", "stable_remote_id", "normalized_settings", "_money", "_number", "_xml", "_ledger",
+    "_clean_invoice_address", "_string_list_xml",
     "_customer_snapshot", "_tally_escalation_payload", "build_sales_voucher_xml", "parse_invoice_command",
     "_node_text", "_decimal_text", "_tag", "_direct_text", "_parse_tally_xml", "_tally_date", "parse_snapshot_responses", "validate_snapshot_responses", "build_master_xml",
     "valid_gstin_format", "_normalized_phone", "_strict_party_matches", "parse_outstanding_response", "parse_profit_loss_response", "build_report_xml",
-    "_export_collection_xml", "build_invoice_export_xml", "parse_invoice_export_response", "_pdf_document", "render_invoice_pdf",
+    "_export_collection_xml", "build_snapshot_requests", "build_invoice_export_xml", "parse_invoice_export_response", "_pdf_document", "render_invoice_pdf",
+    "_financial_year_period", "_merge_deleted_transactions",
+    "_pdf_expires_at", "_pdf_is_current", "_pdf_client_view",
     "_exact_product_master_id", "_job_phase",
     "_validate_tally_pdf",
 }
@@ -33,7 +36,8 @@ nodes = [
     or (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in {"DEFAULT_SETTINGS", "GSTIN_PATTERN", "INVALID_XML10_CHARACTERS", "INVALID_XML10_REFERENCES", "SNAPSHOT_KEYS"} for target in node.targets))
 ]
 namespace = {
-    "hashlib": hashlib, "date": date, "datetime": datetime, "Decimal": Decimal, "ROUND_HALF_UP": ROUND_HALF_UP,
+    "hashlib": hashlib, "date": date, "datetime": datetime, "timedelta": timedelta, "timezone": timezone,
+    "Decimal": Decimal, "ROUND_HALF_UP": ROUND_HALF_UP,
     "escape": escape, "HTTPException": HTTPException, "re": re, "shlex": shlex, "ET": ET,
 }
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "services/tally_service.py", "exec"), namespace)
@@ -53,12 +57,16 @@ build_report_xml = namespace["build_report_xml"]
 exact_product_master_id = namespace["_exact_product_master_id"]
 job_phase = namespace["_job_phase"]
 export_collection_xml = namespace["_export_collection_xml"]
+build_snapshot_requests = namespace["build_snapshot_requests"]
 build_invoice_export_xml = namespace["build_invoice_export_xml"]
 parse_invoice_export_response = namespace["parse_invoice_export_response"]
 render_invoice_pdf = namespace["render_invoice_pdf"]
 validate_tally_pdf = namespace["_validate_tally_pdf"]
 normalized_phone = namespace["_normalized_phone"]
 strict_party_matches = namespace["_strict_party_matches"]
+merge_deleted_transactions = namespace["_merge_deleted_transactions"]
+pdf_is_current = namespace["_pdf_is_current"]
+pdf_client_view = namespace["_pdf_client_view"]
 
 
 class TallyContractTests(unittest.TestCase):
@@ -97,6 +105,11 @@ class TallyContractTests(unittest.TestCase):
         }
 
     def test_xml_is_escaped_balanced_and_stable(self):
+        self.quote.update({
+            "bill_to": {"name": "Buyer & Sons", "address": "Bill Road\nPune", "state": "Maharashtra", "pincode": "411001", "gstin": "27ABCDE1234F1Z5"},
+            "ship_to": {"name": "Buyer Warehouse", "address": "Ship <Road>", "state": "Karnataka", "pincode": "560001", "gstin": "29ABCDE1234F1Z1", "place": "Bengaluru"},
+            "dispatch_from": {"name": "Heidel Dispatch", "address": "Dock & Yard", "state": "Maharashtra", "pincode": "400001", "place": "Mumbai"},
+        })
         xml = build_sales_voucher_xml(self.quote, self.settings, "Buyer & Sons", "cgst_sgst")
         self.assertIn("Heidel &amp; Co", xml)
         self.assertIn("RTX &lt;5060&gt; &amp; build", xml)
@@ -107,6 +120,12 @@ class TallyContractTests(unittest.TestCase):
         self.assertEqual(xml.count("REMOTEID="), 1)
         self.assertNotIn("<VOUCHERNUMBER>", xml)
         self.assertIn("<REFERENCE>Q-100</REFERENCE>", xml)
+        self.assertIn("<BASICBUYERADDRESS>Bill Road</BASICBUYERADDRESS>", xml)
+        self.assertIn("<CONSIGNEEMAILINGNAME>Buyer Warehouse</CONSIGNEEMAILINGNAME>", xml)
+        self.assertIn("<ADDRESS>Ship &lt;Road&gt;</ADDRESS>", xml)
+        self.assertIn("<CONSIGNEEGSTIN>29ABCDE1234F1Z1</CONSIGNEEGSTIN>", xml)
+        self.assertIn("<DISPATCHFROMADDRESS>Dock &amp; Yard</DISPATCHFROMADDRESS>", xml)
+        self.assertIn("<DISPATCHFROMPLACE>Mumbai</DISPATCHFROMPLACE>", xml)
         self.assertNotIn("Buyer & Sons", xml)
 
     def test_mismatched_money_fails_before_connector(self):
@@ -128,6 +147,7 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn('await admin_required(user)', source)
         self.assertIn('/api/tally/operations', source)
         self.assertIn('connector_version_number < 7', source)
+        self.assertIn('"credit_notes"', source)
         self.assertNotIn('"connector_key_hash": integration', source)
         self.assertIn('"response_meta": response_meta', service)
         self.assertNotIn('"responses": result.get("responses")', service)
@@ -204,10 +224,15 @@ class TallyContractTests(unittest.TestCase):
             "key": "ledgers", "xml": (
                 "<ENVELOPE><LEDGER><NAME>Lee Computers</NAME><MASTERID>7</MASTERID>"
                 "<LEDGERMOBILE>9876543210</LEDGERMOBILE><LEDGERPHONE>0201234567</LEDGERPHONE>"
+                "<MAILINGNAME>Lee Legal</MAILINGNAME><ADDRESS.LIST><ADDRESS>MG Road</ADDRESS></ADDRESS.LIST><PINCODE>411001</PINCODE>"
+                "<LEDGSTREGDETAILS.LIST><GSTIN>27ABCDE1234F1Z5</GSTIN></LEDGSTREGDETAILS.LIST>"
                 "</LEDGER></ENVELOPE>"
             ),
         }])
         self.assertEqual(parsed["ledgers"][0]["phones"], ["9876543210", "0201234567"])
+        self.assertEqual(parsed["ledgers"][0]["gstin"], "27ABCDE1234F1Z5")
+        self.assertEqual(parsed["ledgers"][0]["mailing_name"], "Lee Legal")
+        self.assertEqual(parsed["ledgers"][0]["address"], "MG Road")
 
     def test_xml10_control_markers_do_not_break_ledger_sync(self):
         parsed = parse_snapshot_responses([{
@@ -239,6 +264,30 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn("<NATIVEMETHOD>Name</NATIVEMETHOD>", xml)
         self.assertIn("<NATIVEMETHOD>Parent</NATIVEMETHOD>", xml)
 
+    def test_sales_transaction_snapshot_tracks_credit_notes_and_lifecycle(self):
+        requests = {item["key"]: item["xml"] for item in build_snapshot_requests(self.settings)}
+        self.assertIn("$$IsSales:$VoucherTypeName", requests["invoices"])
+        self.assertIn("$$IsCreditNote:$VoucherTypeName", requests["credit_notes"])
+        self.assertIn("<NATIVEMETHOD>IsCancelled</NATIVEMETHOD>", requests["credit_notes"])
+        parsed = parse_snapshot_responses([
+            {"key": "invoices", "xml": "<ENVELOPE><VOUCHER><MASTERID>1</MASTERID><VOUCHERNUMBER>S-1</VOUCHERNUMBER><VOUCHERTYPENAME>Sales</VOUCHERTYPENAME><AMOUNT>-100</AMOUNT></VOUCHER></ENVELOPE>"},
+            {"key": "credit_notes", "xml": "<ENVELOPE><VOUCHER><MASTERID>2</MASTERID><VOUCHERNUMBER>CN-1</VOUCHERNUMBER><VOUCHERTYPENAME>Credit Note</VOUCHERTYPENAME><ISCANCELLED>Yes</ISCANCELLED><AMOUNT>25</AMOUNT></VOUCHER></ENVELOPE>"},
+        ])
+        self.assertEqual(parsed["invoices"][0]["lifecycle_status"], "active")
+        self.assertEqual(parsed["credit_notes"][0]["transaction_type"], "credit_note")
+        self.assertEqual(parsed["credit_notes"][0]["lifecycle_status"], "cancelled")
+        merged = merge_deleted_transactions(
+            parsed["invoices"] + parsed["credit_notes"],
+            [{"invoice_id": "3", "master_id": "3", "voucher_number": "S-OLD", "outstanding_amount": 50}],
+            "2026-08-21T00:00:00Z",
+        )
+        deleted = next(row for row in merged if row.get("master_id") == "3")
+        self.assertEqual(deleted["lifecycle_status"], "deleted")
+        self.assertEqual(deleted["outstanding_amount"], 0)
+
+        with self.assertRaises(HTTPException):
+            parse_snapshot_responses([{"key": "credit_notes", "xml": "<ENVELOPE><HEADER><STATUS>0</STATUS></HEADER></ENVELOPE>"}])
+
     def test_invoice_pdf_is_built_from_the_requested_tally_voucher(self):
         request = build_invoice_export_xml(self.settings, "99", "2026-08-20")
         self.assertIn("<ID>HeidelAIInvoice</ID>", request)
@@ -249,6 +298,9 @@ class TallyContractTests(unittest.TestCase):
             "<VOUCHERNUMBER>INV-99</VOUCHERNUMBER><REFERENCE>Q-99</REFERENCE>"
             "<PARTYLEDGERNAME>Lee Computers</PARTYLEDGERNAME><PARTYGSTIN>27ABCDE1234F1Z5</PARTYGSTIN>"
             "<BASICBUYERADDRESS.LIST><BASICBUYERADDRESS>Pune</BASICBUYERADDRESS></BASICBUYERADDRESS.LIST>"
+            "<CONSIGNEEMAILINGNAME>Lee Warehouse</CONSIGNEEMAILINGNAME><CONSIGNEEGSTIN>29ABCDE1234F1Z1</CONSIGNEEGSTIN>"
+            "<ADDRESS.LIST><ADDRESS>Bengaluru</ADDRESS></ADDRESS.LIST><CONSIGNEESTATENAME>Karnataka</CONSIGNEESTATENAME>"
+            "<DISPATCHFROMNAME>Mumbai Depot</DISPATCHFROMNAME><DISPATCHFROMADDRESS.LIST><DISPATCHFROMADDRESS>Dock 4</DISPATCHFROMADDRESS></DISPATCHFROMADDRESS.LIST>"
             "<AMOUNT>-106200</AMOUNT><ALLINVENTORYENTRIES.LIST><STOCKITEMNAME>RTX 5090</STOCKITEMNAME>"
             "<BILLEDQTY>2 Nos</BILLEDQTY><RATE>45000/Nos</RATE><AMOUNT>90000</AMOUNT>"
             "</ALLINVENTORYENTRIES.LIST><ALLLEDGERENTRIES.LIST><LEDGERNAME>CGST</LEDGERNAME>"
@@ -258,10 +310,15 @@ class TallyContractTests(unittest.TestCase):
         invoice = parse_invoice_export_response(response, "99")
         self.assertEqual(invoice["voucher_number"], "INV-99")
         self.assertEqual(invoice["items"][0]["name"], "RTX 5090")
+        self.assertEqual(invoice["bill_to"]["address"], "Pune")
+        self.assertEqual(invoice["ship_to"]["name"], "Lee Warehouse")
+        self.assertEqual(invoice["dispatch_from"]["address"], "Dock 4")
         pdf = render_invoice_pdf(invoice, "Derivative AI", "Sales")
         self.assertTrue(pdf.startswith(b"%PDF-1.4"))
         self.assertIn(b"INV-99", pdf)
         self.assertIn(b"CGST", pdf)
+        self.assertIn(b"Ship to", pdf)
+        self.assertIn(b"Dispatch from", pdf)
         self.assertTrue(pdf.endswith(b"%%EOF\n"))
 
     def test_master_operation_waits_for_linked_readback(self):
@@ -333,10 +390,30 @@ class TallyContractTests(unittest.TestCase):
         routes = pathlib.Path("api/tally_routes.py").read_text()
         self.assertIn('"/api/tally/profit-loss"', routes)
         self.assertIn('"/api/tally/invoices/{invoice_id}/pdf"', routes)
+        self.assertIn('"/api/tally/invoices/{invoice_id}/pdf-link"', routes)
         self.assertIn("store_uploaded_tally_pdf", routes)
         self.assertIn('"/api/tally/customers/{party_master_id}/link"', routes)
+        self.assertIn('phone: str = Field(default="", max_length=30)', routes)
         self.assertIn('"/api/tally/invoices/{invoice_id}/reminders"', routes)
         self.assertIn('"/api/tally-connector/jobs/{job_id}/artifact"', routes)
+
+    def test_invoice_pdf_cache_expires_without_exposing_storage_metadata(self):
+        now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+        pdf = {"public_id": "private-id", "alter_id": "7", "generated_at": now - timedelta(days=29)}
+        self.assertTrue(pdf_is_current(pdf, "7", now))
+        view = pdf_client_view(pdf, "7", now)
+        self.assertTrue(view["ready"])
+        self.assertNotIn("public_id", view)
+        self.assertFalse(pdf_is_current({**pdf, "generated_at": now - timedelta(days=31)}, "7", now))
+        self.assertFalse(pdf_is_current(pdf, "8", now))
+
+        cloudinary = pathlib.Path("services/cloudinary_service.py").read_text()
+        scheduler = pathlib.Path("core/scheduler.py").read_text()
+        self.assertIn('type="private"', cloudinary)
+        self.assertIn("private_download_url", cloudinary)
+        self.assertIn('pdf.get("format") or "pdf"', cloudinary)
+        self.assertIn("TALLY_PDF_RETENTION_DAYS = 30", cloudinary)
+        self.assertIn("cleanup_expired_tally_pdfs", scheduler)
 
     def test_connector_result_ignores_v5_null_response_placeholder(self):
         routes = pathlib.Path("api/tally_routes.py").read_text()
