@@ -162,21 +162,6 @@ def build_report_xml(settings: dict, report: str, from_date: str, to_date: str, 
     )
 
 
-def build_invoice_pdf_request(settings: dict, invoice: dict) -> str:
-    settings = normalized_settings(settings)
-    return (
-        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>"
-        "<TYPE>Data</TYPE><ID>Voucher</ID></HEADER><BODY><DESC><STATICVARIABLES>"
-        f"<SVCURRENTCOMPANY>{_xml(settings['company_name'])}</SVCURRENTCOMPANY>"
-        "<SVEXPORTFORMAT>$$SysName:PDF</SVEXPORTFORMAT>"
-        f"<SVVOUCHERTYPENAME>{_xml(invoice.get('voucher_type') or settings['voucher_type'])}</SVVOUCHERTYPENAME>"
-        f"<SVVOUCHERNO>{_xml(invoice.get('voucher_number'))}</SVVOUCHERNO>"
-        f"<SVFROMDATE>{_xml(str(invoice.get('date') or '').replace('-', ''))}</SVFROMDATE>"
-        f"<SVTODATE>{_xml(str(invoice.get('date') or '').replace('-', ''))}</SVTODATE>"
-        "</STATICVARIABLES></DESC></BODY></ENVELOPE>"
-    )
-
-
 def build_snapshot_requests(settings: dict) -> list[dict]:
     fy_from, fy_to = _financial_year_period()
     return [
@@ -1053,29 +1038,34 @@ async def queue_invoice_pdf(org_id: str, user_id: str, invoice_id: str) -> tuple
     pdf = invoice.get("pdf") or {}
     if pdf.get("url") and str(pdf.get("alter_id")) == str(invoice.get("alter_id")):
         return {"status": "completed", "pdf": pdf}, False
-    active = await db.tally_command_jobs.find_one({
-        "org_id": org_id, "job_type": "invoice_pdf", "invoice_id": invoice_id,
-        "status": {"$in": ["pending", "processing"]},
-    }, {"_id": 0, "requests": 0})
-    if active:
-        return serialize_mongo(active), False
-    integration = await get_integration(org_id)
-    if "pdf" not in (integration.get("connector_capabilities") or []):
-        raise HTTPException(status_code=409, detail="Download and restart the latest Tally connector to export invoice PDFs")
-    now = datetime.now(timezone.utc)
-    job = {
-        "job_id": str(uuid.uuid4()), "job_type": "invoice_pdf", "org_id": org_id,
-        "invoice_id": invoice_id, "invoice_alter_id": invoice.get("alter_id", ""), "status": "pending", "attempts": 0,
-        "requests": [{"key": "invoice_pdf", "xml": build_invoice_pdf_request(integration, invoice), "binary": True}],
-        "created_at": now, "updated_at": now, "created_by": user_id,
+    raise HTTPException(
+        status_code=409,
+        detail="Export this invoice as PDF in TallyPrime, then upload it from HeidelAI's Invoices tab",
+    )
+
+
+def _validate_tally_pdf(data: bytes) -> None:
+    if len(data) > 10_000_000 or not data.startswith(b"%PDF"):
+        raise HTTPException(status_code=422, detail="Choose a valid PDF under 10 MB")
+
+
+async def store_uploaded_tally_pdf(org_id: str, invoice_id: str, data: bytes) -> dict:
+    _validate_tally_pdf(data)
+    invoice = await db.tally_invoices.find_one({"org_id": org_id, "invoice_id": invoice_id})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Tally invoice not found")
+    from services.cloudinary_service import upload_tally_invoice_pdf
+    pdf = {
+        "url": await upload_tally_invoice_pdf(data, org_id, invoice_id, str(invoice.get("alter_id") or "current")),
+        "alter_id": invoice.get("alter_id", ""),
+        "generated_at": datetime.now(timezone.utc),
     }
-    await db.tally_command_jobs.insert_one(job)
-    return serialize_mongo({key: value for key, value in job.items() if key != "requests"}), True
+    await db.tally_invoices.update_one({"_id": invoice["_id"]}, {"$set": {"pdf": pdf}})
+    return serialize_mongo(pdf)
 
 
 async def store_tally_pdf_artifact(org_id: str, job_id: str, claim_id: str, data: bytes) -> dict:
-    if len(data) > 10_000_000 or not data.startswith(b"%PDF"):
-        raise HTTPException(status_code=422, detail="Tally did not return a valid PDF under 10 MB")
+    _validate_tally_pdf(data)
     job = await db.tally_command_jobs.find_one({
         "org_id": org_id, "job_id": job_id, "job_type": "invoice_pdf", "status": "processing", "claim_id": claim_id,
     })
