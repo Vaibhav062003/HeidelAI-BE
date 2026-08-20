@@ -58,10 +58,13 @@ def enqueue_intent_check(
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=300)  # 5-minute cooldown per conversation
     
-    # IDEMPOTENCY: Check if there's already a pending/processing job in the last 5 minutes
+    # IDEMPOTENCY: Only dedup against 'pending' jobs.
+    # If a job is already 'processing', it has captured its context snapshot,
+    # so a new message arriving now won't be in that analysis.
+    # Allow a fresh job so the newer message gets analyzed later (Bug #4 fix).
     existing = db[COLLECTION].find_one({
         "conversation_id": conversation_id,
-        "status": {"$in": ["pending", "processing"]},
+        "status": "pending",
         "created_at": {"$gt": cutoff}
     })
     
@@ -192,7 +195,13 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
             
             result = await extract_purchase_intent(messages_str, ist_now)
             
-            if result and result.has_intent and result.confidence != "low":
+            # Branch 1: LLM returned None → transient error (network, malformed response).
+            # Do NOT cancel existing follow-ups on transient failures (Bug #2 fix).
+            if result is None:
+                logger.warning(f"[{job_id}] LLM returned None for {conversation_id} — treating as transient error.")
+
+            # Branch 2: AI explicitly detected purchase intent.
+            elif result.has_intent and result.confidence != "low":
                 logger.success(
                     f"[{job_id}] Intent detected for {conversation_id}: "
                     f"{result.product_name} on {result.tentative_date}"
@@ -214,10 +223,12 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                     product_name=result.product_name or "",
                     tentative_date_iso=result.tentative_date or "",
                 )
+
+            # Branch 3: AI EXPLICITLY said no intent (has_intent=False or low confidence).
+            # Only now is it safe to cancel existing follow-ups.
             else:
-                logger.info(f"[{job_id}] No intent detected for {conversation_id}.")
-                # Cancel any existing follow-ups since customer no longer shows intent
-                # (e.g., "No I've changed my mind", "Not interested anymore")
+                logger.info(f"[{job_id}] No intent detected for {conversation_id} (reason: {result.reasoning}).")
+                # Cancel only intent follow-ups, not unrelated automations (Bug #1 fix).
                 try:
                     from services.automation_scheduler import cancel_conversation_followups
                     cancelled = await asyncio.to_thread(
@@ -225,9 +236,10 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                         org_id=org_id,
                         conversation_id=conversation_id,
                         reason="no_intent_detected",
+                        flow_id="__purchase_intent_followup__",
                     )
                     if cancelled:
-                        logger.info(f"[{job_id}] Cancelled {cancelled} stale follow-up(s) for {conversation_id}")
+                        logger.info(f"[{job_id}] Cancelled {cancelled} stale intent follow-up(s) for {conversation_id}")
                 except Exception as cancel_err:
                     logger.warning(f"[{job_id}] Failed to cancel stale follow-ups: {cancel_err}")
                 

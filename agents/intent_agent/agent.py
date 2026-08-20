@@ -42,13 +42,21 @@ R2. BOTH PRODUCT + SPECIFIC TIME REQUIRED
       (b) WHEN they plan to buy it (a concrete, parseable date or time).
     - If EITHER is missing → has_intent = False.
 
-R3. NEGATIVE SIGNALS OVERRIDE EVERYTHING
-    - If the customer's latest messages contain ANY of these patterns, return
-      has_intent = False regardless of what was said earlier:
+R3. NEGATIVE SIGNALS — ONLY WHEN NO REPLACEMENT IS GIVEN
+    - If the customer's latest messages are PURELY rejecting/declining WITHOUT
+      stating a new product + time, return has_intent = False:
       • Explicit rejection: "no", "nahi", "nope", "not now", "not interested"
       • Mind change: "changed my mind", "mujhe nahi chahiye", "cancel", "drop it"
       • Indefinite deferral: "I'll think about it", "maybe later", "let me check"
       • Past tense completion: "I already bought it", "maine le liya"
+    - HOWEVER, if the customer rejects one thing but IMMEDIATELY provides a
+      replacement intent, extract the NEW intent:
+      • "No, not the MacBook. I'll buy Galaxy Book tomorrow" → has_intent = True
+        (product = Galaxy Book, date = tomorrow)
+      • "Cancel the iPhone order, I want Samsung S24 by Friday" → has_intent = True
+        (product = Samsung S24, date = Friday)
+    - Only return has_intent = False when the customer is ending the conversation
+      or declining entirely with no replacement product + timeline.
 
 R4. VAGUE ≠ SPECIFIC (Date/Time precision)
     These are NOT specific times → has_intent = False:
