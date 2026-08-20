@@ -139,6 +139,22 @@ async def schedule_intent_followup(
     Returns schedule_id on success, None on failure (never raises).
     """
     try:
+        # Cancel any previous intent follow-ups for this conversation.
+        # This handles product changes ("Actually I want Galaxy Book instead")
+        # and timeline updates ("I'll buy it at 6pm instead of 5pm").
+        from services.automation_scheduler import cancel_conversation_followups as cancel_conv_followups
+        cancelled = await asyncio.to_thread(
+            cancel_conv_followups,
+            org_id=org_id,
+            conversation_id=conversation_id,
+            reason="new_intent_detected",
+        )
+        if cancelled:
+            logger.info(
+                f"[IntentFollowup] Cancelled {cancelled} previous follow-up(s) "
+                f"for {conversation_id} before scheduling new one"
+            )
+
         target_dt = _parse_tentative_date(tentative_date_iso)
         if target_dt is None:
             logger.warning(

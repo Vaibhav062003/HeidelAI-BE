@@ -56,9 +56,9 @@ def enqueue_intent_check(
     message_content: str,
 ) -> str:
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(seconds=60)
+    cutoff = now - timedelta(seconds=300)  # 5-minute cooldown per conversation
     
-    # IDEMPOTENCY: Check if there's already a pending/processing job in the last 60s
+    # IDEMPOTENCY: Check if there's already a pending/processing job in the last 5 minutes
     existing = db[COLLECTION].find_one({
         "conversation_id": conversation_id,
         "status": {"$in": ["pending", "processing"]},
@@ -216,6 +216,20 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                 )
             else:
                 logger.info(f"[{job_id}] No intent detected for {conversation_id}.")
+                # Cancel any existing follow-ups since customer no longer shows intent
+                # (e.g., "No I've changed my mind", "Not interested anymore")
+                try:
+                    from services.automation_scheduler import cancel_conversation_followups
+                    cancelled = await asyncio.to_thread(
+                        cancel_conversation_followups,
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        reason="no_intent_detected",
+                    )
+                    if cancelled:
+                        logger.info(f"[{job_id}] Cancelled {cancelled} stale follow-up(s) for {conversation_id}")
+                except Exception as cancel_err:
+                    logger.warning(f"[{job_id}] Failed to cancel stale follow-ups: {cancel_err}")
                 
             await asyncio.to_thread(
                 lambda: db[COLLECTION].update_one(
