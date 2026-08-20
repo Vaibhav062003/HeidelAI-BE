@@ -21,7 +21,7 @@ tree = ast.parse(source)
 wanted = {
     "connector_key_hash", "stable_remote_id", "normalized_settings", "_money", "_number", "_xml", "_ledger",
     "_customer_snapshot", "_tally_escalation_payload", "build_sales_voucher_xml", "parse_invoice_command",
-    "_node_text", "_decimal_text", "_tag", "_direct_text", "_tally_date", "parse_snapshot_responses", "validate_snapshot_responses", "build_master_xml",
+    "_node_text", "_decimal_text", "_tag", "_direct_text", "_parse_tally_xml", "_tally_date", "parse_snapshot_responses", "validate_snapshot_responses", "build_master_xml",
     "valid_gstin_format", "parse_outstanding_response", "parse_profit_loss_response", "build_report_xml",
     "build_invoice_pdf_request", "_export_collection_xml",
     "_exact_product_master_id", "_job_phase",
@@ -29,7 +29,7 @@ wanted = {
 nodes = [
     node for node in tree.body
     if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted)
-    or (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in {"DEFAULT_SETTINGS", "GSTIN_PATTERN", "SNAPSHOT_KEYS"} for target in node.targets))
+    or (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in {"DEFAULT_SETTINGS", "GSTIN_PATTERN", "INVALID_XML10_CHARACTERS", "INVALID_XML10_REFERENCES", "SNAPSHOT_KEYS"} for target in node.targets))
 ]
 namespace = {
     "hashlib": hashlib, "date": date, "datetime": datetime, "Decimal": Decimal, "ROUND_HALF_UP": ROUND_HALF_UP,
@@ -158,6 +158,17 @@ class TallyContractTests(unittest.TestCase):
         self.assertEqual(parsed["stock_items"][0]["standard_rate"], 75000.0)
         self.assertTrue(parsed["ledgers"][0]["billwise"])
         self.assertEqual(parsed["ledgers"][0]["name"], "Lee Computers")
+
+    def test_xml10_control_markers_do_not_break_ledger_sync(self):
+        parsed = parse_snapshot_responses([{
+            "key": "ledgers",
+            "xml": (
+                "<ENVELOPE><LEDGER><NAME>Cash</NAME><PARENT>&#4; Primary</PARENT></LEDGER>"
+                "<LEDGER><NAME>Profit &amp; Loss A/c</NAME><PARENT>\x04Primary</PARENT></LEDGER></ENVELOPE>"
+            ),
+        }])
+        self.assertEqual(parsed["ledgers"][0]["parent"], "Primary")
+        self.assertEqual(parsed["ledgers"][1]["parent"], "Primary")
 
     def test_incomplete_snapshot_cannot_replace_the_last_good_cache(self):
         parsed = parse_snapshot_responses([
