@@ -24,6 +24,7 @@ from services.tally_service import (
     link_tally_customer,
     list_bills,
     list_payment_reminders,
+    list_tally_operations,
     list_tally_invoices,
     list_tally_ledgers,
     list_tally_stock_items,
@@ -205,6 +206,7 @@ async def get_tally_integration(request: Request, user: CurrentUser):
         "connector_update_required": connected and (
             connector_version_number < 3 or not {"reports", "pdf"}.issubset(set(capabilities))
         ),
+        "connector_update_available": connected and connector_version_number < 4,
         "can_edit": user.role in {"admin", "org:admin"},
         "settings": settings,
     }
@@ -343,6 +345,13 @@ async def post_tally_profit_loss(request: Request, payload: ProfitLossPayload, u
 async def get_tally_job(request: Request, job_id: str, user: CurrentUser):
     await _require_accounting_access(user)
     return {"job": await get_tally_command_job(user.org_id, job_id)}
+
+
+@router.get("/api/tally/operations")
+@limiter.limit("60/minute")
+async def get_tally_operations(request: Request, user: CurrentUser, limit: int = Query(20, ge=1, le=50)):
+    await _require_accounting_access(user)
+    return {"operations": await list_tally_operations(user.org_id, limit)}
 
 
 @router.post("/api/tally/invoices/{invoice_id}/pdf", status_code=202)

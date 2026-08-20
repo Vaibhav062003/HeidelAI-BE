@@ -21,15 +21,15 @@ tree = ast.parse(source)
 wanted = {
     "connector_key_hash", "stable_remote_id", "normalized_settings", "_money", "_number", "_xml", "_ledger",
     "_customer_snapshot", "_tally_escalation_payload", "build_sales_voucher_xml", "parse_invoice_command",
-    "_node_text", "_decimal_text", "_tag", "_direct_text", "_tally_date", "parse_snapshot_responses", "build_master_xml",
+    "_node_text", "_decimal_text", "_tag", "_direct_text", "_tally_date", "parse_snapshot_responses", "validate_snapshot_responses", "build_master_xml",
     "valid_gstin_format", "parse_outstanding_response", "parse_profit_loss_response", "build_report_xml",
-    "build_invoice_pdf_request",
-    "_exact_product_master_id",
+    "build_invoice_pdf_request", "_export_collection_xml",
+    "_exact_product_master_id", "_job_phase",
 }
 nodes = [
     node for node in tree.body
     if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted)
-    or (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in {"DEFAULT_SETTINGS", "GSTIN_PATTERN"} for target in node.targets))
+    or (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in {"DEFAULT_SETTINGS", "GSTIN_PATTERN", "SNAPSHOT_KEYS"} for target in node.targets))
 ]
 namespace = {
     "hashlib": hashlib, "date": date, "datetime": datetime, "Decimal": Decimal, "ROUND_HALF_UP": ROUND_HALF_UP,
@@ -43,6 +43,7 @@ customer_snapshot = namespace["_customer_snapshot"]
 tally_escalation_payload = namespace["_tally_escalation_payload"]
 parse_invoice_command = namespace["parse_invoice_command"]
 parse_snapshot_responses = namespace["parse_snapshot_responses"]
+validate_snapshot_responses = namespace["validate_snapshot_responses"]
 build_master_xml = namespace["build_master_xml"]
 valid_gstin_format = namespace["valid_gstin_format"]
 parse_outstanding_response = namespace["parse_outstanding_response"]
@@ -50,6 +51,8 @@ parse_profit_loss_response = namespace["parse_profit_loss_response"]
 build_report_xml = namespace["build_report_xml"]
 build_invoice_pdf_request = namespace["build_invoice_pdf_request"]
 exact_product_master_id = namespace["_exact_product_master_id"]
+job_phase = namespace["_job_phase"]
+export_collection_xml = namespace["_export_collection_xml"]
 
 
 class TallyContractTests(unittest.TestCase):
@@ -113,11 +116,15 @@ class TallyContractTests(unittest.TestCase):
 
     def test_routes_keep_connector_separate_from_user_auth(self):
         source = pathlib.Path("api/tally_routes.py").read_text()
+        service = pathlib.Path("services/tally_service.py").read_text()
         self.assertIn('alias="X-Tally-Connector-Key"', source)
         self.assertIn('alias="X-Tally-Claim-Id"', source)
         self.assertIn('await admin_required(user)', source)
+        self.assertIn('/api/tally/operations', source)
         self.assertIn('connector_version_number < 3', source)
         self.assertNotIn('"connector_key_hash": integration', source)
+        self.assertIn('"response_meta": response_meta', service)
+        self.assertNotIn('"responses": result.get("responses")', service)
 
     def test_failure_escalation_connects_customer_and_tally_context(self):
         customer = customer_snapshot(self.quote)
@@ -144,12 +151,40 @@ class TallyContractTests(unittest.TestCase):
                 "<STANDARDPRICE>75,000.00/Nos</STANDARDPRICE><GSTIGSTRATE>18</GSTIGSTRATE>"
                 "</STOCKITEM></ENVELOPE>"
             )},
-            {"key": "ledgers", "xml": "<ENVELOPE><LEDGER><NAME>Lee Computers</NAME><MASTERID>7</MASTERID><ISBILLWISEON>Yes</ISBILLWISEON></LEDGER></ENVELOPE>"},
+            {"key": "ledgers", "xml": '<ENVELOPE><LEDGER NAME="Lee Computers"><PARENT>Sundry Debtors</PARENT><MASTERID>7</MASTERID><ISBILLWISEON>Yes</ISBILLWISEON></LEDGER></ENVELOPE>'},
         ])
         self.assertEqual(parsed["stock_items"][0]["model_number"], "RTX-5060")
         self.assertEqual(parsed["stock_items"][0]["closing_quantity"], 5.0)
         self.assertEqual(parsed["stock_items"][0]["standard_rate"], 75000.0)
         self.assertTrue(parsed["ledgers"][0]["billwise"])
+        self.assertEqual(parsed["ledgers"][0]["name"], "Lee Computers")
+
+    def test_incomplete_snapshot_cannot_replace_the_last_good_cache(self):
+        parsed = parse_snapshot_responses([
+            {"key": "ledgers", "xml": "<ENVELOPE><LEDGER><NAME>Cash</NAME></LEDGER></ENVELOPE>"},
+        ])
+        with self.assertRaises(HTTPException):
+            validate_snapshot_responses([{"key": "ledgers"}], parsed)
+        empty = {"ledgers": []}
+        responses = [{"key": key} for key in namespace["SNAPSHOT_KEYS"]]
+        with self.assertRaises(HTTPException):
+            validate_snapshot_responses(responses, empty)
+
+    def test_collection_export_defines_the_collection_tally_is_asked_to_export(self):
+        xml = export_collection_xml(self.settings, "Ledger", ["Name", "Parent"])
+        self.assertIn("<ID>HeidelAILedger</ID>", xml)
+        self.assertIn('<COLLECTION NAME="HeidelAILedger" ISINITIALIZE="Yes">', xml)
+        self.assertIn("<TYPE>Ledger</TYPE>", xml)
+        self.assertIn("<NATIVEMETHOD>Name</NATIVEMETHOD>", xml)
+        self.assertIn("<NATIVEMETHOD>Parent</NATIVEMETHOD>", xml)
+
+    def test_master_operation_waits_for_linked_readback(self):
+        master = {"status": "completed", "job_type": "master_create", "readback_job_id": "sync-1", "master": {"name": "Lee Computers"}}
+        self.assertEqual(job_phase(master, {"status": "pending"})[0], "reading_from_tally")
+        self.assertEqual(job_phase(master, {"status": "completed"}, master_found=True)[0], "completed")
+        phase, error = job_phase(master, {"status": "completed"}, master_found=False)
+        self.assertEqual(phase, "failed")
+        self.assertIn("read-back did not contain it", error)
 
     def test_master_xml_only_creates_or_alters_supported_masters(self):
         xml = build_master_xml("sales", {"name": "Computer Sales"})
