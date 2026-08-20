@@ -20,6 +20,7 @@ from services.tally_service import (
     get_customer_mapping,
     get_integration,
     get_profit_loss_report,
+    get_invoice_pdf_download,
     get_tally_command_job,
     link_tally_customer,
     list_bills,
@@ -104,7 +105,7 @@ class TallySettingsPayload(BaseModel):
 
 
 class ConnectorResponsePayload(BaseModel):
-    key: Literal["ledgers", "stock_items", "units", "invoices", "outstandings", "profit_loss", "master", "invoice"]
+    key: Literal["ledgers", "stock_items", "units", "invoices", "credit_notes", "outstandings", "profit_loss", "master", "invoice"]
     xml: str = Field(max_length=10_000_000)
 
 
@@ -161,11 +162,28 @@ class InvoiceDraftItemPayload(BaseModel):
     gst_inclusive: bool = False
 
 
+class InvoiceAddressPayload(BaseModel):
+    name: str = Field(default="", max_length=160)
+    address: str = Field(default="", max_length=1000)
+    state: str = Field(default="", max_length=80)
+    pincode: str = Field(default="", max_length=20)
+    gstin: str = Field(default="", max_length=20)
+    place: str = Field(default="", max_length=120)
+
+    @field_validator("name", "address", "state", "pincode", "gstin", "place")
+    @classmethod
+    def strip_address_text(cls, value: str) -> str:
+        return value.strip()
+
+
 class InvoiceDraftReviewPayload(BaseModel):
     party_master_id: str = Field(min_length=1, max_length=120)
     sales_ledger: str = Field(min_length=1, max_length=120)
     tax_mode: Literal["none", "cgst_sgst", "igst"]
     items: list[InvoiceDraftItemPayload] = Field(min_length=1, max_length=100)
+    bill_to: InvoiceAddressPayload = Field(default_factory=InvoiceAddressPayload)
+    ship_to: InvoiceAddressPayload = Field(default_factory=InvoiceAddressPayload)
+    dispatch_from: InvoiceAddressPayload = Field(default_factory=InvoiceAddressPayload)
 
 
 class ProfitLossPayload(BaseModel):
@@ -174,8 +192,15 @@ class ProfitLossPayload(BaseModel):
 
 
 class CustomerLinkPayload(BaseModel):
-    conversation_id: str = Field(min_length=1, max_length=200)
+    conversation_id: str = Field(default="", max_length=200)
+    phone: str = Field(default="", max_length=30)
     is_primary: bool = False
+
+    @model_validator(mode="after")
+    def require_customer_or_phone(self):
+        if not self.conversation_id.strip() and not self.phone.strip():
+            raise ValueError("Choose a WhatsApp customer or enter a number")
+        return self
 
 
 class ReminderPayload(BaseModel):
@@ -371,6 +396,13 @@ async def post_tally_invoice_pdf(request: Request, invoice_id: str, user: Curren
     return {"job": job, "created": created}
 
 
+@router.get("/api/tally/invoices/{invoice_id}/pdf-link")
+@limiter.limit("30/minute")
+async def get_tally_invoice_pdf_link(request: Request, invoice_id: str, user: CurrentUser):
+    await _require_accounting_access(user)
+    return await get_invoice_pdf_download(user.org_id, invoice_id)
+
+
 @router.put("/api/tally/invoices/{invoice_id}/pdf")
 @limiter.limit("10/minute")
 async def put_tally_invoice_pdf(request: Request, invoice_id: str, user: CurrentUser):
@@ -387,7 +419,8 @@ async def put_tally_customer_link(
 ):
     await _require_accounting_access(user)
     return {"link": await link_tally_customer(
-        user.org_id, user.user_id, party_master_id, payload.conversation_id, make_primary=payload.is_primary,
+        user.org_id, user.user_id, party_master_id, payload.conversation_id,
+        phone=payload.phone, make_primary=payload.is_primary,
     )}
 
 

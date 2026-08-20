@@ -7,7 +7,8 @@ import io
 import re
 import uuid
 import cloudinary
-from datetime import datetime, timedelta
+import cloudinary.utils
+from datetime import datetime, timedelta, timezone
 
 # Internal modules
 from config.settings import (
@@ -28,6 +29,8 @@ cloudinary.config(
 
 AUDIO_RETENTION_DAYS = 30
 AUDIO_RETENTION_TAG = "heidelai-audio-note"
+TALLY_PDF_RETENTION_DAYS = 30
+TALLY_PDF_RETENTION_TAG = "heidelai-tally-invoice"
 
 
 def _outbound_upload_options(semantic_type: str, convert_audio: bool, media_kind: Optional[str] = None) -> dict:
@@ -113,24 +116,83 @@ async def cleanup_expired_audio_notes(days_threshold: int = AUDIO_RETENTION_DAYS
         return 0
 
 
-async def upload_tally_invoice_pdf(data: bytes, org_id: str, invoice_id: str, alter_id: str) -> str:
-    """Store an exact Tally export at a stable, versioned URL for downloads and WhatsApp."""
+async def upload_tally_invoice_pdf(data: bytes, org_id: str, invoice_id: str, alter_id: str) -> dict:
+    """Store an exact Tally export privately for at most 30 days."""
     safe_invoice = re.sub(r"[^A-Za-z0-9_-]", "-", invoice_id)[:100] or uuid.uuid4().hex
     safe_alter = re.sub(r"[^A-Za-z0-9_-]", "-", alter_id)[:40] or "current"
     file_obj = io.BytesIO(data)
     file_obj.name = f"{safe_invoice}-{safe_alter}.pdf"
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=TALLY_PDF_RETENTION_DAYS)
     result = await asyncio.to_thread(
         cloudinary.uploader.upload,
         file_obj,
         folder=f"tally_invoices/{org_id}",
         public_id=file_obj.name,
         resource_type="raw",
+        type="private",
+        tags=[TALLY_PDF_RETENTION_TAG],
+        context={"expires_at": expires_at.isoformat()},
         overwrite=True,
     )
-    secure_url = result.get("secure_url")
-    if not secure_url:
-        raise RuntimeError("Cloudinary did not return a Tally invoice PDF URL")
-    return secure_url
+    if not result.get("public_id"):
+        raise RuntimeError("Cloudinary did not return a Tally invoice PDF identifier")
+    return {
+        "public_id": result["public_id"], "asset_id": result.get("asset_id"),
+        "resource_type": result.get("resource_type") or "raw", "delivery_type": result.get("type") or "private",
+        "format": result.get("format") or "pdf", "generated_at": now, "expires_at": expires_at,
+    }
+
+
+def tally_invoice_pdf_download_url(pdf: dict, expires_in_seconds: int = 300) -> str:
+    """Create a short-lived URL; legacy public URLs remain usable only until their stored expiry."""
+    if pdf.get("public_id"):
+        return cloudinary.utils.private_download_url(
+            pdf["public_id"], pdf.get("format") or "pdf", resource_type=pdf.get("resource_type") or "raw",
+            type=pdf.get("delivery_type") or "private",
+            expires_at=int(datetime.now(timezone.utc).timestamp()) + expires_in_seconds,
+            attachment=True,
+        )
+    if pdf.get("url"):
+        return pdf["url"]
+    raise RuntimeError("Tally invoice PDF storage metadata is missing")
+
+
+def _cleanup_expired_tally_invoice_pdfs_sync(days_threshold: int) -> int:
+    groups = {}
+    next_cursor = None
+    while True:
+        search = cloudinary.Search().expression(
+            f"folder:tally_invoices/* AND resource_type:raw AND created_at<={days_threshold}d"
+        ).max_results(500)
+        if next_cursor:
+            search = search.next_cursor(next_cursor)
+        result = search.execute()
+        for resource in result.get("resources", []):
+            if resource.get("public_id"):
+                groups.setdefault((resource.get("resource_type") or "raw", resource.get("type") or "upload"), []).append(resource["public_id"])
+        next_cursor = result.get("next_cursor")
+        if not next_cursor:
+            break
+    deleted = 0
+    for (resource_type, delivery_type), public_ids in groups.items():
+        for start in range(0, len(public_ids), 100):
+            response = cloudinary.api.delete_resources(
+                public_ids[start:start + 100], resource_type=resource_type, type=delivery_type,
+            )
+            deleted += sum(status in {"deleted", "not_found"} for status in response.get("deleted", {}).values())
+    return deleted
+
+
+async def cleanup_expired_tally_invoice_pdfs(days_threshold: int = TALLY_PDF_RETENTION_DAYS) -> int | None:
+    try:
+        deleted = await asyncio.to_thread(_cleanup_expired_tally_invoice_pdfs_sync, days_threshold)
+        if deleted:
+            logger.info(f"Deleted {deleted} expired Tally invoice PDFs from Cloudinary")
+        return deleted
+    except Exception as exc:
+        logger.error(f"Failed to delete expired Tally invoice PDFs: {exc}")
+        return None
 
 # @app.get("/api/cloudinary/stats")
 async def get_cloudinary_stats():

@@ -14,7 +14,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from database import get_async_mongo_db
-from services.utils import serialize_mongo
+from services.utils import normalize_phone, serialize_mongo
 from services.work_team_service import require_conversation_access
 
 
@@ -46,7 +46,7 @@ INVALID_XML10_REFERENCES = re.compile(
     r"&#(?:0*(?:[0-8]|1[12]|1[4-9]|2[0-9]|3[01])|x0*(?:[0-8bcef]|1[0-9a-f]));",
     re.IGNORECASE,
 )
-SNAPSHOT_KEYS = {"ledgers", "stock_items", "units", "invoices", "outstandings", "profit_loss"}
+SNAPSHOT_KEYS = {"ledgers", "stock_items", "units", "invoices", "credit_notes", "outstandings", "profit_loss"}
 
 
 def _money(value) -> Decimal:
@@ -213,13 +213,16 @@ def parse_invoice_command(command: str) -> dict:
     return {"items": items}
 
 
-def _export_collection_xml(settings: dict, collection: str, fetch: list[str], *, filters: str = "") -> str:
+def _export_collection_xml(
+    settings: dict, collection: str, fetch: list[str], *, filters: str = "", formula: str = "",
+) -> str:
     settings = normalized_settings(settings)
     collection_id = f"HeidelAI{collection}"
     native_methods = "".join(f"<NATIVEMETHOD>{_xml(field)}</NATIVEMETHOD>" for field in fetch)
     filter_xml = f"<FILTER>{_xml(filters)}</FILTER>" if filters else ""
+    formula_text = formula or f'$VoucherTypeName = "{settings["voucher_type"]}"'
     formula_xml = (
-        f"<SYSTEM TYPE=\"Formulae\" NAME=\"{_xml(filters)}\">$VoucherTypeName = \"{_xml(settings['voucher_type'])}\"</SYSTEM>"
+        f"<SYSTEM TYPE=\"Formulae\" NAME=\"{_xml(filters)}\">{_xml(formula_text)}</SYSTEM>"
         if filters else ""
     )
     tdl = (
@@ -260,7 +263,10 @@ def build_invoice_export_xml(settings: dict, master_id: str, invoice_date: str =
     fetch = [
         "Date", "EffectiveDate", "VoucherNumber", "Reference", "VoucherTypeName", "PartyLedgerName",
         "PartyGSTIN", "StateName", "PlaceOfSupply", "BasicBuyerName", "BuyerName", "BasicBuyerAddress",
-        "Address", "BuyerPinNumber", "Narration", "GUID", "MasterID", "AlterID", "Amount",
+        "Address", "BuyerPinNumber", "BillToPlace", "ConsigneeMailingName", "ConsigneeGSTIN",
+        "ConsigneeStateName", "ConsigneePinNumber", "ShipToPlace", "DispatchFromName",
+        "DispatchFromAddress", "DispatchFromStateName", "DispatchFromPinCode", "DispatchFromPlace",
+        "Narration", "GUID", "MasterID", "AlterID", "Amount",
         "AllLedgerEntries", "AllInventoryEntries",
     ]
     native_methods = "".join(f"<NATIVEMETHOD>{field}</NATIVEMETHOD>" for field in fetch)
@@ -288,7 +294,8 @@ def build_snapshot_requests(settings: dict) -> list[dict]:
     return [
         {"key": "ledgers", "xml": _export_collection_xml(settings, "Ledger", [
             "Name", "Parent", "GUID", "MasterID", "AlterID", "ClosingBalance", "OpeningBalance",
-            "LedgerMobile", "LedgerPhone", "Email", "PartyGSTIN", "LedgerStateName", "GSTRegistrationType", "IsBillWiseOn",
+            "LedgerMobile", "LedgerPhone", "Email", "PartyGSTIN", "GSTIN", "LedGSTRegDetails",
+            "LedgerStateName", "GSTRegistrationType", "IsBillWiseOn", "MailingName", "Address", "Pincode",
         ])},
         {"key": "stock_items", "xml": _export_collection_xml(settings, "StockItem", [
             "Name", "Alias", "Parent", "GUID", "MasterID", "AlterID", "BaseUnits", "ClosingBalance",
@@ -299,8 +306,12 @@ def build_snapshot_requests(settings: dict) -> list[dict]:
         ])},
         {"key": "invoices", "xml": _export_collection_xml(settings, "Voucher", [
             "Date", "EffectiveDate", "VoucherNumber", "Reference", "VoucherTypeName", "PartyLedgerName", "GUID", "MasterID",
-            "AlterID", "Amount", "AllLedgerEntries", "AllInventoryEntries",
-        ], filters="HeidelAISalesVoucher")},
+            "AlterID", "Amount", "IsCancelled", "IsOptional", "IsPostDated", "AllLedgerEntries", "AllInventoryEntries",
+        ], filters="HeidelAISalesVoucher", formula="$$IsSales:$VoucherTypeName")},
+        {"key": "credit_notes", "xml": _export_collection_xml(settings, "Voucher", [
+            "Date", "EffectiveDate", "VoucherNumber", "Reference", "VoucherTypeName", "PartyLedgerName", "GUID", "MasterID",
+            "AlterID", "Amount", "IsCancelled", "IsOptional", "IsPostDated", "AllLedgerEntries", "AllInventoryEntries",
+        ], filters="HeidelAICreditNote", formula="$$IsCreditNote:$VoucherTypeName")},
         {"key": "outstandings", "xml": build_report_xml(settings, "Bills Receivable", "1970-01-01", fy_to)},
         {"key": "profit_loss", "xml": build_report_xml(settings, "Profit and Loss", fy_from, fy_to)},
     ]
@@ -399,8 +410,8 @@ def parse_profit_loss_response(xml: str) -> dict:
 
 
 def parse_snapshot_responses(responses: list[dict]) -> dict:
-    parsed = {"ledgers": [], "stock_items": [], "units": [], "invoices": [], "outstandings": [], "profit_loss": {}}
-    tags = {"ledgers": "LEDGER", "stock_items": "STOCKITEM", "units": "UNIT", "invoices": "VOUCHER"}
+    parsed = {"ledgers": [], "stock_items": [], "units": [], "invoices": [], "credit_notes": [], "outstandings": [], "profit_loss": {}}
+    tags = {"ledgers": "LEDGER", "stock_items": "STOCKITEM", "units": "UNIT", "invoices": "VOUCHER", "credit_notes": "VOUCHER"}
     for response in responses or []:
         key = response.get("key")
         if key == "outstandings":
@@ -415,6 +426,9 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
             root = _parse_tally_xml(response.get("xml") or "")
         except ET.ParseError as exc:
             raise HTTPException(status_code=502, detail=f"Tally returned invalid {key} XML") from exc
+        line_error = _node_text(root, "LINEERROR")
+        if line_error or _node_text(root, "STATUS") == "0" or (_node_text(root, "ERRORS").isdigit() and int(_node_text(root, "ERRORS")) > 0):
+            raise HTTPException(status_code=502, detail=line_error or f"Tally rejected the {key} export")
         seen = set()
         for node in root.iter():
             if node.tag.rsplit("}", 1)[-1].upper() != tags[key]:
@@ -435,6 +449,10 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                 phones = list(dict.fromkeys(filter(None, [
                     _node_text(node, "LEDGERMOBILE"), _node_text(node, "LEDGERPHONE"),
                 ])))
+                addresses = list(dict.fromkeys(
+                    child.text.strip() for child in node.iter()
+                    if _tag(child) == "ADDRESS" and child.text and child.text.strip()
+                ))
                 parsed[key].append({**common,
                     "parent": _node_text(node, "PARENT"),
                     "closing_balance": float(_decimal_text(_node_text(node, "CLOSINGBALANCE"))),
@@ -442,8 +460,11 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                     "phone": phones[0] if phones else "",
                     "phones": phones,
                     "email": _node_text(node, "EMAIL"),
-                    "gstin": _node_text(node, "PARTYGSTIN"),
+                    "gstin": _node_text(node, "PARTYGSTIN", "GSTIN"),
                     "state": _node_text(node, "LEDGERSTATENAME", "LEDSTATENAME"),
+                    "mailing_name": _node_text(node, "MAILINGNAME") or name,
+                    "address": ", ".join(addresses),
+                    "pincode": _node_text(node, "PINCODE"),
                     "registration_type": _node_text(node, "GSTREGISTRATIONTYPE"),
                     "billwise": _node_text(node, "ISBILLWISEON").casefold() == "yes",
                 })
@@ -483,6 +504,9 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                         bill_reference = _node_text(child, "NAME")
                         due_date = _tally_date(_node_text(child, "BILLDUE", "DUEDATE"))
                 invoice_date = _tally_date(_node_text(node, "EFFECTIVEDATE", "DATE"))
+                is_cancelled = _node_text(node, "ISCANCELLED", "CANCELLED").casefold() in {"yes", "true", "1"}
+                is_optional = _node_text(node, "ISOPTIONAL").casefold() in {"yes", "true", "1"}
+                is_post_dated = _node_text(node, "ISPOSTDATED").casefold() in {"yes", "true", "1"}
                 parsed[key].append({**common,
                     "voucher_number": _node_text(node, "VOUCHERNUMBER"),
                     "date": invoice_date,
@@ -490,11 +514,30 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                     "bill_reference": bill_reference or _node_text(node, "REFERENCE") or _node_text(node, "VOUCHERNUMBER"),
                     "due_date": due_date or invoice_date,
                     "voucher_type": _node_text(node, "VOUCHERTYPENAME"),
+                    "transaction_type": "credit_note" if key == "credit_notes" else "invoice",
+                    "lifecycle_status": "cancelled" if is_cancelled else "optional" if is_optional else "post_dated" if is_post_dated else "active",
+                    "is_cancelled": is_cancelled,
+                    "is_optional": is_optional,
+                    "is_post_dated": is_post_dated,
                     "party_ledger": _node_text(node, "PARTYLEDGERNAME"),
                     "amount": float(abs(amount)),
                     "items": items,
                 })
     return parsed
+
+
+def _merge_deleted_transactions(current: list[dict], previous: list[dict], deleted_at) -> list[dict]:
+    live_ids = {str(row.get("master_id") or row.get("guid") or row.get("invoice_id") or "") for row in current}
+    merged = list(current)
+    for row in previous:
+        identity = str(row.get("master_id") or row.get("guid") or row.get("invoice_id") or "")
+        if not identity or identity in live_ids:
+            continue
+        deleted = {key: value for key, value in row.items() if key not in {"_id", "sync_id", "synced_at"}}
+        deleted.update({"lifecycle_status": "deleted", "payment_status": "deleted", "outstanding_amount": 0})
+        deleted.setdefault("deleted_at", deleted_at)
+        merged.append(deleted)
+    return merged
 
 
 def validate_snapshot_responses(responses: list[dict], parsed: dict) -> None:
@@ -516,13 +559,19 @@ def parse_invoice_export_response(xml: str, master_id: str) -> dict:
     voucher = next((node for node in root.iter() if _tag(node) == "VOUCHER" and _node_text(node, "MASTERID") == str(master_id)), None)
     if voucher is None:
         raise HTTPException(status_code=502, detail="Tally did not return the requested invoice voucher")
-    addresses = []
+    bill_addresses = []
+    ship_addresses = []
+    dispatch_addresses = []
     ledger_entries = []
     seen_ledgers = set()
     for node in voucher.iter():
         tag = _tag(node)
-        if tag in {"ADDRESS", "BASICBUYERADDRESS"} and node.text and node.text.strip() not in addresses:
-            addresses.append(node.text.strip())
+        if tag == "BASICBUYERADDRESS" and node.text and node.text.strip() not in bill_addresses:
+            bill_addresses.append(node.text.strip())
+        elif tag == "ADDRESS" and node.text and node.text.strip() not in ship_addresses:
+            ship_addresses.append(node.text.strip())
+        elif tag == "DISPATCHFROMADDRESS" and node.text and node.text.strip() not in dispatch_addresses:
+            dispatch_addresses.append(node.text.strip())
         if tag in {"ALLLEDGERENTRIES.LIST", "LEDGERENTRIES.LIST"}:
             name = _node_text(node, "LEDGERNAME")
             amount = float(abs(_decimal_text(_direct_text(node, "AMOUNT"))))
@@ -530,11 +579,37 @@ def parse_invoice_export_response(xml: str, master_id: str) -> dict:
             if name and identity not in seen_ledgers:
                 seen_ledgers.add(identity)
                 ledger_entries.append({"name": name, "amount": amount})
+    bill_to = {
+        "name": _node_text(voucher, "BASICBUYERNAME", "BUYERNAME", "PARTYNAME") or invoice.get("party_ledger"),
+        "address": ", ".join(bill_addresses),
+        "gstin": _node_text(voucher, "PARTYGSTIN"),
+        "state": _node_text(voucher, "STATENAME"),
+        "pincode": _node_text(voucher, "BUYERPINNUMBER"),
+        "place": _node_text(voucher, "BILLTOPLACE"),
+    }
+    ship_to = {
+        "name": _node_text(voucher, "CONSIGNEEMAILINGNAME"),
+        "address": ", ".join(ship_addresses),
+        "gstin": _node_text(voucher, "CONSIGNEEGSTIN"),
+        "state": _node_text(voucher, "CONSIGNEESTATENAME") or _node_text(voucher, "PLACEOFSUPPLY"),
+        "pincode": _node_text(voucher, "CONSIGNEEPINNUMBER"),
+        "place": _node_text(voucher, "SHIPTOPLACE"),
+    }
+    dispatch_from = {
+        "name": _node_text(voucher, "DISPATCHFROMNAME"),
+        "address": ", ".join(dispatch_addresses),
+        "state": _node_text(voucher, "DISPATCHFROMSTATENAME"),
+        "pincode": _node_text(voucher, "DISPATCHFROMPINCODE"),
+        "place": _node_text(voucher, "DISPATCHFROMPLACE"),
+    }
     invoice.update({
-        "party_name": _node_text(voucher, "BASICBUYERNAME", "BUYERNAME", "PARTYNAME") or invoice.get("party_ledger"),
-        "party_gstin": _node_text(voucher, "PARTYGSTIN"),
-        "party_state": _node_text(voucher, "PLACEOFSUPPLY", "STATENAME"),
-        "party_address": ", ".join(addresses),
+        "party_name": bill_to["name"],
+        "party_gstin": bill_to["gstin"],
+        "party_state": bill_to["state"] or ship_to["state"],
+        "party_address": bill_to["address"],
+        "bill_to": {key: value for key, value in bill_to.items() if value},
+        "ship_to": {key: value for key, value in ship_to.items() if value},
+        "dispatch_from": {key: value for key, value in dispatch_from.items() if value},
         "narration": _node_text(voucher, "NARRATION"),
         "ledger_entries": ledger_entries,
     })
@@ -598,18 +673,35 @@ def render_invoice_pdf(invoice: dict, company_name: str, sales_ledger: str = "Sa
                 current = f"{current} {word}".strip()
         return rows + ([current] if current else [])
 
+    def address_lines(title: str, value: dict) -> list[str]:
+        rows = wrap(f"{title}: {value.get('name') or '-'}")
+        if value.get("address"):
+            rows.extend(wrap(f"Address: {value['address']}"))
+        if value.get("gstin"):
+            rows.append(f"GSTIN: {value['gstin']}")
+        location = ", ".join(filter(None, [value.get("place"), value.get("state"), value.get("pincode")]))
+        if location:
+            rows.extend(wrap(f"Place / state / PIN: {location}"))
+        return rows
+
+    bill_to = invoice.get("bill_to") or {
+        "name": invoice.get("party_name") or invoice.get("party_ledger"),
+        "address": invoice.get("party_address"), "gstin": invoice.get("party_gstin"),
+        "state": invoice.get("party_state"),
+    }
+    ship_to = invoice.get("ship_to") or {}
+    dispatch_from = invoice.get("dispatch_from") or {}
+
     lines = [
         str(company_name or "Tally company").upper()[:80], "TAX INVOICE", "=" * 88,
         f"Invoice: {invoice.get('voucher_number') or '-'}    Date: {invoice.get('date') or '-'}",
         *wrap(f"Reference: {invoice.get('reference') or '-'}"), "",
-        *wrap(f"Bill to: {invoice.get('party_name') or invoice.get('party_ledger') or '-'}"),
+        *address_lines("Bill to", bill_to),
     ]
-    if invoice.get("party_address"):
-        lines.extend(wrap(f"Address: {invoice['party_address']}"))
-    if invoice.get("party_gstin"):
-        lines.append(f"GSTIN: {invoice['party_gstin']}")
-    if invoice.get("party_state"):
-        lines.append(f"State / place of supply: {invoice['party_state']}")
+    if ship_to and ship_to != bill_to:
+        lines.extend(["", *address_lines("Ship to", ship_to)])
+    if dispatch_from:
+        lines.extend(["", *address_lines("Dispatch from", dispatch_from)])
     lines.extend(["", f"{'Product':<48}{'Qty':>8}{'Rate':>15}{'Amount':>17}", "-" * 88])
     subtotal = 0.0
     for item in invoice.get("items") or []:
@@ -636,12 +728,24 @@ def render_invoice_pdf(invoice: dict, company_name: str, sales_ledger: str = "Sa
 def _customer_snapshot(quote: dict, conversation: dict | None = None) -> dict:
     customer = quote.get("customer") or {}
     conversation = conversation or {}
+    billing_address = (
+        customer.get("billing_address") or customer.get("address")
+        or conversation.get("billing_address") or conversation.get("billingAddress")
+    )
+    shipping_address = (
+        customer.get("shipping_address") or conversation.get("shipping_address")
+        or conversation.get("shippingAddress") or billing_address
+    )
     values = {
         "name": customer.get("name") or conversation.get("customer_name"),
         "phone": customer.get("phone") or conversation.get("customer_id"),
         "email": customer.get("email"),
         "gstin": customer.get("gstin"),
-        "address": customer.get("address"),
+        "address": billing_address,
+        "billing_address": billing_address,
+        "shipping_address": shipping_address,
+        "state": customer.get("state") or conversation.get("state"),
+        "pincode": customer.get("pincode") or conversation.get("pincode"),
     }
     return {key: str(value).strip() for key, value in values.items() if value}
 
@@ -708,12 +812,14 @@ async def _store_customer_mapping(org_id: str, party: dict, link: dict) -> None:
         {"conversation_id": link["conversation_id"]},
         {"$set": {"tally_customer_mapping": mapping}},
     )
+    now = datetime.now(timezone.utc)
     await db[f"contacts_{org_id}"].update_one(
-        {"$or": [
-            {"conversation_id": link["conversation_id"]},
-            {"phone_number": link["phone"]},
-        ]},
-        {"$set": {"tally_customer_mapping": mapping, "company": party["name"], "gstin": party.get("gstin") or ""}},
+        {"conversation_id": link["conversation_id"]},
+        {"$set": {
+            "conversation_id": link["conversation_id"], "phone_number": link["phone"], "platform": "whatsapp",
+            "tally_customer_mapping": mapping, "company": party["name"], "gstin": party.get("gstin") or "", "updated_at": now,
+        }, "$setOnInsert": {"full_name": party["name"], "created_at": now}},
+        upsert=True,
     )
 
 
@@ -858,6 +964,27 @@ def _ledger(
     )
 
 
+def _clean_invoice_address(value: dict | None, fallback: dict | None = None) -> dict:
+    value, fallback = value or {}, fallback or {}
+    result = {
+        key: str(value.get(key) or fallback.get(key) or "").strip()
+        for key in ("name", "address", "state", "pincode", "gstin", "place")
+        if value.get(key) or fallback.get(key)
+    }
+    if result.get("gstin"):
+        result["gstin"] = result["gstin"].upper()
+    return result
+
+
+def _string_list_xml(field: str, value: str) -> str:
+    lines = [line.strip() for line in re.split(r"[\r\n]+", str(value or "")) if line.strip()]
+    return (
+        f"<{field}.LIST TYPE=\"String\">"
+        + "".join(f"<{field}>{_xml(line)}</{field}>" for line in lines)
+        + f"</{field}.LIST>"
+    ) if lines else ""
+
+
 def build_sales_voucher_xml(quote: dict, settings: dict, party_ledger: str, tax_mode: str) -> str:
     settings = normalized_settings(settings)
     items = quote.get("items") or []
@@ -938,6 +1065,33 @@ def build_sales_voucher_xml(quote: dict, settings: dict, party_ledger: str, tax_
     issued = str(quote.get("issued_on") or date.today().isoformat()).replace("-", "")
     revision = int(quote.get("revision_number") or 1)
     remote_id = stable_remote_id(quote["org_id"], quote["quote_id"], revision)
+    bill_to = _clean_invoice_address(quote.get("bill_to"), quote.get("customer"))
+    ship_to = _clean_invoice_address(quote.get("ship_to"), bill_to)
+    dispatch_from = _clean_invoice_address(quote.get("dispatch_from"))
+    bill_xml = (
+        f"<BASICBUYERNAME>{_xml(bill_to.get('name'))}</BASICBUYERNAME>"
+        f"{_string_list_xml('BASICBUYERADDRESS', bill_to.get('address', ''))}"
+        f"<PARTYGSTIN>{_xml(bill_to.get('gstin'))}</PARTYGSTIN>"
+        f"<STATENAME>{_xml(bill_to.get('state'))}</STATENAME>"
+        f"<BUYERPINNUMBER>{_xml(bill_to.get('pincode'))}</BUYERPINNUMBER>"
+        f"<BILLTOPLACE>{_xml(bill_to.get('place') or bill_to.get('state'))}</BILLTOPLACE>"
+    ) if bill_to else ""
+    ship_xml = (
+        f"<CONSIGNEEMAILINGNAME>{_xml(ship_to.get('name'))}</CONSIGNEEMAILINGNAME>"
+        f"{_string_list_xml('ADDRESS', ship_to.get('address', ''))}"
+        f"<CONSIGNEEGSTIN>{_xml(ship_to.get('gstin'))}</CONSIGNEEGSTIN>"
+        f"<CONSIGNEESTATENAME>{_xml(ship_to.get('state'))}</CONSIGNEESTATENAME>"
+        f"<CONSIGNEEPINNUMBER>{_xml(ship_to.get('pincode'))}</CONSIGNEEPINNUMBER>"
+        f"<SHIPTOPLACE>{_xml(ship_to.get('place') or ship_to.get('state'))}</SHIPTOPLACE>"
+        f"<PLACEOFSUPPLY>{_xml(ship_to.get('state') or ship_to.get('place'))}</PLACEOFSUPPLY>"
+    ) if ship_to and ship_to != bill_to else ""
+    dispatch_xml = (
+        f"<DISPATCHFROMNAME>{_xml(dispatch_from.get('name'))}</DISPATCHFROMNAME>"
+        f"{_string_list_xml('DISPATCHFROMADDRESS', dispatch_from.get('address', ''))}"
+        f"<DISPATCHFROMSTATENAME>{_xml(dispatch_from.get('state'))}</DISPATCHFROMSTATENAME>"
+        f"<DISPATCHFROMPINCODE>{_xml(dispatch_from.get('pincode'))}</DISPATCHFROMPINCODE>"
+        f"<DISPATCHFROMPLACE>{_xml(dispatch_from.get('place'))}</DISPATCHFROMPLACE>"
+    ) if dispatch_from else ""
     return (
         "<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA>"
         "<REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES>"
@@ -947,6 +1101,7 @@ def build_sales_voucher_xml(quote: dict, settings: dict, party_ledger: str, tax_
         f"<VOUCHER REMOTEID=\"{remote_id}\" VCHTYPE=\"{_xml(settings['voucher_type'])}\" ACTION=\"Create\">"
         f"<DATE>{issued}</DATE><VOUCHERTYPENAME>{_xml(settings['voucher_type'])}</VOUCHERTYPENAME>"
         f"<PARTYLEDGERNAME>{_xml(party_ledger)}</PARTYLEDGERNAME>"
+        f"{bill_xml}{ship_xml}{dispatch_xml}"
         f"<REFERENCE>{_xml(quote.get('quote_number'))}</REFERENCE>"
         "<PERSISTEDVIEW>Invoice Voucher View</PERSISTEDVIEW><ISINVOICE>Yes</ISINVOICE>"
         "<OBJVIEW>Invoice Voucher View</OBJVIEW>"
@@ -1106,10 +1261,10 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
     validate_snapshot_responses(responses, parsed)
     sync_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
+    previous_rows = []
     previous_invoices = {}
-    async for row in db.tally_invoices.find(
-        {"org_id": org_id}, {"master_id": 1, "alter_id": 1, "pdf": 1, "billing_contact": 1}
-    ):
+    async for row in db.tally_invoices.find({"org_id": org_id}):
+        previous_rows.append(row)
         if row.get("master_id"):
             previous_invoices[row["master_id"]] = row
     invoice_origins = {}
@@ -1127,31 +1282,46 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
     }
     ledger_ids = {row["name"].casefold(): row.get("master_id", "") for row in parsed["ledgers"]}
     billwise_ledgers = {row["name"].casefold(): row.get("billwise") is True for row in parsed["ledgers"]}
-    for invoice in parsed["invoices"]:
+    transactions = parsed["invoices"] + parsed["credit_notes"]
+    for invoice in transactions:
         invoice["invoice_id"] = invoice.get("master_id") or invoice.get("guid") or f"{invoice['voucher_number']}:{invoice['date']}"
         invoice["party_master_id"] = ledger_ids.get(invoice.get("party_ledger", "").casefold(), "")
-        due = outstanding.get((invoice.get("party_ledger", "").casefold(), invoice.get("bill_reference", "").casefold()))
+        due = outstanding.get((invoice.get("party_ledger", "").casefold(), invoice.get("bill_reference", "").casefold())) if (
+            invoice["transaction_type"] == "invoice" and invoice["lifecycle_status"] == "active"
+        ) else None
         invoice["outstanding_amount"] = float((due or {}).get("outstanding_amount") or 0)
         invoice["due_date"] = (due or {}).get("due_date") or invoice.get("due_date") or invoice.get("date")
         invoice["payment_status"] = (
-            "overdue" if due and invoice["due_date"] and invoice["due_date"] < date.today().isoformat()
+            invoice["lifecycle_status"] if invoice["lifecycle_status"] != "active"
+            else "credit" if invoice["transaction_type"] == "credit_note"
+            else "overdue" if due and invoice["due_date"] and invoice["due_date"] < date.today().isoformat()
             else "outstanding" if due
             else "paid" if billwise_ledgers.get(invoice.get("party_ledger", "").casefold())
             else "unknown"
         )
         previous = previous_invoices.get(invoice.get("master_id")) or {}
         pdf = previous.get("pdf") or {}
-        if pdf.get("url") and str(pdf.get("alter_id")) == str(invoice.get("alter_id")):
+        if (pdf.get("public_id") or pdf.get("url")) and str(pdf.get("alter_id")) == str(invoice.get("alter_id")):
             invoice["pdf"] = pdf
         billing_contact = previous.get("billing_contact") or invoice_origins.get(invoice.get("master_id"))
         if billing_contact:
             invoice["billing_contact"] = billing_contact
+    parsed["invoices"] = _merge_deleted_transactions(transactions, previous_rows, now)
     for key, collection in (("ledgers", db.tally_ledgers), ("stock_items", db.tally_stock_items), ("units", db.tally_units), ("invoices", db.tally_invoices), ("outstandings", db.tally_outstandings)):
         rows = [{**row, "org_id": org_id, "sync_id": sync_id, "synced_at": now} for row in parsed[key]]
         if rows:
             await collection.insert_many(rows)
         await collection.delete_many({"org_id": org_id, "sync_id": {"$ne": sync_id}})
     await _reconcile_customer_links(org_id, parsed["ledgers"])
+    invalid_invoice_ids = [
+        row["invoice_id"] for row in parsed["invoices"]
+        if row.get("invoice_id") and (row.get("transaction_type") != "invoice" or row.get("lifecycle_status") != "active")
+    ]
+    if invalid_invoice_ids:
+        await db.tally_payment_reminders.update_many(
+            {"org_id": org_id, "invoice_id": {"$in": invalid_invoice_ids}, "status": {"$in": ["pending", "needs_review", "failed"]}},
+            {"$set": {"status": "cancelled", "cancel_reason": "Voucher is no longer an active Tally invoice", "cancelled_at": now, "updated_at": now}},
+        )
     fy_from, fy_to = _financial_year_period()
     if parsed["profit_loss"].get("rows"):
         await db.tally_profit_loss_reports.update_one(
@@ -1159,7 +1329,13 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
             {"$set": {**parsed["profit_loss"], "synced_at": now}},
             upsert=True,
         )
-    counts = {key: len(value) for key, value in parsed.items() if isinstance(value, list)}
+    counts = {key: len(value) for key, value in parsed.items() if isinstance(value, list) and key != "invoices"}
+    counts.update({
+        "invoices": sum(row.get("transaction_type") == "invoice" and row.get("lifecycle_status") != "deleted" for row in parsed["invoices"]),
+        "credit_notes": sum(row.get("transaction_type") == "credit_note" and row.get("lifecycle_status") != "deleted" for row in parsed["invoices"]),
+        "cancelled": sum(row.get("lifecycle_status") == "cancelled" for row in parsed["invoices"]),
+        "deleted": sum(row.get("lifecycle_status") == "deleted" for row in parsed["invoices"]),
+    })
     await db.tally_integrations.update_one(
         {"org_id": org_id}, {"$set": {
             "last_sync_at": now, "last_sync_error": None, "last_sync_counts": counts,
@@ -1217,8 +1393,12 @@ async def list_tally_invoices(
     if query.strip():
         pattern = {"$regex": re.escape(query.strip()), "$options": "i"}
         match["$or"] = [{"voucher_number": pattern}, {"party_ledger": pattern}, {"reference": pattern}]
-    if status in {"paid", "outstanding", "overdue", "unknown"}:
+    if status in {"paid", "outstanding", "overdue", "unknown", "credit"}:
         match["payment_status"] = status
+    elif status in {"active", "cancelled", "deleted", "optional", "post_dated"}:
+        match["lifecycle_status"] = status
+    elif status == "credit_note":
+        match["transaction_type"] = "credit_note"
     if from_date or to_date:
         match["date"] = {}
         if from_date:
@@ -1247,6 +1427,7 @@ async def list_tally_invoices(
             next((link for link in links if link.get("is_primary")), links[0] if links else None),
         )
         row["next_reminder"] = reminders.get(row.get("invoice_id"))
+        row["pdf"] = _pdf_client_view(row.get("pdf") or {}, row.get("alter_id", ""))
     return serialize_mongo({"invoices": rows, "total": total, "page": page, "page_size": page_size})
 
 
@@ -1263,7 +1444,7 @@ async def tally_overview(org_id: str, include_financials: bool = False) -> dict:
         last_seen.replace(tzinfo=timezone.utc) if last_seen.tzinfo is None else last_seen
     ) >= now - timedelta(seconds=90)
     receivable_totals = await db.tally_invoices.aggregate([
-        {"$match": {"org_id": org_id, "payment_status": {"$in": ["outstanding", "overdue"]}}},
+        {"$match": {"org_id": org_id, "transaction_type": {"$ne": "credit_note"}, "lifecycle_status": {"$nin": ["cancelled", "deleted", "optional", "post_dated"]}, "payment_status": {"$in": ["outstanding", "overdue"]}}},
         {"$group": {"_id": None, "total": {"$sum": "$outstanding_amount"}}},
     ]).to_list(length=1)
     latest_sync = await db.tally_command_jobs.find_one(
@@ -1282,7 +1463,10 @@ async def tally_overview(org_id: str, include_financials: bool = False) -> dict:
         "sync_status": (latest_sync or {}).get("status"), "active_operations": active_operations,
         "receivables": float((receivable_totals[0] if receivable_totals else {}).get("total") or 0),
         "customers": customers, "products": products, "low_stock": low_stock,
-        "invoices": await db.tally_invoices.count_documents({"org_id": org_id}),
+        "invoices": await db.tally_invoices.count_documents({"org_id": org_id, "transaction_type": {"$ne": "credit_note"}, "lifecycle_status": {"$nin": ["cancelled", "deleted"]}}),
+        "credit_notes": await db.tally_invoices.count_documents({"org_id": org_id, "transaction_type": "credit_note", "lifecycle_status": {"$nin": ["cancelled", "deleted"]}}),
+        "cancelled_transactions": await db.tally_invoices.count_documents({"org_id": org_id, "lifecycle_status": "cancelled"}),
+        "deleted_transactions": await db.tally_invoices.count_documents({"org_id": org_id, "lifecycle_status": "deleted"}),
         "connector_version": integration.get("connector_version") or "",
         "connector_capabilities": integration.get("connector_capabilities") or [],
     }
@@ -1363,6 +1547,8 @@ async def _command_operation(org_id: str, job: dict, linked: dict | None = None)
         }, {"_id": 1}))
     phase, operation_error = _job_phase(job, linked, found)
     result = serialize_mongo(job)
+    if job.get("pdf"):
+        result["pdf"] = serialize_mongo(_pdf_client_view(job["pdf"], job.get("invoice_alter_id", "")))
     if linked and linked.get("sync"):
         result["sync"] = serialize_mongo(linked["sync"])
     result.update({"operation_phase": phase, "operation_error": operation_error})
@@ -1423,13 +1609,53 @@ async def list_tally_operations(org_id: str, limit: int = 20) -> list[dict]:
     return operations[:limit]
 
 
+def _pdf_expires_at(pdf: dict) -> datetime | None:
+    value = pdf.get("expires_at")
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            value = None
+    if not isinstance(value, datetime):
+        value = pdf.get("generated_at")
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                value = None
+        value = value + timedelta(days=30) if isinstance(value, datetime) else None
+    if isinstance(value, datetime) and value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _pdf_is_current(pdf: dict, alter_id: str, now: datetime | None = None) -> bool:
+    expiry = _pdf_expires_at(pdf or {})
+    return bool(
+        (pdf or {}).get("public_id") or (pdf or {}).get("url")
+    ) and str((pdf or {}).get("alter_id")) == str(alter_id or "") and bool(expiry and expiry > (now or datetime.now(timezone.utc)))
+
+
+def _pdf_client_view(pdf: dict, alter_id: str, now: datetime | None = None) -> dict:
+    if not pdf:
+        return {"ready": False}
+    expiry = _pdf_expires_at(pdf)
+    return {
+        "ready": _pdf_is_current(pdf, alter_id, now), "alter_id": pdf.get("alter_id", ""),
+        "generated_at": pdf.get("generated_at"), "expires_at": expiry,
+    }
+
+
 async def queue_invoice_pdf(org_id: str, user_id: str, invoice_id: str) -> tuple[dict, bool]:
     invoice = await db.tally_invoices.find_one({"org_id": org_id, "invoice_id": invoice_id})
     if not invoice:
         raise HTTPException(status_code=404, detail="Tally invoice not found")
     pdf = invoice.get("pdf") or {}
-    if pdf.get("url") and str(pdf.get("alter_id")) == str(invoice.get("alter_id")):
-        return {"status": "completed", "pdf": pdf}, False
+    if _pdf_is_current(pdf, invoice.get("alter_id", "")):
+        return {"status": "completed", "pdf": _pdf_client_view(pdf, invoice.get("alter_id", ""))}, False
+    if invoice.get("lifecycle_status", "active") != "active":
+        lifecycle = str(invoice.get("lifecycle_status") or "inactive").replace("_", " ")
+        raise HTTPException(status_code=409, detail=f"This Tally voucher is {lifecycle} and cannot be pulled as a current PDF")
     integration = await get_integration(org_id)
     if "invoice_pdf" not in (integration.get("connector_capabilities") or []):
         raise HTTPException(status_code=409, detail="Download and restart the latest Tally connector to pull invoice PDFs")
@@ -1453,6 +1679,22 @@ async def queue_invoice_pdf(org_id: str, user_id: str, invoice_id: str) -> tuple
     return serialize_mongo({key: value for key, value in job.items() if key != "requests"}), True
 
 
+async def get_invoice_pdf_download(org_id: str, invoice_id: str) -> dict:
+    invoice = await db.tally_invoices.find_one({"org_id": org_id, "invoice_id": invoice_id})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Tally invoice not found")
+    pdf = invoice.get("pdf") or {}
+    if not _pdf_is_current(pdf, invoice.get("alter_id", "")):
+        raise HTTPException(status_code=409, detail="This PDF is not ready or has expired. Prepare it again from TallyPrime")
+    try:
+        from services.cloudinary_service import tally_invoice_pdf_download_url
+        url = tally_invoice_pdf_download_url(pdf)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="HeidelAI could not prepare the secure PDF download") from exc
+    filename = re.sub(r"[^A-Za-z0-9._-]", "-", invoice.get("voucher_number") or invoice_id)[:120]
+    return {"download_url": url, "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5), "filename": f"{filename}.pdf"}
+
+
 def _validate_tally_pdf(data: bytes) -> None:
     if len(data) > 10_000_000 or not data.startswith(b"%PDF"):
         raise HTTPException(status_code=422, detail="Choose a valid PDF under 10 MB")
@@ -1464,13 +1706,10 @@ async def store_uploaded_tally_pdf(org_id: str, invoice_id: str, data: bytes) ->
     if not invoice:
         raise HTTPException(status_code=404, detail="Tally invoice not found")
     from services.cloudinary_service import upload_tally_invoice_pdf
-    pdf = {
-        "url": await upload_tally_invoice_pdf(data, org_id, invoice_id, str(invoice.get("alter_id") or "current")),
-        "alter_id": invoice.get("alter_id", ""),
-        "generated_at": datetime.now(timezone.utc),
-    }
+    pdf = await upload_tally_invoice_pdf(data, org_id, invoice_id, str(invoice.get("alter_id") or "current"))
+    pdf["alter_id"] = invoice.get("alter_id", "")
     await db.tally_invoices.update_one({"_id": invoice["_id"]}, {"$set": {"pdf": pdf}})
-    return serialize_mongo(pdf)
+    return serialize_mongo(_pdf_client_view(pdf, invoice.get("alter_id", "")))
 
 
 async def store_tally_pdf_artifact(org_id: str, job_id: str, claim_id: str, data: bytes) -> dict:
@@ -1481,11 +1720,11 @@ async def store_tally_pdf_artifact(org_id: str, job_id: str, claim_id: str, data
     if not job:
         raise HTTPException(status_code=409, detail="This Tally PDF claim is no longer active")
     from services.cloudinary_service import upload_tally_invoice_pdf
-    url = await upload_tally_invoice_pdf(data, org_id, job["invoice_id"], str(job.get("invoice_alter_id") or "current"))
-    pdf = {"url": url, "alter_id": job.get("invoice_alter_id", ""), "generated_at": datetime.now(timezone.utc)}
+    pdf = await upload_tally_invoice_pdf(data, org_id, job["invoice_id"], str(job.get("invoice_alter_id") or "current"))
+    pdf["alter_id"] = job.get("invoice_alter_id", "")
     await db.tally_invoices.update_one({"org_id": org_id, "invoice_id": job["invoice_id"]}, {"$set": {"pdf": pdf}})
     await db.tally_command_jobs.update_one({"_id": job["_id"], "claim_id": claim_id}, {"$set": {"pdf": pdf}})
-    return serialize_mongo(pdf)
+    return serialize_mongo(_pdf_client_view(pdf, job.get("invoice_alter_id", "")))
 
 
 async def _product_candidates(org_id: str, term: str) -> list[dict]:
@@ -1578,12 +1817,25 @@ async def create_tally_invoice_draft(
         else party_candidates[0].get("master_id", "") if len(party_candidates) == 1
         else ""
     )
+    selected_party = next((row for row in party_candidates if row.get("master_id") == party_master_id), {})
+    party_address = {
+        "name": selected_party.get("mailing_name") or selected_party.get("name") or customer.get("name"),
+        "address": selected_party.get("address") or customer.get("billing_address") or customer.get("address"),
+        "state": selected_party.get("state") or customer.get("state"),
+        "pincode": selected_party.get("pincode") or customer.get("pincode"),
+        "gstin": selected_party.get("gstin") or customer.get("gstin"),
+    }
+    bill_to = _clean_invoice_address(party_address)
+    ship_to = _clean_invoice_address({
+        **bill_to, "address": customer.get("shipping_address") or bill_to.get("address"),
+    })
     now = datetime.now(timezone.utc)
     draft = {
         "draft_id": str(uuid.uuid4()), "org_id": org_id, "conversation_id": conversation_id,
         "source": source, "reference": reference, "quote_id": (quote or {}).get("quote_id"),
         "quote_revision": int((quote or {}).get("revision_number") or 1), "customer": customer,
         "party_candidates": party_candidates, "party_master_id": party_master_id,
+        "bill_to": bill_to, "ship_to": ship_to, "dispatch_from": {},
         "items": items, "status": "needs_review",
         "shipping": float(_money((quote or {}).get("shipping"))),
         "discount": float(_money((quote or {}).get("discount"))),
@@ -1623,6 +1875,16 @@ async def review_tally_invoice_draft(org_id: str, user_id: str, role: str, draft
     tax_mode = payload.get("tax_mode")
     if tax_mode not in {"none", "cgst_sgst", "igst"}:
         raise HTTPException(status_code=422, detail="Choose the GST posting")
+    party_address = {
+        "name": party.get("mailing_name") or party.get("name"), "address": party.get("address"),
+        "state": party.get("state"), "pincode": party.get("pincode"), "gstin": party.get("gstin"),
+    }
+    bill_to = _clean_invoice_address(payload.get("bill_to"), _clean_invoice_address(draft.get("bill_to"), party_address))
+    ship_to = _clean_invoice_address(payload.get("ship_to"), bill_to)
+    dispatch_from = _clean_invoice_address(payload.get("dispatch_from"))
+    for label, address in (("Bill To", bill_to), ("Ship To", ship_to)):
+        if address.get("gstin") and not valid_gstin_format(address["gstin"]):
+            raise HTTPException(status_code=422, detail=f"Enter a valid GSTIN for {label}")
     items = []
     subtotal = Decimal("0")
     gst_total = Decimal("0")
@@ -1667,6 +1929,7 @@ async def review_tally_invoice_draft(org_id: str, user_id: str, role: str, draft
         {"_id": draft["_id"], "status": {"$in": ["needs_review", "ready"]}},
         {"$set": {
             "party_master_id": party["master_id"], "party_ledger": party["name"], "items": items,
+            "bill_to": bill_to, "ship_to": ship_to, "dispatch_from": dispatch_from,
             "sales_ledger": sales_ledger, "tax_mode": tax_mode, "subtotal": float(subtotal),
             "gst_total": float(gst_total), "total": float(total), "status": "ready",
             "reviewed_by": user_id, "reviewed_at": now, "updated_at": now,
@@ -1717,6 +1980,8 @@ async def submit_tally_invoice_draft(
         "items": quote_items, "private_subtotal": draft["subtotal"], "private_gst_total": draft["gst_total"],
         "shipping": draft.get("shipping") or 0, "discount": draft.get("discount") or 0,
         "public_grand_total": draft["total"], "customer": draft.get("customer") or {},
+        "bill_to": draft.get("bill_to") or {}, "ship_to": draft.get("ship_to") or {},
+        "dispatch_from": draft.get("dispatch_from") or {},
     }
     settings = {**normalized_settings(integration), "sales_ledger": draft["sales_ledger"]}
     request_xml = build_sales_voucher_xml(quote, settings, draft["party_ledger"], draft["tax_mode"])
@@ -1788,18 +2053,22 @@ def _default_reminder_time(due_date: str, days_after: int, settings: dict) -> da
 
 
 async def link_tally_customer(
-    org_id: str, user_id: str, party_master_id: str, conversation_id: str, *, make_primary: bool = False,
+    org_id: str, user_id: str, party_master_id: str, conversation_id: str = "", *, phone: str = "", make_primary: bool = False,
 ) -> dict:
     party = await db.tally_ledgers.find_one({"org_id": org_id, "master_id": party_master_id, "parent": "Sundry Debtors"})
-    conversation = await db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
     if not party:
         raise HTTPException(status_code=404, detail="Tally customer ledger not found")
-    if not conversation or not conversation_id.startswith("whatsapp_"):
-        raise HTTPException(status_code=422, detail="Choose an existing WhatsApp customer")
+    conversation_id = str(conversation_id or "").strip()
+    conversation = await db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id}) if conversation_id else None
+    contact = await db[f"contacts_{org_id}"].find_one({"conversation_id": conversation_id, "platform": "whatsapp"}) if conversation_id else None
+    phone = normalize_phone(phone or (conversation or {}).get("customer_id") or (contact or {}).get("phone_number") or conversation_id.removeprefix("whatsapp_"))
+    if not re.fullmatch(r"\d{10,15}", phone):
+        raise HTTPException(status_code=422, detail="Enter a valid WhatsApp number with country code")
+    conversation_id = conversation_id or f"whatsapp_{phone}"
+    if not conversation_id.startswith("whatsapp_"):
+        raise HTTPException(status_code=422, detail="Choose a WhatsApp customer")
     link = await _upsert_customer_link(
-        org_id, party, conversation_id,
-        str(conversation.get("customer_id") or conversation_id.removeprefix("whatsapp_")),
-        user_id, match_source="manual", make_primary=make_primary,
+        org_id, party, conversation_id, phone, user_id, match_source="manual", make_primary=make_primary,
     )
     return serialize_mongo(link)
 
@@ -1838,6 +2107,7 @@ async def reconcile_default_payment_reminders(org_id: str) -> int:
     created = 0
     invoices = db.tally_invoices.find({
         "org_id": org_id, "payment_status": {"$in": ["outstanding", "overdue"]},
+        "transaction_type": {"$ne": "credit_note"}, "lifecycle_status": {"$in": ["active", None]},
         "due_date": {"$type": "string", "$ne": ""}, "party_master_id": {"$type": "string", "$ne": ""},
     }, {"_id": 0})
     linked_ids = set(await db.tally_customer_links.distinct("party_master_id", {"org_id": org_id}))
@@ -1894,6 +2164,8 @@ async def create_payment_reminder(org_id: str, user_id: str, user_name: str, inv
     invoice = await db.tally_invoices.find_one({"org_id": org_id, "invoice_id": invoice_id})
     if not invoice:
         raise HTTPException(status_code=404, detail="Tally invoice not found")
+    if invoice.get("transaction_type", "invoice") != "invoice" or invoice.get("lifecycle_status", "active") != "active":
+        raise HTTPException(status_code=409, detail="Payment reminders can only be sent for an active Tally invoice")
     if invoice.get("payment_status") == "unknown":
         raise HTTPException(status_code=409, detail="Enable bill-by-bill tracking for this Tally customer and sync again")
     if invoice.get("payment_status") == "paid" or float(invoice.get("outstanding_amount") or 0) <= 0:
@@ -1964,6 +2236,13 @@ async def process_tally_payment_reminders() -> int:
         error = None
         if not invoice:
             error = "The Tally invoice is no longer in the latest snapshot"
+        elif invoice.get("transaction_type", "invoice") != "invoice" or invoice.get("lifecycle_status", "active") != "active":
+            await db.tally_payment_reminders.update_one(
+                {"_id": claimed["_id"], "claim_id": claim_id},
+                {"$set": {"status": "cancelled", "cancelled_at": now, "cancel_reason": "Voucher is no longer an active Tally invoice", "updated_at": now}, "$unset": {"claim_id": "", "claimed_at": ""}},
+            )
+            processed += 1
+            continue
         elif invoice.get("payment_status") == "unknown":
             error = "Enable bill-by-bill tracking for this Tally customer and sync again"
         elif invoice.get("payment_status") == "paid" or float(invoice.get("outstanding_amount") or 0) <= 0:
@@ -1995,7 +2274,7 @@ async def process_tally_payment_reminders() -> int:
         elif not error and claimed.get("source") == "default" and not settings["reminders_enabled"]:
             error = "Automatic payment reminders are disabled"
         pdf = (invoice or {}).get("pdf") or {}
-        if not error and (not pdf.get("url") or str(pdf.get("alter_id")) != str(invoice.get("alter_id"))):
+        if not error and not _pdf_is_current(pdf, invoice.get("alter_id", ""), now):
             try:
                 await queue_invoice_pdf(claimed["org_id"], "payment-reminder", claimed["invoice_id"])
                 waits = int(claimed.get("pdf_waits") or 0) + 1
@@ -2008,6 +2287,13 @@ async def process_tally_payment_reminders() -> int:
             except HTTPException:
                 pass
             error = "The Tally invoice PDF is not available"
+        pdf_url = ""
+        if not error:
+            try:
+                from services.cloudinary_service import tally_invoice_pdf_download_url
+                pdf_url = tally_invoice_pdf_download_url(pdf, expires_in_seconds=86400)
+            except Exception:
+                error = "The secure Tally invoice PDF link could not be created"
         if error:
             await db.tally_payment_reminders.update_one(
                 {"_id": claimed["_id"], "claim_id": claim_id},
@@ -2019,7 +2305,7 @@ async def process_tally_payment_reminders() -> int:
         template = {
             "name": settings["reminder_template_name"], "language": {"code": settings["reminder_template_language"]},
             "components": [
-                {"type": "header", "parameters": [{"type": "document", "document": {"link": pdf["url"], "filename": f"Invoice-{invoice['voucher_number']}.pdf"}}]},
+                {"type": "header", "parameters": [{"type": "document", "document": {"link": pdf_url, "filename": f"Invoice-{invoice['voucher_number']}.pdf"}}]},
                 {"type": "body", "parameters": [
                     {"type": "text", "parameter_name": "customer_name", "text": invoice.get("party_ledger") or "Customer"},
                     {"type": "text", "parameter_name": "invoice_number", "text": invoice.get("voucher_number") or invoice["invoice_id"]},
@@ -2048,6 +2334,21 @@ async def process_tally_payment_reminders() -> int:
             )
         processed += 1
     return processed
+
+
+async def cleanup_expired_tally_pdfs() -> int:
+    from services.cloudinary_service import cleanup_expired_tally_invoice_pdfs
+    deleted = await cleanup_expired_tally_invoice_pdfs()
+    if deleted is None:
+        return 0
+    now = datetime.now(timezone.utc)
+    expired = {"$or": [
+        {"pdf.expires_at": {"$lte": now}},
+        {"pdf.expires_at": {"$exists": False}, "pdf.generated_at": {"$lte": now - timedelta(days=30)}},
+    ]}
+    invoices = await db.tally_invoices.update_many(expired, {"$unset": {"pdf": ""}})
+    await db.tally_command_jobs.update_many({"job_type": "invoice_pdf", **expired}, {"$unset": {"pdf": ""}})
+    return invoices.modified_count
 
 
 async def ensure_tally_indexes() -> None:
@@ -2271,19 +2572,17 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                 data = render_invoice_pdf(invoice, settings["company_name"], settings["sales_ledger"])
                 _validate_tally_pdf(data)
                 from services.cloudinary_service import upload_tally_invoice_pdf
-                pdf = {
-                    "url": await upload_tally_invoice_pdf(
-                        data, integration["org_id"], command["invoice_id"], str(command.get("invoice_alter_id") or "current"),
-                    ),
-                    "alter_id": command.get("invoice_alter_id", ""), "generated_at": now,
-                }
+                pdf = await upload_tally_invoice_pdf(
+                    data, integration["org_id"], command["invoice_id"], str(command.get("invoice_alter_id") or "current"),
+                )
+                pdf["alter_id"] = command.get("invoice_alter_id", "")
                 await db.tally_invoices.update_one(
                     {"org_id": integration["org_id"], "invoice_id": command["invoice_id"]}, {"$set": {"pdf": pdf}},
                 )
                 await db.tally_command_jobs.update_one(
                     {"org_id": integration["org_id"], "job_id": job_id}, {"$set": {"pdf": pdf, "updated_at": now}},
                 )
-                command["pdf"] = serialize_mongo(pdf)
+                command["pdf"] = serialize_mongo(_pdf_client_view(pdf, command.get("invoice_alter_id", "")))
             except Exception as exc:
                 status = "failed"
                 error = str(exc.detail) if isinstance(exc, HTTPException) else f"HeidelAI could not generate the Tally invoice PDF: {type(exc).__name__}"
