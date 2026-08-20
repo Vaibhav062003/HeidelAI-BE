@@ -100,26 +100,69 @@ def _financial_year_period(today: date | None = None) -> tuple[str, str]:
 
 
 def parse_invoice_command(command: str) -> dict:
+    text = (command or "").strip()
+    if not re.match(r"^/invoice(?:\s|$)", text, re.IGNORECASE):
+        raise HTTPException(status_code=422, detail="Use /invoice <product> <quantity> <price>+")
+    body = re.sub(r"^/invoice\b", "", text, count=1, flags=re.IGNORECASE).strip()
     try:
-        parts = shlex.split((command or "").strip())
+        tokens = shlex.split(body)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"Invalid /invoice command: {exc}") from exc
-    if not parts or parts[0].lower() != "/invoice":
-        raise HTTPException(status_code=422, detail="Use /invoice <model-or-SKU> [qty=<number>]")
-    quantity = Decimal("1")
-    model = []
-    for part in parts[1:]:
-        if part.lower().startswith("qty="):
-            try:
-                quantity = Decimal(part.split("=", 1)[1])
-            except Exception as exc:
-                raise HTTPException(status_code=422, detail="Invoice quantity must be a number") from exc
-        else:
-            model.append(part)
-    model_text = " ".join(model).strip()
-    if not model_text or quantity <= 0 or quantity > 10000:
-        raise HTTPException(status_code=422, detail="Use /invoice <model-or-SKU> [qty=<positive number>]")
-    return {"model": model_text, "quantity": str(quantity.normalize())}
+    compact_items, start = [], 0
+    for index, token in enumerate(tokens):
+        price_match = re.fullmatch(r"(?:₹)?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\+", token)
+        if not price_match:
+            continue
+        if index - start < 2:
+            raise HTTPException(status_code=422, detail="Put product name and quantity before every price+")
+        try:
+            quantity = Decimal(tokens[index - 1].replace(",", ""))
+            rate = Decimal(price_match.group(1).replace(",", ""))
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Check quantity or price near {token}") from exc
+        model = " ".join(tokens[start:index - 1]).strip()
+        if not model or quantity <= 0 or quantity > 10000 or rate <= 0 or rate > 1_000_000_000:
+            raise HTTPException(status_code=422, detail=f"Use <product> <quantity> <price>+ near {token}")
+        compact_items.append({
+            "model": model, "quantity": str(quantity.normalize()), "rate": float(_money(rate)), "gst_inclusive": False,
+        })
+        start = index + 1
+    if compact_items:
+        if start != len(tokens) or len(compact_items) > 50:
+            raise HTTPException(status_code=422, detail="Finish every product with quantity and price+")
+        return {"items": compact_items}
+
+    entries = [entry.strip() for entry in re.split(r"[;\r\n]+", body) if entry.strip()]
+    if not entries or len(entries) > 50:
+        raise HTTPException(status_code=422, detail="Add between 1 and 50 products after /invoice")
+    items = []
+    for entry in entries:
+        try:
+            parts = [part for part in shlex.split(entry) if part != "|"]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid /invoice product: {exc}") from exc
+        quantity, rate, model = Decimal("1"), None, []
+        for part in parts:
+            key, separator, raw_value = part.partition("=")
+            if separator and key.casefold() in {"qty", "quantity", "price", "rate"}:
+                try:
+                    value = Decimal(raw_value.replace(",", "").replace("₹", ""))
+                except Exception as exc:
+                    raise HTTPException(status_code=422, detail=f"Check quantity or price in: {entry}") from exc
+                if key.casefold() in {"qty", "quantity"}:
+                    quantity = value
+                else:
+                    rate = value
+            else:
+                model.append(part)
+        model_text = " ".join(model).strip()
+        if not model_text or quantity <= 0 or quantity > 10000 or rate is not None and (rate <= 0 or rate > 1_000_000_000):
+            raise HTTPException(status_code=422, detail=f"Use <product> | qty=1 | price=45000 for: {entry}")
+        item = {"model": model_text, "quantity": str(quantity.normalize())}
+        if rate is not None:
+            item["rate"] = float(_money(rate))
+        items.append(item)
+    return {"items": items}
 
 
 def _export_collection_xml(settings: dict, collection: str, fetch: list[str], *, filters: str = "") -> str:
@@ -1135,12 +1178,13 @@ async def create_tally_invoice_draft(
     items = []
     quote = None
     if source == "command":
-        request = parse_invoice_command(payload.get("command") or "")
-        candidates = await _product_candidates(org_id, request["model"])
-        items.append({
-            "requested": request["model"], "quantity": request["quantity"],
-            "candidates": candidates, "selected_master_id": _exact_product_master_id(candidates, request["model"]),
-        })
+        for request in parse_invoice_command(payload.get("command") or "")["items"]:
+            candidates = await _product_candidates(org_id, request["model"])
+            items.append({
+                "requested": request["model"], "quantity": request["quantity"], "rate": request.get("rate"),
+                "gst_inclusive": request.get("gst_inclusive", False),
+                "candidates": candidates, "selected_master_id": _exact_product_master_id(candidates, request["model"]),
+            })
         reference = f"HDL-{uuid.uuid4().hex[:8].upper()}"
     elif source == "quote":
         quote = await db[f"quotes_{org_id}"].find_one({

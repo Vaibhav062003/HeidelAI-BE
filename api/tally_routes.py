@@ -147,7 +147,7 @@ class TallyMasterPayload(BaseModel):
 
 class InvoiceDraftCreatePayload(BaseModel):
     source: Literal["command", "quote"]
-    command: str = Field(default="", max_length=500)
+    command: str = Field(default="", max_length=3500)
     quote_id: str = Field(default="", max_length=120)
 
 

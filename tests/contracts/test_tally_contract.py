@@ -143,8 +143,26 @@ class TallyContractTests(unittest.TestCase):
 
     def test_invoice_command_and_snapshot_are_normalized_for_review(self):
         self.assertEqual(parse_invoice_command('/invoice "RTX 5060" qty=2'), {
-            "model": "RTX 5060", "quantity": "2",
+            "items": [{"model": "RTX 5060", "quantity": "2"}],
         })
+        self.assertEqual(parse_invoice_command(
+            "/invoice AMD RYZEN 9 9950X3D | qty=2 | price=45,000; RTX 5090 | quantity=1 | rate=180000"
+        ), {
+            "items": [
+                {"model": "AMD RYZEN 9 9950X3D", "quantity": "2", "rate": 45000.0},
+                {"model": "RTX 5090", "quantity": "1", "rate": 180000.0},
+            ],
+        })
+        self.assertEqual(parse_invoice_command(
+            "/invoice 995x3d 2 45000+ rtx 5090 msi 1 256500+"
+        ), {
+            "items": [
+                {"model": "995x3d", "quantity": "2", "rate": 45000.0, "gst_inclusive": False},
+                {"model": "rtx 5090 msi", "quantity": "1", "rate": 256500.0, "gst_inclusive": False},
+            ],
+        })
+        with self.assertRaises(HTTPException):
+            parse_invoice_command("/invoice RTX 5090 | qty=0 | price=180000")
         parsed = parse_snapshot_responses([
             {"key": "stock_items", "xml": (
                 "<ENVELOPE><STOCKITEM><NAME>Gaming PC</NAME><ALIAS>RTX-5060</ALIAS>"
