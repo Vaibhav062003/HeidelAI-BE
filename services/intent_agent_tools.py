@@ -139,13 +139,33 @@ async def schedule_intent_followup(
     Returns schedule_id on success, None on failure (never raises).
     """
     try:
+        # IMPORTANT: Validate the new date FIRST, before cancelling anything.
+        # If the AI returned an unparseable date, we must NOT destroy
+        # the existing valid follow-up (Bug #3 from code review).
         target_dt = _parse_tentative_date(tentative_date_iso)
         if target_dt is None:
             logger.warning(
                 f"[IntentFollowup] Could not parse date '{tentative_date_iso}' "
-                f"for {conversation_id}"
+                f"for {conversation_id} — keeping existing follow-ups intact"
             )
             return None
+
+        # Date is valid — now safe to cancel previous intent follow-ups.
+        # Uses flow_id filter so we ONLY cancel intent follow-ups,
+        # not unrelated automations (OOS, marketing, etc.) (Bug #1 from code review).
+        from services.automation_scheduler import cancel_conversation_followups as cancel_conv_followups
+        cancelled = await asyncio.to_thread(
+            cancel_conv_followups,
+            org_id=org_id,
+            conversation_id=conversation_id,
+            reason="new_intent_detected",
+            flow_id="__purchase_intent_followup__",
+        )
+        if cancelled:
+            logger.info(
+                f"[IntentFollowup] Cancelled {cancelled} previous intent follow-up(s) "
+                f"for {conversation_id} before scheduling new one"
+            )
 
         now = datetime.now(timezone.utc)
         now_ist = now.astimezone(IST)

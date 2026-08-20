@@ -167,22 +167,33 @@ def cancel_flow_followups(org_id: str, flow_id: str, reason: str) -> int:
     return count
 
 
-def cancel_conversation_followups(org_id: str, conversation_id: str, reason: str) -> int:
+def cancel_conversation_followups(org_id: str, conversation_id: str, reason: str, flow_id: Optional[str] = None) -> int:
     """
     Cancel all pending follow-up jobs for a specific conversation.
     Called when a customer sends a new message.
+
+    Args:
+        org_id:          Organization ID
+        conversation_id: Conversation to cancel follow-ups for
+        reason:          Human-readable cancellation reason
+        flow_id:         Optional — if provided, only cancel follow-ups for this
+                         specific flow. If None, cancels ALL flows (original behavior).
 
     Returns:
         Number of jobs cancelled
     """
     now = datetime.now(timezone.utc)
 
+    query = {
+        "org_id": org_id,
+        "conversation_id": conversation_id,
+        "status": "pending",
+    }
+    if flow_id is not None:
+        query["flow_id"] = flow_id
+
     result = db[COLLECTION].update_many(
-        {
-            "org_id": org_id,
-            "conversation_id": conversation_id,
-            "status": "pending",
-        },
+        query,
         {
             "$set": {
                 "status": "cancelled",
