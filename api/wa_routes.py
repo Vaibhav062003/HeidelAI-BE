@@ -1738,9 +1738,9 @@ async def bulk_send_whatsapp_message(
     """
     try:
         org_id = user.org_id
-        logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(request.recipients)}")
+        logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(req.recipients)}")
 
-        if not request.recipients:
+        if not req.recipients:
             raise HTTPException(status_code=400, detail="At least one recipient is required")
 
         # Look up the org's WhatsApp connection
@@ -1775,9 +1775,9 @@ async def bulk_send_whatsapp_message(
             create_bulk_job,
             org_id=org_id,
             job_id=job_id,
-            template_name=request.template_name,
-            language_code=request.language_code,
-            total=len(request.recipients),
+            template_name=req.template_name,
+            language_code=req.language_code,
+            total=len(req.recipients),
         )
 
         # Enqueue the heavy work as a background task
@@ -1788,21 +1788,21 @@ async def bulk_send_whatsapp_message(
             org_id=org_id,
             phone_id=phone_id,
             access_token=access_token,
-            template_name=request.template_name,
-            language_code=request.language_code,
-            recipients=request.recipients,
-            components=request.components,
-            delay_seconds=request.delay_seconds,
+            template_name=req.template_name,
+            language_code=req.language_code,
+            recipients=req.recipients,
+            components=req.components,
+            delay_seconds=req.delay_seconds,
             # max_concurrent=20, # Optional: can be passed if needed
         )
 
-        logger.success(f"Bulk WA | job={job_id} enqueued | org={org_id} | recipients={len(request.recipients)}")
+        logger.success(f"Bulk WA | job={job_id} enqueued | org={org_id} | recipients={len(req.recipients)}")
 
         return {
             "status": "accepted",
             "message": "Bulk send job enqueued.",
             "job_id": job_id,
-            "total": len(request.recipients),
+            "total": len(req.recipients),
         }
     except HTTPException as http_exc:
         raise http_exc
