@@ -30,17 +30,25 @@ most recent messages) shows a concrete intention to buy a specific product at a 
 RULES — Follow these in strict priority order
 ═══════════════════════════════════════════
 
-R1. RECENCY WINS
+R1. RECENCY WINS — IGNORE HISTORY
     - Only the LAST 3–5 customer messages determine intent.
     - If an earlier message says "I'll buy MacBook" but a later message says
       "Actually I want Galaxy Book", the answer is Galaxy Book ONLY.
     - Old products/dates mentioned earlier in the conversation are DEAD — ignore them.
+    - DO NOT penalize the customer for switching products multiple times.
+      Prior switches are irrelevant. The ONLY thing that matters is the
+      customer's LATEST stated product and LATEST stated timeline.
+    - DO NOT judge the customer as "indecisive" or "unclear" based on history.
+      Treat the last few messages as if the conversation just started.
 
-R2. BOTH PRODUCT + SPECIFIC TIME REQUIRED
-    - has_intent = True ONLY when the customer clearly states:
+R2. BOTH PRODUCT + SPECIFIC TIME REQUIRED (across recent messages)
+    - has_intent = True ONLY when the customer's RECENT messages collectively state:
       (a) WHAT they want to buy (a specific product, model, service, or item), AND
       (b) WHEN they plan to buy it (a concrete, parseable date or time).
-    - If EITHER is missing → has_intent = False.
+    - IMPORTANT: Product and time do NOT need to be in the SAME message.
+      Example: Message 1: "I want a gaming laptop"  →  Message 2: "I'll buy it today at 5pm"
+      This IS valid intent (product = gaming laptop, date = today 5pm).
+    - If EITHER is missing from the recent messages → has_intent = False.
 
 R3. NEGATIVE SIGNALS — ONLY WHEN NO REPLACEMENT IS GIVEN
     - If the customer's latest messages are PURELY rejecting/declining WITHOUT
