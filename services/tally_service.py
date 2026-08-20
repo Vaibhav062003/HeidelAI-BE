@@ -104,37 +104,56 @@ def parse_invoice_command(command: str) -> dict:
     if not re.match(r"^/invoice(?:\s|$)", text, re.IGNORECASE):
         raise HTTPException(status_code=422, detail="Use /invoice <product> <quantity> <price>+")
     body = re.sub(r"^/invoice\b", "", text, count=1, flags=re.IGNORECASE).strip()
-    try:
-        tokens = shlex.split(body)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid /invoice command: {exc}") from exc
+    tokens = body.split()
+    entries = [entry.strip() for entry in re.split(r"[;\r\n]+", body) if entry.strip()]
     compact_items, start = [], 0
-    for index, token in enumerate(tokens):
-        price_match = re.fullmatch(r"(?:₹)?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\+", token)
-        if not price_match:
-            continue
-        if index - start < 2:
-            raise HTTPException(status_code=422, detail="Put product name and quantity before every price+")
-        try:
-            quantity = Decimal(tokens[index - 1].replace(",", ""))
-            rate = Decimal(price_match.group(1).replace(",", ""))
-        except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"Check quantity or price near {token}") from exc
-        model = " ".join(tokens[start:index - 1]).strip()
-        if not model or quantity <= 0 or quantity > 10000 or rate <= 0 or rate > 1_000_000_000:
-            raise HTTPException(status_code=422, detail=f"Use <product> <quantity> <price>+ near {token}")
-        compact_items.append({
-            "model": model, "quantity": str(quantity.normalize()), "rate": float(_money(rate)), "gst_inclusive": False,
-        })
-        start = index + 1
+    if len(entries) == 1:
+        for index, token in enumerate(tokens):
+            price_match = re.fullmatch(r"(?:₹)?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)\+", token)
+            if not price_match:
+                continue
+            if index - start < 2:
+                raise HTTPException(status_code=422, detail="Put product name and quantity before every price+")
+            try:
+                quantity = Decimal(tokens[index - 1].replace(",", ""))
+                rate = Decimal(price_match.group(1).replace(",", ""))
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=f"Check quantity or price near {token}") from exc
+            model = " ".join(tokens[start:index - 1]).strip()
+            if not model or quantity <= 0 or quantity > 10000 or rate <= 0 or rate > 1_000_000_000:
+                raise HTTPException(status_code=422, detail=f"Use <product> <quantity> <price>+ near {token}")
+            compact_items.append({
+                "model": model, "quantity": str(quantity.normalize()), "rate": float(_money(rate)), "gst_inclusive": False,
+            })
+            start = index + 1
     if compact_items:
         if start != len(tokens) or len(compact_items) > 50:
             raise HTTPException(status_code=422, detail="Finish every product with quantity and price+")
         return {"items": compact_items}
 
-    entries = [entry.strip() for entry in re.split(r"[;\r\n]+", body) if entry.strip()]
     if not entries or len(entries) > 50:
         raise HTTPException(status_code=422, detail="Add between 1 and 50 products after /invoice")
+    compact_entries = []
+    for entry in entries:
+        parts = [part for part in entry.split() if part != "|"]
+        price_match = re.fullmatch(r"(?:₹)?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)(\+)?", parts[-1]) if len(parts) >= 3 else None
+        try:
+            quantity = Decimal(parts[-2].replace(",", "")) if price_match else None
+        except Exception:
+            quantity = None
+        if not price_match or quantity is None or quantity <= 0 or quantity > 10000:
+            compact_entries = []
+            continue
+        rate = Decimal(price_match.group(1).replace(",", ""))
+        model = " ".join(parts[:-2]).strip()
+        if not model or rate <= 0 or rate > 1_000_000_000:
+            raise HTTPException(status_code=422, detail=f"Use <product> <quantity> <price> for: {entry}")
+        compact_entries.append({
+            "model": model, "quantity": str(quantity.normalize()), "rate": float(_money(rate)),
+            "gst_inclusive": price_match.group(2) is None,
+        })
+    if len(compact_entries) == len(entries):
+        return {"items": compact_entries}
     items = []
     for entry in entries:
         try:

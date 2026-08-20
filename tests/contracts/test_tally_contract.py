@@ -161,6 +161,13 @@ class TallyContractTests(unittest.TestCase):
                 {"model": "rtx 5090 msi", "quantity": "1", "rate": 256500.0, "gst_inclusive": False},
             ],
         })
+        laptop = (
+            'ASUS Vivobook Go 15 E1504FA-BQ2111WS\tAMD Ryzen 3 30/ 8GB DDR5/ 512GB SSD/ '
+            '15.6" FHD ANTI-GLARE/ Cool Silver/ Win 11 Home/ OFFICE HOME 24(IN)+M365 BASIC/ Backpack'
+        )
+        self.assertEqual(parse_invoice_command(f'/invoice {laptop} 1 55000'), {
+            "items": [{"model": laptop.replace("\t", " "), "quantity": "1", "rate": 55000.0, "gst_inclusive": True}],
+        })
         with self.assertRaises(HTTPException):
             parse_invoice_command("/invoice RTX 5090 | qty=0 | price=180000")
         parsed = parse_snapshot_responses([
