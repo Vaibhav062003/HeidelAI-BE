@@ -22,7 +22,7 @@ wanted = {
     "connector_key_hash", "stable_remote_id", "normalized_settings", "_money", "_number", "_xml", "_ledger",
     "_customer_snapshot", "_tally_escalation_payload", "build_sales_voucher_xml", "parse_invoice_command",
     "_node_text", "_decimal_text", "_tag", "_direct_text", "_parse_tally_xml", "_tally_date", "parse_snapshot_responses", "validate_snapshot_responses", "build_master_xml",
-    "valid_gstin_format", "parse_outstanding_response", "parse_profit_loss_response", "build_report_xml",
+    "valid_gstin_format", "_normalized_phone", "_strict_party_matches", "parse_outstanding_response", "parse_profit_loss_response", "build_report_xml",
     "_export_collection_xml", "build_invoice_export_xml", "parse_invoice_export_response", "_pdf_document", "render_invoice_pdf",
     "_exact_product_master_id", "_job_phase",
     "_validate_tally_pdf",
@@ -57,6 +57,8 @@ build_invoice_export_xml = namespace["build_invoice_export_xml"]
 parse_invoice_export_response = namespace["parse_invoice_export_response"]
 render_invoice_pdf = namespace["render_invoice_pdf"]
 validate_tally_pdf = namespace["_validate_tally_pdf"]
+normalized_phone = namespace["_normalized_phone"]
+strict_party_matches = namespace["_strict_party_matches"]
 
 
 class TallyContractTests(unittest.TestCase):
@@ -188,6 +190,25 @@ class TallyContractTests(unittest.TestCase):
         self.assertTrue(parsed["ledgers"][0]["billwise"])
         self.assertEqual(parsed["ledgers"][0]["name"], "Lee Computers")
 
+    def test_customer_matching_is_exact_and_supports_multiple_tally_phone_fields(self):
+        parties = [
+            {"master_id": "1", "gstin": "27ABCDE1234F1Z5", "phones": ["020-1234567", "+91 98765 43210"]},
+            {"master_id": "2", "gstin": "29ABCDE1234F1Z1", "phones": ["99887 76655"]},
+        ]
+        self.assertEqual(normalized_phone("+91 98765-43210"), "9876543210")
+        self.assertEqual(strict_party_matches(parties, phone="919876543210")[0]["master_id"], "1")
+        self.assertEqual(strict_party_matches(parties, gstin="29abcde1234f1z1")[0]["master_id"], "2")
+        self.assertEqual(strict_party_matches(parties, gstin="27ABCDE1234F1Z5", phone="9988776655"), [])
+
+        parsed = parse_snapshot_responses([{
+            "key": "ledgers", "xml": (
+                "<ENVELOPE><LEDGER><NAME>Lee Computers</NAME><MASTERID>7</MASTERID>"
+                "<LEDGERMOBILE>9876543210</LEDGERMOBILE><LEDGERPHONE>0201234567</LEDGERPHONE>"
+                "</LEDGER></ENVELOPE>"
+            ),
+        }])
+        self.assertEqual(parsed["ledgers"][0]["phones"], ["9876543210", "0201234567"])
+
     def test_xml10_control_markers_do_not_break_ledger_sync(self):
         parsed = parse_snapshot_responses([{
             "key": "ledgers",
@@ -250,6 +271,17 @@ class TallyContractTests(unittest.TestCase):
         phase, error = job_phase(master, {"status": "completed"}, master_found=False)
         self.assertEqual(phase, "failed")
         self.assertIn("read-back did not contain it", error)
+
+    def test_invoice_writes_are_not_starved_by_snapshot_refreshes(self):
+        service = pathlib.Path("services/tally_service.py").read_text()
+        claim = service[service.index("async def claim_next_job"):service.index("async def finish_job")]
+        self.assertIn('"job_type": {"$ne": "sync_snapshot"}', claim)
+        self.assertLess(
+            claim.index("db.tally_bill_jobs.find_one_and_update"),
+            claim.index('"job_type": "sync_snapshot"'),
+        )
+        self.assertIn("Verify Tally Day Book before retrying this unconfirmed invoice", service)
+        self.assertIn('"status": "pending", "request_xml": request_xml', service)
 
     def test_master_xml_only_creates_or_alters_supported_masters(self):
         xml = build_master_xml("sales", {"name": "Computer Sales"})

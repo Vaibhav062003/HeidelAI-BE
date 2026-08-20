@@ -42,6 +42,7 @@ from services.tally_service import (
     store_tally_pdf_artifact,
     submit_tally_invoice_draft,
     tally_overview,
+    unlink_tally_customer,
 )
 from services.utils import serialize_mongo
 from services.work_team_service import list_work_teams
@@ -68,6 +69,7 @@ class TallySettingsPayload(BaseModel):
     reminder_timezone: str = Field(default="Asia/Kolkata", min_length=1, max_length=80)
     reminder_template_name: str = Field(default="", max_length=512)
     reminder_template_language: str = Field(default="en", min_length=1, max_length=20)
+    reminder_template_parameter_format: Literal["named", "positional"] = "named"
 
     @field_validator(
         "company_name", "voucher_type", "sales_ledger", "stock_unit", "cgst_ledger",
@@ -173,6 +175,7 @@ class ProfitLossPayload(BaseModel):
 
 class CustomerLinkPayload(BaseModel):
     conversation_id: str = Field(min_length=1, max_length=200)
+    is_primary: bool = False
 
 
 class ReminderPayload(BaseModel):
@@ -383,7 +386,19 @@ async def put_tally_customer_link(
     request: Request, party_master_id: str, payload: CustomerLinkPayload, user: CurrentUser,
 ):
     await _require_accounting_access(user)
-    return {"link": await link_tally_customer(user.org_id, user.user_id, party_master_id, payload.conversation_id)}
+    return {"link": await link_tally_customer(
+        user.org_id, user.user_id, party_master_id, payload.conversation_id, make_primary=payload.is_primary,
+    )}
+
+
+@router.delete("/api/tally/customers/{party_master_id}/links/{conversation_id}")
+@limiter.limit("20/minute")
+async def delete_tally_customer_link(
+    request: Request, party_master_id: str, conversation_id: str, user: CurrentUser,
+):
+    await _require_accounting_access(user)
+    await unlink_tally_customer(user.org_id, party_master_id, conversation_id)
+    return {"deleted": True}
 
 
 @router.get("/api/tally/invoices/{invoice_id}/reminders")
