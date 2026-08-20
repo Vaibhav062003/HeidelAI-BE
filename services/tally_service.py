@@ -40,6 +40,7 @@ DEFAULT_SETTINGS = {
     "reminder_template_language": "en",
 }
 GSTIN_PATTERN = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
+SNAPSHOT_KEYS = {"ledgers", "stock_items", "units", "invoices", "outstandings", "profit_loss"}
 
 
 def _money(value) -> Decimal:
@@ -118,17 +119,19 @@ def parse_invoice_command(command: str) -> dict:
 
 def _export_collection_xml(settings: dict, collection: str, fetch: list[str], *, filters: str = "") -> str:
     settings = normalized_settings(settings)
-    tdl = ""
-    collection_id = collection
-    if filters:
-        collection_id = f"HeidelAI{collection}"
-        tdl = (
-            "<TDL><TDLMESSAGE>"
-            f"<COLLECTION NAME=\"{collection_id}\"><TYPE>{_xml(collection)}</TYPE>"
-            f"<FILTER>{_xml(filters)}</FILTER><FETCH>{_xml(','.join(fetch))}</FETCH></COLLECTION>"
-            f"<SYSTEM TYPE=\"Formulae\" NAME=\"{_xml(filters)}\">$VoucherTypeName = \"{_xml(settings['voucher_type'])}\"</SYSTEM>"
-            "</TDLMESSAGE></TDL>"
-        )
+    collection_id = f"HeidelAI{collection}"
+    native_methods = "".join(f"<NATIVEMETHOD>{_xml(field)}</NATIVEMETHOD>" for field in fetch)
+    filter_xml = f"<FILTER>{_xml(filters)}</FILTER>" if filters else ""
+    formula_xml = (
+        f"<SYSTEM TYPE=\"Formulae\" NAME=\"{_xml(filters)}\">$VoucherTypeName = \"{_xml(settings['voucher_type'])}\"</SYSTEM>"
+        if filters else ""
+    )
+    tdl = (
+        "<TDL><TDLMESSAGE>"
+        f"<COLLECTION NAME=\"{collection_id}\" ISINITIALIZE=\"Yes\"><TYPE>{_xml(collection)}</TYPE>"
+        f"{filter_xml}{native_methods}</COLLECTION>{formula_xml}"
+        "</TDLMESSAGE></TDL>"
+    )
     fetch_xml = "".join(f"<FETCH>{_xml(field)}</FETCH>" for field in fetch)
     return (
         "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST>"
@@ -372,6 +375,16 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                     "items": items,
                 })
     return parsed
+
+
+def validate_snapshot_responses(responses: list[dict], parsed: dict) -> None:
+    missing = SNAPSHOT_KEYS - {response.get("key") for response in responses or []}
+    if missing:
+        raise HTTPException(status_code=502, detail=f"Tally snapshot is incomplete: missing {', '.join(sorted(missing))}")
+    # Every Tally company has built-in ledgers. An empty ledger export means the
+    # collection request was not fulfilled and must not erase the last good cache.
+    if not parsed.get("ledgers"):
+        raise HTTPException(status_code=502, detail="Tally returned an empty ledger export; existing HeidelAI data was kept")
 
 
 def _customer_snapshot(quote: dict, conversation: dict | None = None) -> dict:
@@ -677,16 +690,20 @@ def _snapshot_is_stale(integration: dict, now: datetime | None = None) -> bool:
     return value < (now or datetime.now(timezone.utc)) - SNAPSHOT_STALE_AFTER
 
 
-async def queue_tally_sync(org_id: str, user_id: str = "system", *, force: bool = False) -> tuple[dict, bool]:
+async def queue_tally_sync(
+    org_id: str, user_id: str = "system", *, force: bool = False,
+    force_new: bool = False, triggered_by_job_id: str | None = None,
+) -> tuple[dict, bool]:
     integration = await get_integration(org_id)
     settings = normalized_settings(integration)
     if not settings["company_name"].strip() or not integration.get("connector_key_hash"):
         raise HTTPException(status_code=409, detail="Configure and connect TallyPrime first")
-    active = await db.tally_command_jobs.find_one({
-        "org_id": org_id, "job_type": "sync_snapshot", "status": {"$in": ["pending", "processing"]},
-    }, {"_id": 0})
-    if active:
-        return serialize_mongo(active), False
+    if not force_new:
+        active = await db.tally_command_jobs.find_one({
+            "org_id": org_id, "job_type": "sync_snapshot", "status": {"$in": ["pending", "processing"]},
+        }, {"_id": 0})
+        if active:
+            return serialize_mongo(active), False
     if not force and not _snapshot_is_stale(integration):
         return {"status": "completed", "last_sync_at": serialize_mongo(integration.get("last_sync_at"))}, False
     now = datetime.now(timezone.utc)
@@ -694,6 +711,7 @@ async def queue_tally_sync(org_id: str, user_id: str = "system", *, force: bool 
         "job_id": str(uuid.uuid4()), "job_type": "sync_snapshot", "org_id": org_id,
         "status": "pending", "requests": build_snapshot_requests(settings), "attempts": 0,
         "created_at": now, "updated_at": now, "created_by": user_id,
+        "triggered_by_job_id": triggered_by_job_id,
     }
     await db.tally_command_jobs.insert_one(job)
     return serialize_mongo(job), True
@@ -737,6 +755,7 @@ async def queue_tally_master(org_id: str, user_id: str, kind: str, value: dict, 
 
 async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
     parsed = parse_snapshot_responses(responses)
+    validate_snapshot_responses(responses, parsed)
     sync_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     previous_pdfs = {}
@@ -778,11 +797,14 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
             {"$set": {**parsed["profit_loss"], "synced_at": now}},
             upsert=True,
         )
+    counts = {key: len(value) for key, value in parsed.items() if isinstance(value, list)}
     await db.tally_integrations.update_one(
-        {"org_id": org_id}, {"$set": {"last_sync_at": now, "last_sync_error": None}}
+        {"org_id": org_id}, {"$set": {
+            "last_sync_at": now, "last_sync_error": None, "last_sync_counts": counts,
+        }}
     )
     await reconcile_default_payment_reminders(org_id)
-    return {"counts": {key: len(value) for key, value in parsed.items() if isinstance(value, list)}, "last_sync_at": now}
+    return {"counts": counts, "last_sync_at": now}
 
 
 async def list_tally_ledgers(org_id: str, kind: str = "", query: str = "") -> list[dict]:
@@ -864,9 +886,20 @@ async def tally_overview(org_id: str, include_financials: bool = False) -> dict:
         {"$match": {"org_id": org_id, "payment_status": {"$in": ["outstanding", "overdue"]}}},
         {"$group": {"_id": None, "total": {"$sum": "$outstanding_amount"}}},
     ]).to_list(length=1)
+    latest_sync = await db.tally_command_jobs.find_one(
+        {"org_id": org_id, "job_type": "sync_snapshot"},
+        {"_id": 0, "requests": 0, "responses": 0}, sort=[("created_at", -1)],
+    )
+    active_operations = await db.tally_command_jobs.count_documents({
+        "org_id": org_id, "status": {"$in": ["pending", "processing"]},
+    }) + await db.tally_bill_jobs.count_documents({
+        "org_id": org_id, "status": {"$in": ["pending", "processing"]},
+    })
     overview = {
         "connected": connected, "last_seen_at": last_seen, "last_sync_at": integration.get("last_sync_at"),
-        "stale": _snapshot_is_stale(integration, now), "last_error": integration.get("last_sync_error") or integration.get("last_error"),
+        "stale": _snapshot_is_stale(integration, now), "last_error": integration.get("last_sync_error"),
+        "last_sync_counts": integration.get("last_sync_counts") or {},
+        "sync_status": (latest_sync or {}).get("status"), "active_operations": active_operations,
         "receivables": float((receivable_totals[0] if receivable_totals else {}).get("total") or 0),
         "customers": customers, "products": products, "low_stock": low_stock,
         "invoices": await db.tally_invoices.count_documents({"org_id": org_id}),
@@ -907,11 +940,100 @@ async def queue_profit_loss_report(org_id: str, user_id: str, from_date: str, to
     return serialize_mongo({key: value for key, value in job.items() if key != "requests"}), True
 
 
+def _job_phase(job: dict, linked: dict | None = None, master_found: bool = True) -> tuple[str, str | None]:
+    status = job.get("status")
+    if status == "pending":
+        return "queued", None
+    if status == "processing":
+        return ("reading_from_tally" if job.get("job_type") == "sync_snapshot" else "writing_to_tally"), None
+    if status == "delivery_unknown":
+        return "needs_verification", job.get("error")
+    if status == "failed":
+        return "failed", job.get("error")
+    if status != "completed" or job.get("job_type") not in {"master_create", "master_update"} or not job.get("readback_job_id"):
+        return "completed", None
+    if not linked:
+        return "failed", "The required Tally read-back job could not be found"
+    if linked.get("status") in {"pending", "processing"}:
+        return "reading_from_tally", None
+    if linked.get("status") != "completed":
+        return "failed", linked.get("error") or "Tally read-back failed"
+    if not master_found:
+        return "failed", f"Tally accepted {job.get('master', {}).get('name') or 'the master'}, but the read-back did not contain it"
+    return "completed", None
+
+
+async def _command_operation(org_id: str, job: dict, linked: dict | None = None) -> dict:
+    found = True
+    if job.get("job_type") in {"master_create", "master_update"} and linked and linked.get("status") == "completed":
+        collection = {
+            "stock_item": db.tally_stock_items,
+            "unit": db.tally_units,
+        }.get(job.get("master_type"), db.tally_ledgers)
+        name = str(job.get("master", {}).get("name") or "").strip()
+        found = bool(name and await collection.find_one({
+            "org_id": org_id, "name": {"$regex": f"^{re.escape(name)}$", "$options": "i"},
+        }, {"_id": 1}))
+    phase, operation_error = _job_phase(job, linked, found)
+    result = serialize_mongo(job)
+    if linked and linked.get("sync"):
+        result["sync"] = serialize_mongo(linked["sync"])
+    result.update({"operation_phase": phase, "operation_error": operation_error})
+    return result
+
+
 async def get_tally_command_job(org_id: str, job_id: str) -> dict:
-    job = await db.tally_command_jobs.find_one({"org_id": org_id, "job_id": job_id}, {"_id": 0, "requests": 0, "responses": 0})
+    job = await db.tally_command_jobs.find_one(
+        {"org_id": org_id, "job_id": job_id}, {"_id": 0, "requests": 0, "responses": 0}
+    )
     if not job:
         raise HTTPException(status_code=404, detail="Tally job not found")
-    return serialize_mongo(job)
+    linked = None
+    if job.get("readback_job_id"):
+        linked = await db.tally_command_jobs.find_one(
+            {"org_id": org_id, "job_id": job["readback_job_id"]}, {"_id": 0, "requests": 0, "responses": 0}
+        )
+    return await _command_operation(org_id, job, linked)
+
+
+async def list_tally_operations(org_id: str, limit: int = 20) -> list[dict]:
+    commands = await db.tally_command_jobs.find(
+        {"org_id": org_id}, {"_id": 0, "requests": 0, "responses": 0}
+    ).sort("created_at", -1).limit(limit * 2).to_list(length=limit * 2)
+    readback_ids = [job.get("readback_job_id") for job in commands if job.get("readback_job_id")]
+    linked = {
+        job["job_id"]: job async for job in db.tally_command_jobs.find(
+            {"org_id": org_id, "job_id": {"$in": readback_ids}}, {"_id": 0, "requests": 0, "responses": 0}
+        )
+    } if readback_ids else {}
+    operations = []
+    for job in commands:
+        if job.get("triggered_by_job_id"):
+            continue
+        view = await _command_operation(org_id, job, linked.get(job.get("readback_job_id")))
+        view["label"] = (
+            str(job.get("master", {}).get("name") or job.get("master_type") or "Tally master")
+            if job.get("job_type") in {"master_create", "master_update"}
+            else "Sync Tally" if job.get("job_type") == "sync_snapshot"
+            else "Profit & Loss" if job.get("job_type") == "profit_loss_report"
+            else "Invoice PDF"
+        )
+        operations.append(view)
+    bills = await db.tally_bill_jobs.find(
+        {"org_id": org_id}, {"_id": 0, "request_xml": 0, "tally_response": 0, "customer": 0}
+    ).sort("created_at", -1).limit(limit).to_list(length=limit)
+    phases = {
+        "pending": "queued", "processing": "writing_to_tally", "completed": "completed",
+        "failed": "failed", "delivery_unknown": "needs_verification",
+    }
+    operations.extend({
+        **serialize_mongo(job), "job_type": "invoice_create",
+        "operation_phase": phases.get(job.get("status"), job.get("status")),
+        "operation_error": job.get("error"),
+        "label": f"Invoice {job.get('quote_number') or job.get('quote_id') or ''}".strip(),
+    } for job in bills)
+    operations.sort(key=lambda job: str(job.get("created_at") or ""), reverse=True)
+    return operations[:limit]
 
 
 async def queue_invoice_pdf(org_id: str, user_id: str, invoice_id: str) -> tuple[dict, bool]:
@@ -1589,15 +1711,16 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
     status = {"success": "completed", "failed": "failed", "unknown": "delivery_unknown"}[outcome]
     now = datetime.now(timezone.utc)
     error = None if status == "completed" else (result.get("error") or "Tally did not confirm this invoice")[:500]
+    response_meta = [{"key": item.get("key"), "bytes": len(item.get("xml") or "")} for item in result.get("responses") or []]
     command = await db.tally_command_jobs.find_one_and_update(
         {"org_id": integration["org_id"], "job_id": job_id, "status": "processing", "claim_id": claim_id},
         {"$set": {
             "status": status,
             "error": error,
-            "responses": result.get("responses") or [],
+            "response_meta": response_meta,
             "result_at": now,
             "updated_at": now,
-        }, "$unset": {"claim_id": "", "claimed_at": ""}},
+        }, "$unset": {"claim_id": "", "claimed_at": "", "responses": ""}},
         return_document=ReturnDocument.AFTER,
         projection={"_id": 0, "requests": 0, "responses.xml": 0},
     )
@@ -1605,11 +1728,19 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
         if status == "completed" and command["job_type"] == "sync_snapshot":
             try:
                 command["sync"] = await _store_tally_snapshot(integration["org_id"], result.get("responses") or [])
-            except HTTPException as exc:
-                status, error = "failed", str(exc.detail)
+                await db.tally_command_jobs.update_one(
+                    {"org_id": integration["org_id"], "job_id": job_id},
+                    {"$set": {"sync": command["sync"], "updated_at": now}},
+                )
+            except Exception as exc:
+                status = "failed"
+                error = str(exc.detail) if isinstance(exc, HTTPException) else f"HeidelAI could not store the Tally snapshot: {type(exc).__name__}"
                 await db.tally_command_jobs.update_one(
                     {"org_id": integration["org_id"], "job_id": job_id},
                     {"$set": {"status": status, "error": error, "updated_at": now}},
+                )
+                await db.tally_integrations.update_one(
+                    {"org_id": integration["org_id"]}, {"$set": {"last_sync_error": error}}
                 )
                 command.update({"status": status, "error": error})
         elif status == "completed" and command["job_type"] == "profit_loss_report":
@@ -1638,12 +1769,38 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                 )
                 command.update({"status": status, "error": error})
         elif status == "completed" and command["job_type"] in {"master_create", "master_update"}:
-            await queue_tally_sync(integration["org_id"], force=True)
+            readback, _ = await queue_tally_sync(
+                integration["org_id"], force=True, force_new=True, triggered_by_job_id=job_id,
+            )
+            command["readback_job_id"] = readback["job_id"]
+            await db.tally_command_jobs.update_one(
+                {"org_id": integration["org_id"], "job_id": job_id},
+                {"$set": {"readback_job_id": readback["job_id"], "updated_at": now}},
+            )
+        if command["job_type"] == "sync_snapshot" and status != "completed":
+            await db.tally_integrations.update_one(
+                {"org_id": integration["org_id"]}, {"$set": {"last_sync_error": error}}
+            )
         await db.tally_integrations.update_one(
             {"org_id": integration["org_id"]},
             {"$set": {"last_error": error, "last_result_at": now}},
         )
-        return serialize_mongo(command)
+        return await get_tally_command_job(integration["org_id"], job_id)
+    existing_command = await db.tally_command_jobs.find_one(
+        {"org_id": integration["org_id"], "job_id": job_id}, {"_id": 0, "requests": 0, "responses": 0}
+    )
+    if existing_command:
+        if existing_command.get("status") != status:
+            raise HTTPException(status_code=409, detail="This Tally command was already completed with a different result")
+        if status == "completed" and existing_command.get("job_type") in {"master_create", "master_update"} and not existing_command.get("readback_job_id"):
+            readback, _ = await queue_tally_sync(
+                integration["org_id"], force=True, force_new=True, triggered_by_job_id=job_id,
+            )
+            await db.tally_command_jobs.update_one(
+                {"org_id": integration["org_id"], "job_id": job_id},
+                {"$set": {"readback_job_id": readback["job_id"], "updated_at": now}},
+            )
+        return await get_tally_command_job(integration["org_id"], job_id)
     updated = await db.tally_bill_jobs.find_one_and_update(
         {"org_id": integration["org_id"], "job_id": job_id, "status": "processing", "claim_id": claim_id},
         {"$set": {
