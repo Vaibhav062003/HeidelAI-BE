@@ -40,6 +40,11 @@ DEFAULT_SETTINGS = {
     "reminder_template_language": "en",
 }
 GSTIN_PATTERN = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
+INVALID_XML10_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+INVALID_XML10_REFERENCES = re.compile(
+    r"&#(?:0*(?:[0-8]|1[12]|1[4-9]|2[0-9]|3[01])|x0*(?:[0-8bcef]|1[0-9a-f]));",
+    re.IGNORECASE,
+)
 SNAPSHOT_KEYS = {"ledgers", "stock_items", "units", "invoices", "outstandings", "profit_loss"}
 
 
@@ -221,9 +226,14 @@ def _direct_text(node: ET.Element, *names: str) -> str:
     return ""
 
 
+def _parse_tally_xml(xml: str) -> ET.Element:
+    text = INVALID_XML10_REFERENCES.sub("", xml or "")
+    return ET.fromstring(INVALID_XML10_CHARACTERS.sub("", text))
+
+
 def parse_outstanding_response(xml: str) -> list[dict]:
     try:
-        root = ET.fromstring(xml or "")
+        root = _parse_tally_xml(xml)
     except ET.ParseError as exc:
         raise HTTPException(status_code=502, detail="Tally returned invalid outstandings XML") from exc
     fixed = [node for node in root.iter() if _tag(node) in {"BILLFIXED", "BILLOUTSTANDING"}]
@@ -249,7 +259,7 @@ def parse_outstanding_response(xml: str) -> list[dict]:
 
 def parse_profit_loss_response(xml: str) -> dict:
     try:
-        root = ET.fromstring(xml or "")
+        root = _parse_tally_xml(xml)
     except ET.ParseError as exc:
         raise HTTPException(status_code=502, detail="Tally returned invalid Profit & Loss XML") from exc
     names = [
@@ -296,7 +306,7 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
         if key not in tags:
             continue
         try:
-            root = ET.fromstring(response.get("xml") or "")
+            root = _parse_tally_xml(response.get("xml") or "")
         except ET.ParseError as exc:
             raise HTTPException(status_code=502, detail=f"Tally returned invalid {key} XML") from exc
         seen = set()
