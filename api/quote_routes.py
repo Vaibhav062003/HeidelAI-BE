@@ -47,6 +47,10 @@ class QuoteItem(BaseModel):
     gst_rate: float = Field(default=0, ge=0, le=100)
     gst_inclusive: bool = False
     image_url: str = Field(default="", max_length=2048)
+    tally_master_id: str = Field(default="", max_length=120)
+    tally_guid: str = Field(default="", max_length=120)
+    tally_alter_id: str = Field(default="", max_length=120)
+    tally_unit: str = Field(default="", max_length=30)
 
 
 class QuotePublicOptions(BaseModel):

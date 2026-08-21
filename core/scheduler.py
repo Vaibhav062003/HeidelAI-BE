@@ -132,7 +132,7 @@ def start_scheduler():
     from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
     from services.pricing_service import process_pending_pricing_escalations
     from services.sales_offer_service import process_pending_sales_offer_audits
-    from services.tally_service import reconcile_stale_tally_jobs
+    from services.tally_service import cleanup_expired_tally_pdfs, process_tally_payment_reminders, reconcile_stale_tally_jobs
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
@@ -150,11 +150,13 @@ def start_scheduler():
     scheduler.add_job(process_pending_oos_reply_steps, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_sales_offer_audits, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(reconcile_stale_tally_jobs, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(process_tally_payment_reminders, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_pricing_escalations, "interval", minutes=1, max_instances=1, coalesce=True)
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
     scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_member_device_revocations, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
+    scheduler.add_job(cleanup_expired_tally_pdfs, "cron", hour=3, minute=45, max_instances=1, coalesce=True)
     scheduler.start()
     logger.success("APScheduler started (interval = 6 hours).")
