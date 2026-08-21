@@ -170,18 +170,27 @@ async def schedule_intent_followup(
         now = datetime.now(timezone.utc)
         now_ist = now.astimezone(IST)
         target_ist = target_dt.astimezone(IST)
-
-        if now_ist.date() == target_ist.date():
-            # Same day: fire at the exact time mentioned
+        
+        # Calculate calendar day difference in IST
+        date_diff = (target_ist.date() - now_ist.date()).days
+        
+        # STRICT TIMELINE ADHERENCE RULES:
+        if date_diff == 0:
+            # Rule 1: "if the timeline is mentioned on same day and time is mentioned then followup should be sent on exact time."
             fire_at = target_dt
-        elif target_ist.date() > now_ist.date():
-            # Future: fire 1 day prior at 10:00 AM IST
-            day_before_ist = target_ist - timedelta(days=1)
-            fire_at = day_before_ist.replace(
-                hour=10, minute=0, second=0, microsecond=0
-            ).astimezone(timezone.utc)
+        elif date_diff == 1:
+            # Rule 3: "if the timline is tomorrow then send the followup at 10 am tomorrow."
+            fire_at = target_ist.replace(hour=10, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         else:
-            # Past date: fire in 5 minutes as graceful fallback
+            # Rule 4: "if the time is after tomorrow/anyday/date then send the followup message one day prior at 10 am."
+            # Note: date_diff > 1 triggers this (after tomorrow). 
+            # If date_diff < 0 (past date), this gracefully schedules it for 1 day prior to the past date, 
+            # which guarantees it falls into the 'past fallback' below.
+            day_before_ist = target_ist - timedelta(days=1)
+            fire_at = day_before_ist.replace(hour=10, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+
+        # Fallback: if the computed time is already in the past (e.g. they say a time that just passed, or date_diff < 0)
+        if fire_at < now:
             fire_at = now + timedelta(minutes=5)
 
         delay_seconds = max(int((fire_at - now).total_seconds()), 60)  # minimum 60s
