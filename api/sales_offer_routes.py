@@ -10,6 +10,7 @@ from database import get_async_mongo_db
 from services.sales_offer_policy import is_admin, report_query
 from services.utils import serialize_mongo
 from services.work_team_service import require_conversation_access
+from services.entitlement_service import require_feature
 
 
 router = APIRouter(prefix="/api/offers", tags=["Sales offers"])
@@ -151,6 +152,7 @@ async def update_offer_outcome(
     payload: OfferOutcomePayload,
     user: CurrentUser,
 ):
+    require_feature(user.org_id, "OFFERS")
     query: dict = {"_id": offer_id, "org_id": user.org_id}
     if not is_admin(user.role):
         query["agent_id"] = user.user_id

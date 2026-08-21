@@ -372,6 +372,8 @@ async def _execute_job(job: dict) -> None:
     max_retries = job.get("max_retries", 3)
 
     try:
+        from services.entitlement_service import consume_quota_async
+        await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", 1, f"automation-schedule:{schedule_id}")
         # Step 1: Validate conversation still exists and is open
         conv_collection = db[f"conversations_{org_id}"]
         conversation = await asyncio.to_thread(lambda: conv_collection.find_one({"conversation_id": conversation_id}))

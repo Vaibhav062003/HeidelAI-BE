@@ -821,6 +821,13 @@ async def process_scheduled_messages(messaging_services: dict) -> None:
         )
         if not claimed:
             continue
+        from services.entitlement_service import feature_access
+        if feature_access(claimed["org_id"], "FOLLOW_UPS")["state"] != "active":
+            await collection.update_one(
+                {"_id": claimed["_id"], "claim_id": claim_id},
+                {"$set": {"status": "cancelled", "cancelled_at": claim_time, "error": "Follow-ups entitlement is not active", "updated_at": claim_time}, "$unset": {"active_key": "", "claim_id": "", "claimed_at": ""}},
+            )
+            continue
         if not _is_customer_facing_followup(claimed):
             await collection.update_one(
                 {"_id": claimed["_id"], "claim_id": claim_id},

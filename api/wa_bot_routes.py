@@ -14,6 +14,7 @@ from services.wa_bot_service import (
     unpublish_wa_bot_flow,
     duplicate_wa_bot_flow,
 )
+from services.entitlement_service import release_automation_publish, require_automation_publish, require_feature
 from loguru import logger
 
 db = get_mongo_db()
@@ -50,6 +51,7 @@ async def create_flow(payload: WaBotFlowBody, user: CurrentUser):
     WaBotEditor POSTs here on first save.
     """
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
@@ -130,13 +132,19 @@ async def update_flow(flow_id: str, payload: WaBotFlowBody, user: CurrentUser):
     WaBotEditor PATCHes here on every subsequent save.
     """
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
+        reserved = payload.flat_dict().get("status") == "active" and require_automation_publish(user.org_id, flow_id, "wabot")
         org_id = user.org_id
-        updated = await update_wa_bot_flow(
-            org_id=org_id,
-            flow_id=flow_id,
-            payload=payload.flat_dict(),
-            updated_by=user.user_id,
-        )
+        try:
+            updated = await update_wa_bot_flow(
+                org_id=org_id,
+                flow_id=flow_id,
+                payload=payload.flat_dict(),
+                updated_by=user.user_id,
+            )
+        finally:
+            if reserved:
+                release_automation_publish(org_id, flow_id, "wabot")
         if not updated:
             raise HTTPException(status_code=404, detail="WaBot flow not found")
         return {"flow": updated}
@@ -154,6 +162,7 @@ async def update_flow(flow_id: str, payload: WaBotFlowBody, user: CurrentUser):
 async def delete_flow(flow_id: str, user: CurrentUser):
     """Delete a WaBot flow permanently."""
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         deleted = await delete_wa_bot_flow(org_id=org_id, flow_id=flow_id)
         if not deleted:
@@ -186,12 +195,17 @@ async def publish_flow(flow_id: str, user: CurrentUser):
     we just flip the status.
     """
     try:
+        reserved = require_automation_publish(user.org_id, flow_id, "wabot")
         org_id = user.org_id
-        flow = await publish_wa_bot_flow(
-            org_id=org_id,
-            flow_id=flow_id,
-            updated_by=user.user_id,
-        )
+        try:
+            flow = await publish_wa_bot_flow(
+                org_id=org_id,
+                flow_id=flow_id,
+                updated_by=user.user_id,
+            )
+        finally:
+            if reserved:
+                release_automation_publish(org_id, flow_id, "wabot")
         if not flow:
             raise HTTPException(status_code=404, detail="WaBot flow not found")
         return {"flow": flow, "message": "WaBot flow published and live"}
@@ -211,6 +225,7 @@ async def unpublish_flow(flow_id: str, user: CurrentUser):
     Revert status → "draft" so the webhook stops firing this flow.
     """
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         flow = await unpublish_wa_bot_flow(
             org_id=org_id,
@@ -237,6 +252,7 @@ async def duplicate_flow(flow_id: str, user: CurrentUser):
     The copy is always created in 'draft' status.
     """
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")

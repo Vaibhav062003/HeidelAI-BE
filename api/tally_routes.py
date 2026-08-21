@@ -47,6 +47,7 @@ from services.tally_service import (
 )
 from services.utils import serialize_mongo
 from services.work_team_service import list_work_teams
+from services.entitlement_service import require_feature
 
 
 router = APIRouter(tags=["Tally"])
@@ -211,7 +212,9 @@ def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
-async def _require_accounting_access(user: CurrentUser) -> None:
+async def _require_accounting_access(user: CurrentUser, write: bool = False) -> None:
+    if write:
+        require_feature(user.org_id, "TALLY")
     if user.role in {"admin", "org:admin"}:
         return
     teams = await list_work_teams(user.org_id)
@@ -249,6 +252,7 @@ async def get_tally_integration(request: Request, user: CurrentUser):
 @router.put("/api/integrations/tally")
 @limiter.limit("10/minute")
 async def put_tally_integration(request: Request, payload: TallySettingsPayload, user: CurrentUser):
+    require_feature(user.org_id, "TALLY")
     await admin_required(user)
     integration = await save_integration(user.org_id, user.user_id, payload.model_dump())
     return {"settings": normalized_settings(integration)}
@@ -257,6 +261,7 @@ async def put_tally_integration(request: Request, payload: TallySettingsPayload,
 @router.post("/api/integrations/tally/connector-key")
 @limiter.limit("5/minute")
 async def post_tally_connector_key(request: Request, user: CurrentUser):
+    require_feature(user.org_id, "TALLY")
     await admin_required(user)
     integration = await get_integration(user.org_id)
     if not normalized_settings(integration)["company_name"].strip():
@@ -267,6 +272,7 @@ async def post_tally_connector_key(request: Request, user: CurrentUser):
 @router.delete("/api/integrations/tally/connector-key")
 @limiter.limit("5/minute")
 async def delete_tally_connector_key(request: Request, user: CurrentUser):
+    require_feature(user.org_id, "TALLY")
     await admin_required(user)
     await db.tally_integrations.update_one(
         {"org_id": user.org_id},
@@ -279,7 +285,7 @@ async def delete_tally_connector_key(request: Request, user: CurrentUser):
 @router.post("/api/quotes/{quote_id}/tally", status_code=201)
 @limiter.limit("20/minute")
 async def post_quote_to_tally(request: Request, quote_id: str, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     quote = await db[f"quotes_{user.org_id}"].find_one(
         {"org_id": user.org_id, "quote_id": quote_id}, {"_id": 0, "conversation_id": 1}
     )
@@ -304,7 +310,7 @@ async def get_tally_bills(request: Request, conversation_id: str, user: CurrentU
 @router.post("/api/tally-bills/{job_id}/retry")
 @limiter.limit("10/minute")
 async def post_tally_retry(request: Request, job_id: str, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     return {"bill": await retry_bill(user.org_id, job_id, user.user_id, user.role)}
 
 
@@ -318,7 +324,7 @@ async def get_tally_overview(request: Request, user: CurrentUser):
 @router.post("/api/tally/sync", status_code=202)
 @limiter.limit("10/minute")
 async def post_tally_sync(request: Request, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     job, created = await queue_tally_sync(user.org_id, user.user_id, force=True)
     return {"job": job, "created": created}
 
@@ -365,6 +371,7 @@ async def get_tally_profit_loss(
 @router.post("/api/tally/profit-loss", status_code=202)
 @limiter.limit("10/minute")
 async def post_tally_profit_loss(request: Request, payload: ProfitLossPayload, user: CurrentUser):
+    require_feature(user.org_id, "TALLY")
     await admin_required(user)
     if payload.from_date > payload.to_date:
         raise HTTPException(status_code=422, detail="Profit & Loss start date must be before the end date")
@@ -391,7 +398,7 @@ async def get_tally_operations(request: Request, user: CurrentUser, limit: int =
 @router.post("/api/tally/invoices/{invoice_id}/pdf", status_code=202)
 @limiter.limit("20/minute")
 async def post_tally_invoice_pdf(request: Request, invoice_id: str, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     job, created = await queue_invoice_pdf(user.org_id, user.user_id, invoice_id)
     return {"job": job, "created": created}
 
@@ -406,7 +413,7 @@ async def get_tally_invoice_pdf_link(request: Request, invoice_id: str, user: Cu
 @router.put("/api/tally/invoices/{invoice_id}/pdf")
 @limiter.limit("10/minute")
 async def put_tally_invoice_pdf(request: Request, invoice_id: str, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     if request.headers.get("content-type", "").split(";", 1)[0].lower() != "application/pdf":
         raise HTTPException(status_code=415, detail="Choose a PDF exported from TallyPrime")
     return {"pdf": await store_uploaded_tally_pdf(user.org_id, invoice_id, await request.body())}
@@ -417,7 +424,7 @@ async def put_tally_invoice_pdf(request: Request, invoice_id: str, user: Current
 async def put_tally_customer_link(
     request: Request, party_master_id: str, payload: CustomerLinkPayload, user: CurrentUser,
 ):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     return {"link": await link_tally_customer(
         user.org_id, user.user_id, party_master_id, payload.conversation_id,
         phone=payload.phone, make_primary=payload.is_primary,
@@ -429,7 +436,7 @@ async def put_tally_customer_link(
 async def delete_tally_customer_link(
     request: Request, party_master_id: str, conversation_id: str, user: CurrentUser,
 ):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     await unlink_tally_customer(user.org_id, party_master_id, conversation_id)
     return {"deleted": True}
 
@@ -444,7 +451,7 @@ async def get_invoice_reminders(request: Request, invoice_id: str, user: Current
 @router.post("/api/tally/invoices/{invoice_id}/reminders", status_code=201)
 @limiter.limit("20/minute")
 async def post_invoice_reminder(request: Request, invoice_id: str, payload: ReminderPayload, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     return {"reminder": await create_payment_reminder(
         user.org_id, user.user_id, user.full_name or "Team member", invoice_id, payload.scheduled_at
     )}
@@ -453,14 +460,14 @@ async def post_invoice_reminder(request: Request, invoice_id: str, payload: Remi
 @router.patch("/api/tally/reminders/{reminder_id}")
 @limiter.limit("20/minute")
 async def patch_invoice_reminder(request: Request, reminder_id: str, payload: ReminderPayload, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     return {"reminder": await reschedule_payment_reminder(user.org_id, reminder_id, user.user_id, payload.scheduled_at)}
 
 
 @router.delete("/api/tally/reminders/{reminder_id}")
 @limiter.limit("20/minute")
 async def delete_invoice_reminder(request: Request, reminder_id: str, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     return {"reminder": await cancel_payment_reminder(user.org_id, reminder_id, user.user_id)}
 
 
@@ -479,6 +486,7 @@ async def post_tally_master(
     payload: TallyMasterPayload,
     user: CurrentUser,
 ):
+    require_feature(user.org_id, "TALLY")
     await admin_required(user)
     return {"job": await queue_tally_master(user.org_id, user.user_id, kind, payload.model_dump())}
 
@@ -492,6 +500,7 @@ async def put_tally_master(
     payload: TallyMasterPayload,
     user: CurrentUser,
 ):
+    require_feature(user.org_id, "TALLY")
     await admin_required(user)
     return {"job": await queue_tally_master(
         user.org_id, user.user_id, kind, payload.model_dump(), master_id=master_id
@@ -503,7 +512,7 @@ async def put_tally_master(
 async def post_tally_invoice_draft(
     request: Request, conversation_id: str, payload: InvoiceDraftCreatePayload, user: CurrentUser,
 ):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     return {"draft": await create_tally_invoice_draft(
         user.org_id, user.user_id, user.role, conversation_id, payload.model_dump()
     )}
@@ -514,7 +523,7 @@ async def post_tally_invoice_draft(
 async def patch_tally_invoice_draft(
     request: Request, draft_id: str, payload: InvoiceDraftReviewPayload, user: CurrentUser,
 ):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     return {"draft": await review_tally_invoice_draft(
         user.org_id, user.user_id, user.role, draft_id, payload.model_dump()
     )}
@@ -523,7 +532,7 @@ async def patch_tally_invoice_draft(
 @router.post("/api/tally-invoice-drafts/{draft_id}/submit", status_code=202)
 @limiter.limit("20/minute")
 async def post_tally_invoice_draft_submit(request: Request, draft_id: str, user: CurrentUser):
-    await _require_accounting_access(user)
+    await _require_accounting_access(user, write=True)
     job, created = await submit_tally_invoice_draft(
         user.org_id, user.user_id, user.full_name or "Team member", user.role, draft_id
     )

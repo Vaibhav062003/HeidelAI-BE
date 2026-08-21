@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import asyncio
 import logging
 from typing import Literal
 
@@ -54,6 +55,11 @@ async def update_org_ai_policy(org_id: str, enabled: bool, pause_minutes: int) -
 
 async def is_effective_ai_enabled(org_id: str, conversation_id: str) -> bool:
     try:
+        from services.entitlement_service import quota_status
+
+        quota = await asyncio.to_thread(quota_status, org_id, "AI", "monthly_messages")
+        if quota["remaining"] == 0:
+            return False
         organization = await db.organizations.find_one(
             {"org_id": org_id},
             {"_id": 0, "is_ai_enabled": 1},

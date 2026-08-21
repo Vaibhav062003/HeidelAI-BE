@@ -2,6 +2,10 @@
 
 This is the backend for the HeidelAI project.
 
+## Product entitlements
+
+Set `ENTITLEMENT_HMAC_SECRET` to the same secret used by the CRM product adapter. Deploy first with `ENTITLEMENT_ENFORCEMENT_MODE=observe` so organizations without grants keep grandfathered access; after grants are synchronized, switch it to `enforce`. Trial and monthly quota boundaries use `Asia/Kolkata`.
+
 ## Run a script or command
 
 ```bash

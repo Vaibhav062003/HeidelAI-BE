@@ -12,6 +12,7 @@ from services.oos_service import ensure_oos_indexes
 from services.pricing_service import ensure_pricing_indexes
 from services.sales_offer_service import ensure_sales_offer_indexes
 from services.tally_service import ensure_tally_indexes
+from services.entitlement_service import ensure_entitlement_indexes
 from services.push_notification_service import (
     ensure_push_notification_indexes,
     start_push_notification_workers,
@@ -39,6 +40,7 @@ async def lifespan(app: FastAPI):
     await ensure_pricing_indexes()
     await ensure_sales_offer_indexes()
     await ensure_tally_indexes()
+    await asyncio.to_thread(ensure_entitlement_indexes)
     await start_push_notification_workers()
     await startup_intent_worker()
     yield
