@@ -35,6 +35,7 @@ from services.common_service import (
     delete_private_note)
 from services.contacts_service import (
     get_contacts_for_org, 
+    get_contacts_page_for_org,
     update_contact_tag_categories,
     update_contact_labels,
     add_tag_to_org_metadata,
@@ -513,7 +514,15 @@ async def post_private_note(request: Request, user: CurrentUser, conversation_id
 
 @router.get("/api/contacts")
 @limiter.limit("60/minute")
-async def get_contacts(request: Request, user: CurrentUser):
+async def get_contacts(
+    request: Request,
+    user: CurrentUser,
+    page: int | None = Query(default=None, ge=1),
+    limit: int | None = Query(default=None, ge=1, le=100),
+    search: str = Query(default="", max_length=100),
+    tags: list[str] = Query(default=[]),
+    snapshot: str | None = Query(default=None, min_length=24, max_length=24),
+):
     """
     Retrieve contacts
     """
@@ -521,9 +530,12 @@ async def get_contacts(request: Request, user: CurrentUser):
     if not org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
-    contacts = await get_contacts_for_org(org_id)
+    # Keep the no-parameter response for older clients during the rollout.
+    if page is None or limit is None:
+        contacts = await get_contacts_for_org(org_id)
+        return {"contacts": contacts}
 
-    return {"contacts": contacts}
+    return await get_contacts_page_for_org(org_id, page, limit, search, tags[:20], snapshot)
 
 @router.post("/api/contacts/update-categories")
 @limiter.limit("60/minute")
