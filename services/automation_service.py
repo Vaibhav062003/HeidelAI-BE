@@ -796,6 +796,7 @@ async def execute_whatsapp_flow(
     message_content: str,
     whatsapp_business_id: str,
     message_type: str,
+    source_message_id: str | None = None,
 ):
     logger.info(f"[{org_id}] Executing WhatsApp flow for conversation: {conversation_id} | Stage: {stage} | Type: {message_type}")
 
@@ -823,6 +824,18 @@ async def execute_whatsapp_flow(
 
     ctx = dict(org_id=org_id, whatsapp_business_id=whatsapp_business_id, conversation_id=conversation_id)
 
+    async def consume_run() -> bool:
+        from fastapi import HTTPException
+        from services.entitlement_service import consume_quota_async
+
+        key = source_message_id or f"{conversation_id}:{message_type}:{message_content}"
+        try:
+            await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", 1, f"wabot:{flow.get('flow_id')}:{key}")
+            return True
+        except HTTPException as exc:
+            logger.warning(f"[{org_id}] WhatsApp automation blocked: {exc.detail}")
+            return False
+
     # Interactive (button / list click)
     if message_type == "interactive":
         selection_id = message_content
@@ -830,6 +843,9 @@ async def execute_whatsapp_flow(
 
         if selection_id not in flow_nodes:
             logger.warning(f"[{org_id}] Node '{selection_id}' not found in flow, routing to AI...")
+            return False
+
+        if not await consume_run():
             return False
 
         if selection_id in welcome_message_ids:
@@ -880,6 +896,9 @@ async def execute_whatsapp_flow(
 
         if not is_keyword_match:
             logger.info(f"[{org_id}] Message '{msg_lower}' did not match flow trigger keywords {trigger_keywords}, routing to AI...")
+            return False
+
+        if not await consume_run():
             return False
 
         # Send optional introduction first

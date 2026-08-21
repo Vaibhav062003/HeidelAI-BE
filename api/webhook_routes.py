@@ -1014,6 +1014,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             customer_name=sender_name2,
                                             whatsapp_business_id=whatsapp_business_id,
                                             message_type=message_type,
+                                            source_message_id=wa_message_id,
                                         )
 
                                         # If the flow handled the message successfully, exit early.
@@ -1404,6 +1405,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_name=sender_name2,
                                         whatsapp_business_id=whatsapp_business_id,
                                         message_type=message_type,
+                                        source_message_id=wa_message_id,
                                     )
 
                                     if automation_response:

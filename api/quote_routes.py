@@ -15,6 +15,7 @@ from services.cloudinary_service import upload_media_to_cloudinary
 from services.quote_math import quote_line_amounts
 from services.utils import serialize_mongo
 from services.work_team_service import require_conversation_access
+from services.entitlement_service import require_feature
 
 
 router = APIRouter(prefix="/api/quotes", tags=["Quotes"])
@@ -203,6 +204,7 @@ async def list_quotes(
 @router.post("", status_code=201)
 @limiter.limit("20/minute")
 async def create_quote(request: Request, payload: QuotePayload, user: CurrentUser):
+    require_feature(user.org_id, "OFFERS")
     await _require_conversation(user, payload.conversation_id)
     now = datetime.now(timezone.utc)
     document = {
@@ -243,6 +245,7 @@ async def get_quote_settings(request: Request, user: CurrentUser):
 @router.put("/settings")
 @limiter.limit("10/minute")
 async def update_quote_settings(request: Request, payload: QuoteSettingsPayload, user: CurrentUser):
+    require_feature(user.org_id, "OFFERS")
     await admin_required(user)
     updates = {}
     if payload.logo_url is not None:
@@ -271,6 +274,7 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
 @router.put("/{quote_id}")
 @limiter.limit("20/minute")
 async def update_quote(request: Request, quote_id: str, payload: QuotePayload, user: CurrentUser):
+    require_feature(user.org_id, "OFFERS")
     await _require_conversation(user, payload.conversation_id)
     collection = _collection(user.org_id)
     current = await collection.find_one({"org_id": user.org_id, "quote_id": quote_id})
@@ -322,6 +326,7 @@ async def get_quote_revisions(request: Request, quote_id: str, user: CurrentUser
 @router.post("/assets")
 @limiter.limit("20/minute")
 async def upload_quote_asset(request: Request, user: CurrentUser, file: UploadFile = File(...)):
+    require_feature(user.org_id, "OFFERS")
     allowed = {"image/jpeg": b"\xff\xd8\xff", "image/png": b"\x89PNG\r\n\x1a\n"}
     if file.content_type not in allowed or not file.size or file.size > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Use a JPG or PNG image up to 5 MB")

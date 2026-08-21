@@ -1738,10 +1738,21 @@ async def bulk_send_whatsapp_message(
     """
     try:
         org_id = user.org_id
-        logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(request.recipients)}")
+        from services.entitlement_service import consume_quota_async, feature_access, release_quota_async, require_feature
 
-        if not request.recipients:
+        require_feature(org_id, "BROADCASTING")
+        unique_recipients = {}
+        for recipient in req.recipients:
+            phone = "".join(character for character in recipient.phone_number if character.isdigit())
+            unique_recipients[phone] = recipient.model_copy(update={"phone_number": phone})
+        recipients = list(unique_recipients.values())
+        logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(recipients)}")
+
+        if not recipients:
             raise HTTPException(status_code=400, detail="At least one recipient is required")
+        batch_limit = feature_access(org_id, "BROADCASTING")["limits"].get("max_batch_recipients")
+        if batch_limit is not None and len(recipients) > batch_limit:
+            raise HTTPException(status_code=422, detail={"code": "broadcast_batch_limit", "feature": "BROADCASTING", "metric": "max_batch_recipients", "used": len(recipients), "limit": batch_limit, "message": f"This broadcast exceeds the {batch_limit}-recipient batch limit."})
 
         # Look up the org's WhatsApp connection
         org_document = db.organizations.find_one({"org_id": org_id})
@@ -1771,14 +1782,20 @@ async def bulk_send_whatsapp_message(
 
         # Create the job record off the event loop so the client gets the job_id immediately
         job_id = uuid.uuid4().hex
-        await asyncio.to_thread(
-            create_bulk_job,
-            org_id=org_id,
-            job_id=job_id,
-            template_name=request.template_name,
-            language_code=request.language_code,
-            total=len(request.recipients),
-        )
+        quota_event_key = f"broadcast:{job_id}"
+        await consume_quota_async(org_id, "BROADCASTING", "monthly_recipients", len(recipients), quota_event_key)
+        try:
+            await asyncio.to_thread(
+                create_bulk_job,
+                org_id=org_id,
+                job_id=job_id,
+                template_name=req.template_name,
+                language_code=req.language_code,
+                total=len(recipients),
+            )
+        except Exception:
+            await release_quota_async(org_id, "monthly_recipients", quota_event_key)
+            raise
 
         # Enqueue the heavy work as a background task
         background_tasks.add_task(
@@ -1788,21 +1805,21 @@ async def bulk_send_whatsapp_message(
             org_id=org_id,
             phone_id=phone_id,
             access_token=access_token,
-            template_name=request.template_name,
-            language_code=request.language_code,
-            recipients=request.recipients,
-            components=request.components,
-            delay_seconds=request.delay_seconds,
+            template_name=req.template_name,
+            language_code=req.language_code,
+            recipients=recipients,
+            components=req.components,
+            delay_seconds=req.delay_seconds,
             # max_concurrent=20, # Optional: can be passed if needed
         )
 
-        logger.success(f"Bulk WA | job={job_id} enqueued | org={org_id} | recipients={len(request.recipients)}")
+        logger.success(f"Bulk WA | job={job_id} enqueued | org={org_id} | recipients={len(recipients)}")
 
         return {
             "status": "accepted",
             "message": "Bulk send job enqueued.",
             "job_id": job_id,
-            "total": len(request.recipients),
+            "total": len(recipients),
         }
     except HTTPException as http_exc:
         raise http_exc

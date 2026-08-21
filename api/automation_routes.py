@@ -17,6 +17,7 @@ from services.automation_service import (
     unpublish_automation_flow,
     validate_flow_structure
 )
+from services.entitlement_service import release_automation_publish, require_automation_publish, require_feature
 from loguru import logger
 
 db = get_mongo_db()
@@ -75,6 +76,7 @@ async def create_flow(request: Request, payload: CreateFlowRequest, user: Curren
     
     """
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
@@ -222,6 +224,7 @@ async def get_flow(flow_id: str, user: CurrentUser):
 async def update_flow(flow_id: str, payload: UpdateFlowRequest, user: CurrentUser):
     """Update an existing automation flow"""
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
@@ -262,6 +265,7 @@ async def update_flow(flow_id: str, payload: UpdateFlowRequest, user: CurrentUse
 async def delete_flow(flow_id: str, user: CurrentUser):
     """Delete an automation flow"""
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
@@ -287,11 +291,16 @@ async def delete_flow(flow_id: str, user: CurrentUser):
 async def publish_flow(flow_id: str, user: CurrentUser):
     """Publish (activate) an automation flow"""
     try:
+        reserved = require_automation_publish(user.org_id, flow_id, "automation")
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
-        flow = await publish_automation_flow(org_id=org_id, flow_id=flow_id)
+        try:
+            flow = await publish_automation_flow(org_id=org_id, flow_id=flow_id)
+        finally:
+            if reserved:
+                release_automation_publish(org_id, flow_id, "automation")
         if not flow:
             raise HTTPException(status_code=404, detail="Automation flow not found")
 
@@ -310,6 +319,7 @@ async def publish_flow(flow_id: str, user: CurrentUser):
 async def unpublish_flow(flow_id: str, user: CurrentUser):
     """Unpublish (deactivate) an automation flow"""
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")
@@ -453,6 +463,7 @@ async def get_flow_followups(
 async def cancel_flow_followup(flow_id: str, schedule_id: str, user: CurrentUser):
     """Cancel a specific pending follow-up job."""
     try:
+        require_feature(user.org_id, "AUTOMATIONS")
         org_id = user.org_id
         if not org_id:
             raise HTTPException(status_code=400, detail="Organization ID not found")

@@ -18,6 +18,7 @@ from services.followup_service import (
     schedule_followup_message,
     transition_scheduled_followup,
 )
+from services.entitlement_service import require_feature
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required
@@ -160,6 +161,7 @@ async def schedule_message(
     Schedule a follow-up using the customer's timeline or the fixed three-hour default.
     """
     try:
+        require_feature(user.org_id, "FOLLOW_UPS")
         body = payload or ScheduleFollowUpRequest()
         await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
         if body.source == "quotation" and not body.quote_id:
@@ -214,6 +216,7 @@ async def update_followup_status(
     payload: FollowUpStatusRequest,
     user: CurrentUser,
 ):
+    require_feature(user.org_id, "FOLLOW_UPS")
     existing = await get_async_mongo_db().scheduled_messages.find_one(
         {"_id": _followup_object_id(followup_id), "org_id": user.org_id},
         {"conversation_id": 1},
@@ -238,6 +241,7 @@ async def cancel_next_followup(
     followup_id: str,
     user: CurrentUser,
 ):
+    require_feature(user.org_id, "FOLLOW_UPS")
     existing = await get_async_mongo_db().scheduled_messages.find_one(
         {"_id": _followup_object_id(followup_id), "org_id": user.org_id},
         {"conversation_id": 1},

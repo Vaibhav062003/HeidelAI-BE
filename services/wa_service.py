@@ -482,6 +482,8 @@ async def send_whatsapp_message(
     whatsapp_id = message.get("sender_id")
     outbound_operation = None
     provider_started = False
+    quota_event_key = None
+    quota_consumed = False
 
     if not whatsapp_id:
         logger.error("Missing 'sender_id' in outbound WhatsApp message payload")
@@ -581,6 +583,17 @@ async def send_whatsapp_message(
         if outbound_operation and outbound_operation.get("action") == "replay":
             return outbound_operation["result"]
 
+        if mode == "ai":
+            from services.ai_policy_service import is_effective_ai_enabled
+            from services.entitlement_service import consume_quota_async
+
+            if not await is_effective_ai_enabled(org_id, conversation_id):
+                raise AIProviderUnavailable("ai_disabled", escalation_required=False)
+            operation_id = str((outbound_operation or {}).get("_id") or temp_id or pricing_source_message_id or conversation_id)
+            quota_event_key = f"ai:{operation_id}"
+            quota = await consume_quota_async(org_id, "AI", "monthly_messages", len(contents), quota_event_key)
+            quota_consumed = not quota.get("duplicate", False)
+
         # Ensure the conversation document exists in the database
         if mode != "ai":
             await create_or_update_whatsapp_conversation(
@@ -657,6 +670,10 @@ async def send_whatsapp_message(
                         raise HTTPException(status_code=503, detail="WhatsApp delivery could not be confirmed. Refresh the conversation before retrying.")
 
                     if response.status_code != 200:
+                        if quota_consumed and quota_event_key:
+                            from services.entitlement_service import release_quota_async
+                            await release_quota_async(org_id, "monthly_messages", quota_event_key)
+                            quota_consumed = False
                         if i == 0:
                             release_claim(db.whatsapp_outbound_sends, outbound_operation, provider_started=True)
                         logger.error(f"WhatsApp API error: {response.text}")
@@ -785,24 +802,36 @@ async def send_whatsapp_message(
         return result
 
     except AIProviderUnavailable:
+        if quota_consumed and quota_event_key and not provider_started:
+            from services.entitlement_service import release_quota_async
+            await release_quota_async(org_id, "monthly_messages", quota_event_key)
         if provider_started:
             mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
         else:
             release_claim(db.whatsapp_outbound_sends, outbound_operation)
         raise
     except asyncio.CancelledError:
+        if quota_consumed and quota_event_key and not provider_started:
+            from services.entitlement_service import release_quota_async
+            await release_quota_async(org_id, "monthly_messages", quota_event_key)
         if provider_started:
             mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
         else:
             release_claim(db.whatsapp_outbound_sends, outbound_operation)
         raise
     except HTTPException as e:
+        if quota_consumed and quota_event_key and not provider_started:
+            from services.entitlement_service import release_quota_async
+            await release_quota_async(org_id, "monthly_messages", quota_event_key)
         if provider_started:
             mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
         else:
             release_claim(db.whatsapp_outbound_sends, outbound_operation)
         raise e
     except Exception as e:
+        if quota_consumed and quota_event_key and not provider_started:
+            from services.entitlement_service import release_quota_async
+            await release_quota_async(org_id, "monthly_messages", quota_event_key)
         if provider_started:
             mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
         else:
