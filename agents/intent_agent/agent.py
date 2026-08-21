@@ -41,14 +41,13 @@ R1. RECENCY WINS — USE HYBRID CONTEXT
     - DO NOT penalize the customer for switching products multiple times.
     - DO NOT judge the customer as "indecisive" based on older messages.
 
-R2. BOTH PRODUCT + SPECIFIC TIME REQUIRED (across recent messages)
-    - has_intent = True ONLY when the customer's RECENT messages collectively state:
-      (a) WHAT they want to buy (a specific product, model, service, or item), AND
+R2. BOTH PRODUCT + SPECIFIC TIME REQUIRED
+    - has_intent = True ONLY when the customer provides BOTH:
+      (a) WHAT they want to buy (a specific product/service).
       (b) WHEN they plan to buy it (a concrete, parseable date or time).
-    - IMPORTANT: Product and time do NOT need to be in the SAME message.
-      Example: Message 1: "I want a gaming laptop"  →  Message 2: "I'll buy it today at 5pm"
-      This IS valid intent (product = gaming laptop, date = today 5pm).
-    - If EITHER is missing from the recent messages → has_intent = False.
+    - The TIMELINE and INTENT must come from RECENT MESSAGES.
+    - The PRODUCT can come from either RECENT MESSAGES or OLDER CONTEXT.
+    - If there is NO time in recent messages, or NO product mentioned anywhere → has_intent = False.
 
 R3. NEGATIVE SIGNALS — ONLY WHEN NO REPLACEMENT IS GIVEN
     - If the customer's latest messages are PURELY rejecting/declining WITHOUT
