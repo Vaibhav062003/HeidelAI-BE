@@ -35,6 +35,11 @@ R1. RECENCY WINS — USE HYBRID CONTEXT
     - If the product was mentioned in the OLDER CONTEXT (e.g., they discussed specs
       20 messages ago) and the RECENT MESSAGES say "I'll buy it tomorrow", that
       is VALID INTENT. Extract the product from the older context.
+    - CRITICAL AVOIDANCE: Only link a recent timeline to an older product if the recent 
+      message logically refers back to it (e.g., using "it", "that one"). If the recent 
+      message uses a generic indefinite phrase like "I am looking for a product to buy tomorrow" 
+      or "I want to buy something", DO NOT link it to the older product. This implies 
+      they haven't decided yet → has_intent = False.
     - HOWEVER, the actual INTENT and TIMELINE must come from the RECENT MESSAGES.
     - If an older message says "I'll buy MacBook" but recent messages say
       "Actually I want Galaxy Book", the answer is Galaxy Book ONLY.
@@ -96,13 +101,17 @@ R8. MULTILINGUAL HANDLING
     - "Kal 5 baje le lunga MacBook" = "I'll take MacBook tomorrow at 5" → valid intent.
     - Parse the date/time from ANY language the customer uses.
 
-R9. DATE RESOLUTION
+R9. DATE RESOLUTION & AM/PM LOGIC
     - Use the provided current_datetime_iso to resolve relative dates.
     - "tomorrow" = current date + 1 day.
     - "next Friday" = the coming Friday after today.
-    - "today at 5pm" = today's date with time 17:00.
-    - "in 2 weeks" = current date + 14 days, default to 10:00 AM.
+    - "in 2 weeks" = current date + 14 days.
     - "20th August" = the next occurrence of Aug 20 (this year or next).
+    - SAME DAY AM/PM RULE: If the customer mentions a time for the SAME DAY (e.g., "remind me at 5")
+      without specifying AM or PM, resolve it to the CLOSEST upcoming time.
+      For example, if the current time is 1:00 PM (13:00) and the customer says "at 5",
+      assume 5:00 PM (17:00). If the current time is 7:00 PM (19:00) and the customer says "at 8",
+      assume 8:00 PM (20:00). If a time has already passed today, assume the PM equivalent.
     - ALWAYS output tentative_date in full ISO 8601 format with time component.
     - If only a date is mentioned (no time), default to 10:00 AM local time.
 
