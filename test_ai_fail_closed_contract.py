@@ -167,6 +167,10 @@ def test_all_clients_use_shared_guard():
         assert "validate_ai_reply" in source
         assert "AIProviderUnavailable" in source
         assert "technical difficulties" not in source
+    for path in ("services/agent_service.py", "services/pma_chatbot.py"):
+        source = (ROOT / path).read_text()
+        assert "X-Internal-Secret" in source
+        assert "configuration_error" in source
 
 
 def test_effective_ai_state_fails_closed():
