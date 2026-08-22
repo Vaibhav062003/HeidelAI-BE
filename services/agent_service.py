@@ -8,6 +8,17 @@ from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
 CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app/"
 #CHATBOT_BASE_URL = "http://localhost:8001"  For local testing with self-signed certs, ensure to disable SSL verification in httpx client
 
+def _reported_usage(value) -> Dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in ("input_tokens", "output_tokens", "recorded_cost_microusd"):
+        amount = value.get(key)
+        if isinstance(amount, int) and not isinstance(amount, bool) and 0 <= amount <= 10**12:
+            result[key] = amount
+    return result
+
+
 async def send_to_agent(
     conversation_id: str,
     user_input: str,
@@ -94,7 +105,7 @@ async def send_to_agent(
             # Extract the chatbot's response
             final_response = validate_ai_reply(response_data.get("response"))
             logger.info(f"Received response from chatbot for ...{conversation_id[-6:]}")
-            return {"final_response": final_response}
+            return {"final_response": final_response, "usage": _reported_usage(response_data.get("usage"))}
 
     except AIProviderUnavailable:
         raise

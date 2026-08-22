@@ -17,6 +17,7 @@ LIMIT_KEYS = {
     "AUTOMATIONS": {"active_flows", "monthly_runs"},
     "BROADCASTING": {"max_batch_recipients", "monthly_recipients"},
 }
+AI_CHANNELS = ("whatsapp", "instagram", "playground", "direct")
 IST = ZoneInfo("Asia/Kolkata")
 db = get_mongo_db()
 
@@ -39,6 +40,18 @@ def period_window(now: datetime | None = None) -> tuple[str, datetime]:
     else:
         reset = local.replace(month=local.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
     return local.strftime("%Y-%m"), reset.astimezone(timezone.utc)
+
+
+def recent_periods(count: int, now: datetime | None = None) -> list[str]:
+    local = (now or datetime.now(timezone.utc)).astimezone(IST)
+    periods = []
+    year, month = local.year, local.month
+    for _ in range(count):
+        periods.append(f"{year:04d}-{month:02d}")
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+    return periods
 
 
 def normalize_product(value: str) -> str:
@@ -215,6 +228,65 @@ async def release_quota_async(*args, **kwargs) -> bool:
     return await asyncio.to_thread(release_quota, *args, **kwargs)
 
 
+def record_ai_usage(
+    account_id: str,
+    event_key: str,
+    channel: str,
+    quantity: int = 1,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    recorded_cost_microusd: int = 0,
+) -> dict:
+    if channel not in AI_CHANNELS:
+        raise ValueError("unsupported AI channel")
+    values = (quantity, input_tokens, output_tokens, recorded_cost_microusd)
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values) or quantity < 1:
+        raise ValueError("AI usage values must be non-negative integers and quantity must be positive")
+    period, _ = period_window()
+    event_id = hashlib.sha256(f"{account_id}:{period}:ai-analytics:{event_key}".encode()).hexdigest()
+    result = {"duplicate": False}
+
+    def transaction(session):
+        if db.feature_usage_events.find_one({"_id": event_id}, session=session):
+            result["duplicate"] = True
+            return
+        now = datetime.now(timezone.utc)
+        increments = {
+            f"usage.ai_messages_{channel}": quantity,
+            "usage.ai_input_tokens": input_tokens,
+            "usage.ai_output_tokens": output_tokens,
+            "usage.ai_recorded_cost_microusd": recorded_cost_microusd,
+        }
+        db.feature_usage_counters.update_one(
+            {"account_id": account_id, "period": period},
+            {"$inc": increments, "$set": {"updated_at": now}, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+            session=session,
+        )
+        db.feature_usage_events.insert_one({
+            "_id": event_id,
+            "account_id": account_id,
+            "period": period,
+            "product": "AI",
+            "metric": "analytics",
+            "quantity": quantity,
+            "event_key": event_key,
+            "channel": channel,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "recorded_cost_microusd": recorded_cost_microusd,
+            "created_at": now,
+        }, session=session)
+
+    with get_mongo_client().start_session() as session:
+        session.with_transaction(transaction)
+    return result
+
+
+async def record_ai_usage_async(*args, **kwargs) -> dict:
+    return await asyncio.to_thread(record_ai_usage, *args, **kwargs)
+
+
 def automation_active_count(account_id: str, session=None) -> int:
     return db[f"automation_flows_{account_id}"].count_documents({"org_id": account_id, "status": "published"}, session=session) + db[f"wa_bot_flows_{account_id}"].count_documents({"org_id": account_id, "status": "active"}, session=session)
 
@@ -254,7 +326,16 @@ def release_automation_publish(account_id: str, flow_id: str, engine: str) -> No
     db.feature_automation_reservations.delete_one({"_id": f"{account_id}:{engine}:{flow_id}"})
 
 
-def access_snapshot(account_id: str) -> dict:
+def _analytics(values: dict) -> dict:
+    return {
+        "input_tokens": int(values.get("ai_input_tokens", 0)),
+        "output_tokens": int(values.get("ai_output_tokens", 0)),
+        "recorded_cost_microusd": int(values.get("ai_recorded_cost_microusd", 0)),
+        "channels": {channel: int(values.get(f"ai_messages_{channel}", 0)) for channel in AI_CHANNELS},
+    }
+
+
+def access_snapshot(account_id: str, history_months: int = 12) -> dict:
     features = {product.lower(): feature_access(account_id, product) for product in PRODUCTS}
     period, reset_at = period_window()
     counter = db.feature_usage_counters.find_one({"account_id": account_id, "period": period}) or {}
@@ -265,4 +346,30 @@ def access_snapshot(account_id: str) -> dict:
         used = automation_active_count(account_id) if key == "active_flows" else int(usage_values.get(key, 0))
         return {"used": used, "limit": limit, "remaining": None if limit is None else max(0, limit - used), "reset_at": None if key == "active_flows" else reset_at}
 
-    return {"features": features, "usage": {"ai_messages": metric("AI", "monthly_messages"), "active_automations": metric("AUTOMATIONS", "active_flows"), "automation_runs": metric("AUTOMATIONS", "monthly_runs"), "broadcast_recipients": metric("BROADCASTING", "monthly_recipients"), "broadcast_batch_limit": features["broadcasting"]["limits"].get("max_batch_recipients")}, "period": period}
+    periods = recent_periods(max(1, min(history_months, 24)))
+    counters = db.feature_usage_counters.find({"account_id": account_id, "period": {"$in": periods}})
+    by_period = {row["period"]: row.get("usage") or {} for row in counters}
+    history = []
+    for item_period in reversed(periods):
+        values = by_period.get(item_period, {})
+        history.append({
+            "period": item_period,
+            "ai_messages": int(values.get("monthly_messages", 0)),
+            "automation_runs": int(values.get("monthly_runs", 0)),
+            "broadcast_recipients": int(values.get("monthly_recipients", 0)),
+            **_analytics(values),
+        })
+
+    return {
+        "features": features,
+        "usage": {
+            "ai_messages": metric("AI", "monthly_messages"),
+            "active_automations": metric("AUTOMATIONS", "active_flows"),
+            "automation_runs": metric("AUTOMATIONS", "monthly_runs"),
+            "broadcast_recipients": metric("BROADCASTING", "monthly_recipients"),
+            "broadcast_batch_limit": features["broadcasting"]["limits"].get("max_batch_recipients"),
+        },
+        "analytics": _analytics(usage_values),
+        "history": history,
+        "period": period,
+    }
