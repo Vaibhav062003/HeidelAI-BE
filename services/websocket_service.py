@@ -367,6 +367,20 @@ async def broadcast_org_ws(org_id: str, event_type: str, payload: dict, exclude_
         services.active_clients.pop(client_id, None)
         services.client_metadata.pop(client_id, None)
 
+
+async def broadcast_org_admin_ws(org_id: str, event_type: str, payload: dict):
+    """Broadcast an organization event only to its administrators."""
+    safe_payload = jsonable_encoder(payload)
+    for client_id in list(services.org_clients.get(org_id, set())):
+        if services.client_metadata.get(client_id, {}).get("role") not in {"admin", "org:admin"}:
+            continue
+        websocket = services.active_clients.get(client_id)
+        if websocket:
+            try:
+                await websocket.send_json({"type": event_type, "data": safe_payload})
+            except Exception:
+                logger.error(f"Failed to send {event_type} to an organization administrator")
+
 async def broadcast_on_stats_update(
     org_id: str, 
     target_date: str = None, 

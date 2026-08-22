@@ -47,7 +47,7 @@ from services.tally_service import (
 )
 from services.utils import serialize_mongo
 from services.work_team_service import list_work_teams
-from services.entitlement_service import require_feature
+from services.entitlement_service import feature_access, require_feature
 
 
 router = APIRouter(tags=["Tally"])
@@ -213,7 +213,8 @@ def _utc(value: datetime) -> datetime:
 
 
 async def _require_accounting_access(user: CurrentUser, write: bool = False) -> None:
-    if write:
+    access = feature_access(user.org_id, "TALLY")
+    if access["state"] == "locked" or (write and access["state"] != "active"):
         require_feature(user.org_id, "TALLY")
     if user.role in {"admin", "org:admin"}:
         return
@@ -225,6 +226,7 @@ async def _require_accounting_access(user: CurrentUser, write: bool = False) -> 
 @router.get("/api/integrations/tally")
 @limiter.limit("60/minute")
 async def get_tally_integration(request: Request, user: CurrentUser):
+    await _require_accounting_access(user)
     integration = await get_integration(user.org_id)
     settings = normalized_settings(integration)
     last_seen = integration.get("last_seen_at")
@@ -244,9 +246,26 @@ async def get_tally_integration(request: Request, user: CurrentUser):
             connector_version_number < 7 or "reports" not in capabilities or "invoice_pdf" not in capabilities
         ),
         "connector_update_available": connected and connector_version_number < 7,
-        "can_edit": user.role in {"admin", "org:admin"},
+        "can_edit": user.role in {"admin", "org:admin"} and feature_access(user.org_id, "TALLY")["state"] == "active",
         "settings": settings,
     }
+
+
+@router.get("/api/tally/access")
+@limiter.limit("60/minute")
+async def get_tally_access(request: Request, user: CurrentUser):
+    access = feature_access(user.org_id, "TALLY")
+    response = {"access": serialize_mongo(access)}
+    if user.role in {"admin", "org:admin"} and access["state"] == "active":
+        integration = await get_integration(user.org_id)
+        response["contact_sync"] = {
+            "status": integration.get("contact_sync_status") or "setup_required",
+            "error": integration.get("contact_sync_error"),
+            "last_attempt_at": serialize_mongo(integration.get("contact_sync_last_attempt_at")),
+            "last_success_at": serialize_mongo(integration.get("contact_sync_last_success_at")),
+            "counts": integration.get("contact_sync_counts") or {},
+        }
+    return response
 
 
 @router.put("/api/integrations/tally")
@@ -362,6 +381,7 @@ async def get_tally_invoices(
 async def get_tally_profit_loss(
     request: Request, user: CurrentUser, from_date: date = Query(...), to_date: date = Query(...),
 ):
+    await _require_accounting_access(user)
     await admin_required(user)
     if from_date > to_date:
         raise HTTPException(status_code=422, detail="Profit & Loss start date must be before the end date")

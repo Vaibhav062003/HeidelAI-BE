@@ -98,7 +98,8 @@ def apply_entitlement(account_id: str, payload: dict) -> dict:
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail={"code": "invalid_entitlement", "message": f"{name} must be an ISO timestamp."}) from exc
 
-    starts_at = parsed("starts_at", True)
+    effective_at = parsed("effective_at") or datetime.now(timezone.utc)
+    starts_at = parsed("starts_at") or effective_at
     expires_at = parsed("expires_at")
     if grant_type == "TRIAL" and expires_at is None:
         raise HTTPException(status_code=422, detail={"code": "invalid_entitlement", "message": "Trials require an expiry."})
@@ -117,7 +118,7 @@ def apply_entitlement(account_id: str, payload: dict) -> dict:
     now = datetime.now(timezone.utc)
     db.feature_entitlements.update_one(
         {"_id": document_id},
-        {"$set": {"account_id": account_id, "product": product, **comparable, "version": version, "reason": str(payload.get("reason") or "")[:500], "effective_at": parsed("effective_at") or now, "updated_at": now}, "$setOnInsert": {"created_at": now}},
+        {"$set": {"account_id": account_id, "product": product, **comparable, "version": version, "reason": str(payload.get("reason") or "")[:500], "effective_at": effective_at, "updated_at": now}, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
     return {"account_id": account_id, "state": state, "version": version}
@@ -130,6 +131,8 @@ def feature_access(account_id: str, product: str, now: datetime | None = None) -
     if product == "AI" and not row:
         row = db.feature_entitlements.find_one({"account_id": account_id, "product": "CHATBOT"})
     if not row:
+        if product == "TALLY":
+            return {"state": "locked", "grant_type": None, "starts_at": None, "expires_at": None, "limits": {}}
         if not enforcement_enabled():
             return {"state": "active", "grant_type": "GRANDFATHERED", "starts_at": None, "expires_at": None, "limits": {}, "observed": True}
         return {"state": "locked", "grant_type": None, "starts_at": None, "expires_at": None, "limits": {}}

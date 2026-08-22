@@ -150,7 +150,7 @@ def _get_contacts_page(
         search_query = {
             "$or": [
                 {field: {"$regex": re.escape(safe_search), "$options": "i"}}
-                for field in ("full_name", "phone_number", "email", "username")
+                for field in ("full_name", "phone_number", "email", "username", "company", "gstin", "tally.legal_name")
             ]
         }
         if query:
@@ -171,6 +171,9 @@ def _get_contacts_page(
         "phone_number": 1,
         "instagram_id": 1,
         "username": 1,
+        "company": 1,
+        "gstin": 1,
+        "tally": 1,
     }
     if snapshot:
         if not ObjectId.is_valid(snapshot):
