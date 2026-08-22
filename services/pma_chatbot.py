@@ -62,6 +62,8 @@ async def send_to_pma_chatbot(
     endpoint = f"{CHATBOT_BASE_URL}/api/v1/chat"
 
     try:
+        if not settings.X_INTERNAL_SECRET:
+            raise AIProviderUnavailable("configuration_error")
         logger.info(f"Sending message to chatbot for ...{conversation_id[-6:]}")
         logger.debug(
             f"PMA chatbot payload org={org_id}, conversation=...{conversation_id[-4:]}, "
@@ -69,7 +71,11 @@ async def send_to_pma_chatbot(
         )
 
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(endpoint, json=payload)
+            response = await client.post(
+                endpoint,
+                json=payload,
+                headers={"X-Internal-Secret": settings.X_INTERNAL_SECRET},
+            )
 
             response.raise_for_status()
             try:
