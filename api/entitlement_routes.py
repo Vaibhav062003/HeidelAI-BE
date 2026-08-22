@@ -18,6 +18,7 @@ router = APIRouter(tags=["Feature entitlements"])
 
 
 @router.put("/entitlements/{account_id}")
+@router.put("/internal/entitlements/{account_id}")
 async def put_entitlement(
     account_id: str,
     request: Request,

@@ -14,13 +14,16 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from database import get_async_mongo_db
+from services.entitlement_service import feature_access, require_feature
 from services.utils import normalize_phone, serialize_mongo
+from services.websocket_service import broadcast_org_admin_ws
 from services.work_team_service import require_conversation_access
 
 
 db = get_async_mongo_db()
 CLAIM_TIMEOUT = timedelta(minutes=15)
 SNAPSHOT_STALE_AFTER = timedelta(minutes=10)
+CONTACT_SYNC_STALE_AFTER = timedelta(minutes=15)
 DEFAULT_SETTINGS = {
     "company_name": "",
     "voucher_type": "Sales",
@@ -110,6 +113,37 @@ def _strict_party_matches(parties: list[dict], gstin: str = "", phone: str = "")
         return []
     matched_ids = set.intersection(*identifiers)
     return [party for party in parties if str(party.get("master_id") or "") in matched_ids]
+
+
+def _contact_match_id(
+    party: dict,
+    master_index: dict[str, set],
+    gstin_index: dict[str, set],
+    phone_index: dict[str, set],
+) -> tuple[object | None, str]:
+    """Choose one safe existing contact without guessing across conflicting identities."""
+    master_id = str(party.get("master_id") or "")
+    master_matches = master_index.get(master_id, set())
+    if len(master_matches) == 1:
+        return next(iter(master_matches)), "master_id"
+    if len(master_matches) > 1:
+        return None, "ambiguous"
+
+    gstin = str(party.get("gstin") or "").strip().upper()
+    phone = _normalized_phone(party.get("phone") or "")
+    gstin_matches = gstin_index.get(gstin, set()) if gstin else set()
+    phone_matches = phone_index.get(phone, set()) if phone else set()
+    if len(gstin_matches) > 1 or (not gstin_matches and len(phone_matches) > 1):
+        return None, "ambiguous"
+    gstin_id = next(iter(gstin_matches)) if gstin_matches else None
+    phone_id = next(iter(phone_matches)) if len(phone_matches) == 1 else None
+    if gstin_id is not None and phone_id is not None and gstin_id != phone_id:
+        return None, "ambiguous"
+    if gstin_id is not None:
+        return gstin_id, "gstin"
+    if phone_id is not None:
+        return phone_id, "phone"
+    return None, "new"
 
 
 def _tally_date(value: str) -> str:
@@ -905,6 +939,157 @@ async def _reconcile_customer_links(org_id: str, ledgers: list[dict]) -> None:
                 linked_conversations.add(conversation_id)
 
 
+async def _sync_tally_contacts(org_id: str, ledgers: list[dict]) -> dict:
+    parties = [
+        party for party in ledgers
+        if party.get("parent") == "Sundry Debtors" and party.get("master_id")
+    ]
+    collection = db[f"contacts_{org_id}"]
+    # ponytail: one org-local scan per Tally snapshot; batch/index this beyond 100k contacts per org.
+    contacts = await collection.find({}, {
+        "_id": 1, "conversation_id": 1, "platform": 1, "phone_number": 1, "gstin": 1,
+        "tally.master_id": 1, "tally_customer_mapping.party_master_id": 1,
+    }).to_list(length=None)
+    master_index: dict[str, set] = {}
+    gstin_index: dict[str, set] = {}
+    phone_index: dict[str, set] = {}
+    by_id = {contact["_id"]: contact for contact in contacts}
+
+    def index(target: dict[str, set], key: str, contact_id) -> None:
+        if key:
+            target.setdefault(key, set()).add(contact_id)
+
+    for contact in contacts:
+        contact_id = contact["_id"]
+        tally = contact.get("tally") or {}
+        mapping = contact.get("tally_customer_mapping") or {}
+        index(master_index, str(tally.get("master_id") or mapping.get("party_master_id") or ""), contact_id)
+        index(gstin_index, str(tally.get("gstin") or contact.get("gstin") or "").strip().upper(), contact_id)
+        index(phone_index, _normalized_phone(contact.get("phone_number") or ""), contact_id)
+
+    counts = {"imported": 0, "updated": 0, "inactive": 0, "ambiguous": 0, "skipped": 0}
+    active_master_ids = []
+    now = datetime.now(timezone.utc)
+    party_gstins: dict[str, int] = {}
+    party_phones: dict[str, int] = {}
+    for party in parties:
+        gstin = str(party.get("gstin") or "").strip().upper()
+        phone = _normalized_phone(party.get("phone") or "")
+        if gstin:
+            party_gstins[gstin] = party_gstins.get(gstin, 0) + 1
+        if phone:
+            party_phones[phone] = party_phones.get(phone, 0) + 1
+    for party in parties:
+        master_id = str(party["master_id"])
+        active_master_ids.append(master_id)
+        gstin = str(party.get("gstin") or "").strip().upper()
+        phone = _normalized_phone(party.get("phone") or "")
+        contact_id, source = _contact_match_id(party, master_index, gstin_index, phone_index)
+        if source != "master_id" and ((gstin and party_gstins[gstin] > 1) or (not gstin and phone and party_phones[phone] > 1)):
+            counts["ambiguous"] += 1
+            continue
+        if source == "ambiguous":
+            counts["ambiguous"] += 1
+            continue
+        phones = sorted({normalize_phone(value) for value in party.get("phones") or [party.get("phone")] if normalize_phone(value)})
+        tally_contact = {
+            "master_id": master_id,
+            "legal_name": str(party.get("name") or "").strip(),
+            "gstin": str(party.get("gstin") or "").strip().upper(),
+            "phones": phones,
+            "email": str(party.get("email") or "").strip(),
+            "state": str(party.get("state") or "").strip(),
+            "active": True,
+            "match_source": source,
+            "synced_at": now,
+        }
+        if contact_id is None:
+            conversation_id = f"tally_{hashlib.sha256(f'{org_id}:{master_id}'.encode()).hexdigest()[:24]}"
+            result = await collection.update_one(
+                {"conversation_id": conversation_id},
+                {"$set": {"tally": tally_contact, "company": tally_contact["legal_name"], "gstin": tally_contact["gstin"], "updated_at": now},
+                 "$setOnInsert": {
+                     "conversation_id": conversation_id, "platform": "tally",
+                     "full_name": tally_contact["legal_name"], "phone_number": phones[0] if phones else "",
+                     "email": tally_contact["email"] or None, "categories": [], "labels": [], "created_at": now,
+                 }},
+                upsert=True,
+            )
+            counts["imported"] += int(result.upserted_id is not None)
+            counts["updated"] += int(result.upserted_id is None)
+            continue
+
+        contact = by_id[contact_id]
+        primary_fields = {"full_name": tally_contact["legal_name"], "phone_number": phones[0] if phones else "", "email": tally_contact["email"] or None} if contact.get("platform") == "tally" else {}
+        await collection.update_one(
+            {"_id": contact_id},
+            {"$set": {"tally": tally_contact, "company": tally_contact["legal_name"], "gstin": tally_contact["gstin"], "updated_at": now, **primary_fields}},
+        )
+        counts["updated"] += 1
+        conversation_id = str(contact.get("conversation_id") or "")
+        phone = str(contact.get("phone_number") or "")
+        if conversation_id.startswith("whatsapp_") and phone:
+            await _upsert_customer_link(org_id, party, conversation_id, phone, "tally-contact-sync", match_source=source)
+
+    inactive = await collection.update_many(
+        {"tally.master_id": {"$exists": True, "$nin": active_master_ids}, "tally.active": {"$ne": False}},
+        {"$set": {"tally.active": False, "tally.synced_at": now, "updated_at": now}},
+    )
+    counts["inactive"] = inactive.modified_count
+    counts["skipped"] = len([
+        party for party in ledgers
+        if party.get("parent") == "Sundry Debtors" and not party.get("master_id")
+    ])
+    return counts
+
+
+async def _set_contact_sync_health(org_id: str, status: str, *, counts: dict | None = None) -> None:
+    now = datetime.now(timezone.utc)
+    values = {"contact_sync_status": status, "contact_sync_last_attempt_at": now}
+    if status in {"healthy", "partial"}:
+        values.update({
+            "contact_sync_last_success_at": now,
+            "contact_sync_error": None if status == "healthy" else "Some Tally customers need manual review",
+            "contact_sync_counts": counts or {},
+        })
+    elif status == "failed":
+        values["contact_sync_error"] = "Tally contacts could not be synchronized"
+    previous = await db.tally_integrations.find_one_and_update(
+        {"org_id": org_id},
+        {"$set": values, "$setOnInsert": {"org_id": org_id}},
+        upsert=True,
+        return_document=ReturnDocument.BEFORE,
+    )
+    if (previous or {}).get("contact_sync_status") != status:
+        await broadcast_org_admin_ws(org_id, "tally_contact_sync_health", {
+            "org_id": org_id, "status": status, "error": values.get("contact_sync_error"),
+            "counts": counts or {}, "updated_at": now.isoformat(),
+        })
+
+
+async def check_tally_contact_sync_health() -> int:
+    """Keep a persistent setup/staleness warning for entitled organizations."""
+    checked = 0
+    now = datetime.now(timezone.utc)
+    async for row in db.feature_entitlements.find({"product": "TALLY"}, {"account_id": 1}):
+        org_id = str(row.get("account_id") or "")
+        if not org_id or feature_access(org_id, "TALLY", now)["state"] != "active":
+            continue
+        integration = await get_integration(org_id)
+        settings = normalized_settings(integration)
+        if not settings["company_name"].strip() or not integration.get("connector_key_hash"):
+            status = "setup_required"
+        else:
+            last_success = integration.get("contact_sync_last_success_at")
+            if last_success and last_success.tzinfo is None:
+                last_success = last_success.replace(tzinfo=timezone.utc)
+            status = "stale" if not last_success or last_success < now - CONTACT_SYNC_STALE_AFTER else "healthy"
+        if status != "healthy" and integration.get("contact_sync_status") != status:
+            await _set_contact_sync_health(org_id, status)
+        checked += 1
+    return checked
+
+
 async def _remember_customer_mapping(org_id: str, job: dict) -> None:
     ledger = await db.tally_ledgers.find_one({
         "org_id": org_id, "name": {"$regex": f"^{re.escape(job['party_ledger'])}$", "$options": "i"},
@@ -1313,6 +1498,18 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
             await collection.insert_many(rows)
         await collection.delete_many({"org_id": org_id, "sync_id": {"$ne": sync_id}})
     await _reconcile_customer_links(org_id, parsed["ledgers"])
+    contact_counts = {}
+    try:
+        contact_counts = await _sync_tally_contacts(org_id, parsed["ledgers"])
+        contact_status = "partial" if contact_counts["ambiguous"] or contact_counts["skipped"] else "healthy"
+        await _set_contact_sync_health(org_id, contact_status, counts=contact_counts)
+    except Exception as error:
+        try:
+            await _set_contact_sync_health(org_id, "failed")
+        except Exception as health_error:
+            logger.error(f"Tally contact health update failed: {type(health_error).__name__}")
+        # Contact sync is secondary: never discard a valid financial snapshot.
+        logger.error(f"Tally contact reconciliation failed: {type(error).__name__}")
     invalid_invoice_ids = [
         row["invoice_id"] for row in parsed["invoices"]
         if row.get("invoice_id") and (row.get("transaction_type") != "invoice" or row.get("lifecycle_status") != "active")
@@ -1342,7 +1539,7 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
         }}
     )
     await reconcile_default_payment_reminders(org_id)
-    return {"counts": counts, "last_sync_at": now}
+    return {"counts": counts, "contact_counts": contact_counts, "last_sync_at": now}
 
 
 async def list_tally_ledgers(org_id: str, kind: str = "", query: str = "") -> list[dict]:
@@ -2223,6 +2420,8 @@ async def process_tally_payment_reminders() -> int:
     due = await db.tally_payment_reminders.find({"status": "pending", "scheduled_at": {"$lte": now}}).sort("scheduled_at", 1).limit(50).to_list(length=50)
     processed = 0
     for item in due:
+        if feature_access(item["org_id"], "TALLY", now)["state"] != "active":
+            continue
         claim_id = str(uuid.uuid4())
         claimed = await db.tally_payment_reminders.find_one_and_update(
             {"_id": item["_id"], "status": "pending"},
@@ -2430,6 +2629,7 @@ async def authenticate_connector(raw_key: str | None, capabilities: str = "", ve
     integration = await db.tally_integrations.find_one({"connector_key_hash": connector_key_hash(raw_key)})
     if not integration:
         raise HTTPException(status_code=401, detail="Invalid Tally connector key")
+    require_feature(integration["org_id"], "TALLY")
     now = datetime.now(timezone.utc)
     await db.tally_integrations.update_one(
         {"_id": integration["_id"], "connector_key_hash": integration["connector_key_hash"]},

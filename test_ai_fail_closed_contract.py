@@ -122,11 +122,14 @@ def _load_ai_policy_service():
         return None
 
     websocket.broadcast_org_ws = _broadcast
+    entitlement = types.ModuleType("services.entitlement_service")
+    entitlement.quota_status = lambda *_args, **_kwargs: {"remaining": None}
     sys.modules["fastapi"] = fastapi
     sys.modules["pymongo"] = pymongo
     sys.modules["database"] = database
     sys.modules["services.utils"] = utils
     sys.modules["services.websocket_service"] = websocket
+    sys.modules["services.entitlement_service"] = entitlement
     spec = importlib.util.spec_from_file_location("ai_policy_contract", ROOT / "services/ai_policy_service.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -150,7 +153,7 @@ def _failure_category(module, *, response=None, error=None):
 
 def test_provider_contract():
     module = _load_agent_service()
-    assert asyncio.run(_call(module)) == {"final_response": "Valid reply"}
+    assert asyncio.run(_call(module)) == {"final_response": "Valid reply", "usage": {}}
     assert _failure_category(module, response=_Response(status=500, payload={})) == "http_error"
     assert _failure_category(module, error=_TimeoutException("timeout")) == "timeout"
     assert _failure_category(module, response=_Response(malformed=True)) == "malformed_response"
