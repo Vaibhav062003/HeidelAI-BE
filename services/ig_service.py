@@ -259,6 +259,7 @@ async def send_ig_message(
     context: Optional[dict] = None,
     is_auto_followup: bool = False,
     enforce_ai_state: bool = False,
+    ai_usage: Optional[dict] = None,
 ) -> dict:
     """
     Send a message to an Instagram user using the appropriate access token
@@ -270,7 +271,8 @@ async def send_ig_message(
         mode: The mode of the message (reply or private message)
         org_id: The organization ID
     """
-    request_id = claim_token = None
+    request_id = claim_token = quota_event_key = None
+    quota_consumed = False
     try:
         access_token = _instagram_access_token(org_id, instagram_id)
         
@@ -313,6 +315,7 @@ async def send_ig_message(
             # Send the message
             if enforce_ai_state:
                 from services.ai_policy_service import is_effective_ai_enabled
+                from services.entitlement_service import consume_quota_async
 
                 if not await is_effective_ai_enabled(org_id, conversation_id):
                     db[f"instagram_outbox_{org_id}"].delete_one({
@@ -321,8 +324,19 @@ async def send_ig_message(
                         "status": "sending",
                     })
                     raise AIProviderUnavailable("ai_disabled", escalation_required=False)
+                quota_event_key = f"ai:{request_id or temp_id or conversation_id}"
+                try:
+                    quota = await consume_quota_async(org_id, "AI", "monthly_messages", 1, quota_event_key)
+                    quota_consumed = not quota.get("duplicate", False)
+                except HTTPException as exc:
+                    raise AIProviderUnavailable("quota_exhausted", escalation_required=False) from exc
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(url, headers=headers, json=data)
+            if response.status_code >= 400 and quota_consumed and quota_event_key:
+                from services.entitlement_service import release_quota_async
+
+                await release_quota_async(org_id, "monthly_messages", quota_event_key)
+                quota_consumed = False
             response.raise_for_status()
             response_data = response.json()
             message_id = response_data.get("message_id") or response_data.get("messages", [{}])[0].get("id")
@@ -331,6 +345,22 @@ async def send_ig_message(
             logger.info(f"Instagram message response: {response.status_code}, {response.text}")
             result = {"message_id": message_id, "success": True, "status": "sent", "response": response_data}
             _finish_instagram_send(org_id, request_id, claim_token, result)
+            if enforce_ai_state:
+                try:
+                    from services.entitlement_service import record_ai_usage_async
+
+                    usage = ai_usage if isinstance(ai_usage, dict) else {}
+                    await record_ai_usage_async(
+                        org_id,
+                        quota_event_key or f"ai:{message_id}",
+                        "instagram",
+                        1,
+                        int(usage.get("input_tokens", 0)),
+                        int(usage.get("output_tokens", 0)),
+                        int(usage.get("recorded_cost_microusd", 0)),
+                    )
+                except Exception as exc:
+                    logger.error(f"Could not record Instagram AI analytics for org={org_id}: {exc}")
             try:
                 await _record_confirmed_instagram_outbound(
                     org_id, conversation_id, instagram_id, id, sender_name,

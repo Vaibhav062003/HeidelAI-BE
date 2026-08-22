@@ -14,7 +14,7 @@ class HTTPException(Exception):
 sys.modules.setdefault("fastapi", types.SimpleNamespace(HTTPException=HTTPException))
 sys.modules.setdefault("database", types.SimpleNamespace(get_mongo_client=lambda: None, get_mongo_db=lambda: types.SimpleNamespace()))
 
-from services.entitlement_service import period_window, validate_limits
+from services.entitlement_service import period_window, recent_periods, validate_limits
 from services.entitlement_auth import verify_entitlement_request
 
 
@@ -24,6 +24,7 @@ class EntitlementContractTest(unittest.TestCase):
         self.assertEqual(period, "2027-01")
         self.assertEqual(reset.isoformat(), "2027-01-31T18:30:00+00:00")
         self.assertEqual(validate_limits("AI", {"monthly_messages": 100}), {"monthly_messages": 100})
+        self.assertEqual(recent_periods(3, datetime(2027, 1, 15, tzinfo=timezone.utc)), ["2027-01", "2026-12", "2026-11"])
         with self.assertRaises(HTTPException):
             validate_limits("BROADCASTING", {"max_batch_recipients": 101, "monthly_recipients": 100})
 

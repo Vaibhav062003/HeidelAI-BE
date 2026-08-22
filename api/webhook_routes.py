@@ -1048,6 +1048,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                 "content": chatbot_response["final_response"],
                                                 "sender_id": whatsapp_business_id,
                                                 "pricing_source_message_id": wa_message_id,
+                                                "ai_usage": chatbot_response.get("usage"),
                                             }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
                                         except AIProviderUnavailable as exc:
                                             await _handle_ai_provider_failure(
@@ -1156,6 +1157,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "conversation_id": conversation_id,
                                             "content": chatbot_response["final_response"],
                                             "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                            "ai_usage": chatbot_response.get("usage"),
                                             }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
                                     except AIProviderUnavailable as exc:
                                         await _handle_ai_provider_failure(
@@ -1193,6 +1195,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "content": chatbot_response["final_response"],
                                             "sender_id": whatsapp_business_id,
                                             "pricing_source_message_id": wa_message_id,
+                                            "ai_usage": chatbot_response.get("usage"),
                                         }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
                                     except AIProviderUnavailable as exc:
                                         await _handle_ai_provider_failure(
@@ -1674,6 +1677,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                         "conversation_id": conversation_id,
                                                         "content": chatbot_response["final_response"],
                                                         "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                                        "ai_usage": chatbot_response.get("usage"),
                                                         }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
                                                 except AIProviderUnavailable as exc:
                                                     await _handle_ai_provider_failure(
@@ -2304,6 +2308,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             conversation_id=conversation_id,
                                             sender_name="AI",
                                             enforce_ai_state=True,
+                                            ai_usage=chatbot_response.get("usage"),
                                         )
                                         if not ai_result.get("success"):
                                             raise AIProviderUnavailable("delivery_error")

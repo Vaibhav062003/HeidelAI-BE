@@ -700,6 +700,23 @@ async def send_whatsapp_message(
             all_message_ids.append(message_id)
             now = datetime.now(timezone.utc)
 
+            if mode == "ai":
+                try:
+                    from services.entitlement_service import record_ai_usage_async
+
+                    usage = message.get("ai_usage") if isinstance(message.get("ai_usage"), dict) else {}
+                    await record_ai_usage_async(
+                        org_id,
+                        quota_event_key or f"ai:{message_id}",
+                        "whatsapp",
+                        1,
+                        int(usage.get("input_tokens", 0)),
+                        int(usage.get("output_tokens", 0)),
+                        int(usage.get("recorded_cost_microusd", 0)),
+                    )
+                except Exception as exc:
+                    logger.error(f"Could not record WhatsApp AI analytics for org={org_id}: {exc}")
+
             if mode == "private":
                 last_message = f"Private Note: {content_item}"
             elif mode == "ai":
