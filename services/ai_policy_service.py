@@ -28,29 +28,38 @@ def _pause_minutes(value: int | None) -> int:
 async def get_org_ai_policy(org_id: str) -> dict:
     organization = await db.organizations.find_one(
         {"org_id": org_id},
-        {"_id": 0, "is_ai_enabled": 1, "ai_pause_minutes": 1},
+        {"_id": 0, "is_ai_enabled": 1, "ai_pause_minutes": 1, "quote_followup_prompt_enabled": 1},
     )
     if not organization:
         raise HTTPException(status_code=404, detail="Organization not found.")
     return {
         "enabled": bool(organization.get("is_ai_enabled", False)),
         "pause_minutes": _pause_minutes(organization.get("ai_pause_minutes")),
+        "quote_followup_prompt_enabled": organization.get("quote_followup_prompt_enabled") is not False,
     }
 
 
-async def update_org_ai_policy(org_id: str, enabled: bool, pause_minutes: int) -> dict:
+async def update_org_ai_policy(
+    org_id: str,
+    enabled: bool,
+    pause_minutes: int,
+    quote_followup_prompt_enabled: bool | None = None,
+) -> dict:
     pause_minutes = _pause_minutes(pause_minutes)
+    fields = {
+        "is_ai_enabled": enabled,
+        "ai_pause_minutes": pause_minutes,
+        "ai_policy_updated_at": datetime.now(timezone.utc),
+    }
+    if quote_followup_prompt_enabled is not None:
+        fields["quote_followup_prompt_enabled"] = quote_followup_prompt_enabled
     result = await db.organizations.update_one(
         {"org_id": org_id},
-        {"$set": {
-            "is_ai_enabled": enabled,
-            "ai_pause_minutes": pause_minutes,
-            "ai_policy_updated_at": datetime.now(timezone.utc),
-        }},
+        {"$set": fields},
     )
     if not result.matched_count:
         raise HTTPException(status_code=404, detail="Organization not found.")
-    return {"enabled": enabled, "pause_minutes": pause_minutes}
+    return await get_org_ai_policy(org_id)
 
 
 async def is_effective_ai_enabled(org_id: str, conversation_id: str) -> bool:
