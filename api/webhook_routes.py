@@ -1134,24 +1134,24 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 #     return {"status": "ok"}
 
-                                elif is_pma_wa and ai_enabled and is_production:
+                            elif is_pma_wa and ai_enabled and is_production:
 
-                                    flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
+                                flow_response = await process_onboarding_if_needed(user_input=content, conversation_id=conversation_id, org_id=org_id, stage=stage, whatsapp_business_id=whatsapp_business_id, sender_name=sender_name2)
                                         
-                                    if flow_response:
-                                        await send_interactive_whatsapp_message(
+                                if flow_response:
+                                    await send_interactive_whatsapp_message(
                                             org_id=org_id,
                                             conversation_id=conversation_id,
                                             sender_id=whatsapp_business_id,
                                             interactive_message=flow_response
                                         )
                                     
-                                        return {"status": "ok"}
+                                return {"status": "ok"}
 
-                                    if not await is_effective_ai_enabled(org_id, conversation_id):
-                                        return {"status": "ok"}
-                                    try:
-                                        chatbot_response = await send_to_pma_chatbot(
+                                if not await is_effective_ai_enabled(org_id, conversation_id):
+                                    return {"status": "ok"}
+                                try:
+                                    chatbot_response = await send_to_pma_chatbot(
                                                 conversation_id=conversation_id,
                                                 user_input=content,
                                                 persona=convo_doc.get("persona", "fallback"),
@@ -1162,65 +1162,63 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                 reply_context_message_id=replied_message_id,
                                                 message_id=wa_message_id,
                                         )
-                                        if not await is_effective_ai_enabled(org_id, conversation_id):
-                                            return {"status": "ok"}
-                                        await send_whatsapp_message({
-                                            "conversation_id": conversation_id,
-                                            "content": chatbot_response["final_response"],
-                                            "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
-                                            "ai_usage": chatbot_response.get("usage"),
-                                            }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
-                                    except AIProviderUnavailable as exc:
-                                        await _handle_ai_provider_failure(
-                                            exc,
-                                            org_id=org_id,
-                                            conversation_id=conversation_id,
-                                            platform="whatsapp",
-                                            customer_name=sender_name2,
-                                            customer_number=customer_phone_no,
-                                            source_message_id=wa_message_id,
-                                        )
-                                        return {"status": "ok"}
-
-                                elif ai_enabled and is_production and is_lee_dealer_wa:
-                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
-
                                     if not await is_effective_ai_enabled(org_id, conversation_id):
                                         return {"status": "ok"}
-                                    try:
-                                        chatbot_response = await send_to_agent(
-                                            conversation_id=conversation_id,
-                                            user_input=content,
-                                            persona="dealers",
-                                            location=convo_doc.get("location", "india"),
-                                            customer_name=sender_name2,
-                                            org_id=org_id,
-                                            source="webhook",
-                                            reply_context_message_id=replied_message_id,
-                                            message_id=wa_message_id,
-                                        )
-                                        if not await is_effective_ai_enabled(org_id, conversation_id):
-                                            return {"status": "ok"}
-                                        await send_whatsapp_message({
-                                            "conversation_id": conversation_id,
-                                            "content": chatbot_response["final_response"],
-                                            "sender_id": whatsapp_business_id,
-                                            "pricing_source_message_id": wa_message_id,
-                                            "ai_usage": chatbot_response.get("usage"),
+                                    await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": chatbot_response["final_response"],
+                                        "sender_id": PARIJAT_ACADEMY_ORG_WA_ID,
+                                        "ai_usage": chatbot_response.get("usage"),
                                         }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
-                                    except AIProviderUnavailable as exc:
-                                        await _handle_ai_provider_failure(
-                                            exc,
-                                            org_id=org_id,
-                                            conversation_id=conversation_id,
-                                            platform="whatsapp",
-                                            customer_name=sender_name2,
-                                            customer_number=customer_phone_no,
-                                            source_message_id=wa_message_id,
-                                        )
+                                except AIProviderUnavailable as exc:
+                                    await _handle_ai_provider_failure(
+                                        exc,
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        platform="whatsapp",
+                                        customer_name=sender_name2,
+                                        customer_number=customer_phone_no,
+                                        source_message_id=wa_message_id,
+                                    )
+                                return {"status": "ok"}
 
+                            elif ai_enabled and is_production and is_lee_dealer_wa:
+                                # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
+
+                                if not await is_effective_ai_enabled(org_id, conversation_id):
                                     return {"status": "ok"}
-                                
+                                try:
+                                    chatbot_response = await send_to_agent(
+                                        conversation_id=conversation_id,
+                                        user_input=content,
+                                        persona="dealers",
+                                        location=convo_doc.get("location", "india"),
+                                        customer_name=sender_name2,
+                                        org_id=org_id,
+                                        source="webhook",
+                                        reply_context_message_id=replied_message_id,
+                                        message_id=wa_message_id,
+                                    )
+                                    if not await is_effective_ai_enabled(org_id, conversation_id):
+                                        return {"status": "ok"}
+                                    await send_whatsapp_message({
+                                        "conversation_id": conversation_id,
+                                        "content": chatbot_response["final_response"],
+                                        "sender_id": whatsapp_business_id,
+                                        "pricing_source_message_id": wa_message_id,
+                                        "ai_usage": chatbot_response.get("usage"),
+                                    }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
+                                except AIProviderUnavailable as exc:
+                                    await _handle_ai_provider_failure(
+                                        exc,
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        platform="whatsapp",
+                                        customer_name=sender_name2,
+                                        customer_number=customer_phone_no,
+                                        source_message_id=wa_message_id,
+                                    )
+
                                 return {"status": "ok"}
 
                             elif message_type in ["image", "video", "document", "audio"]:
