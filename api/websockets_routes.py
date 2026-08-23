@@ -181,8 +181,11 @@ async def main_ws(websocket: WebSocket, client_id: str):
         "wa_id": wa_id,
         "user_id": user.user_id,
         "org_id": user.org_id,
+        "role": user.role,
         "agent_name": user.full_name,
     }
+    from services.work_team_service import record_team_presence
+    await record_team_presence(user.org_id, user.user_id)
     
     # Register under organization for wide broadcasts
     services.org_clients[user.org_id].add(client_id)

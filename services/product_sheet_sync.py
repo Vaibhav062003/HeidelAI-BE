@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import math
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -30,8 +31,8 @@ FIELD_ALIASES = {
     # --- Component-specific aliases (where sheet column ≠ MongoDB field) ---
     "brand":                         ["brand", "manufacturer", "make"],
     "model_name":                    ["model_name", "model name"],
-    "graphics_card":                 ["graphics_card", "graphics card", "gpu"],
-    "graphics_card_space_gb":        ["graphics_card_space_gb", "graphics card space gb", "gpu memory", "vram"],
+    "graphic_card":                   ["graphic_card", "graphic card", "graphics_card", "graphics card", "gpu"],
+    "graphic_card_space_gb":          ["graphic_card_space_gb", "graphic card space gb", "graphics_card_space_gb", "graphics card space gb", "gpu memory", "vram"],
     "ram_gb":                        ["ram_gb", "ram", "ram gb", "memory", "memory gb"],
     "storage_gb":                    ["storage_gb", "ssd", "storage", "storage gb", "ssd gb"],
     "ssd_type":                      ["ssd_type", "ssd type", "ssd_t", "sd_type", "storage type"],
@@ -40,20 +41,71 @@ FIELD_ALIASES = {
     "processor":                     ["processor", "cpu", "chip"],
     "processor_series":              ["processor_series", "processor series", "cpu series"],
     "motherboard_series":            ["motherboard_series", "motherboard series", "motherboard_d_series", "motherboard d series"],
-    "motherboard_processor_support": ["motherboard_processor_support", "motherboard processor support", "motherboard_processor_sup_port", "motherboard processor sup port"],
+    "motherboard_support":           ["motherboard_support", "motherboard support", "motherboard_processor_support", "motherboard processor support"],
     "cabinet":                       ["cabinet", "case", "chassis"],
     "category":                      ["category", "product category", "product type"],
     "in_stock":                      ["in_stock", "in stock"],
+    "cpu_cooler":                    ["cpu_cooler", "cpu cooler"],
+    "series":                        ["series", "product series"],
+    "warranty":                      ["warranty", "warranty period", "guarantee"],
+    # --- Case / Cabinet fields ---
+    "odd_bays":                      ["odd_bays", "odd bays", "optical drive bays"],
+    "hdd_bays":                      ["hdd_bays", "hdd bays", "hard drive bays"],
+    "ssd_bays":                      ["ssd_bays", "ssd bays"],
+    "rgb_support":                   ["rgb_support", "rgb support", "rgb"],
+    "max_gpu_cooler_ht_mm":          ["max_gpu_cooler_ht_mm", "max gpu cooler ht mm", "max gpu cooler height", "gpu cooler height mm"],
+    # --- Cooling fields ---
+    "socket_type":                   ["socket_type", "socket type", "socket"],
+    "air_cooler":                    ["air_cooler", "air cooler"],
+    "liquid_cooler":                 ["liquid_cooler", "liquid cooler", "aio", "aio cooler"],
+    "packaging_type":                ["packaging_type", "packaging type", "package type"],
+    # --- Monitor fields ---
+    "screen_size":                   ["screen_size", "screen size", "display size", "monitor size"],
+    "panel_type":                    ["panel_type", "panel type", "display type"],
+    "resolution":                    ["resolution", "display resolution", "native resolution"],
+    "frame_rate":                    ["frame_rate", "frame rate", "refresh rate", "refresh_rate", "hz"],
+    "flat_or_curved":                ["flat_or_curved", "flat or curved", "display shape", "curved"],
+    "gaming_monitor":                ["gaming_monitor", "gaming monitor", "gaming"],
+    "professional_monitor":          ["professional_monitor", "professional monitor", "professional"],
+    "office_monitor":                ["office_monitor", "office monitor", "office"],
+    "hdr":                           ["hdr", "hdr support", "hdr_support"],
+    "adaptive_sync":                 ["adaptive_sync", "adaptive sync", "freesync", "gsync", "g-sync", "free_sync"],
+    "smart":                         ["smart", "smart tv", "smart_tv"],
+    "stand_type":                    ["stand_type", "stand type", "mount type"],
+    "pivot_supported":               ["pivot_supported", "pivot supported", "pivot"],
+    "pivot_range":                   ["pivot_range", "pivot range"],
+    "response_time_ms":              ["response_time_ms", "response time ms", "response time", "response_time"],
+    # --- Connectivity fields ---
+    "wifi_supported":                ["wifi_supported", "wifi supported", "wifi", "wi-fi", "wi_fi"],
+    "usb_c_supported":               ["usb_c_supported", "usb c supported", "usb-c", "usb_c", "type-c", "type_c"],
+    "usb_c_details":                 ["usb_c_details", "usb c details", "usb-c details", "type-c details"],
+    "hdmi":                          ["hdmi", "hdmi port", "hdmi_port", "hdmi ports"],
+    "rear_color":                    ["rear_color", "rear color", "back color", "chassis color"],
 }
 
 CANONICAL_FIELDS = set(FIELD_ALIASES.keys())
 
 # Columns that, if present, strongly indicate this is a component sheet
 COMPONENT_INDICATORS = {
-    "processor_series", "motherboard_series", "motherboard_processor_support",
-    "cabinet", "smps", "hdd", "ssd_type", "graphics_card", "ram",
-    "processor", "gpu", "cpu", "psu",
+    "processor_series", "motherboard_series", "motherboard_support",
+    "cabinet", "smps", "hdd", "ssd_type", "graphic_card", "ram",
+    "processor", "gpu", "cpu", "psu", "cpu_cooler",
+    "socket_type", "air_cooler", "liquid_cooler",
+    "hdd_bays", "ssd_bays", "odd_bays",
+    "gaming_monitor", "panel_type", "screen_size",
 }
+
+# ─── Field Name Normalization ──────────────────────────────────────────────────
+# Auto-generated from FIELD_ALIASES: maps variant snake_case column names to
+# the canonical DB field name so that "graphics_card" and "graphic_card" both
+# resolve to the same key in the product document.
+
+FIELD_NAME_NORMALIZE = {}
+for _canonical, _aliases in FIELD_ALIASES.items():
+    for _alias in _aliases:
+        _normalized = re.sub(r'[^a-z0-9]+', '_', _alias.strip().lower()).strip('_')
+        if _normalized != _canonical:
+            FIELD_NAME_NORMALIZE[_normalized] = _canonical
 
 
 
@@ -109,17 +161,25 @@ def auto_suggest_mapping(columns: list[str]) -> dict[str, str]:
 
 
 def generate_search_text(product_data: dict) -> str:
-    """Generate search_text from ALL string fields for LLM retrieval.
+    """Generate search_text from ALL fields for LLM retrieval.
     Includes product name, description, brand, model, specs — everything
-    that could help the AI find this product in a customer query."""
+    that could help the AI find this product in a customer query.
+    Booleans are rendered as "field_name:yes/no" and numbers as "field_name:value"
+    so the AI can search by spec (e.g. "16GB RAM", "wifi supported")."""
     parts = []
-    # Include all string values from the document (skip internal/meta fields)
-    skip_keys = {"_id", "org_id", "source", "source_sheet_id", "search_text",
-                 "unique_identifier", "created_at", "updated_at"}
+    # Include all values from the document (skip internal/meta fields)
+    skip_keys = {"_id", "org_id", "source", "source_sheet_id", "source_sheet_ids",
+                 "search_text", "unique_identifier", "created_at", "updated_at", "type"}
     for key, val in product_data.items():
         if key in skip_keys:
             continue
-        if isinstance(val, str) and val.strip():
+        if val is None:
+            continue
+        if isinstance(val, bool):
+            parts.append(f"{key}:{'yes' if val else 'no'}")
+        elif isinstance(val, (int, float)):
+            parts.append(f"{key}:{val}")
+        elif isinstance(val, str) and val.strip():
             parts.append(val.strip())
     return " ".join(parts)
 
@@ -127,7 +187,14 @@ def generate_search_text(product_data: dict) -> str:
 def auto_detect_product_type(columns: list[str]) -> str:
     """Auto-detect whether a sheet contains laptop or component data
     based on the presence of component-specific columns."""
-    normalized = {col.strip().lower().replace(" ", "_") for col in columns}
+    normalized = set()
+    for col in columns:
+        clean_key = col.strip().lower()
+        clean_key = re.sub(r'[^a-z0-9]+', '_', clean_key).strip('_')
+        if clean_key:
+            clean_key = FIELD_NAME_NORMALIZE.get(clean_key, clean_key)
+            normalized.add(clean_key)
+            
     matches = normalized & COMPONENT_INDICATORS
     # If 2+ component-specific columns are present, classify as component
     return "component" if len(matches) >= 2 else "laptop"
@@ -153,14 +220,19 @@ def transform_row(
     doc = {}
     
     for col_name, value in row_data.items():
-        if not value or not str(value).strip():
-            continue
-            
         clean_key = col_name.strip().lower()
         clean_key = re.sub(r'[^a-z0-9]+', '_', clean_key).strip('_')
         if not clean_key:
             continue
         
+        # Normalize variant field names to canonical DB field name
+        clean_key = FIELD_NAME_NORMALIZE.get(clean_key, clean_key)
+        
+        # Handle empty/cleared cells explicitly by setting to None
+        if value is None or str(value).strip() == "":
+            doc[clean_key] = None
+            continue
+            
         val_str = str(value).strip().lower()
         if val_str == "yes" or val_str == "true":
             val = True
@@ -168,27 +240,35 @@ def transform_row(
             val = False
         else:
             try:
-                if val_str.isdigit() or (val_str.startswith('-') and val_str[1:].isdigit()):
-                    val = int(value)
+                numeric = re.sub(r"(?i)\b(?:inr|rs\.?)\b|₹|,|\s", "", val_str) if clean_key == "price" else val_str
+                if numeric.isdigit() or (numeric.startswith('-') and numeric[1:].isdigit()):
+                    val = int(numeric)
                 else:
-                    val = float(value)
+                    val = float(numeric)
             except ValueError:
                 val = str(value).strip()
+        if clean_key == "price" and isinstance(val, (int, float)) and not isinstance(val, bool) and not math.isfinite(val):
+            return None, "price must be finite"
                 
         doc[clean_key] = val
 
-    if not doc:
+    # Check if row is entirely empty (all values are None)
+    if not any(v is not None for v in doc.values()):
         return None, "empty row"
 
     # Find a unique identifier — try known unique key columns in priority order
     unique_key = None
     for k in ["sku", "sku_full", "model_no", "model_name", "id"]:
-        if k in doc and str(doc[k]).strip():
+        if doc.get(k) is not None and str(doc[k]).strip():
             unique_key = str(doc[k]).strip()
             break
             
     if not unique_key:
-        unique_key = str(list(doc.values())[0])
+        # Fallback to the first non-empty value in the row
+        for val in doc.values():
+            if val is not None and str(val).strip():
+                unique_key = str(val).strip()
+                break
 
     doc["model_no"] = unique_key
     doc["unique_identifier"] = unique_key
@@ -365,23 +445,41 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
         data_start_row = header_row + 1
 
         encoded_tab = urllib.parse.quote(tab_name, safe="")
-        range_str = f"{encoded_tab}!A{data_start_row}:ZZ10001"
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_str}"
+
+        # ── Paginated fetch: pull rows in pages of 10,000 ─────────────────
+        PAGE_SIZE = 10_000
+        raw_rows = []
+        page_start = data_start_row
 
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30
-            )
-            if resp.status_code == 401:
-                access_token = await _force_token_refresh(org_id)
-                resp = await client.get(
-                    url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30
-                )
-            if resp.status_code != 200:
-                error_msg = resp.json().get("error", {}).get("message", "Unknown error")
-                raise Exception(f"Google Sheets API error: {error_msg}")
+            while True:
+                page_end = page_start + PAGE_SIZE - 1
+                range_str = f"{encoded_tab}!A{page_start}:ZZ{page_end}"
+                url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_str}"
 
-        raw_rows = resp.json().get("values", [])
+                resp = await client.get(
+                    url, headers={"Authorization": f"Bearer {access_token}"}, timeout=60
+                )
+                if resp.status_code == 401:
+                    access_token = await _force_token_refresh(org_id)
+                    resp = await client.get(
+                        url, headers={"Authorization": f"Bearer {access_token}"}, timeout=60
+                    )
+                if resp.status_code != 200:
+                    error_msg = resp.json().get("error", {}).get("message", "Unknown error")
+                    raise Exception(f"Google Sheets API error: {error_msg}")
+
+                page_rows = resp.json().get("values", [])
+                if not page_rows:
+                    break  # no more data
+
+                raw_rows.extend(page_rows)
+                logger.info(f"[ProductSync] Fetched page {page_start}-{page_end}: {len(page_rows)} rows (total so far: {len(raw_rows)})")
+
+                if len(page_rows) < PAGE_SIZE:
+                    break  # last page — fewer rows than requested
+
+                page_start = page_end + 1
 
         # ── Transform rows ───────────────────────────────────────────────────
         products_to_upsert = []
@@ -578,4 +676,3 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
         )
         logger.error(f"Product sheet sync failed for org {org_id} sheet {sheet_id}: {e}")
         raise
-

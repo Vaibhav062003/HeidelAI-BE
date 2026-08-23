@@ -1,4 +1,5 @@
 # Built-in modules
+import hashlib
 import uuid
 import httpx
 import json
@@ -9,6 +10,7 @@ from services.cloudinary_service import upload_media_to_cloudinary
 from services.websocket_service import broadcast_main_ws
 from supabase import create_client, Client
 from pymongo import UpdateOne, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from fastapi import HTTPException
 from fastapi import BackgroundTasks
 
@@ -18,8 +20,11 @@ from core.managers import manager
 from schemas.models import MessageRole
 from database import get_mongo_db, get_mongo_client
 from core.services import services
-from services.scheduler_service import abort_scheduled_message
+from services.followup_service import abort_scheduled_message
 from services.conversation_utils import reopen_conversation
+from services.push_notification_service import schedule_customer_message_push
+from services.ai_reply_guard import AIProviderUnavailable
+from services.utils import name_search_prefixes, serialize_mongo
 
 from config.settings import (
     IG_ID, 
@@ -39,7 +44,223 @@ db = get_mongo_db()
 
 mongo_client = get_mongo_client()
 
-async def send_ig_message(id, message_text, instagram_id, mode, org_id) -> dict:
+_indexed_instagram_outboxes = set()
+
+
+def _instagram_access_token(org_id: str, instagram_id: str) -> str:
+    connection = db.instagram_connections.find_one(
+        {"org_id": org_id, "instagram_id": instagram_id, "is_active": True},
+        {"page_access_token": 1},
+        sort=[("last_updated", -1)],
+    )
+    if not connection or not connection.get("page_access_token"):
+        raise HTTPException(status_code=400, detail="Instagram connection is unavailable")
+    return connection["page_access_token"]
+
+
+def _claim_instagram_send(
+    org_id: str,
+    conversation_id: str,
+    temp_id: Optional[str],
+    kind: str,
+    fingerprint: str,
+):
+    if not temp_id:
+        raise ValueError("temp_id is required for Instagram replies")
+    collection = db[f"instagram_outbox_{org_id}"]
+    if org_id not in _indexed_instagram_outboxes:
+        collection.create_index("expires_at", expireAfterSeconds=0)
+        _indexed_instagram_outboxes.add(org_id)
+    request_id = f"{conversation_id}:{temp_id}:{kind}"
+    now = datetime.now(timezone.utc)
+    claim_token = str(uuid.uuid4())
+    try:
+        existing = collection.find_one_and_update(
+            {"_id": request_id},
+            {"$setOnInsert": {
+                "status": "sending",
+                "fingerprint": fingerprint,
+                "claim_token": claim_token,
+                "claimed_at": now,
+                "created_at": now,
+                "expires_at": now + timedelta(days=30),
+            }},
+            upsert=True,
+            return_document=ReturnDocument.BEFORE,
+        )
+    except DuplicateKeyError:
+        existing = collection.find_one({"_id": request_id})
+    if not existing:
+        return request_id, claim_token, None
+    if existing.get("fingerprint") != fingerprint:
+        return request_id, None, {
+            "error": "temp_id was already used for a different Instagram message",
+            "success": False,
+        }
+    if existing.get("result"):
+        return request_id, None, existing["result"]
+    stale_before = now - timedelta(minutes=2)
+    claimed_at = existing.get("claimed_at")
+    if not claimed_at or claimed_at < stale_before:
+        unknown_result = {
+            "error": "The previous Instagram delivery could not be confirmed. Check the chat before sending again.",
+            "success": False,
+            "delivery_unknown": True,
+        }
+        reconciled = collection.update_one(
+            {
+                "_id": request_id,
+                "status": "sending",
+                "claim_token": existing.get("claim_token"),
+                "claimed_at": claimed_at,
+            },
+            {"$set": {"status": "delivery_unknown", "result": unknown_result, "updated_at": now}},
+        )
+        if reconciled.modified_count:
+            return request_id, None, unknown_result
+    return request_id, None, {
+        "error": "This Instagram send is already being processed",
+        "success": False,
+        "duplicate_suppressed": True,
+    }
+
+
+def _finish_instagram_send(
+    org_id: str,
+    request_id: Optional[str],
+    claim_token: Optional[str],
+    result: dict,
+) -> None:
+    if request_id and claim_token:
+        db[f"instagram_outbox_{org_id}"].update_one(
+            {"_id": request_id, "claim_token": claim_token},
+            {"$set": {
+                "status": "sent" if result.get("success") else "failed",
+                "result": result,
+                "updated_at": datetime.now(timezone.utc),
+            }},
+        )
+
+
+def _instagram_conversation_id(org_id: str, recipient_id: str) -> Optional[str]:
+    conversation = db[f"conversations_{org_id}"].find_one(
+        {"platform": "instagram", "customer_id": recipient_id},
+        {"conversation_id": 1},
+    )
+    return conversation.get("conversation_id") if conversation else None
+
+
+async def sync_instagram_outbound_conversation(
+    org_id: str,
+    conversation_id: str,
+    instagram_id: str,
+    message_id: str,
+) -> None:
+    messages = db[f"messages_{org_id}"]
+    message = messages.find_one({"id": message_id, "platform": "instagram"})
+    if not message or not message.get("queue_sync_pending"):
+        return
+    timestamp = message.get("timestamp") or datetime.now(timezone.utc)
+    activity = (message.get("content") or "Shared an attachment").strip()
+    sender_name = message.get("sender_name") or "Agent"
+    is_auto_followup = bool(message.get("is_auto_followup"))
+    update = {
+        "last_message": f"{sender_name}: {activity}",
+        "last_message_timestamp": timestamp,
+        "last_sender": "agent",
+        "last_message_is_private_note": False,
+        "needs_reply": False,
+    }
+    if not is_auto_followup:
+        update.update({
+            "status": "open",
+            "reminder_stage": 0,
+            "next_action_at": timestamp + timedelta(hours=6),
+        })
+    mongo_update = {"$set": update}
+    if not is_auto_followup:
+        mongo_update["$unset"] = {"closed_at": "", "closure_reason": ""}
+    conversation = db[f"conversations_{org_id}"].find_one_and_update(
+        {
+            "conversation_id": conversation_id,
+            "$or": [
+                {"last_message_timestamp": {"$lte": timestamp}},
+                {"last_message_timestamp": {"$exists": False}},
+            ],
+        },
+        mongo_update,
+        return_document=ReturnDocument.AFTER,
+    )
+    if conversation:
+        if not is_auto_followup:
+            await abort_scheduled_message(org_id, conversation_id)
+        await broadcast_main_ws(
+            platform_id=instagram_id,
+            platform_type="instagram",
+            event_type="conversation_updated",
+            payload={"conversation": serialize_mongo(conversation)},
+        )
+    messages.update_one({"id": message_id, "platform": "instagram"}, {"$set": {"queue_sync_pending": False}})
+
+
+async def _record_confirmed_instagram_outbound(
+    org_id: str,
+    conversation_id: Optional[str],
+    instagram_id: str,
+    recipient_id: str,
+    sender_name: str,
+    message_id: str,
+    content: str,
+    message_type: str = "text",
+    payload: Optional[dict] = None,
+    temp_id: Optional[str] = None,
+    context_type: Optional[str] = None,
+    context: Optional[dict] = None,
+    is_auto_followup: bool = False,
+) -> None:
+    conversation_id = conversation_id or _instagram_conversation_id(org_id, recipient_id)
+    if not conversation_id:
+        raise RuntimeError("Instagram conversation not found after send")
+    await store_instagram_message(
+        org_id=org_id,
+        content=content,
+        conversation_id=conversation_id,
+        sender_id=instagram_id,
+        type=message_type,
+        payload=payload,
+        sender_name=sender_name or "Agent",
+        sender_username=sender_name or "Agent",
+        recipient_id=instagram_id,
+        role=MessageRole.AGENT,
+        mode="reply",
+        message_id=message_id,
+        context_type=context_type,
+        context=context,
+        temp_id=temp_id,
+        is_auto_followup=is_auto_followup,
+    )
+    await sync_instagram_outbound_conversation(
+        org_id,
+        conversation_id,
+        instagram_id,
+        message_id,
+    )
+
+async def send_ig_message(
+    id,
+    message_text,
+    instagram_id,
+    mode,
+    org_id,
+    temp_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    sender_name: str = "Agent",
+    context_type: Optional[str] = None,
+    context: Optional[dict] = None,
+    is_auto_followup: bool = False,
+    enforce_ai_state: bool = False,
+    ai_usage: Optional[dict] = None,
+) -> dict:
     """
     Send a message to an Instagram user using the appropriate access token
     
@@ -50,40 +271,30 @@ async def send_ig_message(id, message_text, instagram_id, mode, org_id) -> dict:
         mode: The mode of the message (reply or private message)
         org_id: The organization ID
     """
+    request_id = claim_token = quota_event_key = None
+    quota_consumed = False
     try:
-        # If an Instagram business account ID is provided, look up its access token
-        if instagram_id:
-            # Query the specific Instagram connection to get its access token
-            connection = db.instagram_connections.find_one(
-                {"instagram_id": instagram_id, "is_active": True},
-                {"page_access_token": 1},
-                sort=[("last_updated", -1)]
-            )
-
-            logger.success(f"Retrieved IG Connection: {connection}")
-            
-            if connection and connection.get("page_access_token"):
-                # Use the connection-specific token and page ID
-                access_token = connection["page_access_token"]
-                # page_id = connection.get("page_id", instagram_id)
-                logger.info(f"Using Instagram-specific token for {instagram_id}")
-            else:
-                # Fallback to default token if connection not found
-                logger.error(f"No Instagram ID specified, cannot send message")
-                raise HTTPException(status_code=400, detail="Instagram ID not specified")
-                # return 1
-                # access_token = IG_ACCESS_TOKEN
-                # page_id = IG_ID
-                # print(f"Instagram connection not found for {instagram_id}, using default token")
-        else:
-            # Use default token if no Instagram ID specified
-            logger.error(f"No Instagram ID specified, cannot send message")
-            return 1
-            # access_token = IG_ACCESS_TOKEN
-            # page_id = IG_ID
-            # print("Using default Instagram token")
+        access_token = _instagram_access_token(org_id, instagram_id)
         
         if mode == "reply":
+            conversation_id = conversation_id or _instagram_conversation_id(org_id, id)
+            fingerprint = hashlib.sha256(f"{id}\0text\0{message_text}".encode()).hexdigest()
+            request_id, claim_token, cached = _claim_instagram_send(
+                org_id, conversation_id or str(id), temp_id, "text", fingerprint
+            )
+            if cached:
+                if cached.get("success") and cached.get("message_id"):
+                    try:
+                        await _record_confirmed_instagram_outbound(
+                            org_id, conversation_id, instagram_id, id, sender_name,
+                            cached["message_id"], message_text, temp_id=temp_id,
+                            context_type=context_type, context=context,
+                            is_auto_followup=is_auto_followup,
+                        )
+                    except Exception:
+                        logger.exception("Retry could not reconcile a confirmed Instagram message")
+                        cached["local_sync_pending"] = True
+                return cached
             # Build the API URL using the appropriate page_id
             url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
 
@@ -102,13 +313,65 @@ async def send_ig_message(id, message_text, instagram_id, mode, org_id) -> dict:
             }
 
             # Send the message
+            if enforce_ai_state:
+                from services.ai_policy_service import is_effective_ai_enabled
+                from services.entitlement_service import consume_quota_async
+
+                if not await is_effective_ai_enabled(org_id, conversation_id):
+                    db[f"instagram_outbox_{org_id}"].delete_one({
+                        "_id": request_id,
+                        "claim_token": claim_token,
+                        "status": "sending",
+                    })
+                    raise AIProviderUnavailable("ai_disabled", escalation_required=False)
+                quota_event_key = f"ai:{request_id or temp_id or conversation_id}"
+                try:
+                    quota = await consume_quota_async(org_id, "AI", "monthly_messages", 1, quota_event_key)
+                    quota_consumed = not quota.get("duplicate", False)
+                except HTTPException as exc:
+                    raise AIProviderUnavailable("quota_exhausted", escalation_required=False) from exc
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(url, headers=headers, json=data)
-                
+            if response.status_code >= 400 and quota_consumed and quota_event_key:
+                from services.entitlement_service import release_quota_async
+
+                await release_quota_async(org_id, "monthly_messages", quota_event_key)
+                quota_consumed = False
+            response.raise_for_status()
+            response_data = response.json()
+            message_id = response_data.get("message_id") or response_data.get("messages", [{}])[0].get("id")
+            if not message_id:
+                raise RuntimeError("Instagram did not return a message ID")
             logger.info(f"Instagram message response: {response.status_code}, {response.text}")
-            
-            # Return the response for further processing
-            return response.json()
+            result = {"message_id": message_id, "success": True, "status": "sent", "response": response_data}
+            _finish_instagram_send(org_id, request_id, claim_token, result)
+            if enforce_ai_state:
+                try:
+                    from services.entitlement_service import record_ai_usage_async
+
+                    usage = ai_usage if isinstance(ai_usage, dict) else {}
+                    await record_ai_usage_async(
+                        org_id,
+                        quota_event_key or f"ai:{message_id}",
+                        "instagram",
+                        1,
+                        int(usage.get("input_tokens", 0)),
+                        int(usage.get("output_tokens", 0)),
+                        int(usage.get("recorded_cost_microusd", 0)),
+                    )
+                except Exception as exc:
+                    logger.error(f"Could not record Instagram AI analytics for org={org_id}: {exc}")
+            try:
+                await _record_confirmed_instagram_outbound(
+                    org_id, conversation_id, instagram_id, id, sender_name,
+                    message_id, message_text, temp_id=temp_id,
+                    context_type=context_type, context=context,
+                    is_auto_followup=is_auto_followup,
+                )
+            except Exception:
+                logger.exception("Instagram message sent but local synchronization is pending")
+                result["local_sync_pending"] = True
+            return result
         else:
             message_id = f"privatenote_{uuid.uuid4()}"
 
@@ -146,12 +409,31 @@ async def send_ig_message(id, message_text, instagram_id, mode, org_id) -> dict:
 
             return {"message_id": message_id, "success": True, "status": "sent"}
         
+    except AIProviderUnavailable:
+        raise
     except Exception as e:
         logger.error(f"Error sending Instagram message: {e}")
         # Return an error response that can be handled by the caller
-        return {"error": str(e), "success": False}
+        result = {"error": str(e), "success": False}
+        _finish_instagram_send(org_id, request_id, claim_token, result)
+        return result
     
-async def send_ig_media_message(recipient, media_url, media_type, instagram_id, mode, org_id) -> dict:
+async def send_ig_media_message(
+    recipient,
+    media_url,
+    media_type,
+    instagram_id,
+    mode,
+    org_id,
+    temp_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    sender_name: str = "Agent",
+    context_type: Optional[str] = None,
+    context: Optional[dict] = None,
+    is_auto_followup: bool = False,
+    _request_id: Optional[str] = None,
+    _claim_token: Optional[str] = None,
+) -> dict:
     """
     Send a media message to an Instagram user using the appropriate access token
     
@@ -160,25 +442,41 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
         media_url: The URL of the media to send
         instagram_id: Instagram business account ID to use for sending
     """
+    request_id, claim_token = _request_id, _claim_token
     try:
-        connection = db.instagram_connections.find_one(
-            {"instagram_id": instagram_id, "is_active": True},
-            {"page_access_token": 1},
-            sort=[("last_updated", -1)]
-        )
-
-        logger.success(f"Retrieved IG Connection: {connection}")
-        
-        if connection and connection.get("page_access_token"):
-            # Use the connection-specific token
-            access_token = connection["page_access_token"]
-            logger.info(f"Using Instagram-specific token for {instagram_id}")
-        else:
-            # Fallback to default token if connection not found
-            access_token = IG_ACCESS_TOKEN
-            logger.error(f"Instagram connection not found for {instagram_id}, using default token")
+        access_token = _instagram_access_token(org_id, instagram_id)
+        provider_media_type = "file" if media_type == "document" else media_type
+        content = {
+            "audio": "Shared an audio",
+            "file": "Shared a file",
+            "document": "Shared a file",
+            "image": "Shared an image",
+            "video": "Shared a video",
+        }.get(media_type, "Shared an attachment")
 
         if mode == "reply":
+            conversation_id = conversation_id or _instagram_conversation_id(org_id, recipient)
+            if not request_id:
+                fingerprint = hashlib.sha256(
+                    f"{recipient}\0{provider_media_type}\0{media_url}".encode()
+                ).hexdigest()
+                request_id, claim_token, cached = _claim_instagram_send(
+                    org_id, conversation_id or str(recipient), temp_id, "media", fingerprint
+                )
+                if cached:
+                    if cached.get("success") and cached.get("message_id"):
+                        try:
+                            await _record_confirmed_instagram_outbound(
+                                org_id, conversation_id, instagram_id, recipient, sender_name,
+                                cached["message_id"], content, message_type=provider_media_type,
+                                payload={"url": cached.get("media_url") or media_url}, temp_id=temp_id,
+                                context_type=context_type, context=context,
+                                is_auto_followup=is_auto_followup,
+                            )
+                        except Exception:
+                            logger.exception("Retry could not reconcile confirmed Instagram media")
+                            cached["local_sync_pending"] = True
+                    return cached
             # Query the specific Instagram connection to get its access token
         
             url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
@@ -194,7 +492,7 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
                 },
                 "message":{
                     "attachment":{
-                        "type":media_type,
+                        "type":provider_media_type,
                         "payload":{
                             "url":media_url
                         }
@@ -205,18 +503,35 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
             # Send the media message
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(url, headers=headers, json=data)
-            
+            response.raise_for_status()
+            response_data = response.json()
+            message_id = response_data.get("message_id") or response_data.get("messages", [{}])[0].get("id")
+            if not message_id:
+                raise RuntimeError("Instagram did not return a message ID")
             logger.info(f"Instagram media message response: {response.status_code}, {response.text}")
-            
-            # Return the response for further processing
-            return response.json()
+            result = {
+                "message_id": message_id,
+                "success": True,
+                "status": "sent",
+                "response": response_data,
+                "media_url": media_url,
+                "media_type": media_type,
+            }
+            _finish_instagram_send(org_id, request_id, claim_token, result)
+            try:
+                await _record_confirmed_instagram_outbound(
+                    org_id, conversation_id, instagram_id, recipient, sender_name,
+                    message_id, content, message_type=provider_media_type,
+                    payload={"url": media_url}, temp_id=temp_id,
+                    context_type=context_type, context=context,
+                    is_auto_followup=is_auto_followup,
+                )
+            except Exception:
+                logger.exception("Instagram media sent but local synchronization is pending")
+                result["local_sync_pending"] = True
+            return result
         else:
             message_id = f"privatenote_{uuid.uuid4()}"
-
-            if media_type == "image":
-                content = "Shared an image"
-            elif media_type == "video":
-                content = "Shared a video"
 
             user_details = await get_ig_username(recipient, access_token)
             username = user_details.get('username')
@@ -249,13 +564,28 @@ async def send_ig_media_message(recipient, media_url, media_type, instagram_id, 
                 message_id=message_id,  # Use the ID from the webhook for deduplication
                 mode=mode
             )
+            return {"message_id": message_id, "success": True, "status": "sent"}
         
     except Exception as e:
         logger.error(f"Error sending Instagram media message: {e}")
         # Return an error response that can be handled by the caller
-        return {"error": str(e), "success": False}
+        result = {"error": str(e), "success": False}
+        _finish_instagram_send(org_id, request_id, claim_token, result)
+        return result
 
-async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id, mode) -> dict:
+async def upload_and_send_ig_media_message(
+    recipient,
+    file,
+    instagram_id,
+    org_id,
+    mode,
+    temp_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    sender_name: str = "Agent",
+    context_type: Optional[str] = None,
+    context: Optional[dict] = None,
+    is_auto_followup: bool = False,
+) -> dict:
     """
     Upload media to Cloudinary and send it as an Instagram message
     
@@ -265,31 +595,186 @@ async def upload_and_send_ig_media_message(recipient, file, instagram_id, org_id
         instagram_id: Instagram business account ID to use for sending
         org_id: Organization ID for context
     """
+    request_id = claim_token = None
     try:
+        if mode == "reply":
+            conversation_id = conversation_id or _instagram_conversation_id(org_id, recipient)
+            digest = hashlib.sha256(
+                f"{recipient}\0{getattr(file, 'content_type', '')}\0{getattr(file, 'filename', '')}\0".encode()
+            )
+            while chunk := await file.read(1024 * 1024):
+                digest.update(chunk)
+            await file.seek(0)
+            request_id, claim_token, cached = _claim_instagram_send(
+                org_id, conversation_id or str(recipient), temp_id, "media", digest.hexdigest()
+            )
+            if cached:
+                if cached.get("success") and cached.get("message_id"):
+                    try:
+                        await _record_confirmed_instagram_outbound(
+                            org_id, conversation_id, instagram_id, recipient, sender_name,
+                            cached["message_id"], "Shared an attachment",
+                            message_type=cached.get("media_type") or "file",
+                            payload={"url": cached.get("media_url")}, temp_id=temp_id,
+                            context_type=context_type, context=context,
+                            is_auto_followup=is_auto_followup,
+                        )
+                    except Exception:
+                        logger.exception("Retry could not reconcile confirmed Instagram upload")
+                        cached["local_sync_pending"] = True
+                return cached
+
         # Upload media to Cloudinary
         result = await upload_media_to_cloudinary(file, platform="instagram", org_id=org_id)
+
+        if not result:
+            failure = {"error": "Media upload failed", "success": False}
+            _finish_instagram_send(org_id, request_id, claim_token, failure)
+            return failure
 
         file_url = result.get("file_url")
         file_type = result.get("file_type")
         
         if not file_url:
             logger.error("Media upload failed, cannot send Instagram media message.")
-            return {"error": "Media upload failed", "success": False}
+            failure = {"error": "Media upload failed", "success": False}
+            _finish_instagram_send(org_id, request_id, claim_token, failure)
+            return failure
         
         # Send the media message via Instagram API
-        response = await send_ig_media_message(recipient, file_url, file_type, instagram_id, mode, org_id)
+        response = await send_ig_media_message(
+            recipient,
+            file_url,
+            file_type,
+            instagram_id,
+            mode,
+            org_id,
+            temp_id=temp_id,
+            conversation_id=conversation_id,
+            sender_name=sender_name,
+            context_type=context_type,
+            context=context,
+            is_auto_followup=is_auto_followup,
+            _request_id=request_id,
+            _claim_token=claim_token,
+        )
         
         if response.get("message_id"):
             logger.success("Instagram media message sent successfully.")
 
-            return {"success": True, "response": response}
+            return {
+                **response,
+                "media_url": file_url,
+                "media_type": file_type,
+            }
 
 
-        return {"error": "Sending media message failed", "success": False}
+        return response
         
     except Exception as e:
         logger.error(f"Error in upload_and_send_ig_media_message: {e}")
-        return {"error": str(e), "success": False}
+        failure = {"error": str(e), "success": False}
+        _finish_instagram_send(org_id, request_id, claim_token, failure)
+        return failure
+
+
+def _instagram_message_storage_id(message_id: str) -> str:
+    return f"instagram:{message_id}"
+
+
+def claim_instagram_webhook_message(org_id: str, message_id: str) -> Optional[str]:
+    collection = db[f"messages_{org_id}"]
+    if collection.find_one({"id": message_id, "_processing": {"$ne": True}}, {"_id": 1}):
+        return None
+    storage_id = _instagram_message_storage_id(message_id)
+    now = datetime.now(timezone.utc)
+    claim_token = str(uuid.uuid4())
+    try:
+        existing = collection.find_one_and_update(
+            {"_id": storage_id},
+            {"$setOnInsert": {
+                "id": message_id,
+                "message_id": message_id,
+                "platform": "instagram",
+                "_processing": True,
+                "processing_at": now,
+                "claim_token": claim_token,
+            }},
+            upsert=True,
+            return_document=ReturnDocument.BEFORE,
+        )
+    except DuplicateKeyError:
+        existing = collection.find_one({"_id": storage_id})
+    if existing is None:
+        return claim_token
+    processing_at = existing.get("processing_at")
+    if existing.get("_processing") and (not processing_at or processing_at < now - timedelta(minutes=2)):
+        reclaimed = collection.update_one(
+            {
+                "_id": storage_id,
+                "_processing": True,
+                "claim_token": existing.get("claim_token"),
+                "processing_at": processing_at,
+            },
+            {"$set": {"processing_at": now, "claim_token": claim_token}},
+        )
+        if reclaimed.modified_count:
+            return claim_token
+    return None
+
+
+def release_instagram_webhook_claim(org_id: str, message_id: str, claim_token: str) -> None:
+    db[f"messages_{org_id}"].delete_one({
+        "_id": _instagram_message_storage_id(message_id),
+        "_processing": True,
+        "claim_token": claim_token,
+    })
+
+
+def claim_instagram_webhook_downstream(org_id: str, message_id: str) -> Optional[str]:
+    collection = db[f"messages_{org_id}"]
+    message = collection.find_one({"id": message_id})
+    if not message or message.get("webhook_status") not in {"pending", "processing"}:
+        return None
+    now = datetime.now(timezone.utc)
+    claimed_at = message.get("webhook_claimed_at")
+    if claimed_at and claimed_at >= now - timedelta(minutes=2):
+        return None
+    claim_token = str(uuid.uuid4())
+    updated = collection.update_one(
+        {
+            "_id": message["_id"],
+            "webhook_status": message.get("webhook_status"),
+            "webhook_claim_token": message.get("webhook_claim_token"),
+        },
+        {"$set": {
+            "webhook_status": "processing",
+            "webhook_claim_token": claim_token,
+            "webhook_claimed_at": now,
+        }},
+    )
+    return claim_token if updated.modified_count else None
+
+
+def complete_instagram_webhook_message(org_id: str, message_id: str, claim_token: str) -> None:
+    db[f"messages_{org_id}"].update_one(
+        {"id": message_id, "webhook_claim_token": claim_token},
+        {"$set": {"webhook_status": "complete", "webhook_completed_at": datetime.now(timezone.utc)}},
+    )
+
+
+def release_instagram_webhook_downstream(org_id: str, message_id: str, claim_token: str) -> None:
+    db[f"messages_{org_id}"].update_one(
+        {
+            "id": message_id,
+            "webhook_status": "processing",
+            "webhook_claim_token": claim_token,
+        },
+        {
+            "$set": {"webhook_status": "pending"},
+            "$unset": {"webhook_claim_token": "", "webhook_claimed_at": ""},
+        },
+    )
 
 async def store_instagram_message(
     org_id: str,
@@ -305,7 +790,11 @@ async def store_instagram_message(
     mode: Optional[str] = None,
     message_id: Optional[str] = None,
     context_type: Optional[str] = None,
-    context: Optional[dict] = None
+    context: Optional[dict] = None,
+    notify_push: bool = False,
+    temp_id: Optional[str] = None,
+    claim_token: Optional[str] = None,
+    is_auto_followup: bool = False,
     ) -> str:
     """
     Store a message in the Instagram-specific collection and notify appropriate WebSocket clients
@@ -352,17 +841,56 @@ async def store_instagram_message(
         "role": role,
         "timestamp": datetime.now(timezone.utc),
         "status": "sent",
-        "mode": mode
+        "mode": mode,
+        "is_auto_followup": is_auto_followup,
+        "queue_sync_pending": role == MessageRole.AGENT and mode == "reply",
+        "webhook_status": "processing" if claim_token else "complete",
     }
-    
-    # Store message in Instagram-specific collection
-    messages_collection.insert_one(message)
+    if claim_token:
+        message.update({
+            "webhook_claim_token": claim_token,
+            "webhook_claimed_at": datetime.now(timezone.utc),
+        })
 
-    logger.success(f"Instagram message stored: {message_id}")
+    if temp_id:
+        message["temp_id"] = temp_id
+
+    existing = messages_collection.find_one(
+        {"id": message_id, "_processing": {"$ne": True}},
+        {"_id": 1},
+    )
+    if existing:
+        return message_id
+    storage_filter = {"_id": _instagram_message_storage_id(message_id)}
+    if claim_token:
+        storage_filter["claim_token"] = claim_token
+    stored = messages_collection.update_one(
+        storage_filter,
+        {"$set": message, "$unset": {"_processing": "", "processing_at": "", "claim_token": ""}},
+        upsert=not claim_token,
+    )
+    if claim_token and not stored.modified_count:
+        raise RuntimeError("Instagram webhook claim is no longer owned by this worker")
+    inserted = stored.upserted_id is not None or stored.modified_count > 0
+    if inserted:
+        logger.success(f"Instagram message stored: {message_id}")
+    else:
+        return message_id
+
+    if inserted and notify_push and role == MessageRole.CUSTOMER and mode != "private":
+        await schedule_customer_message_push(
+            org_id=org_id,
+            platform="instagram",
+            message_id=message_id,
+            conversation_id=conversation_id,
+            sender_name=sender_name,
+            content=content,
+            message_type=type,
+        )
     
     # Keep only latest 500 messages per conversation
-    messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
-    if messages_count > 500:
+    messages_count = messages_collection.count_documents({"conversation_id": conversation_id}) if inserted else 0
+    if inserted and messages_count > 500:
         # Find and delete oldest message
         oldest_message = messages_collection.find_one(
             {"conversation_id": conversation_id},
@@ -396,11 +924,13 @@ async def store_instagram_message(
         "context": context,
         "sender_id": sender_username,  # Use username for the frontend
         "role": role,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": message["timestamp"].isoformat(),
         "status": "sent",
         "sender_name": sender_name,
         "mode": mode
     }
+    if temp_id:
+        broadcast_message["temp_id"] = temp_id
     
     # Broadcast to /main-ws clients
     await broadcast_main_ws(
@@ -484,6 +1014,7 @@ async def create_or_update_instagram_conversation(org_id: str,
             "instagram_id": recipient_id,
             "customer_id": sender_id,
             "customer_name": customer_name,
+            "customer_name_prefixes": name_search_prefixes(customer_name),
             "customer_username": username,
             "last_message": last_message,
             "last_message_timestamp": now,
@@ -513,6 +1044,7 @@ async def create_or_update_instagram_conversation(org_id: str,
             "instagram_id": recipient_id,
             "customer_id": sender_id,
             "customer_name": customer_name,
+            "customer_name_prefixes": name_search_prefixes(customer_name),
             "customer_username": username,
             "last_message": last_message,
             "last_message_timestamp": now,
@@ -1577,4 +2109,4 @@ async def process_comments_events(value: dict, ig_account_id: str, background_ta
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(send_ig_message("1241623887433864", "Hello from the test", "17841471805170358", "reply", "org_2zV2OOhodLocEnTybzR8t9MIYCE"))
+    asyncio.run(send_ig_message("1241623887433864", "Hello from the test", "17841471805170358", "reply", "org_2zV2OOhodLocEnTybzR8t9MIYCE", temp_id="manual-test"))

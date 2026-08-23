@@ -1,6 +1,7 @@
 import uuid
 import time
 import re
+import asyncio
 from bson import ObjectId
 from typing import Optional, List, Dict
 from fastapi import HTTPException, status
@@ -12,9 +13,15 @@ from datetime import datetime, timezone, timedelta
 from core.services import services
 from services.wa_service import send_whatsapp_message, upload_and_send_wa_media_message, send_whatsapp_template_message
 from services.ig_service import send_ig_message, upload_and_send_ig_media_message
-from services.utils import serialize_mongo
+from services.utils import serialize_mongo, phone_search_parts
 # from services.websocket_service import broadcast_on_stats_update
 from services.websocket_service import broadcast_team_message
+from services.work_team_service import (
+    can_claim_conversation_ownership,
+    conversation_access_condition,
+    require_conversation_access,
+    team_queue_condition,
+)
 
 from database import get_mongo_db, get_async_mongo_db
 
@@ -23,6 +30,425 @@ from dateutil import parser
 
 
 db = get_mongo_db()
+
+
+def validate_outbound_attachment(file) -> None:
+    content_type = (file.content_type or "").lower()
+    allowed = content_type.startswith(("image/", "video/", "audio/")) or content_type in {
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "text/plain",
+        "text/csv",
+    }
+    if not allowed:
+        raise HTTPException(status_code=415, detail="Unsupported attachment type")
+    max_size = 5 * 1024 * 1024 if content_type.startswith("image/") else 16 * 1024 * 1024
+    if file.size is not None and file.size > max_size:
+        raise HTTPException(status_code=413, detail="Attachment is too large")
+
+FOCUS_GROUPS = {"needs_now", "high_intent", "waiting", "later"}
+SEARCH_INDEXED_ORGS = set()
+SEARCH_INDEX_LOCKS: Dict[str, asyncio.Lock] = {}
+
+def build_focus_group_condition(
+    focus_group: str,
+    now: Optional[datetime] = None,
+) -> Dict:
+    if focus_group not in FOCUS_GROUPS:
+        raise HTTPException(status_code=400, detail="Invalid focus group")
+
+    now = now or datetime.now(timezone.utc)
+    expiring_soon = now + timedelta(hours=2)
+    active = {"status": {"$in": ["open", "follow-up"]}}
+    needs_attention = {
+        "$or": [
+            {"unread_count": {"$gt": 0}},
+            {
+                "$and": [
+                    {"status": "open"},
+                    {
+                        "reply_window_ends_at": {
+                            "$gt": now,
+                            "$lte": expiring_soon,
+                        }
+                    },
+                ]
+            },
+        ]
+    }
+
+    conditions: List[Dict] = [
+        {"type": {"$ne": "team"}},
+        active,
+        {"$nor": [needs_attention]},
+        {"priority": {"$ne": "high"}},
+    ]
+
+    if focus_group == "needs_now":
+        return {"$and": [{"type": {"$ne": "team"}}, active, needs_attention]}
+    if focus_group == "high_intent":
+        return {
+            "$and": [
+                {"type": {"$ne": "team"}},
+                active,
+                {"$nor": [needs_attention]},
+                {"priority": "high"},
+            ]
+        }
+    if focus_group == "waiting":
+        return {"$and": [*conditions, {"status": "follow-up"}]}
+    return {"$and": [*conditions, {"status": "open"}]}
+
+
+async def fetch_focus_counts(org_id: str, user_id: str, role: str) -> Dict[str, int]:
+    async_db = get_async_mongo_db()
+    collection = async_db[f"conversations_{org_id}"]
+    now = datetime.now(timezone.utc)
+    access = await conversation_access_condition(org_id, user_id, role)
+    facets = {
+        group: [
+            {"$match": {"$and": [build_focus_group_condition(group, now), access]} if access else build_focus_group_condition(group, now)},
+            {"$count": "count"},
+        ]
+        for group in FOCUS_GROUPS
+    }
+    result = await collection.aggregate([{"$facet": facets}]).to_list(length=1)
+    counts = {
+        group: (
+            result[0].get(group, [{}])[0].get("count", 0)
+            if result and result[0].get(group)
+            else 0
+        )
+        for group in FOCUS_GROUPS
+    }
+    counts["total_active"] = sum(counts.values())
+    return counts
+
+
+async def ensure_conversation_search_indexes(org_id: str) -> None:
+    if org_id in SEARCH_INDEXED_ORGS:
+        return
+    lock = SEARCH_INDEX_LOCKS.setdefault(org_id, asyncio.Lock())
+    async with lock:
+        if org_id in SEARCH_INDEXED_ORGS:
+            return
+        async_db = get_async_mongo_db()
+        conversations = async_db[f"conversations_{org_id}"]
+        messages = async_db[f"messages_{org_id}"]
+        await conversations.create_index("conversation_id")
+        await conversations.create_index("customer_id")
+        await conversations.create_index("phone_search_suffixes")
+        await conversations.create_index("customer_name_prefixes")
+        await conversations.create_index([("last_message_timestamp", -1)])
+        await messages.create_index([("conversation_id", 1), ("timestamp", -1)])
+        await messages.create_index(
+            [("content", "text")],
+            name="message_search_text",
+            default_language="none",
+        )
+        SEARCH_INDEXED_ORGS.add(org_id)
+
+
+def _search_snippet(value: object, query: str, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    match_at = text.casefold().find(query.casefold())
+    start = max(0, match_at - limit // 3) if match_at >= 0 else 0
+    end = min(len(text), start + limit)
+    return f"{'…' if start else ''}{text[start:end]}{'…' if end < len(text) else ''}"
+
+
+def _lookup_scope(value: object) -> object:
+    if isinstance(value, list):
+        return [_lookup_scope(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        (key if key.startswith("$") else f"conversation.{key}"): _lookup_scope(item)
+        for key, item in value.items()
+    }
+
+def _escalated_condition() -> Dict:
+    return {
+        "$or": [
+            {"type": "escalated"},
+            {"priority": "urgent"},
+            {"categories": {"$regex": "escalat", "$options": "i"}},
+            {"labels": {"$regex": "escalat", "$options": "i"}},
+        ]
+    }
+
+
+def _queue_filter_conditions(
+    active_tab: str,
+    current_user_id: Optional[str],
+    attention: Optional[str],
+    handling: Optional[str],
+    status_filter: Optional[str],
+    assigned_agent_id: Optional[str],
+    team_id: Optional[str] = None,
+) -> List[Dict]:
+    conditions: List[Dict] = []
+    if active_tab == "mine" and current_user_id:
+        conditions.append({"$or": [
+            {"assigned_agent.id": current_user_id},
+            {"assigned_agent_id": current_user_id},
+            {"active_work": {"$elemMatch": {
+                "assigned_agent_id": current_user_id,
+                "status": {"$in": ["pending", "in_progress", "needs_review"]},
+            }}},
+        ]})
+    elif active_tab == "team" and team_id:
+        conditions.append({"active_work": {"$elemMatch": {
+                "team_id": team_id,
+                "status": {"$in": ["pending", "in_progress", "needs_review"]},
+            }}})
+    elif active_tab == "unassigned":
+        conditions.append({"$and": [
+            {"$or": [
+                {"assigned_agent": None},
+                {"assigned_agent": {}},
+                {"assigned_agent": {"$exists": False}},
+            ]},
+            {"$or": [
+                {"assigned_agent_id": None},
+                {"assigned_agent_id": {"$exists": False}},
+            ]},
+            {"$or": [
+                {"owner_team_id": None},
+                {"owner_team_id": {"$exists": False}},
+            ]},
+        ]})
+    elif active_tab == "escalated":
+        conditions.append(_escalated_condition())
+    elif active_tab == "open":
+        conditions.append({"status": {"$in": ["open", "follow-up"]}})
+    elif active_tab == "closed":
+        conditions.append({"status": "closed"})
+
+    if attention == "needs_reply":
+        conditions.append({"$and": [
+            {"is_ai_enabled": {"$ne": True}},
+            {"$or": [
+                {"needs_reply": True},
+                {"last_sender": "customer"},
+                {"last_message_role": "customer"},
+            ]},
+        ]})
+    elif attention == "unread":
+        conditions.append({"unread_count": {"$gt": 0}})
+    elif attention == "follow_up":
+        conditions.append({"status": "follow-up"})
+
+    if handling == "ai":
+        conditions.append({"is_ai_enabled": True})
+    elif handling == "human":
+        conditions.append({"is_ai_enabled": {"$ne": True}})
+
+    if status_filter in {"resolved", "closed"}:
+        conditions.append({"status": "closed"})
+    elif status_filter == "follow_up":
+        conditions.append({"status": "follow-up"})
+    elif status_filter == "escalated":
+        conditions.append(_escalated_condition())
+    elif status_filter == "open":
+        conditions.append({"status": {"$in": ["open", None]}})
+
+    if assigned_agent_id:
+        conditions.append({"$or": [
+            {"assigned_agent.id": assigned_agent_id},
+            {"assigned_agent_id": assigned_agent_id},
+        ]})
+    return conditions
+
+
+def _priority_condition(priority: Optional[str]) -> Optional[Dict]:
+    values = [item.strip() for item in (priority or "").split(",") if item.strip()]
+    if not values:
+        return None
+    if "medium" in values:
+        return {"$or": [{"priority": {"$in": values}}, {"priority": None}]}
+    return {"priority": {"$in": values}}
+
+
+async def search_conversations(
+    org_id: str,
+    query: str,
+    current_user_id: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 20,
+    active_tab: str = "all",
+    unread_only: bool = False,
+    platform: Optional[str] = None,
+    priority: Optional[str] = None,
+    labels: Optional[str] = None,
+    focus_group: Optional[str] = None,
+    attention: Optional[str] = None,
+    handling: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    assigned_agent_id: Optional[str] = None,
+    current_user_role: str = "org:member",
+    team_id: Optional[str] = None,
+) -> Dict:
+    clean_query = query.strip()
+    if len(clean_query) < 2:
+        return {"conversations": [], "has_more": False}
+
+    await ensure_conversation_search_indexes(org_id)
+    async_db = get_async_mongo_db()
+    conversations = async_db[f"conversations_{org_id}"]
+    messages = async_db[f"messages_{org_id}"]
+    conditions: List[Dict] = [{"type": {"$ne": "team"}}]
+    access = await conversation_access_condition(org_id, current_user_id or "", current_user_role)
+    if access:
+        conditions.append(access)
+    if active_tab == "team" and team_id:
+        await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
+
+    conditions.extend(_queue_filter_conditions(
+        active_tab, current_user_id, attention, handling, status_filter, assigned_agent_id, team_id
+    ))
+
+    if focus_group:
+        conditions.append(build_focus_group_condition(focus_group))
+    if unread_only:
+        conditions.append({"unread_count": {"$gt": 0}})
+    if platform:
+        conditions.append({"platform": {"$in": [item.strip() for item in platform.split(",") if item.strip()]}})
+    priority_condition = _priority_condition(priority)
+    if priority_condition:
+        conditions.append(priority_condition)
+    if labels:
+        requested_labels = [item.strip() for item in labels.split(",") if item.strip()]
+        if requested_labels:
+            label_regexes = [re.compile(f"^{re.escape(item)}$", re.IGNORECASE) for item in requested_labels]
+            matching_ids = await async_db[f"contacts_{org_id}"].distinct(
+                "conversation_id", {"labels": {"$in": label_regexes}}
+            )
+            if not matching_ids:
+                return {"conversations": [], "has_more": False}
+            conditions.append({"conversation_id": {"$in": matching_ids}})
+
+    projection = {
+        "_id": 0,
+        "whatsapp_id": 0,
+        "instagram_id": 0,
+        "raw_data": 0,
+    }
+    candidate_limit = skip + limit + 1
+    digits, _ = phone_search_parts(clean_query)
+    phone_query = len(digits) >= 6 and bool(re.fullmatch(r"[+\d\s().-]+", clean_query))
+    results: Dict[str, tuple[Dict, Dict]] = {}
+
+    def add_result(doc: Dict, match_type: str, snippet: str, message: Optional[Dict] = None) -> None:
+        conversation_id = doc.get("conversation_id")
+        if not conversation_id or conversation_id in results:
+            return
+        item = serialize_mongo(doc)
+        item["id"] = conversation_id
+        match = {
+            "type": match_type,
+            "snippet": snippet,
+        }
+        if message:
+            match["message_id"] = message.get("id") or message.get("message_id")
+            match["timestamp"] = serialize_mongo(message.get("timestamp"))
+        item["search_match"] = match
+        results[conversation_id] = (doc, item)
+
+    if phone_query:
+        phone_conditions: List[Dict] = [
+            {"customer_id": digits},
+            {"phone_digits": digits},
+            {"conversation_id": f"whatsapp_{digits}"},
+            {"conversation_id": f"dealer_{digits}"},
+            {"phone_search_suffixes": digits},
+            {"conversation_id": {"$regex": f"^(?:whatsapp|dealer)_\\d*{re.escape(digits)}$"}},
+        ]
+        direct_query = {"$and": [*conditions, {"$or": phone_conditions}]}
+        direct_docs = await conversations.find(direct_query, projection).sort(
+            "last_message_timestamp", -1
+        ).limit(candidate_limit).to_list(length=candidate_limit)
+        for doc in direct_docs:
+            add_result(doc, "phone", str(doc.get("customer_id") or doc.get("conversation_id") or ""))
+    else:
+        name_terms = re.findall(r"[^\W_]+", clean_query.casefold())
+        direct_docs = []
+        if name_terms:
+            direct_query = {"$and": [*conditions, {
+                "customer_name_prefixes": {"$all": name_terms}
+            }]}
+            direct_docs = await conversations.find(direct_query, projection).sort(
+                "last_message_timestamp", -1
+            ).limit(candidate_limit).to_list(length=candidate_limit)
+        for doc in direct_docs:
+            name = str(doc.get("customer_name") or "")
+            add_result(doc, "name", _search_snippet(name, clean_query))
+
+        message_hits = await messages.aggregate([
+            {"$match": {"$text": {"$search": clean_query}}},
+            {"$sort": {"timestamp": -1, "id": -1}},
+            {"$group": {
+                "_id": "$conversation_id",
+                "message": {"$first": "$$ROOT"},
+                "match_timestamp": {"$first": "$timestamp"},
+            }},
+            {"$lookup": {
+                "from": f"conversations_{org_id}",
+                "localField": "_id",
+                "foreignField": "conversation_id",
+                "as": "conversation",
+            }},
+            {"$unwind": "$conversation"},
+            {"$match": {"$and": [_lookup_scope(condition) for condition in conditions]}},
+            {"$sort": {"conversation.last_message_timestamp": -1, "match_timestamp": -1, "_id": 1}},
+            {"$limit": candidate_limit},
+            {"$replaceRoot": {"newRoot": "$message"}},
+            {"$project": {"_id": 0, "id": 1, "message_id": 1, "conversation_id": 1, "content": 1, "timestamp": 1}},
+        ], allowDiskUse=True).to_list(length=candidate_limit)
+        missing_ids = [
+            message["conversation_id"]
+            for message in message_hits
+            if message.get("conversation_id") and message["conversation_id"] not in results
+        ]
+        if missing_ids:
+            matching_docs = await conversations.find(
+                {"$and": [*conditions, {"conversation_id": {"$in": missing_ids}}]},
+                projection,
+            ).to_list(length=len(missing_ids))
+            docs_by_id = {doc.get("conversation_id"): doc for doc in matching_docs}
+            for message in message_hits:
+                conversation_id = message.get("conversation_id")
+                doc = docs_by_id.get(conversation_id)
+                if doc:
+                    add_result(doc, "message", _search_snippet(message.get("content"), clean_query), message)
+
+    def last_activity(pair: tuple[Dict, Dict]) -> float:
+        value = pair[0].get("last_message_timestamp")
+        if not isinstance(value, datetime):
+            return 0
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+
+    ordered = sorted(
+        results.values(),
+        key=last_activity,
+        reverse=True,
+    )
+    page_end = min(skip + limit, 500)
+    truncated = len(ordered) > page_end and page_end >= 500
+    return {
+        "conversations": [item for _, item in ordered[skip:page_end]],
+        "has_more": len(ordered) > page_end and not truncated,
+        "truncated": truncated,
+    }
 
 async def fetch_conversations_new(
     org_id: str, 
@@ -34,8 +460,16 @@ async def fetch_conversations_new(
     unread_only: bool = False,
     platform: Optional[str] = None,
     priority: Optional[str] = None,
-    labels: Optional[str] = None
-) -> List[Dict]:
+    labels: Optional[str] = None,
+    focus_group: Optional[str] = None,
+    attention: Optional[str] = None,
+    handling: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    assigned_agent_id: Optional[str] = None,
+    include_meta: bool = False,
+    current_user_role: str = "org:member",
+    team_id: Optional[str] = None,
+) -> object:
     start_time = time.time()
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{org_id}"]
@@ -43,8 +477,6 @@ async def fetch_conversations_new(
     projection = {
         "whatsapp_id": 0,
         "instagram_id": 0,
-        "last_sender": 0,
-        "message_counter": 0,
         "next_action_at": 0,
         "reminder_stage": 0,
         "started_at": 0,
@@ -58,6 +490,23 @@ async def fetch_conversations_new(
     base_conditions = [
         {"type": {"$ne": "team"}}
     ]
+    access = await conversation_access_condition(org_id, current_user_id or "", current_user_role)
+    if access:
+        base_conditions.append(access)
+    if active_tab == "team" and team_id:
+        await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
+    base_conditions.extend(_queue_filter_conditions(
+        active_tab,
+        current_user_id,
+        attention,
+        handling,
+        status_filter,
+        assigned_agent_id,
+        team_id,
+    ))
+
+    if focus_group:
+        base_conditions.append(build_focus_group_condition(focus_group))
 
     # Labels filter
     if labels:
@@ -72,15 +521,9 @@ async def fetch_conversations_new(
             matching_ids = await contact_col.distinct("conversation_id", {"labels": {"$in": regex_labels}})
             
             if not matching_ids:
-                return [] # Early exit to save resources
+                return {"conversations": [], "has_more": False, "total": 0, "counts": {"all": 0, "mine": 0, "unassigned": 0, "escalated": 0}} if include_meta else []
             
             base_conditions.append({"conversation_id": {"$in": matching_ids}})
-
-    # Tab filters
-    if active_tab == "open":
-        base_conditions.append({"status": {"$in": ["open", "follow-up"]}})
-    elif active_tab == "closed":
-        base_conditions.append({"status": "closed"})
 
     # Unread filter
     if unread_only:
@@ -93,9 +536,9 @@ async def fetch_conversations_new(
         base_conditions.append({"platform": {"$in": platform_list}})
 
     # Priority Filter
-    if priority:
-        priority_list = [p.strip() for p in priority.split(",")]
-        base_conditions.append({"priority": {"$in": priority_list}})
+    priority_condition = _priority_condition(priority)
+    if priority_condition:
+        base_conditions.append(priority_condition)
 
     # Search filter
     if search:
@@ -123,6 +566,7 @@ async def fetch_conversations_new(
 
     # Fetch all docs
     raw_docs = await cursor.to_list(length=limit)
+    total = await collection.count_documents(query) if include_meta else None
 
     fetch_time = time.time()
     logger.info(f"[TIMING] Mongo fetch: {fetch_time - start_time:.4f}s")
@@ -142,21 +586,36 @@ async def fetch_conversations_new(
             "customer_name": doc.get("customer_name") or "Unknown",
             "last_message": doc.get("last_message") or "",
             "last_message_is_private_note": doc.get("last_message_is_private_note", False),
+            "last_message_role": doc.get("last_message_role") or doc.get("last_sender"),
+            "needs_reply": doc.get("needs_reply"),
             "timestamp": (
                 doc["last_message_timestamp"].isoformat()
                 if isinstance(doc.get("last_message_timestamp"), datetime)
                 else None
             ),
             "unread_count": doc.get("unread_count", 0),
+            "message_counter": doc.get("message_counter", 0),
             "status": doc.get("status"),
             "priority": doc.get("priority"),
             "sentiment": doc.get("sentiment"),
             "assigned_agent": doc.get("assigned_agent", {}),
+            "assigned_agent_id": doc.get("assigned_agent_id"),
+            "owner_team_id": doc.get("owner_team_id"),
+            "owner_team_name": doc.get("owner_team_name"),
+            "active_work": doc.get("active_work", []),
             "is_ai_enabled": doc.get("is_ai_enabled"),
+            "auto_ai_disabled": doc.get("auto_ai_disabled", False),
+            "auto_ai_disabled_until": (
+                doc["auto_ai_disabled_until"].isoformat()
+                if isinstance(doc.get("auto_ai_disabled_until"), datetime)
+                else doc.get("auto_ai_disabled_until")
+            ),
             "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
             "assignment_history": doc.get("assignment_history", []),
             "suggestions": doc.get("suggestions", []),
             "summary": doc.get("summary", []),
+            "categories": doc.get("categories", []),
+            "labels": doc.get("labels", []),
             "participants": doc.get("participants", []),
             "unread": doc.get("unread", {})
         }
@@ -167,10 +626,36 @@ async def fetch_conversations_new(
     logger.info(f"[TIMING] Python transform: {end_time - fetch_time:.4f}s")
     logger.info(f"[TIMING] Total: {end_time - start_time:.4f}s")
 
-    return result
+    if not include_meta:
+        return result
+
+    count_scope_parts = [{"type": {"$ne": "team"}}]
+    if access:
+        count_scope_parts.append(access)
+    count_scope = {"$and": count_scope_parts} if len(count_scope_parts) > 1 else count_scope_parts[0]
+    team_conditions = _queue_filter_conditions("team", current_user_id, None, None, None, None, team_id)
+    facets = {
+        "all": [{"$match": count_scope}, {"$count": "value"}],
+        "mine": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("mine", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
+        "team": [{"$match": {"$and": [count_scope, *team_conditions]}} if team_conditions else {"$match": {"_id": None}}, {"$count": "value"}],
+        "unassigned": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("unassigned", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
+        "escalated": [{"$match": {"$and": [count_scope, _escalated_condition()]}}, {"$count": "value"}],
+    }
+    count_result = await collection.aggregate([{"$facet": facets}]).to_list(length=1)
+    raw_counts = count_result[0] if count_result else {}
+    counts = {
+        key: (raw_counts.get(key) or [{"value": 0}])[0].get("value", 0)
+        for key in facets
+    }
+    return {
+        "conversations": result,
+        "has_more": skip + len(result) < (total or 0),
+        "total": total or 0,
+        "counts": counts,
+    }
 
 
-async def fetch_conversation(org_id: str, conversation_id: str):
+async def fetch_conversation(org_id: str, conversation_id: str, user_id: str, role: str):
     """
     Fetch a specific conversation by its ID for a given organization.
     """
@@ -183,10 +668,11 @@ async def fetch_conversation(org_id: str, conversation_id: str):
         # Get the collection
         org_conversations_collection = async_db[org_conversations_collection_name]
 
-        conversation = await org_conversations_collection.find_one(
-            {"conversation_id": conversation_id},
-            {"_id": 0}  
-        )
+        access = await conversation_access_condition(org_id, user_id, role)
+        query = {"conversation_id": conversation_id}
+        if access:
+            query = {"$and": [query, access]}
+        conversation = await org_conversations_collection.find_one(query, {"_id": 0})
         
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -214,7 +700,8 @@ async def fetch_messages(
     agent_id: str,
     agent_username: str,
     before: Optional[str] = None,      # ISO timestamp cursor
-    limit: int = 30
+    limit: int = 30,
+    role: str = "org:member",
 ):
     """
     Fetch messages and private notes for a specific conversation with cursor-based pagination.
@@ -235,53 +722,48 @@ async def fetch_messages(
         - 'next_cursor': ISO timestamp to pass as `before` in the next request
     """
     try:
+        await require_conversation_access(org_id, conversation_id, agent_id, role)
         org_messages_collection_name = f"messages_{org_id}"
         private_note_collection_name = f"private_notes_{org_id}"
         org_conversations_collection_name = f"conversations_{org_id}"
 
         convo_collection = db[org_conversations_collection_name]
         now = datetime.now(timezone.utc)
-
-        # --- Auto-assign agent if conversation is unassigned ---
-        assigned_convo = convo_collection.find_one_and_update(
-            {
-                "conversation_id": conversation_id,
-                "$or": [
-                    {"assigned_agent": {"$exists": False}},
-                    {"assigned_agent": None}
-                ],
-                "status": "open"
-            },
-            {
-                "$set": {
-                    "assigned_agent": {
-                        "id": agent_id,
-                        "username": agent_username,
-                        "assigned_at": now
+        assigned_convo = None
+        if await can_claim_conversation_ownership(org_id, agent_id, role):
+            assigned_convo = convo_collection.find_one_and_update(
+                {
+                    "conversation_id": conversation_id,
+                    "$or": [
+                        {"assigned_agent": {"$exists": False}},
+                        {"assigned_agent": None}
+                    ],
+                    "status": "open"
+                },
+                {
+                    "$set": {
+                        "assigned_agent": {
+                            "id": agent_id,
+                            "username": agent_username,
+                            "assigned_at": now
+                        }
+                    },
+                    "$push": {
+                        "assignment_history": {
+                            "id": agent_id,
+                            "username": agent_username,
+                            "assigned_at": now
+                        }
                     }
                 },
-                "$push": {
-                    "assignment_history": {
-                        "id": agent_id,
-                        "username": agent_username,
-                        "assigned_at": now
-                    }
-                }
-            },
-            projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0},
-            return_document=ReturnDocument.AFTER
-        )
+                projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0},
+                return_document=ReturnDocument.AFTER
+            )
 
         if assigned_convo is None:
             assigned_convo = convo_collection.find_one(
                 {"conversation_id": conversation_id},
                 projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0}
-            )
-
-        if not assigned_convo or assigned_convo.get("type") != "team":
-            convo_collection.update_one(
-                {"conversation_id": conversation_id},
-                {"$set": {"unread_count": 0}}
             )
 
         # Parse compound cursor
@@ -369,6 +851,113 @@ async def fetch_messages(
     except Exception as e:
         logger.error(f"Error fetching messages for {conversation_id} of org {org_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch messages: {str(e)}")
+
+
+async def acknowledge_conversation_opened(org_id: str, conversation_id: str, observed_counter: int) -> dict:
+    result = await get_async_mongo_db()[f"conversations_{org_id}"].update_one(
+        {
+            "conversation_id": conversation_id,
+            "$expr": {"$eq": [{"$ifNull": ["$message_counter", 0]}, observed_counter]},
+        },
+        {"$set": {"unread_count": 0}},
+    )
+    return {"status": "ok", "acknowledged": result.matched_count > 0}
+
+
+async def search_conversation_messages(
+    org_id: str,
+    conversation_id: str,
+    query: str,
+    limit: int = 50,
+) -> Dict:
+    clean_query = query.strip()
+    if len(clean_query) < 3:
+        return {"matches": []}
+    await ensure_conversation_search_indexes(org_id)
+    collection = get_async_mongo_db()[f"messages_{org_id}"]
+    projection = {"_id": 0, "id": 1, "message_id": 1, "content": 1, "timestamp": 1, "role": 1, "type": 1}
+    rows = await collection.find(
+        {"conversation_id": conversation_id, "$text": {"$search": clean_query}},
+        projection,
+    ).sort("timestamp", 1).limit(limit).to_list(length=limit)
+    return {
+        "matches": [
+            {
+                "message_id": str(row.get("id") or row.get("message_id") or ""),
+                "timestamp": serialize_mongo(row.get("timestamp")),
+                "snippet": _search_snippet(row.get("content"), clean_query),
+                "sender": row.get("role"),
+                "type": row.get("type"),
+            }
+            for row in rows
+            if row.get("id") or row.get("message_id")
+        ]
+    }
+
+
+async def fetch_message_context(
+    org_id: str,
+    conversation_id: str,
+    message_id: str,
+    radius: int = 15,
+) -> Dict:
+    collection = get_async_mongo_db()[f"messages_{org_id}"]
+    projection = {
+        "_id": 0,
+        "id": 1,
+        "message_id": 1,
+        "conversation_id": 1,
+        "content": 1,
+        "timestamp": 1,
+        "role": 1,
+        "type": 1,
+        "payload": 1,
+        "context": 1,
+        "status": 1,
+        "sender_name": 1,
+    }
+    target = await collection.find_one(
+        {
+            "conversation_id": conversation_id,
+            "$or": [{"id": message_id}, {"message_id": message_id}],
+        },
+        projection,
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Message not found in this conversation")
+    timestamp = target.get("timestamp")
+    if timestamp is None:
+        return {"messages": [serialize_mongo(target)]}
+
+    target_id = str(target.get("id") or target.get("message_id") or message_id)
+    common = {"conversation_id": conversation_id}
+    older_boundary = {"$or": [
+        {"timestamp": {"$lt": timestamp}},
+        {"timestamp": timestamp, "$or": [
+            {"id": {"$lt": target_id}},
+            {"id": {"$exists": False}, "message_id": {"$lt": target_id}},
+        ]},
+    ]}
+    newer_boundary = {"$or": [
+        {"timestamp": {"$gt": timestamp}},
+        {"timestamp": timestamp, "$or": [
+            {"id": {"$gt": target_id}},
+            {"id": {"$exists": False}, "message_id": {"$gt": target_id}},
+        ]},
+    ]}
+    older = await collection.find(
+        {"$and": [common, older_boundary]}, projection
+    ).sort([("timestamp", -1), ("id", -1), ("message_id", -1)]).limit(radius).to_list(length=radius)
+    newer = await collection.find(
+        {"$and": [common, newer_boundary]}, projection
+    ).sort([("timestamp", 1), ("id", 1), ("message_id", 1)]).limit(radius).to_list(length=radius)
+    messages = [*reversed(older), target, *newer]
+    normalized = []
+    for message in messages:
+        item = serialize_mongo(message)
+        item["id"] = str(item.get("id") or item.get("message_id") or "")
+        normalized.append(item)
+    return {"messages": normalized}
 
 async def close_conversation(org_id: str, conversation_id: str, reason: str):
     """
@@ -584,20 +1173,34 @@ async def delete_private_note(org_id: str, note_id: str) -> bool:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting private note: {str(e)}")
 
-async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, sender_name: Optional[str] = "Agent", file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None):
+async def send_message(org_id: str, platform: str, conversation_id: str, content: str, mode:str, sender_name: Optional[str] = "Agent", file: Optional[any] = None, temp_id: Optional[str] = None, context_type: Optional[str] = None, context: Optional[dict] = None, timestamp: Optional[str] = None, media_kind: Optional[str] = None, duration_ms: Optional[int] = None):
     """
     Sends a message to the specified conversation on the given platform.
     """
     res = {"status": "no_action"}
 
-    if platform == "whatsapp":
+    conversation = None
+    if platform in {"whatsapp", "instagram"}:
+        conversation = db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+        stored_platform = (conversation or {}).get("platform") or conversation_id.split("_", 1)[0]
+        if not conversation or stored_platform != platform:
+            raise HTTPException(status_code=404, detail="Conversation not found for this organization and channel")
 
-        wa_id = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}).get("wa_id")
+    if platform == "whatsapp":
+        wa_id = conversation.get("whatsapp_id")
+        recipient_id = conversation.get("customer_id")
+        if not wa_id or not recipient_id:
+            raise HTTPException(status_code=422, detail="This WhatsApp conversation has no connected sender or customer")
+        connection = db.whatsapp_connections.find_one({
+            "org_id": org_id,
+            "wa_id": wa_id,
+            "is_active": {"$ne": False},
+        }, {"_id": 1})
+        if not connection:
+            raise HTTPException(status_code=409, detail="The WhatsApp number for this conversation is not connected")
 
         if file:
-            recipient_id = conversation_id.replace("whatsapp_", "")
-            
-            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name)
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name, media_kind, duration_ms)
 
             if res.get("error"):
                 raise HTTPException(
@@ -611,7 +1214,6 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                 import json
                 content_data = json.loads(content)
                 if isinstance(content_data, dict) and "name" in content_data and "language" in content_data:
-                    recipient_id = conversation_id.replace("whatsapp_", "")
                     res = await send_whatsapp_template_message(
                         recipient_id=recipient_id,
                         template=content_data,
@@ -642,26 +1244,68 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         return res
     
     elif platform == "instagram":
-        ig_id = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}).get("ig_id")
+        ig_id = conversation.get("instagram_id")
+        if not ig_id:
+            raise HTTPException(status_code=422, detail="This Instagram conversation has no connected sender")
+        connection = db.instagram_connections.find_one({
+            "org_id": org_id,
+            "instagram_id": ig_id,
+            "is_active": True,
+        }, {"_id": 1})
+        if not connection:
+            raise HTTPException(status_code=409, detail="The Instagram account for this conversation is not connected")
+        if not conversation or not conversation.get("customer_id"):
+            raise HTTPException(status_code=404, detail="Instagram conversation not found")
+        recipient = conversation["customer_id"]
 
-        recipient = db[f"conversations_{org_id}"].find_one(
-            {"conversation_id": conversation_id},
-            {"customer_id": 1}
-        ).get("customer_id")
-
-
+        media_result = None
         if file:
-            res = await upload_and_send_ig_media_message(recipient, file, ig_id, org_id, mode)
+            media_result = await upload_and_send_ig_media_message(
+                recipient,
+                file,
+                ig_id,
+                org_id,
+                mode,
+                temp_id=temp_id,
+                conversation_id=conversation_id,
+                sender_name=sender_name,
+                context_type=context_type,
+                context=context,
+            )
 
-            if res.get("error"):
+            if not isinstance(media_result, dict) or not media_result.get("success") or not media_result.get("message_id"):
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Failed to send media message: {res['error']}"
+                    detail=f"Failed to send media message: {media_result.get('error', 'Instagram did not confirm the message') if isinstance(media_result, dict) else 'Invalid response'}"
                 )
-        
-        if content :
-            res = await send_ig_message(recipient, content, ig_id, mode, org_id)
-        return res
+        if content:
+            text_result = await send_ig_message(
+                recipient,
+                content,
+                ig_id,
+                mode,
+                org_id,
+                temp_id=f"{temp_id}:caption" if file and temp_id else temp_id,
+                conversation_id=conversation_id,
+                sender_name=sender_name,
+                context_type=context_type,
+                context=context,
+            )
+            if not isinstance(text_result, dict) or not text_result.get("success") or not text_result.get("message_id"):
+                if media_result:
+                    return {
+                        **media_result,
+                        "partial_success": True,
+                        "caption_error": text_result.get("error", "Instagram did not confirm the caption") if isinstance(text_result, dict) else "Invalid response",
+                    }
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to send Instagram message: {text_result.get('error', 'Instagram did not confirm the message') if isinstance(text_result, dict) else 'Invalid response'}"
+                )
+            if media_result:
+                return {**media_result, "caption": text_result}
+            return text_result
+        return media_result or res
     
     elif platform == "internal":
         participants = []

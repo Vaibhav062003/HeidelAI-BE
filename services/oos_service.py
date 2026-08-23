@@ -74,7 +74,40 @@ async def fetch_dealer_directory(org_id: str, sheet_id: Optional[str] = None, ta
 
 def generate_dealer_message(oos_doc: dict) -> str:
     """Generate the formatted inquiry message to send to dealers."""
-    return oos_doc.get("raw_query_text", "")
+    attrs = oos_doc.get("extracted_attributes", {})
+    parts = []
+    if attrs.get("category"):
+        parts.append(f"Category: {attrs['category'].strip().title()}")
+    if attrs.get("brand"):
+        parts.append(f"Brand: {attrs['brand'].strip().upper()}")
+    if attrs.get("model_name"):
+        parts.append(f"Model: {attrs['model_name'].strip()}")
+
+    specs = attrs.get("specs", {})
+    if specs:
+        for k, v in specs.items():
+            if v is None:
+                continue
+            label = k.replace("_", " ").title()
+            if label.lower() == "ram gb":
+                label, v = "RAM", f"{v}GB"
+            elif label.lower() == "storage gb":
+                label, v = "Storage", f"{v}GB"
+            elif label.lower() == "budget max":
+                label = "Max Budget"
+                try:
+                    v = f"Rs. {float(v):,.0f}"
+                except (ValueError, TypeError):
+                    v = f"Rs. {v}"
+            parts.append(f"{label}: {v}")
+
+    spec_summary = "\n".join(f"  - {p}" for p in parts)
+    raw_query = oos_doc.get("raw_query_text", "")
+
+    message = f"Query: \"{raw_query}\""
+    if parts:
+        message += f"\nSpecifications:\n{spec_summary}"
+    return message
 
 
 async def send_oos_to_dealers(oos_doc: dict, org_id: str):
@@ -113,18 +146,33 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     logger.info(f"[OOS] Fetching dealers from directory for org {org_id}...")
     all_dealers = await fetch_dealer_directory(org_id)
 
-    # Filter by brand if known
+    # Filter by brand if known or detected in raw query
+    raw_query = (oos_doc.get("raw_query_text", "") or "").lower()
+    known_brands = ["lenovo", "asus", "dell", "msi", "hp", "apple", "mac", "macbook", "acer", "samsung", "gigabyte"]
+    detected_brand = None
     if brand:
-        brand_lower = brand.strip().lower()
-        target_dealers = [
-            d for d in all_dealers
-            if brand_lower in [b.strip().lower() for b in d.get("brands", "").split(",")]
-        ]
-        logger.info(f"[OOS] Filtered {len(all_dealers)} dealers down to {len(target_dealers)} dealers matching brand='{brand}'")
+        detected_brand = brand.strip().lower()
+    else:
+        for kb in known_brands:
+            if kb in raw_query:
+                detected_brand = kb
+                break
+
+    if detected_brand in ("mac", "macbook", "apple"):
+        brand_search_terms = ["apple", "mac", "macbook"]
+    else:
+        brand_search_terms = [detected_brand] if detected_brand else []
+
+    if detected_brand:
+        target_dealers = []
+        for d in all_dealers:
+            dealer_brands = [b.strip().lower() for b in d.get("brands", "").split(",")]
+            if any(term in dealer_brands for term in brand_search_terms):
+                target_dealers.append(d)
+        logger.info(f"[OOS] Filtered {len(all_dealers)} dealers down to {len(target_dealers)} dealers matching brand='{detected_brand}' (search terms={brand_search_terms})")
         
         # Lenovo specific consumer / commercial sub-filtering
-        if brand_lower == "lenovo":
-            raw_query = (oos_doc.get("raw_query_text", "") or "").lower()
+        if detected_brand == "lenovo":
             model_name = (oos_doc.get("extracted_attributes", {}).get("model_name", "") or "").lower()
             
             # Map keywords to their target dealer categories
@@ -165,11 +213,37 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     target_dealers = target_dealers[:MAX_DEALERS_PER_SEND]
 
     if not target_dealers:
-        logger.warning(f"[OOS] No dealers found to contact for query_id={oos_doc['query_id']}. Transitioning status to 'no_dealers'")
+        logger.warning(f"[OOS] No matching dealers found for brand/category in query_id={oos_doc['query_id']}. Creating escalation and setting status to 'no_dealers'")
         await async_db["oos_requests"].update_one(
             {"query_id": oos_doc["query_id"]},
             {"$set": {"status": "no_dealers"}}
         )
+        # Escalation to team when no matching dealer exists in dealer_directory
+        from services.team_service import create_ai_escalation
+        inquiry_time = oos_doc.get("created_at", "")
+        if isinstance(inquiry_time, datetime):
+            inquiry_time = inquiry_time.astimezone(IST).strftime("%H:%M %d-%b-%Y")
+
+        escalation_text = (
+            f"Customer Number: {oos_doc.get('customer_number', 'N/A')}\n"
+            f"Customer Inquiry: {oos_doc.get('raw_query_text', 'N/A')}\n"
+            f"Inquiry Time: {inquiry_time}\n"
+            f"Status: ESCALATED - No dealer found matching brand '{detected_brand or 'N/A'}' or requested category in dealer directory.\n"
+        )
+
+        await create_ai_escalation(org_id, {
+            "user_name": oos_doc.get("customer_name", "Customer"),
+            "customer_number": oos_doc.get("customer_number", ""),
+            "customer_text": escalation_text,
+            "inferred_intent": "no_dealer_found",
+            "status": "pending_human_review",
+            "role": "oos_no_dealer",
+            "sender_name": "OOS System",
+            "metadata": {
+                "oos_query_id": oos_doc.get("query_id"),
+                "detected_brand": detected_brand,
+            }
+        })
         return
 
     # Generate dealer message
@@ -251,7 +325,14 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         logger.error(f"[OOS] Failed to contact any dealers for query_id={oos_doc['query_id']}. Status set to 'send_failed'")
 
 
-async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, message_context: Optional[dict] = None) -> bool:
+async def handle_dealer_reply(
+    org_id: str,
+    dealer_phone: str,
+    content: str,
+    message_context: Optional[dict] = None,
+    create_escalation: bool = True,
+    source_message_id: Optional[str] = None,
+) -> bool:
     """
     Check if an incoming WhatsApp message is a dealer replying to an OOS request.
     Handles the case where customer and dealer are the SAME phone number.
@@ -266,13 +347,20 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
 
     replied_message_id = message_context.get("id") if message_context else None
 
-    logger.info(f"[OOS] handle_dealer_reply invoked for dealer_phone={dealer_phone}, content='{content}', replied_message_id={replied_message_id}")
+    logger.info(
+        f"[OOS] handle_dealer_reply invoked for dealer=...{dealer_phone[-4:]}, "
+        f"content_length={len(content or '')}, replied_message_id={replied_message_id}"
+    )
 
     # Statuses where we expect dealer replies (only after message was actually sent)
     active_statuses = ["dealers_contacted", "partial_replies", "sending"]
 
-    # Try matching by message_id first
+    from services.pricing_service import is_pricing_enabled, is_supplier_response
+
+    supplier_response = is_supplier_response(content)
     oos_doc = None
+    # Exact reply-to correlation establishes the supplier role; prose heuristics
+    # are only needed for the broader phone fallbacks.
     if replied_message_id:
         logger.info(f"[OOS] Attempting match by replied message_id: {replied_message_id}")
         oos_doc = await oos_col.find_one({
@@ -283,35 +371,26 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
         if oos_doc:
             logger.success(f"[OOS] Match succeeded by message_id {replied_message_id} for query_id={oos_doc['query_id']}")
 
-    # Then by dealer phone in sent_dealers
-    if not oos_doc:
-        logger.info(f"[OOS] Attempting match by dealer phone number: {dealer_phone}")
-        oos_doc = await oos_col.find_one(
+    # Phone-only replies are safe only when exactly one active request matches.
+    allow_phone_fallback = not is_pricing_enabled(org_id) or supplier_response
+    if not oos_doc and allow_phone_fallback:
+        logger.info(f"[OOS] Attempting unique match by dealer phone number: {dealer_phone}")
+        matches = await oos_col.find(
             {
                 "org_id": org_id,
                 "status": {"$in": active_statuses},
-                "sent_dealers.dealer_phone": dealer_phone
+                "$or": [
+                    {"sent_dealers.dealer_phone": dealer_phone},
+                    {"target_dealers.phone": dealer_phone},
+                ],
             },
-            sort=[("created_at", -1)]
-        )
-        if oos_doc:
-            logger.success(f"[OOS] Match succeeded by dealer_phone {dealer_phone} for query_id={oos_doc['query_id']}")
-
-    # Also check if this phone is in target_dealers (covers the case where
-    # the same number is both customer and dealer — message was sent to them
-    # and they reply in the same thread before status transitions)
-    if not oos_doc:
-        logger.info(f"[OOS] Attempting match by target_dealers fallback: {dealer_phone}")
-        oos_doc = await oos_col.find_one(
-            {
-                "org_id": org_id,
-                "status": {"$in": active_statuses},
-                "target_dealers.phone": dealer_phone
-            },
-            sort=[("created_at", -1)]
-        )
-        if oos_doc:
-            logger.success(f"[OOS] Match succeeded by target_dealers fallback for phone {dealer_phone}, query_id={oos_doc['query_id']}")
+        ).sort("created_at", -1).limit(2).to_list(length=2)
+        if len(matches) == 1:
+            oos_doc = matches[0]
+            logger.success(f"[OOS] Unique phone match succeeded for query_id={oos_doc['query_id']}")
+        elif len(matches) > 1:
+            logger.warning(f"[OOS] Ambiguous phone-only reply for dealer=...{dealer_phone[-4:]}; not assigning it")
+            return False
 
     if not oos_doc:
         logger.info(f"[OOS] No active OOS request matched for dealer_phone={dealer_phone}. Falling back to normal chatbot agent.")
@@ -328,15 +407,23 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
         "dealer_phone": dealer_phone,
         "dealer_name": dealer_name,
         "content": content,
+        "source_message_id": source_message_id,
         "replied_at": datetime.now(timezone.utc),
+        "steps": {
+            "pricing": "pending",
+            "sheet": "pending",
+            "escalation": "pending" if create_escalation else "done",
+        },
     }
 
     # Atomic update: push reply and set status in one op
     # Accept any active status (covers race where reply arrives while still sending)
     result = await oos_col.update_one(
         {
+            "org_id": org_id,
             "query_id": oos_doc["query_id"],
-            "status": {"$in": active_statuses}
+            "status": {"$in": active_statuses},
+            **({"dealer_replies.source_message_id": {"$ne": source_message_id}} if source_message_id else {}),
         },
         {
             "$push": {"dealer_replies": reply_entry},
@@ -345,27 +432,152 @@ async def handle_dealer_reply(org_id: str, dealer_phone: str, content: str, mess
     )
 
     if result.modified_count == 0:
+        existing = source_message_id and await oos_col.find_one(
+            {
+                "org_id": org_id,
+                "query_id": oos_doc["query_id"],
+                "dealer_replies.source_message_id": source_message_id,
+            },
+        )
+        if existing:
+            oos_doc = existing
+            reply_entry = next(
+                reply
+                for reply in oos_doc.get("dealer_replies", [])
+                if reply.get("source_message_id") == source_message_id
+            )
+            await _complete_dealer_reply_steps(org_id, oos_doc, reply_entry)
+            return True
         logger.warning(f"[OOS] Could not append reply for query_id={oos_doc['query_id']}, status may have changed")
         return False
 
     logger.success(f"[OOS] Dealer reply successfully logged in MongoDB. dealer={dealer_name} ({dealer_phone}), query_id={oos_doc['query_id']}")
 
-    # Log response to Google Sheet (non-blocking, don't fail the reply flow)
-    try:
-        await log_dealer_response_to_sheet(org_id, oos_doc, dealer_name, dealer_phone, content)
-    except Exception as e:
-        logger.error(f"[OOS] Sheet logging failed: {e}")
-
-    # Create AI escalation with full context
-    try:
-        await create_oos_escalation(org_id, oos_doc, reply_entry)
-    except Exception as e:
-        logger.error(f"[OOS] Escalation creation failed: {e}")
-
+    await _complete_dealer_reply_steps(org_id, oos_doc, reply_entry)
     return True
 
 
-async def log_dealer_response_to_sheet(org_id: str, oos_doc: dict, dealer_name: str, dealer_phone: str, response_text: str):
+async def _complete_dealer_reply_steps(org_id: str, oos_doc: dict, reply: dict) -> None:
+    """Resume the idempotent work attached to one stored dealer reply."""
+    source_message_id = reply.get("source_message_id")
+    if not source_message_id:
+        return
+    collection = get_async_mongo_db()["oos_requests"]
+
+    async def claim(step: str) -> bool:
+        now = datetime.now(timezone.utc)
+        status_key = f"steps.{step}"
+        claim_key = f"step_claimed_at.{step}"
+        try:
+            result = await collection.update_one(
+                {
+                    "org_id": org_id,
+                    "query_id": oos_doc["query_id"],
+                    "dealer_replies": {
+                        "$elemMatch": {
+                            "source_message_id": source_message_id,
+                            "$or": [
+                                {status_key: {"$in": ["pending", "failed"]}},
+                                {status_key: {"$exists": False}},
+                                {
+                                    status_key: "processing",
+                                    claim_key: {"$lt": now - timedelta(minutes=5)},
+                                },
+                            ],
+                        }
+                    },
+                },
+                {
+                    "$set": {
+                        f"dealer_replies.$.{status_key}": "processing",
+                        f"dealer_replies.$.{claim_key}": now,
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.error(f"[OOS] Could not claim {step} reply work: {exc}")
+            return False
+        if result.modified_count == 1:
+            reply.setdefault("steps", {})[step] = "processing"
+            return True
+        return False
+
+    async def mark(step: str, status: str) -> None:
+        try:
+            result = await collection.update_one(
+                {
+                    "org_id": org_id,
+                    "query_id": oos_doc["query_id"],
+                    "dealer_replies": {
+                        "$elemMatch": {
+                            "source_message_id": source_message_id,
+                            f"steps.{step}": "processing",
+                        }
+                    },
+                },
+                {
+                    "$set": {f"dealer_replies.$.steps.{step}": status},
+                    "$unset": {f"dealer_replies.$.step_claimed_at.{step}": ""},
+                },
+            )
+        except Exception as exc:
+            logger.error(f"[OOS] Could not finish {step} reply work: {exc}")
+            return
+        if result.modified_count == 1:
+            reply.setdefault("steps", {})[step] = status
+
+    steps = reply.setdefault("steps", {})
+    if steps.get("pricing") != "done" and await claim("pricing"):
+        try:
+            from services.pricing_service import record_oos_supplier_reply
+
+            await record_oos_supplier_reply(
+                org_id=org_id,
+                dealer_phone=reply.get("dealer_phone", ""),
+                content=reply.get("content", ""),
+                source_message_id=source_message_id,
+                oos_doc=oos_doc,
+            )
+        except Exception as exc:
+            logger.error(f"[OOS] Pricing observation failed: {exc}")
+            await mark("pricing", "failed")
+        else:
+            await mark("pricing", "done")
+
+    if steps.get("sheet") != "done" and await claim("sheet"):
+        try:
+            await log_dealer_response_to_sheet(
+                org_id,
+                oos_doc,
+                reply.get("dealer_name", ""),
+                reply.get("dealer_phone", ""),
+                reply.get("content", ""),
+                source_message_id,
+            )
+        except Exception as exc:
+            logger.error(f"[OOS] Sheet logging failed: {exc}")
+            await mark("sheet", "failed")
+        else:
+            await mark("sheet", "done")
+
+    if steps.get("escalation") != "done" and await claim("escalation"):
+        try:
+            await create_oos_escalation(org_id, oos_doc, reply)
+        except Exception as exc:
+            logger.error(f"[OOS] Escalation creation failed: {exc}")
+            await mark("escalation", "failed")
+        else:
+            await mark("escalation", "done")
+
+
+async def log_dealer_response_to_sheet(
+    org_id: str,
+    oos_doc: dict,
+    dealer_name: str,
+    dealer_phone: str,
+    response_text: str,
+    source_message_id: str,
+):
     """Append a row to the Dealer Responses Google Sheet."""
     from api.google_sheets_routes import refresh_google_token
 
@@ -385,7 +597,7 @@ async def log_dealer_response_to_sheet(org_id: str, oos_doc: dict, dealer_name: 
         access_token = await refresh_google_token(org_id)
     except Exception as e:
         logger.error(f"[OOS] Token refresh failed for response logging: {e}")
-        return
+        raise
 
     now_ist = datetime.now(IST)
     valid_until = now_ist + timedelta(hours=OOS_TTL_HOURS)
@@ -400,23 +612,32 @@ async def log_dealer_response_to_sheet(org_id: str, oos_doc: dict, dealer_name: 
         _sanitize_for_sheet(response_text),
         "",  # price — human fills
         valid_until.strftime("%Y-%m-%d %H:%M"),
+        source_message_id,
     ]
 
     encoded_tab = urllib.parse.quote(response_tab, safe="")
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{response_sheet_id}"
-        f"/values/{encoded_tab}!A:H:append"
+        f"/values/{encoded_tab}!A:I:append"
         f"?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
     )
 
     async with httpx.AsyncClient(timeout=15) as client:
+        existing = await client.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{response_sheet_id}/values/{encoded_tab}!I:I",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if existing.status_code != 200:
+            raise RuntimeError(f"OOS Sheet idempotency lookup failed: {existing.status_code}")
+        if any(row and row[0] == source_message_id for row in existing.json().get("values", [])):
+            return
         resp = await client.post(
             url,
             headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
             json={"values": [row_data]}
         )
         if resp.status_code not in (200, 201):
-            logger.error(f"[OOS] Sheet append failed: {resp.status_code}")
+            raise RuntimeError(f"OOS Sheet append failed: {resp.status_code}")
 
 
 async def create_oos_escalation(org_id: str, oos_doc: dict, new_reply: dict):
@@ -428,7 +649,12 @@ async def create_oos_escalation(org_id: str, oos_doc: dict, new_reply: dict):
     from services.team_service import create_ai_escalation
 
     # oos_doc is from before the $push, so we manually append new_reply
-    all_replies = oos_doc.get("dealer_replies", []) + [new_reply]
+    all_replies = list(oos_doc.get("dealer_replies", []))
+    if not any(
+        reply.get("source_message_id") == new_reply.get("source_message_id")
+        for reply in all_replies
+    ):
+        all_replies.append(new_reply)
 
     dealer_lines = []
     for reply in all_replies:
@@ -459,6 +685,7 @@ async def create_oos_escalation(org_id: str, oos_doc: dict, new_reply: dict):
     )
 
     await create_ai_escalation(org_id, {
+        "id": f"oos:{oos_doc.get('query_id')}:{new_reply.get('source_message_id')}",
         "user_name": oos_doc.get("customer_name", "Customer"),
         "customer_number": oos_doc.get("customer_number", ""),
         "customer_text": escalation_text,
@@ -475,6 +702,34 @@ async def create_oos_escalation(org_id: str, oos_doc: dict, new_reply: dict):
             "total_dealers_contacted": len(oos_doc.get("sent_dealers", [])),
         }
     })
+
+
+async def process_pending_oos_reply_steps() -> None:
+    """Retry stored dealer-reply side effects after a transient failure or restart."""
+    cursor = get_async_mongo_db()["oos_requests"].find(
+        {
+            "dealer_replies": {
+                "$elemMatch": {
+                    "source_message_id": {"$exists": True, "$ne": None},
+                    "$or": [
+                        {"steps.pricing": {"$ne": "done"}},
+                        {"steps.sheet": {"$ne": "done"}},
+                        {"steps.escalation": {"$ne": "done"}},
+                    ],
+                }
+            }
+        }
+    ).limit(50)
+    async for document in cursor:
+        org_id = document.get("org_id")
+        if not org_id:
+            continue
+        for reply in document.get("dealer_replies", []):
+            steps = reply.get("steps") or {}
+            if reply.get("source_message_id") and any(
+                steps.get(step) != "done" for step in ("pricing", "sheet", "escalation")
+            ):
+                await _complete_dealer_reply_steps(org_id, document, reply)
 
 
 async def process_pending_oos_sends():

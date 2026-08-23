@@ -7,6 +7,48 @@ from loguru import logger
 
 db = get_mongo_db()
 
+
+async def _eligible_conversation_clients(client_ids, conversation_id: str | None):
+    if not conversation_id:
+        return set(client_ids)
+    from services.work_team_service import can_user_access_conversation, list_work_teams
+    allowed_clients = set()
+    clients_by_org = {}
+    for client_id in client_ids:
+        org_id = services.client_metadata.get(client_id, {}).get("org_id")
+        if org_id:
+            clients_by_org.setdefault(org_id, []).append(client_id)
+    async_db = get_async_mongo_db()
+    for org_id, org_client_ids in clients_by_org.items():
+        conversation = await async_db[f"conversations_{org_id}"].find_one(
+            {"conversation_id": conversation_id}
+        )
+        if not conversation:
+            continue
+        teams = await list_work_teams(org_id)
+        for client_id in org_client_ids:
+            meta = services.client_metadata.get(client_id, {})
+            if can_user_access_conversation(
+                meta.get("user_id") or "", meta.get("role") or "org:member", conversation, teams
+            ):
+                allowed_clients.add(client_id)
+    return allowed_clients
+
+
+async def latest_unread_whatsapp_message_id(org_id: str, conversation_id: str) -> str | None:
+    async_db = get_async_mongo_db()
+    message = await async_db[f"messages_{org_id}"].find_one(
+        {
+            "role": "customer",
+            "status": {"$ne": "read"},
+            "platform": "whatsapp",
+            "conversation_id": conversation_id,
+        },
+        {"message_id": 1, "_id": 0},
+        sort=[("timestamp", -1)],
+    )
+    return message.get("message_id") if message else None
+
 async def cleanup_client(client_id: str):
     """
     Clean up all references to a disconnected client.
@@ -78,6 +120,19 @@ async def handle_typing_event(client_id: str, data: dict):
     # Which platform is this typing event for?
     platform = data.get("platform")  # "instagram" or "whatsapp"
 
+    conversation_id = data.get("conversation_id")
+    org_id = meta.get("org_id")
+    if not conversation_id or not org_id:
+        return
+    from services.work_team_service import require_conversation_access
+    await require_conversation_access(
+        org_id, conversation_id, meta.get("user_id") or "", meta.get("role") or "org:member"
+    )
+    is_active_viewer = services.client_convo_map.get(client_id) == (org_id, conversation_id)
+    message_id = None
+    if platform == "whatsapp" and wa_id and data.get("is_typing") is True and is_active_viewer:
+        message_id = await latest_unread_whatsapp_message_id(org_id, conversation_id)
+
     # Broadcast to Instagram
     if platform == "instagram" and ig_id:
         await broadcast_main_ws(
@@ -97,13 +152,13 @@ async def handle_typing_event(client_id: str, data: dict):
             payload=data,
             exclude_client_id=client_id 
         )
-        
-        from services.wa_service import read_message_and_typing_indicator
-        asyncio.create_task(read_message_and_typing_indicator(
-            mode="platform",
-            whatsapp_id=wa_id,
-            conversation_id=data.get("conversation_id"),
-        ))
+
+        if message_id and services.client_convo_map.get(client_id) == (org_id, conversation_id):
+            from services.wa_service import read_message_and_typing_indicator
+            asyncio.create_task(read_message_and_typing_indicator(
+                whatsapp_id=wa_id,
+                message_id=message_id,
+            ))
 
 async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: str, payload: dict, exclude_client_id: str = None):
     """
@@ -123,6 +178,10 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
         target_map = services.whatsapp_clients
 
     client_ids = target_map.get(platform_id, [])
+    if not client_ids:
+        return
+
+    client_ids = await _eligible_conversation_clients(client_ids, payload.get("conversation_id"))
     if not client_ids:
         return
 
@@ -198,6 +257,11 @@ async def handle_unread_event(org_id: str, client_id: str, data: dict):
         logger.error(f"Invalid unread event data from {client_id}: {data}")
         return
 
+    from services.work_team_service import require_conversation_access
+    await require_conversation_access(
+        org_id, conversation_id, meta.get("user_id") or "", meta.get("role") or "org:member"
+    )
+
     if event_type == "join_conversation":
         join_conversation_presence(org_id, conversation_id, client_id)
     elif event_type == "leave_conversation":
@@ -224,6 +288,17 @@ def join_conversation_presence(org_id: str, conversation_id: str, client_id: str
     Adds a client to the presence tracker for a specific conversation,
     indexed by org for fast org-scoped lookups.
     """
+    previous = services.client_convo_map.get(client_id)
+    if previous and previous != (org_id, conversation_id):
+        previous_org, previous_conversation = previous
+        previous_viewers = services.org_convo_viewers.get(previous_org, {}).get(previous_conversation)
+        if previous_viewers:
+            previous_viewers.discard(client_id)
+            if not previous_viewers:
+                del services.org_convo_viewers[previous_org][previous_conversation]
+                if not services.org_convo_viewers[previous_org]:
+                    del services.org_convo_viewers[previous_org]
+
     services.org_convo_viewers[org_id][conversation_id].add(client_id)
     services.client_convo_map[client_id] = (org_id, conversation_id)
     logger.info(f"Client {client_id} JOINED conversation ({org_id}, {conversation_id})")
@@ -242,7 +317,8 @@ def leave_conversation_presence(org_id: str, conversation_id: str, client_id: st
             if not services.org_convo_viewers[org_id]:
                 del services.org_convo_viewers[org_id]
 
-    services.client_convo_map.pop(client_id, None)
+    if services.client_convo_map.get(client_id) == (org_id, conversation_id):
+        services.client_convo_map.pop(client_id, None)
     logger.info(f"Client {client_id} LEFT conversation ({org_id}, {conversation_id})")
 
 
@@ -267,7 +343,9 @@ async def broadcast_org_ws(org_id: str, event_type: str, payload: dict, exclude_
     """
     Broadcast an event to every client connected under the same org, excluding the sender.
     """
-    client_ids = services.org_clients.get(org_id, set())
+    client_ids = await _eligible_conversation_clients(
+        services.org_clients.get(org_id, set()), payload.get("conversation_id")
+    )
 
     disconnected_clients = []
 
@@ -288,6 +366,20 @@ async def broadcast_org_ws(org_id: str, event_type: str, payload: dict, exclude_
         services.org_clients[org_id].discard(client_id)
         services.active_clients.pop(client_id, None)
         services.client_metadata.pop(client_id, None)
+
+
+async def broadcast_org_admin_ws(org_id: str, event_type: str, payload: dict):
+    """Broadcast an organization event only to its administrators."""
+    safe_payload = jsonable_encoder(payload)
+    for client_id in list(services.org_clients.get(org_id, set())):
+        if services.client_metadata.get(client_id, {}).get("role") not in {"admin", "org:admin"}:
+            continue
+        websocket = services.active_clients.get(client_id)
+        if websocket:
+            try:
+                await websocket.send_json({"type": event_type, "data": safe_payload})
+            except Exception:
+                logger.error(f"Failed to send {event_type} to an organization administrator")
 
 async def broadcast_on_stats_update(
     org_id: str, 
@@ -426,3 +518,27 @@ async def broadcast_ai_escalation(org_id: str, payload: dict):
                 logger.error(f"Failed to send escalation to {client_id}: {e}")
         else:
             logger.warning(f"WebSocket not found for active client {client_id}")
+
+async def send_to_user(user_id: str, payload: dict, org_id: str | None = None):
+    """
+    Sends a WebSocket notification payload directly to all active connection channels of a user.
+    """
+    if user_id in services.agent_clients:
+        # Auto-wrap payload to ensure it matches the {type, data} format expected by frontend
+        ws_payload = payload
+        if "type" in payload and "data" not in payload:
+            ws_payload = {
+                "type": payload["type"],
+                "data": {k: v for k, v in payload.items() if k != "type"}
+            }
+
+        safe_payload = jsonable_encoder(ws_payload)
+        for client_id in list(services.agent_clients[user_id]):
+            if org_id and services.client_metadata.get(client_id, {}).get("org_id") != org_id:
+                continue
+            ws = services.active_clients.get(client_id)
+            if ws:
+                try:
+                    await ws.send_json(safe_payload)
+                except Exception as e:
+                    logger.error(f"Failed to send websocket message to user {user_id}: {e}")

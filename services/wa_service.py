@@ -19,9 +19,12 @@ from config.settings import IG_VERSION, VERSION, WA_VERSION, APP_ID
 from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
-from services.scheduler_service import abort_scheduled_message
+from services.followup_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
-from services.utils import normalize_phone
+from services.utils import name_search_prefixes, normalize_phone, phone_search_parts
+from services.push_notification_service import schedule_customer_message_push
+from services.ai_reply_guard import AIProviderUnavailable
+from services.whatsapp_reply_idempotency import ReplyOperationConflict, claim_reply, complete_reply, mark_unknown, record_acceptance, release_claim, start_provider
 # from agents.support_agent.ai_features import analyze_conversation_messages, update_product_recommendations
 from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
@@ -45,6 +48,7 @@ async def create_or_update_whatsapp_conversation(
     is_ad_referral: Optional[bool] = None,
     is_auto_followup: bool = False,
     mode: Optional[str] = None,
+    extra_updates: Optional[dict] = None,
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -68,6 +72,7 @@ async def create_or_update_whatsapp_conversation(
     customer_phone_no = normalize_phone(customer_phone_no)
     
     conversation_id = f"whatsapp_{customer_phone_no}"
+    phone_digits, phone_search_suffixes = phone_search_parts(customer_phone_no)
     now = datetime.now(timezone.utc)
     
     # Get the WhatsApp-specific collection
@@ -116,13 +121,19 @@ async def create_or_update_whatsapp_conversation(
         "conversation_id": conversation_id,
         "whatsapp_id": recipient_id,
         "customer_id": customer_phone_no,
+        "phone_digits": phone_digits,
+        "phone_search_suffixes": phone_search_suffixes,
         "customer_name": final_customer_name,
+        "customer_name_prefixes": name_search_prefixes(final_customer_name),
         "last_message": last_message,
         "last_message_timestamp": now,
         "last_message_is_private_note": mode == "private",
         "last_sender": last_sender,
-        "status": "open",
+        "status": existing_conversation.get("status", "open") if is_auto_followup and existing_conversation else "open",
     }
+    
+    if extra_updates:
+        update_set.update(extra_updates)
     
     if last_sender == "customer":
         update_set["meta_name_verified"] = True
@@ -142,7 +153,7 @@ async def create_or_update_whatsapp_conversation(
     }
 
     # Handle Agent vs Customer logic
-    if existing_conversation:
+    if existing_conversation and not is_auto_followup:
         abort_result = await abort_scheduled_message(org_id, conversation_id)
         logger.success(f"Aborted Scheduled message: {abort_result}")
 
@@ -227,7 +238,8 @@ async def store_whatsapp_message(
     temp_id: Optional[str] = None,
     context_type: Optional[str] = None,
     context: Optional[dict] = None,
-    bot_context: Optional[dict] = None
+    bot_context: Optional[dict] = None,
+    notify_push: bool = False,
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -281,6 +293,17 @@ async def store_whatsapp_message(
     messages_collection.insert_one(message)
 
     logger.success(f"Whatsapp message stored: {message_id}")
+
+    if notify_push and role == MessageRole.CUSTOMER and mode != "private":
+        await schedule_customer_message_push(
+            org_id=org_id,
+            platform="whatsapp",
+            message_id=message_id,
+            conversation_id=conversation_id,
+            sender_name=sender_name,
+            content=content,
+            message_type=type,
+        )
     
     # Keep only latest 500 messages per conversation
     messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
@@ -356,6 +379,42 @@ async def store_whatsapp_message(
     
     return message_id
 
+
+async def update_whatsapp_media_message(
+    org_id: str,
+    message_id: str,
+    payload: dict,
+    recipient_id: str,
+    status: str = "received",
+) -> Optional[str]:
+    """Complete or fail an already-stored incoming media message."""
+    message = db[f"messages_{org_id}"].find_one_and_update(
+        {"message_id": message_id, "platform": "whatsapp"},
+        {"$set": {"payload": payload, "status": status}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not message:
+        logger.error(f"WhatsApp media placeholder missing: {message_id}")
+        return None
+
+    broadcast_message = {
+        key: message.get(key)
+        for key in (
+            "id", "platform", "conversation_id", "content", "sender_id", "role",
+            "status", "sender_name", "type", "temp_id", "payload", "mode",
+            "context_type", "context",
+        )
+    }
+    timestamp = message.get("timestamp")
+    broadcast_message["timestamp"] = timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp
+    await broadcast_main_ws(
+        platform_id=recipient_id,
+        platform_type="whatsapp",
+        event_type="new_message",
+        payload={"message": broadcast_message},
+    )
+    return message_id
+
 # Function to broadcast to WhatsApp-specific connections
 async def broadcast_whatsapp_message(whatsapp_id: str, message_type: str, data: dict):
     """
@@ -406,6 +465,7 @@ async def send_whatsapp_message(
         bot_context: Optional[dict] = None,
         raise_on_partial_failure: bool = False,
         sender_name: Optional[str] = "Agent",
+        is_auto_followup: bool = False,
     ) -> dict:
     """
     Send a message to an Whatsapp user using the appropriate access token
@@ -420,6 +480,10 @@ async def send_whatsapp_message(
         raise_on_partial_failure: If True, raises HTTPException if any message in a multi-message payload fails.
     """
     whatsapp_id = message.get("sender_id")
+    outbound_operation = None
+    provider_started = False
+    quota_event_key = None
+    quota_consumed = False
 
     if not whatsapp_id:
         logger.error("Missing 'sender_id' in outbound WhatsApp message payload")
@@ -427,7 +491,7 @@ async def send_whatsapp_message(
         
     # Query the database to validate the ID
     wa_connection = db.whatsapp_connections.find_one(
-        {"wa_id": whatsapp_id},
+        {"wa_id": whatsapp_id, "org_id": org_id, "is_active": {"$ne": False}},
         {"wa_id": 1, "_id": 0}
     )
     
@@ -442,9 +506,48 @@ async def send_whatsapp_message(
     try:
         conversation_id = message["conversation_id"]
         original_content = message["content"]
+        pricing_source_message_id = message.get("pricing_source_message_id")
+        pricing_guard_active = False
+
+        if mode == "ai":
+            from services.pricing_service import (
+                is_pricing_enabled,
+                validate_ai_pricing_response,
+            )
+
+            pricing_guard_active = is_pricing_enabled(org_id)
+
+            validation_text = (
+                "\n".join(str(part) for part in original_content)
+                if isinstance(original_content, list)
+                else str(original_content)
+            )
+            if pricing_guard_active:
+                try:
+                    valid, reason = await validate_ai_pricing_response(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        source_message_id=pricing_source_message_id,
+                        content=validation_text,
+                    )
+                    if not valid:
+                        logger.warning(
+                            f"Blocked unsafe AI price for org={org_id}, "
+                            f"conversation=...{conversation_id[-6:]}, reason={reason}"
+                        )
+                        raise AIProviderUnavailable(reason, escalation_required=False)
+                except AIProviderUnavailable:
+                    raise
+                except Exception as exc:
+                    logger.error(f"AI pricing validation failed closed for org={org_id}: {exc}")
+                    raise AIProviderUnavailable("catalogue_unavailable") from exc
         
         # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_business_id})
+        connection = db.whatsapp_connections.find_one({
+            "wa_id": whatsapp_business_id,
+            "org_id": org_id,
+            "is_active": {"$ne": False},
+        })
         
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
@@ -460,26 +563,69 @@ async def send_whatsapp_message(
         else:
             contents = [str(original_content)]
 
+        # One bounded provider message lets the existing durable reply claim make AI retries safe.
+        if mode == "ai":
+            joined_content = "\n\n".join(contents)
+            if not joined_content.strip():
+                raise AIProviderUnavailable("empty_response")
+            if len(joined_content) > 4096:
+                raise AIProviderUnavailable("response_too_long")
+            contents = [joined_content]
+
         if not contents:
             logger.warning(f"Empty content provided for WhatsApp message to {recipient_id}")
             return {"message": "No content to send"}
 
+        try:
+            outbound_operation = claim_reply(db.whatsapp_outbound_sends, org_id, temp_id, conversation_id, mode, contents)
+        except ReplyOperationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        if outbound_operation and outbound_operation.get("action") == "replay":
+            return outbound_operation["result"]
+
+        if mode == "ai":
+            from services.ai_policy_service import is_effective_ai_enabled
+            from services.entitlement_service import consume_quota_async
+
+            if not await is_effective_ai_enabled(org_id, conversation_id):
+                raise AIProviderUnavailable("ai_disabled", escalation_required=False)
+            operation_id = str((outbound_operation or {}).get("_id") or temp_id or pricing_source_message_id or conversation_id)
+            quota_event_key = f"ai:{operation_id}"
+            quota = await consume_quota_async(org_id, "AI", "monthly_messages", len(contents), quota_event_key)
+            quota_consumed = not quota.get("duplicate", False)
+
         # Ensure the conversation document exists in the database
-        await create_or_update_whatsapp_conversation(
-            org_id=org_id,
-            recipient_id=whatsapp_business_id,
-            customer_phone_no=recipient_id,
-            customer_name=message.get("customer_name") or recipient_id,
-            last_message=contents[0],
-            last_sender="ai" if mode == "ai" else "agent",
-            mode=mode
-        )
+        if mode != "ai":
+            await create_or_update_whatsapp_conversation(
+                org_id=org_id,
+                recipient_id=whatsapp_business_id,
+                customer_phone_no=recipient_id,
+                customer_name=message.get("customer_name") or recipient_id,
+                last_message=contents[0],
+                last_sender="agent",
+                mode=mode,
+                is_auto_followup=is_auto_followup,
+            )
 
         last_stored_id = None
         all_message_ids = []
 
         # Send each content part as a separate bubble
         for i, content_item in enumerate(contents):
+            if pricing_guard_active:
+                try:
+                    valid, reason = await validate_ai_pricing_response(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        source_message_id=pricing_source_message_id,
+                        content=content_item,
+                    )
+                except Exception as exc:
+                    logger.error(f"Final AI pricing revalidation failed closed for org={org_id}: {exc}")
+                    raise AIProviderUnavailable("catalogue_unavailable") from exc
+                if not valid:
+                    raise AIProviderUnavailable(reason, escalation_required=False)
+
             data = {
                 "messaging_product": "whatsapp",
                 "to": recipient_id,
@@ -504,24 +650,72 @@ async def send_whatsapp_message(
                     "Content-Type": "application/json",
                 }
                 
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(url, headers=headers, json=data)
-                
-                if response.status_code != 200:
-                    logger.error(f"WhatsApp API error: {response.text}")
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"Failed to send WhatsApp message part {i+1}"
-                    )
-                
-                response_data = response.json()
-                message_id = response_data.get("messages", [{}])[0].get("id")
+                if outbound_operation and outbound_operation.get("action") == "resume":
+                    response_data = outbound_operation.get("response_data") or {}
+                    message_id = outbound_operation.get("provider_message_id")
+                else:
+                    if mode == "ai":
+                        from services.ai_policy_service import is_effective_ai_enabled
+
+                        if not await is_effective_ai_enabled(org_id, conversation_id):
+                            raise AIProviderUnavailable("ai_disabled", escalation_required=False)
+                    if not start_provider(db.whatsapp_outbound_sends, outbound_operation):
+                        raise HTTPException(status_code=409, detail="This reply is already being sent")
+                    provider_started = True
+                    try:
+                        async with httpx.AsyncClient(timeout=30.0) as client:
+                            response = await client.post(url, headers=headers, json=data)
+                    except httpx.RequestError:
+                        mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
+                        raise HTTPException(status_code=503, detail="WhatsApp delivery could not be confirmed. Refresh the conversation before retrying.")
+
+                    if response.status_code != 200:
+                        if quota_consumed and quota_event_key:
+                            from services.entitlement_service import release_quota_async
+                            await release_quota_async(org_id, "monthly_messages", quota_event_key)
+                            quota_consumed = False
+                        if i == 0:
+                            release_claim(db.whatsapp_outbound_sends, outbound_operation, provider_started=True)
+                        logger.error(f"WhatsApp API error: {response.text}")
+                        raise HTTPException(
+                            status_code=response.status_code,
+                            detail=f"Failed to send WhatsApp message part {i+1}"
+                        )
+
+                    response_data = response.json()
+                    message_id = response_data.get("messages", [{}])[0].get("id")
+                    if not message_id:
+                        mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
+                        raise HTTPException(status_code=502, detail="WhatsApp accepted the request without a message ID. Refresh before retrying.")
+                    if outbound_operation:
+                        accepted_operation = record_acceptance(db.whatsapp_outbound_sends, outbound_operation, message_id, response_data)
+                        if not accepted_operation:
+                            mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
+                            raise HTTPException(status_code=503, detail="WhatsApp delivery was accepted but could not be recorded. Refresh before retrying.")
+                        outbound_operation = accepted_operation
             else: 
                 message_id = f"privatenote_{uuid.uuid4()}"
                 response_data = {"status": "Private note created, no API call made"}
             
             all_message_ids.append(message_id)
             now = datetime.now(timezone.utc)
+
+            if mode == "ai":
+                try:
+                    from services.entitlement_service import record_ai_usage_async
+
+                    usage = message.get("ai_usage") if isinstance(message.get("ai_usage"), dict) else {}
+                    await record_ai_usage_async(
+                        org_id,
+                        quota_event_key or f"ai:{message_id}",
+                        "whatsapp",
+                        1,
+                        int(usage.get("input_tokens", 0)),
+                        int(usage.get("output_tokens", 0)),
+                        int(usage.get("recorded_cost_microusd", 0)),
+                    )
+                except Exception as exc:
+                    logger.error(f"Could not record WhatsApp AI analytics for org={org_id}: {exc}")
 
             if mode == "private":
                 last_message = f"Private Note: {content_item}"
@@ -535,7 +729,7 @@ async def send_whatsapp_message(
                 "last_message_timestamp": now,
                 "last_sender": "ai" if mode == "ai" else "agent" ,
                 "reminder_stage": 0,
-                "next_action_at": now + timedelta(hours=6),
+                "next_action_at": None if is_auto_followup else now + timedelta(hours=6),
                 "last_message_is_private_note": mode == "private"
             }
 
@@ -547,25 +741,52 @@ async def send_whatsapp_message(
             )
 
             # Store message in WhatsApp-specific collection
-            last_stored_id = await store_whatsapp_message(
-                org_id=org_id,
-                content=content_item,
-                conversation_id=conversation_id,
-                customer_phone_no=recipient_id,
-                type="text",
-                payload=None,
-                sender_name="AI" if mode == "ai" else (sender_name),
-                recipient_id=whatsapp_business_id,
-                role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
-                mode=mode,
-                message_id=message_id,
-                raw_data=response_data,
-                status="delivered" if mode == "private" else "sending",
-                temp_id=temp_id,
-                context=context,
-                context_type=context_type,
-                bot_context=bot_context
-            )
+            stored_bot_context = dict(bot_context or {})
+            if pricing_source_message_id:
+                stored_bot_context["pricing_source_message_id"] = pricing_source_message_id
+            stored_message = db[f"messages_{org_id}"].find_one({"message_id": message_id}) if outbound_operation else None
+            if stored_message:
+                last_stored_id = stored_message.get("id") or stored_message.get("message_id")
+            else:
+                try:
+                    last_stored_id = await store_whatsapp_message(
+                        org_id=org_id,
+                        content=content_item,
+                        conversation_id=conversation_id,
+                        customer_phone_no=recipient_id,
+                        type="text",
+                        payload=None,
+                        sender_name="AI" if mode == "ai" else (sender_name),
+                        recipient_id=whatsapp_business_id,
+                        role=MessageRole.AI if mode == "ai" else MessageRole.AGENT,
+                        mode=mode,
+                        message_id=message_id,
+                        raw_data=response_data,
+                        status="delivered" if mode == "private" else "sending",
+                        temp_id=temp_id,
+                        context=context,
+                        context_type=context_type,
+                        bot_context=stored_bot_context or None
+                    )
+                except Exception:
+                    stored_message = db[f"messages_{org_id}"].find_one({"message_id": message_id}) if outbound_operation else None
+                    if not stored_message:
+                        raise
+                    last_stored_id = stored_message.get("id") or stored_message.get("message_id")
+
+            if pricing_guard_active:
+                try:
+                    from services.pricing_service import record_accepted_ai_response
+
+                    await record_accepted_ai_response(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        inbound_message_id=pricing_source_message_id,
+                        outbound_message_id=message_id,
+                        content=content_item,
+                    )
+                except Exception as exc:
+                    logger.error(f"Failed to record accepted AI pricing message: {exc}")
 
             # Small delay between bubbles to ensure delivery order
             if len(contents) > 1 and i < len(contents) - 1:
@@ -589,11 +810,49 @@ async def send_whatsapp_message(
                 payload={"conversation": final_conversation}
             )
 
-        return {"message": "Messages sent", "message_ids": all_message_ids, "message_id": last_stored_id}
-    
+        result = {"message": "Messages sent", "message_ids": all_message_ids, "message_id": last_stored_id}
+        if not complete_reply(db.whatsapp_outbound_sends, outbound_operation, result):
+            existing_operation = db.whatsapp_outbound_sends.find_one({"_id": outbound_operation["_id"], "org_id": org_id}) if outbound_operation else None
+            if existing_operation and existing_operation.get("status") == "completed" and isinstance(existing_operation.get("result"), dict):
+                return existing_operation["result"]
+            raise HTTPException(status_code=409, detail="The reply was delivered and is still being synchronized. Refresh the conversation.")
+        return result
+
+    except AIProviderUnavailable:
+        if quota_consumed and quota_event_key and not provider_started:
+            from services.entitlement_service import release_quota_async
+            await release_quota_async(org_id, "monthly_messages", quota_event_key)
+        if provider_started:
+            mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
+        else:
+            release_claim(db.whatsapp_outbound_sends, outbound_operation)
+        raise
+    except asyncio.CancelledError:
+        if quota_consumed and quota_event_key and not provider_started:
+            from services.entitlement_service import release_quota_async
+            await release_quota_async(org_id, "monthly_messages", quota_event_key)
+        if provider_started:
+            mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
+        else:
+            release_claim(db.whatsapp_outbound_sends, outbound_operation)
+        raise
     except HTTPException as e:
+        if quota_consumed and quota_event_key and not provider_started:
+            from services.entitlement_service import release_quota_async
+            await release_quota_async(org_id, "monthly_messages", quota_event_key)
+        if provider_started:
+            mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
+        else:
+            release_claim(db.whatsapp_outbound_sends, outbound_operation)
         raise e
     except Exception as e:
+        if quota_consumed and quota_event_key and not provider_started:
+            from services.entitlement_service import release_quota_async
+            await release_quota_async(org_id, "monthly_messages", quota_event_key)
+        if provider_started:
+            mark_unknown(db.whatsapp_outbound_sends, outbound_operation)
+        else:
+            release_claim(db.whatsapp_outbound_sends, outbound_operation)
         logger.error(f"Error sending WhatsApp message: {e}")
         raise HTTPException(
             status_code=500, 
@@ -606,7 +865,11 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
     """
     try:
         # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
+        connection = db.whatsapp_connections.find_one({
+            "wa_id": wa_id,
+            "org_id": org_id,
+            "is_active": {"$ne": False},
+        })
 
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
@@ -723,26 +986,39 @@ async def send_wa_media_message(
         context_type: Optional[str], 
         context: Optional[dict],
         sender_name: Optional[str] = "Agent",
+        media_kind: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        mime_type: Optional[str] = None,
+        file_name: Optional[str] = None,
     ) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """
     try:
         # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({"wa_id": wa_id})
+        connection = db.whatsapp_connections.find_one({
+            "wa_id": wa_id,
+            "org_id": org_id,
+            "is_active": {"$ne": False},
+        })
 
+        api_media_type = media_type if media_type in {"image", "video", "audio", "document"} else "document"
         media_payload = {
             "link": media_url,
         }
-        if content:
+        if content and api_media_type in {"image", "video", "document"}:
             media_payload["caption"] = content
+        if media_kind == "voice_note" and api_media_type == "audio" and (mime_type or "").startswith("audio/ogg") and "opus" in (mime_type or ""):
+            media_payload["voice"] = True
+        if file_name and api_media_type == "document":
+            media_payload["filename"] = file_name
 
         data = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": recipient_id,
-            "type": media_type,
-            media_type: media_payload
+            "type": api_media_type,
+            api_media_type: media_payload
         }
         if context_type and context:
             data["context"] = {
@@ -782,7 +1058,7 @@ async def send_wa_media_message(
         now = datetime.now(timezone.utc)
 
         wa_conversation = {
-            "last_message": f"Private Note: {content if content else 'Shared an image'}" if mode == "private" else f"{sender_name}: {content if content else 'Shared an image'}",
+            "last_message": f"Private Note: {content if content else 'Shared an attachment'}" if mode == "private" else f"{sender_name}: {content if content else ('Sent a voice note' if media_kind == 'voice_note' else 'Shared an attachment')}",
             "last_message_timestamp": now,
             "last_sender": "agent",
             "reminder_stage": 0,
@@ -811,8 +1087,15 @@ async def send_wa_media_message(
             content=content,
             conversation_id=f"whatsapp_{recipient_id}",
             customer_phone_no=recipient_id,
-            type=media_type,
-            payload={"url": media_url, "caption": content} if content else {"url": media_url},
+            type="voice" if media_kind == "voice_note" else api_media_type,
+            payload={
+                "url": media_url,
+                "caption": content,
+                "mime_type": mime_type,
+                "file_name": file_name,
+                "duration_ms": duration_ms,
+                "media_kind": media_kind,
+            },
             sender_name=sender_name,
             recipient_id=recipient_id,
             role=MessageRole.AGENT,
@@ -836,14 +1119,18 @@ async def send_wa_media_message(
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent") -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent", media_kind: Optional[str] = None, duration_ms: Optional[int] = None) -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
     try:
         # Upload media to Cloudinary
-        result = await upload_media_to_cloudinary(file, platform="whatsapp", org_id=org_id)
+        result = await upload_media_to_cloudinary(
+            file, platform="whatsapp", org_id=org_id, media_kind=media_kind
+        )
 
+        if not result:
+            return {"error": "Media upload failed", "success": False}
         media_url = result.get("file_url")
         media_type = result.get("file_type")
 
@@ -852,7 +1139,11 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
             return {"error": "Media upload failed", "success": False}
         
         # Send the media message via WhatsApp API
-        response = await send_wa_media_message(recipient_id, media_url, media_type, wa_id, content, org_id, temp_id, mode, context_type, context, sender_name)
+        response = await send_wa_media_message(
+            recipient_id, media_url, media_type, wa_id, content, org_id, temp_id,
+            mode, context_type, context, sender_name, media_kind, duration_ms,
+            result.get("mime_type"), result.get("file_name"),
+        )
         
         return response
     except Exception as e:
@@ -1734,10 +2025,38 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
     except Exception as e:
         logger.error(f"Error while sending typing indicator: {e}")
 
+def ensure_whatsapp_call_indexes() -> None:
+    try:
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("call_id", 1)],
+            unique=True,
+            name="org_id_call_id_unique",
+            partialFilterExpression={"org_id": {"$type": "string"}, "call_id": {"$type": "string"}},
+        )
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("updated_at", -1), ("call_id", -1)],
+            name="org_call_history",
+        )
+        db.whatsapp_calls.create_index(
+            [("org_id", 1), ("conversation_id", 1), ("updated_at", -1), ("call_id", -1)],
+            name="org_conversation_call_history",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create WhatsApp call index: {e}")
+
+
+def ensure_whatsapp_outbound_indexes() -> None:
+    try:
+        db.whatsapp_outbound_sends.create_index("expires_at", expireAfterSeconds=0)
+    except Exception as e:
+        logger.warning(f"Failed to create WhatsApp outbound-send index: {e}")
+
+
 # Bulk jobs are now stored in the "bulk_jobs" collection in MongoDB.
 # This ensures they survive restarts and work across multiple instances.
 # A TTL index is created on "created_at" to clean up old jobs after 7 days (604800 seconds).
 _bulk_job_indexes_initialized = False
+
 
 def ensure_bulk_job_indexes() -> None:
     """

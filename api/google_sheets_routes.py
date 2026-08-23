@@ -18,7 +18,7 @@ import httpx
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from pymongo import UpdateOne
 
@@ -27,6 +27,12 @@ from auth.dependencies import CurrentUser
 from config.settings import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 from loguru import logger
 import asyncio
+
+from services.google_drive_webhook import (
+    create_watch_channel,
+    stop_all_channels_for_sheet,
+    validate_webhook_notification,
+)
 
 db = get_mongo_db()
 
@@ -66,13 +72,27 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
 
         # Auto-detect the first tab if none was provided
         tab_name = request.tab_name
+        sheet_id = request.sheet_id
         if not tab_name:
+            access_token = await refresh_google_token(org_id)
             try:
-                access_token = await refresh_google_token(org_id)
-                detected_tabs = await _fetch_sheet_tabs(request.sheet_id, access_token, org_id)
+                detected_tabs = await _fetch_sheet_tabs(sheet_id, access_token, org_id)
                 tab_name = detected_tabs[0] if detected_tabs else "Sheet1"
+            except HTTPException as e:
+                if e.status_code == 400 and ("not an Office file" in str(e.detail) or "not supported" in str(e.detail)):
+                    logger.info(f"Auto-converting Excel file {sheet_id} to Google Sheet")
+                    try:
+                        sheet_id = await _convert_excel_to_gsheet(sheet_id, access_token, org_id)
+                        detected_tabs = await _fetch_sheet_tabs(sheet_id, access_token, org_id)
+                        tab_name = detected_tabs[0] if detected_tabs else "Sheet1"
+                    except Exception as conv_err:
+                        logger.error(f"Failed to convert Excel sheet {sheet_id}: {conv_err}")
+                        tab_name = "Sheet1"
+                else:
+                    logger.warning(f"Failed to auto-detect tab for sheet {sheet_id}: {e}. Defaulting to Sheet1.")
+                    tab_name = "Sheet1"
             except Exception as e:
-                logger.warning(f"Failed to auto-detect tab for sheet {request.sheet_id}: {e}. Defaulting to Sheet1.")
+                logger.warning(f"Failed to auto-detect tab for sheet {sheet_id}: {e}. Defaulting to Sheet1.")
                 tab_name = "Sheet1"
 
         now = datetime.now(timezone.utc)
@@ -86,7 +106,7 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
 
         insert_data = {
             "org_id": org_id,
-            "sheet_id": request.sheet_id,
+            "sheet_id": sheet_id,
             "sheet_name": request.sheet_name,
             "tab_name": tab_name,
             "last_synced_at": None,
@@ -104,21 +124,32 @@ async def connect_sheet(request: ConnectSheetRequest, user: CurrentUser):
         # Atomic upsert: $setOnInsert ensures no duplicate connections on race condition
         result = await asyncio.to_thread(
             db.google_sheets_connections.update_one,
-            {"org_id": org_id, "sheet_id": request.sheet_id},
+            {"org_id": org_id, "sheet_id": sheet_id},
             {"$setOnInsert": insert_data},
             upsert=True
         )
         if result.matched_count > 0:
-            existing = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": request.sheet_id})
+            existing = db.google_sheets_connections.find_one({"org_id": org_id, "sheet_id": sheet_id})
             return {
-                "sheet_id": existing.get("sheet_id", request.sheet_id),
+                "sheet_id": existing.get("sheet_id", sheet_id),
                 "sheet_name": existing.get("sheet_name", request.sheet_name),
                 "tab_name": existing.get("tab_name") or tab_name or "Sheet1",
                 "message": "Already connected."
             }
 
-        logger.info(f"Sheet {request.sheet_id} connected for org {org_id} (tab: {tab_name})")
-        return {"sheet_id": request.sheet_id, "sheet_name": request.sheet_name, "tab_name": tab_name, "message": "Sheet connected successfully."}
+        logger.info(f"Sheet {sheet_id} connected for org {org_id} (tab: {tab_name})")
+
+        # Create a Drive watch channel for real-time notifications
+        try:
+            access_token = await refresh_google_token(org_id)
+            await create_watch_channel(sheet_id, org_id, access_token)
+        except Exception as wh_err:
+            logger.warning(
+                f"[Webhook] Could not create watch channel for sheet {sheet_id}: {wh_err}. "
+                "Reconciliation fallback will handle syncing."
+            )
+
+        return {"sheet_id": sheet_id, "sheet_name": request.sheet_name, "tab_name": tab_name, "message": "Sheet connected successfully."}
 
     except HTTPException:
         raise
@@ -176,6 +207,13 @@ async def disconnect_sheet(
                         "hint": "Unpublish the automation(s) first, or force disconnect.",
                     }
                 )
+
+        # Stop any active watch channels for this sheet before deleting
+        try:
+            access_token = await refresh_google_token(org_id)
+            await stop_all_channels_for_sheet(org_id, sheet_id, access_token)
+        except Exception as wh_err:
+            logger.warning(f"[Webhook] Could not stop watch channels for sheet {sheet_id}: {wh_err}")
 
         result = db.google_sheets_connections.delete_one({"org_id": org_id, "sheet_id": sheet_id})
         if result.deleted_count == 0:
@@ -235,9 +273,24 @@ async def get_sheet_tabs(
     try:
         org_id = user.org_id
         access_token = await refresh_google_token(org_id)
-        tabs = await _fetch_sheet_tabs(sheet_id, access_token, org_id)
-        return {"tabs": tabs, "sheet_id": sheet_id}
-
+        
+        try:
+            tabs = await _fetch_sheet_tabs(sheet_id, access_token, org_id)
+            return {"tabs": tabs, "sheet_id": sheet_id}
+        except HTTPException as e:
+            if e.status_code == 400 and ("not an Office file" in str(e.detail) or "not supported" in str(e.detail)):
+                logger.info(f"Auto-converting Excel file {sheet_id} to Google Sheet")
+                try:
+                    new_sheet_id = await _convert_excel_to_gsheet(sheet_id, access_token, org_id)
+                    tabs = await _fetch_sheet_tabs(new_sheet_id, access_token, org_id)
+                    return {"tabs": tabs, "sheet_id": new_sheet_id, "converted": True}
+                except Exception as conv_err:
+                    raise HTTPException(status_code=502, detail=f"Failed to convert Excel to Google Sheet: {conv_err}")
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching tabs for sheet {sheet_id} org {user.org_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to fetch tabs: {str(e)}")
+            
     except HTTPException:
         raise
     except Exception as e:
@@ -410,6 +463,19 @@ async def toggle_sheet_polling(sheet_id: str, user: CurrentUser):
             {"org_id": org_id, "sheet_id": sheet_id},
             {"$set": {"polling_enabled": new_state, "updated_at": datetime.now(timezone.utc)}}
         )
+
+        # Manage watch channel based on new state
+        try:
+            access_token = await refresh_google_token(org_id)
+            if new_state:
+                # Enabling — create a new watch channel
+                await create_watch_channel(sheet_id, org_id, access_token)
+            else:
+                # Disabling — stop active watch channels
+                await stop_all_channels_for_sheet(org_id, sheet_id, access_token)
+        except Exception as wh_err:
+            logger.warning(f"[Webhook] Could not manage watch channel for sheet {sheet_id}: {wh_err}")
+
         return {"sheet_id": sheet_id, "polling_enabled": new_state}
 
     except HTTPException:
@@ -419,7 +485,103 @@ async def toggle_sheet_polling(sheet_id: str, user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to toggle polling: {str(e)}")
 
 
+# ─── Webhook: Receive Google Drive push notifications ──────────────────────────
+
+@router.post("/webhook")
+async def google_sheets_webhook(request: Request):
+    """
+    Receive Google Drive push notifications for sheet changes.
+
+    Google sends a POST here whenever a watched spreadsheet file changes.
+    The handler is intentionally thin: validate → identify → enqueue → return 200.
+
+    Headers from Google:
+      X-Goog-Channel-ID:      The channel ID we set at watch creation
+      X-Goog-Resource-ID:     Google's resource identifier
+      X-Goog-Resource-State:  "sync" (initial confirmation) or "update" (change)
+      X-Goog-Channel-Token:   The token we set at watch creation (for validation)
+      X-Goog-Message-Number:  Monotonic message counter for dedup
+    """
+    # Extract notification metadata from headers
+    channel_id = request.headers.get("X-Goog-Channel-ID", "")
+    resource_id = request.headers.get("X-Goog-Resource-ID", "")
+    resource_state = request.headers.get("X-Goog-Resource-State", "")
+    channel_token = request.headers.get("X-Goog-Channel-Token", "")
+    message_number = request.headers.get("X-Goog-Message-Number", "")
+
+    # Always return 200 to Google — even for invalid notifications.
+    # Returning non-200 causes Google to retry aggressively.
+
+    if not channel_id or not resource_id:
+        logger.debug("[Webhook] Received notification with missing headers, ignoring")
+        return Response(status_code=200)
+
+    # Log every notification for debugging and audit
+    logger.info(
+        f"[Webhook] Notification received: state={resource_state} "
+        f"channel={channel_id} message={message_number}"
+    )
+
+    # "sync" state is just Google confirming the watch was set up successfully
+    if resource_state == "sync":
+        logger.info(f"[Webhook] Watch confirmed for channel {channel_id}")
+        return Response(status_code=200)
+
+    # Validate channel against our stored channels
+    channel = await validate_webhook_notification(channel_id, resource_id, channel_token)
+    if not channel:
+        # Unknown channel — could be spoofed, stale, or from a different deployment
+        return Response(status_code=200)
+
+    org_id = channel["org_id"]
+    sheet_id = channel["sheet_id"]
+
+    # Enqueue the sync as a background task — don't block the webhook response
+    async def _webhook_triggered_sync():
+        try:
+            from services.google_sheets_scheduler import _safe_sync_sheet
+            await _safe_sync_sheet(org_id, sheet_id)
+        except Exception as e:
+            logger.error(
+                f"[Webhook] Sync failed for sheet {sheet_id} org {org_id}: {e}"
+            )
+
+    asyncio.create_task(_webhook_triggered_sync())
+
+    return Response(status_code=200)
+
+
 # ─── Internal Helpers ──────────────────────────────────────────────────────────
+
+
+async def _convert_excel_to_gsheet(sheet_id: str, access_token: str, org_id: str) -> str:
+    """Copies an Excel file (.xlsx) from Google Drive to a native Google Sheet format."""
+    # 1. Get the original name
+    url = f"https://www.googleapis.com/drive/v3/files/{sheet_id}?fields=name"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        if resp.status_code == 401:
+            access_token = await _force_token_refresh(org_id)
+            resp = await client.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+            
+        original_name = "Converted Sheet"
+        if resp.status_code == 200:
+            original_name = resp.json().get("name", "Converted Sheet")
+            if original_name.lower().endswith(".xlsx"):
+                original_name = original_name[:-5]
+                
+    # 2. Copy and convert to Google Sheet mimeType
+    copy_url = f"https://www.googleapis.com/drive/v3/files/{sheet_id}/copy"
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            copy_url, 
+            json={"mimeType": "application/vnd.google-apps.spreadsheet", "name": original_name},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30
+        )
+        if resp.status_code != 200:
+            raise Exception(f"Drive API copy failed: {resp.text}")
+        return resp.json()["id"]
 
 
 async def _fetch_sheet_tabs(sheet_id: str, access_token: str, org_id: str) -> List[str]:
@@ -454,6 +616,8 @@ async def _fetch_sheet_tabs(sheet_id: str, access_token: str, org_id: str) -> Li
             raise HTTPException(status_code=403, detail=f"Google Sheets API error: {error_msg}")
         if resp.status_code == 404:
             raise HTTPException(status_code=404, detail=f"Google Sheets API error: {error_msg}")
+        if resp.status_code == 400:
+            raise HTTPException(status_code=400, detail=f"Google Sheets API error: {error_msg}")
         raise HTTPException(status_code=502, detail=f"Google Sheets API error: {error_msg}")
 
     sheets_data = resp.json().get("sheets", [])

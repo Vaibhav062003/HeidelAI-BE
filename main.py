@@ -31,13 +31,14 @@ else:
 ENV = os.getenv("ENV", "prod")
 logger.success(f"Running in {ENV} environment.")
 
-if ENV == "prod":
-    alowed_origins = [
-        "https://www.heidelai.com", 
-        "https://heidelai.com",
-    ]
-else:
-    alowed_origins = [
+def get_allowed_origins(environment: str, capacitor_origin_flag: str) -> list[str]:
+    if environment.strip().lower() not in {"dev", "development", "test", "testing", "staging"}:
+        return [
+            "https://www.heidelai.com",
+            "https://heidelai.com",
+        ]
+
+    origins = [
         "https://www.heidelai.com", 
         "https://heidelai.com",
         "https://www.development.heidelai.com", 
@@ -47,6 +48,15 @@ else:
         "http://localhost", 
         "http://localhost:3000", 
     ]
+    if capacitor_origin_flag.strip().lower() == "true":
+        origins.append("https://localhost")
+    return origins
+
+
+alowed_origins = get_allowed_origins(
+    ENV,
+    os.getenv("ALLOW_CAPACITOR_LOCALHOST_ORIGIN", ""),
+)
 
 app = FastAPI(
     lifespan=lifespan, 

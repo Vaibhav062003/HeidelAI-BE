@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from io import BytesIO
 import re
@@ -5,6 +6,7 @@ import uuid
 
 from fastapi import BackgroundTasks, HTTPException
 import pandas as pd
+from bson import ObjectId
 from pymongo import UpdateOne
 from pymongo.errors import PyMongoError, BulkWriteError
 
@@ -13,7 +15,7 @@ from core.services import services
 from database import get_mongo_db
 from loguru import logger
 from services.websocket_service import broadcast_on_stats_update
-from services.utils import normalize_phone
+from services.utils import name_search_prefixes, normalize_phone
 
 db = get_mongo_db()
 
@@ -91,7 +93,7 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
     contacts_collection.update_one(unique_filter, update_doc, upsert=True)
     logger.success(f"Stored/Updated contact for {platform}: {unique_filter}")
     
-async def get_contacts_for_org(org_id: str):
+def _get_contacts_for_org(org_id: str):
     """
     Retrieve all contacts for a given organization.
     """
@@ -122,6 +124,112 @@ async def get_contacts_for_org(org_id: str):
     except Exception as e:
         logger.error(f"Unexpected error in get_contacts_for_org({org_id}): {e}")
         return []
+
+
+def _get_contacts_page(
+    org_id: str,
+    page: int,
+    limit: int,
+    search: str,
+    tags: list[str],
+    snapshot: str | None,
+) -> dict:
+    collection = db[f"contacts_{org_id}"]
+    query: dict = {}
+    tags = [str(tag).strip()[:100] for tag in tags[:20] if str(tag).strip()]
+
+    if tags:
+        query["$or"] = [
+            {"categories": {"$in": tags}},
+            {"labels": {"$in": tags}},
+        ]
+
+    safe_search = str(search)[:100].strip()
+    if safe_search:
+        # ponytail: escaped scans are limited to explicit searches; move to Atlas Search past 100k contacts/org.
+        search_query = {
+            "$or": [
+                {field: {"$regex": re.escape(safe_search), "$options": "i"}}
+                for field in ("full_name", "phone_number", "email", "username", "company", "gstin", "tally.legal_name")
+            ]
+        }
+        if query:
+            query = {"$and": [query, search_query]}
+        else:
+            query = search_query
+
+    projection = {
+        "_id": 0,
+        "platform": 1,
+        "full_name": 1,
+        "country": 1,
+        "profile_url": 1,
+        "conversation_id": 1,
+        "email": 1,
+        "categories": 1,
+        "labels": 1,
+        "phone_number": 1,
+        "instagram_id": 1,
+        "username": 1,
+        "company": 1,
+        "gstin": 1,
+        "tally": 1,
+    }
+    if snapshot:
+        if not ObjectId.is_valid(snapshot):
+            raise HTTPException(status_code=422, detail="Invalid contacts snapshot")
+        snapshot_id = ObjectId(snapshot)
+    else:
+        newest = collection.find_one(query, {"_id": 1}, sort=[("_id", -1)])
+        snapshot_id = newest.get("_id") if newest else None
+
+    if snapshot_id:
+        query = {"$and": [query, {"_id": {"$lte": snapshot_id}}]} if query else {"_id": {"$lte": snapshot_id}}
+
+    total = collection.count_documents(query)
+    contacts = list(
+        collection.find(query, projection)
+        .sort("_id", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+    )
+    return {
+        "contacts": contacts,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "snapshot": str(snapshot_id) if snapshot_id else None,
+    }
+
+
+async def get_contacts_for_org(org_id: str):
+    """Retrieve all contacts for legacy clients without blocking the async loop."""
+    return await asyncio.to_thread(_get_contacts_for_org, org_id)
+
+
+async def get_contacts_page_for_org(
+    org_id: str,
+    page: int,
+    limit: int,
+    search: str = "",
+    tags: list[str] | None = None,
+    snapshot: str | None = None,
+) -> dict:
+    """Return one contact page without blocking the async request loop."""
+    try:
+        return await asyncio.to_thread(
+            _get_contacts_page,
+            org_id,
+            page,
+            limit,
+            search,
+            tags or [],
+            snapshot,
+        )
+    except PyMongoError as error:
+        logger.error(f"MongoDB error while fetching a contact page: {type(error).__name__}")
+        raise HTTPException(status_code=500, detail="Contacts could not be loaded") from error
+
 
 async def update_contact_tag_categories(org_id: str, conversation_id: str, categories: list):
     """
@@ -567,7 +675,10 @@ def process_bulk_wa_contact_upload(
                 conversation_bulk_ops.append(
                     UpdateOne(
                         {"conversation_id": conversation_id},
-                        {"$set": {"customer_name": full_name}}
+                        {"$set": {
+                            "customer_name": full_name,
+                            "customer_name_prefixes": name_search_prefixes(full_name),
+                        }}
                     )
                 )
 
@@ -772,4 +883,3 @@ def delete_upload_batch(org_id: str, batch_id: str) -> dict:
         "deleted_count": deleted_count,
         "demoted_count": demoted_count,
     }
-

@@ -12,6 +12,7 @@ Key behaviors:
 """
 
 import re
+import hashlib
 import uuid as _uuid
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -173,6 +174,30 @@ async def process_google_sheet_trigger(
             })
 
     if not eligible:
+        return stats
+
+    from fastapi import HTTPException
+    from services.entitlement_service import consume_quota_async, feature_access, release_quota_async
+
+    phones_key = hashlib.sha256("|".join(sorted(item["phone_number"] for item in eligible)).encode()).hexdigest()
+    automation_event = f"google-sheet:{flow_id}:{phones_key}"
+    broadcast_event = f"google-sheet-broadcast:{flow_id}:{phones_key}"
+    batch_limit = feature_access(org_id, "BROADCASTING")["limits"].get("max_batch_recipients")
+    try:
+        if batch_limit is not None and len(eligible) > batch_limit:
+            raise HTTPException(status_code=422, detail="Google Sheet send exceeds the broadcast batch limit")
+        automation_quota = await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", len(eligible), automation_event)
+        try:
+            await consume_quota_async(org_id, "BROADCASTING", "monthly_recipients", len(eligible), broadcast_event)
+        except Exception:
+            if not automation_quota.get("duplicate", False):
+                await release_quota_async(org_id, "monthly_runs", automation_event)
+            raise
+    except HTTPException as exc:
+        logger.warning(f"[GoogleSheetAuto] Flow {flow_id} blocked by entitlement: {exc.detail}")
+        for recipient in eligible:
+            await asyncio.to_thread(_mark_failed, org_id, flow_id, recipient["phone_number"], sheet_id)
+        stats["errors"] += len(eligible)
         return stats
 
     # 5. Send via centralized wa_service functions (handles API call + storage + WebSocket broadcast)

@@ -49,6 +49,11 @@ SERVICE_ACCOUNT_FILE = os.getenv('FIRESTORE_SERVICE_ACCOUNT_FILE')
 
 WA_ACCESS_TOKEN_ENCRYPTION_KEY = os.getenv('WA_ACCESS_TOKEN_ENCRYPTION_KEY')
 
+# Firebase Cloud Messaging (Android app notifications)
+FIREBASE_SERVICE_ACCOUNT_B64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64")
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
+PUSH_TOKEN_ENCRYPTION_KEY = os.getenv("PUSH_TOKEN_ENCRYPTION_KEY")
+
 # JWT Key Set URL
 JWKS_URL = os.getenv('JWKS_URL')
 JWT_TOKEN_ISSUER = os.getenv('JWT_TOKEN_ISSUER')
@@ -74,6 +79,7 @@ CASHFREE_VERSION = os.getenv("CASHFREE_VERSION")
 
 #Clerk
 CLERK_TOKEN = os.getenv("CLERK_TOKEN_KEY")
+CLERK_WEBHOOK_SIGNING_SECRET = os.getenv("CLERK_WEBHOOK_SIGNING_SECRET")
 
 # Webhook for Dev
 DEV_WEBHOOK_URL = os.getenv("DEV_WEBHOOK_URL", "").strip().strip("'\"")
@@ -92,6 +98,13 @@ X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making 
 # Google OAuth 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+
+# Google Drive Webhook (push notifications for sheet changes)
+# GOOGLE_WEBHOOK_BASE_URL: Public HTTPS URL where Google sends notifications
+#   e.g. "https://api.yourapp.com" → webhook receives POSTs at /api/google-sheets/webhook
+# GOOGLE_WEBHOOK_SECRET: Arbitrary secret used to generate watch channel tokens for validation
+GOOGLE_WEBHOOK_BASE_URL = os.getenv("GOOGLE_WEBHOOK_BASE_URL", "").strip().strip("'\"")
+GOOGLE_WEBHOOK_SECRET = os.getenv("GOOGLE_WEBHOOK_SECRET", "default-webhook-secret-change-me")
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
@@ -99,6 +112,12 @@ os.environ["LANGCHAIN_PROJECT"] =os.getenv("LANGCHAIN_PROJECT")
 
 #Azure OpenAI
 AZURE_MODEL=os.getenv("AZURE_MODEL")
+
+#Moonshot / Kimi
+MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY")
+MOONSHOT_ENDPOINT = os.getenv("MOONSHOT_ENDPOINT")
+MOONSHOT_DEPLOYMENT_NAME = os.getenv("MOONSHOT_DEPLOYMENT_NAME", "Kimi-K2.6-f-s-a")
+MOONSHOT_DEPLOYMENT = MOONSHOT_DEPLOYMENT_NAME
 AZURE_OPENAI_ENDPOINT=os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_SUBSCRIPTION_KEY=os.getenv("AZURE_OPENAI_SUBSCRIPTION_KEY")
 AZURE_OPENAI_API_VERSION=os.getenv("AZURE_OPENAI_API_VERSION")
@@ -126,3 +145,10 @@ SAHIL_IG_ID=os.getenv("SAHIL_IG_ID")
 
 KOMAL_ORG_ID=os.getenv("KOMAL_ORG_ID")
 KOMAL_ORG_WA_ID=os.getenv("KOMAL_ORG_WA_ID")
+
+PRICING_INTELLIGENCE_ORG_IDS = {
+    org_id.strip()
+    for org_id in os.getenv("PRICING_INTELLIGENCE_ORG_IDS", "").split(",")
+    if org_id.strip()
+}
+PRICING_FLOOR_MAX_AGE_MINUTES = int(os.getenv("PRICING_FLOOR_MAX_AGE_MINUTES", "60"))
