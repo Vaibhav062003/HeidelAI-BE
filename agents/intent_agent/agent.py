@@ -2,10 +2,10 @@ import os
 import json
 from typing import Optional, Literal
 from dotenv import load_dotenv
-from agno.models.azure import AzureOpenAI
-from config.settings import AZURE_MODEL
+from agno.models.moonshot import MoonShot
+from config.settings import MOONSHOT_API_KEY, MOONSHOT_ENDPOINT, MOONSHOT_DEPLOYMENT_NAME
 from pydantic import BaseModel, Field
-from agno.agent import Agent, RunResponse
+from agno.agent import Agent, RunOutput
 from loguru import logger
 
 load_dotenv()
@@ -158,9 +158,13 @@ EXAMPLES
 
 # Agent that extracts purchase intent using structured outputs
 intent_extraction_agent = Agent(
-    model=AzureOpenAI(id=AZURE_MODEL),
+    model=MoonShot(
+        id=MOONSHOT_DEPLOYMENT_NAME or "kimi-k2-thinking",
+        api_key=MOONSHOT_API_KEY,
+        base_url=MOONSHOT_ENDPOINT,
+    ),
     description=_SYSTEM_PROMPT,
-    response_model=PurchaseIntentResult,
+    output_schema=PurchaseIntentResult,
     instructions=[],  # All instructions are in the system prompt above
 )
 
@@ -184,7 +188,7 @@ async def extract_purchase_intent(conversation_text: str, current_datetime_iso: 
     )
 
     try:
-        response: RunResponse = await intent_extraction_agent.arun(prompt)
+        response: RunOutput = await intent_extraction_agent.arun(prompt)
         if isinstance(response.content, PurchaseIntentResult):
             return response.content
 
