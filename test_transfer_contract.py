@@ -39,6 +39,22 @@ def test_transfer_and_reclaim_return_authoritative_conversation():
     assert {"id", "name", "identifier", "role"} <= response_fields
 
 
+def test_nullable_clerk_members_and_assignment_targets_are_safe():
+    source = Path("api/transfer_routes.py").read_text()
+    tree = ast.parse(source)
+    helpers = [_function(tree, name) for name in ("membership_public_data", "assignment_target_id")]
+    namespace = {"Optional": __import__("typing").Optional}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=helpers, type_ignores=[])), "<test>", "exec"), namespace)
+
+    assert namespace["membership_public_data"]({"public_user_data": None}) == {}
+    assert namespace["assignment_target_id"]({"to_team": None, "to_agent": {"id": "user_1"}}) == "user_1"
+    assert namespace["assignment_target_id"]({"to_team": None, "to_agent": None}) is None
+    assert namespace["assignment_target_id"](None) is None
+    assert 'params={"limit": 500}' in source
+    assert 'get("public_user_data", {})' not in source
+
+
 if __name__ == "__main__":
     test_transfer_and_reclaim_return_authoritative_conversation()
+    test_nullable_clerk_members_and_assignment_targets_are_safe()
     print("Transfer contract check passed.")
