@@ -145,6 +145,11 @@ async def ensure_conversation_search_indexes(org_id: str) -> None:
         await conversations.create_index("phone_search_suffixes")
         await conversations.create_index("customer_name_prefixes")
         await conversations.create_index([("last_message_timestamp", -1)])
+        await conversations.create_index([
+            ("last_assignment_action", 1),
+            ("last_transfer_to_agent_id", 1),
+            ("assigned_agent_id", 1),
+        ])
         await messages.create_index([("conversation_id", 1), ("timestamp", -1)])
         await messages.create_index(
             [("content", "text")],
@@ -185,6 +190,20 @@ def _escalated_condition() -> Dict:
     }
 
 
+def _transferred_condition(current_user_id: Optional[str]) -> Dict:
+    if not current_user_id:
+        return {"_id": {"$exists": False}}
+    return {"$and": [
+        {"$or": [
+            {"assigned_agent.id": current_user_id},
+            {"assigned_agent_id": current_user_id},
+        ]},
+        {"last_assignment_action": "transferred"},
+        {"last_transfer_to_agent_id": current_user_id},
+        {"last_transfer_from_agent_id": {"$nin": [None, current_user_id, "system"]}},
+    ]}
+
+
 def _queue_filter_conditions(
     active_tab: str,
     current_user_id: Optional[str],
@@ -204,6 +223,8 @@ def _queue_filter_conditions(
                 "status": {"$in": ["pending", "in_progress", "needs_review"]},
             }}},
         ]})
+    elif active_tab == "transferred":
+        conditions.append(_transferred_condition(current_user_id))
     elif active_tab == "team" and team_id:
         conditions.append({"active_work": {"$elemMatch": {
                 "team_id": team_id,
@@ -521,7 +542,7 @@ async def fetch_conversations_new(
             matching_ids = await contact_col.distinct("conversation_id", {"labels": {"$in": regex_labels}})
             
             if not matching_ids:
-                return {"conversations": [], "has_more": False, "total": 0, "counts": {"all": 0, "mine": 0, "unassigned": 0, "escalated": 0}} if include_meta else []
+                return {"conversations": [], "has_more": False, "total": 0, "counts": {"all": 0, "mine": 0, "transferred": 0, "team": 0, "unassigned": 0, "escalated": 0}} if include_meta else []
             
             base_conditions.append({"conversation_id": {"$in": matching_ids}})
 
@@ -612,6 +633,9 @@ async def fetch_conversations_new(
             ),
             "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
             "assignment_history": doc.get("assignment_history", []),
+            "last_assignment_action": doc.get("last_assignment_action"),
+            "last_transfer_to_agent_id": doc.get("last_transfer_to_agent_id"),
+            "last_transfer_from_agent_id": doc.get("last_transfer_from_agent_id"),
             "suggestions": doc.get("suggestions", []),
             "summary": doc.get("summary", []),
             "categories": doc.get("categories", []),
@@ -637,6 +661,7 @@ async def fetch_conversations_new(
     facets = {
         "all": [{"$match": count_scope}, {"$count": "value"}],
         "mine": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("mine", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
+        "transferred": [{"$match": {"$and": [count_scope, _transferred_condition(current_user_id)]}}, {"$count": "value"}],
         "team": [{"$match": {"$and": [count_scope, *team_conditions]}} if team_conditions else {"$match": {"_id": None}}, {"$count": "value"}],
         "unassigned": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("unassigned", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
         "escalated": [{"$match": {"$and": [count_scope, _escalated_condition()]}}, {"$count": "value"}],
