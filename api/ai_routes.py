@@ -59,6 +59,7 @@ class FollowUpStatusRequest(BaseModel):
 class AIPolicyRequest(BaseModel):
     enabled: bool
     pause_minutes: int = Field(default=60, ge=5, le=1440)
+    quote_followup_prompt_enabled: Optional[bool] = None
 
 
 class ConversationAIStateRequest(BaseModel):
@@ -76,7 +77,12 @@ async def get_ai_policy(request: Request, user: CurrentUser):
 @limiter.limit("30/minute")
 async def put_ai_policy(request: Request, payload: AIPolicyRequest, user: CurrentUser):
     await admin_required(user)
-    return await update_org_ai_policy(user.org_id, payload.enabled, payload.pause_minutes)
+    return await update_org_ai_policy(
+        user.org_id,
+        payload.enabled,
+        payload.pause_minutes,
+        payload.quote_followup_prompt_enabled,
+    )
 
 
 @router.post("/conversations/{conversation_id}/state")
@@ -166,7 +172,7 @@ async def schedule_message(
         await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
         if body.source == "quotation" and not body.quote_id:
             raise HTTPException(status_code=422, detail="A quote is required for quotation follow-ups.")
-        return await schedule_followup_message(
+        result = await schedule_followup_message(
             user.org_id,
             conversation_id,
             source=body.source,
@@ -175,6 +181,10 @@ async def schedule_message(
             requested_by_name=user.full_name,
             scheduled_for=body.scheduled_for,
         )
+        if body.source == "quotation" and result.get("requires_agent_time"):
+            policy = await get_org_ai_policy(user.org_id)
+            result["prompt_immediately"] = policy["quote_followup_prompt_enabled"]
+        return result
     except HTTPException as e:
         # Graceful return for API
         raise e
