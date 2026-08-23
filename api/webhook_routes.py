@@ -1024,11 +1024,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                     # Fallback to AI Agent (only if AI is enabled for this org+conversation)
                                     if ai_enabled and await is_effective_ai_enabled(org_id, conversation_id):
-
                                         if not convo_doc:
                                             convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
 
-                                    # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
+                                        # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
                                         try:
                                             chatbot_response = await send_to_agent(
                                                 conversation_id=conversation_id,
