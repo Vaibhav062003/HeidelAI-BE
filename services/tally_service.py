@@ -85,6 +85,11 @@ def normalized_settings(value: dict | None) -> dict:
     return settings
 
 
+def _supports_invoice_readback(integration: dict) -> bool:
+    version = str(integration.get("connector_version") or "")
+    return version.isdigit() and int(version) >= 8 and "invoice_readback" in (integration.get("connector_capabilities") or [])
+
+
 def valid_gstin_format(value: str) -> bool:
     return bool(GSTIN_PATTERN.fullmatch((value or "").strip().upper()))
 
@@ -290,10 +295,8 @@ def build_report_xml(settings: dict, report: str, from_date: str, to_date: str, 
     )
 
 
-def build_invoice_export_xml(settings: dict, master_id: str, invoice_date: str = "") -> str:
+def _invoice_export_xml(settings: dict, master_id: str, invoice_date: str = "") -> str:
     settings = normalized_settings(settings)
-    if not re.fullmatch(r"\d+", str(master_id or "").strip()):
-        raise HTTPException(status_code=422, detail="Tally invoice is missing a numeric Master ID")
     fetch = [
         "Date", "EffectiveDate", "VoucherNumber", "Reference", "VoucherTypeName", "PartyLedgerName",
         "PartyGSTIN", "StateName", "PlaceOfSupply", "BasicBuyerName", "BuyerName", "BasicBuyerAddress",
@@ -318,9 +321,19 @@ def build_invoice_export_xml(settings: dict, master_id: str, invoice_date: str =
         f"<FETCHLIST>{fetch_list}</FETCHLIST><TDL><TDLMESSAGE>"
         f"<COLLECTION NAME=\"HeidelAIInvoice\" ISINITIALIZE=\"Yes\"><TYPE>Voucher</TYPE>"
         f"<FILTER>HeidelAIInvoiceMaster</FILTER>{native_methods}</COLLECTION>"
-        f"<SYSTEM TYPE=\"Formulae\" NAME=\"HeidelAIInvoiceMaster\">$MasterID = {int(master_id)}</SYSTEM>"
+        f"<SYSTEM TYPE=\"Formulae\" NAME=\"HeidelAIInvoiceMaster\">$MasterID = {master_id}</SYSTEM>"
         "</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>"
     )
+
+
+def build_invoice_export_xml(settings: dict, master_id: str, invoice_date: str = "") -> str:
+    if not re.fullmatch(r"\d+", str(master_id or "").strip()):
+        raise HTTPException(status_code=422, detail="Tally invoice is missing a numeric Master ID")
+    return _invoice_export_xml(settings, str(int(master_id)), invoice_date)
+
+
+def build_invoice_readback_xml(settings: dict, invoice_date: str = "") -> str:
+    return _invoice_export_xml(settings, "__HEIDELAI_MASTER_ID__", invoice_date)
 
 
 def build_snapshot_requests(settings: dict) -> list[dict]:
@@ -584,6 +597,28 @@ def validate_snapshot_responses(responses: list[dict], parsed: dict) -> None:
         raise HTTPException(status_code=502, detail="Tally returned an empty ledger export; existing HeidelAI data was kept")
 
 
+def parse_tally_import_response(xml: str) -> dict:
+    try:
+        root = _parse_tally_xml(xml)
+    except ET.ParseError as exc:
+        raise HTTPException(status_code=502, detail="Tally returned an invalid invoice import response") from exc
+    line_error = _node_text(root, "LINEERROR")
+    raw_counts = [_node_text(root, name) or "0" for name in ("ERRORS", "CREATED", "ALTERED")]
+    if any(not value.isdigit() for value in raw_counts):
+        raise HTTPException(status_code=502, detail="Tally returned invalid invoice import counters")
+    errors, created, altered = map(int, raw_counts)
+    master_id = _node_text(root, "LASTVCHID")
+    voucher_number = _node_text(root, "VCHNUMBER")
+    if line_error or _node_text(root, "STATUS") == "0" or errors or created + altered < 1:
+        raise HTTPException(status_code=502, detail=line_error or "Tally did not confirm that it saved the invoice")
+    if not master_id.isdigit() or int(master_id) < 1 or not voucher_number:
+        raise HTTPException(status_code=502, detail="Tally saved the invoice but did not return its invoice number and Master ID")
+    return {
+        "master_id": master_id, "voucher_number": voucher_number,
+        "created": created, "altered": altered,
+    }
+
+
 def parse_invoice_export_response(xml: str, master_id: str) -> dict:
     invoices = parse_snapshot_responses([{"key": "invoices", "xml": xml}])["invoices"]
     invoice = next((row for row in invoices if str(row.get("master_id")) == str(master_id)), None)
@@ -647,6 +682,24 @@ def parse_invoice_export_response(xml: str, master_id: str) -> dict:
         "narration": _node_text(voucher, "NARRATION"),
         "ledger_entries": ledger_entries,
     })
+    return invoice
+
+
+def validate_invoice_creation_readback(job: dict, result: dict) -> dict:
+    imported = parse_tally_import_response(result.get("tally_response") or "")
+    if imported["master_id"] != str(result.get("master_id") or "") or imported["voucher_number"] != str(result.get("voucher_number") or ""):
+        raise HTTPException(status_code=502, detail="Tally's invoice identifiers changed between import and confirmation")
+    response = next((item for item in result.get("responses") or [] if item.get("key") == "invoice"), None)
+    invoice = parse_invoice_export_response((response or {}).get("xml") or "", imported["master_id"])
+    checks = (
+        (invoice.get("voucher_number") == imported["voucher_number"], "invoice number"),
+        (invoice.get("reference") == job.get("quote_number"), "reference"),
+        (str(invoice.get("party_ledger") or "").casefold() == str(job.get("party_ledger") or "").casefold(), "customer ledger"),
+        (_money(invoice.get("amount")) == _money(job.get("amount")), "total"),
+    )
+    mismatch = next((label for matched, label in checks if not matched), "")
+    if mismatch:
+        raise HTTPException(status_code=502, detail=f"Tally invoice read-back did not match the requested {mismatch}")
     return invoice
 
 
@@ -1278,12 +1331,13 @@ def build_sales_voucher_xml(quote: dict, settings: dict, party_ledger: str, tax_
         f"<DISPATCHFROMPLACE>{_xml(dispatch_from.get('place'))}</DISPATCHFROMPLACE>"
     ) if dispatch_from else ""
     return (
-        "<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA>"
+        "<ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA>"
         "<REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES>"
         f"<SVCURRENTCOMPANY>{_xml(settings['company_name'])}</SVCURRENTCOMPANY>"
+        "<SVVCHIMPORTFORMAT>$$SysName:XML</SVVCHIMPORTFORMAT>"
         "</STATICVARIABLES></REQUESTDESC><REQUESTDATA>"
         "<TALLYMESSAGE xmlns:UDF=\"TallyUDF\">"
-        f"<VOUCHER REMOTEID=\"{remote_id}\" VCHTYPE=\"{_xml(settings['voucher_type'])}\" ACTION=\"Create\">"
+        f"<VOUCHER REMOTEID=\"{remote_id}\" VCHTYPE=\"{_xml(settings['voucher_type'])}\" ACTION=\"Create\" OBJVIEW=\"Invoice Voucher View\">"
         f"<DATE>{issued}</DATE><VOUCHERTYPENAME>{_xml(settings['voucher_type'])}</VOUCHERTYPENAME>"
         f"<PARTYLEDGERNAME>{_xml(party_ledger)}</PARTYLEDGERNAME>"
         f"{bill_xml}{ship_xml}{dispatch_xml}"
@@ -1670,7 +1724,8 @@ async def tally_overview(org_id: str, include_financials: bool = False) -> dict:
     version = str(overview["connector_version"])
     capabilities = overview["connector_capabilities"]
     overview["connector_update_required"] = connected and (
-        not version.isdigit() or int(version) < 7 or "reports" not in capabilities or "invoice_pdf" not in capabilities
+        not version.isdigit() or int(version) < 8 or "reports" not in capabilities or "invoice_pdf" not in capabilities
+        or "invoice_readback" not in capabilities
     )
     if include_financials:
         overview.update({
@@ -1790,7 +1845,7 @@ async def list_tally_operations(org_id: str, limit: int = 20) -> list[dict]:
         )
         operations.append(view)
     bills = await db.tally_bill_jobs.find(
-        {"org_id": org_id}, {"_id": 0, "request_xml": 0, "tally_response": 0, "customer": 0}
+        {"org_id": org_id}, {"_id": 0, "request_xml": 0, "readback_request_xml": 0, "tally_response": 0, "customer": 0}
     ).sort("created_at", -1).limit(limit).to_list(length=limit)
     phases = {
         "pending": "queued", "processing": "writing_to_tally", "completed": "completed",
@@ -2157,6 +2212,8 @@ async def submit_tally_invoice_draft(
     last_seen = integration.get("last_seen_at")
     if not isinstance(last_seen, datetime) or (last_seen.replace(tzinfo=timezone.utc) if last_seen.tzinfo is None else last_seen) < now - timedelta(seconds=90):
         raise HTTPException(status_code=409, detail="Tally connector is offline")
+    if not _supports_invoice_readback(integration):
+        raise HTTPException(status_code=409, detail="Download and restart Tally connector version 8 before creating invoices")
     if _snapshot_is_stale(integration, now):
         raise HTTPException(status_code=409, detail="Refresh Tally data before creating this invoice")
     quote_items = []
@@ -2188,6 +2245,7 @@ async def submit_tally_invoice_draft(
         "quote_number": draft["reference"], "draft_id": draft_id, "amount": float(_money(draft["total"])),
         "customer": draft.get("customer") or _customer_snapshot({}, conversation), "party_ledger": draft["party_ledger"],
         "tax_mode": draft["tax_mode"], "status": "pending", "request_xml": request_xml,
+        "readback_request_xml": build_invoice_readback_xml(settings, quote["issued_on"]),
         "outstanding_amount": float(_money(draft["total"])), "reminder_days_after": settings["reminder_days_after"],
         "created_at": now, "created_by": user_id, "created_by_name": user_name, "updated_at": now, "attempts": 0,
     }
@@ -2209,7 +2267,8 @@ async def submit_tally_invoice_draft(
             stored = await db.tally_bill_jobs.find_one_and_update(
                 {"_id": stored["_id"], "status": "failed"},
                 {"$set": {
-                    "status": "pending", "request_xml": request_xml, "draft_id": draft_id,
+                    "status": "pending", "request_xml": request_xml,
+                    "readback_request_xml": build_invoice_readback_xml(settings, quote["issued_on"]), "draft_id": draft_id,
                     "amount": job["amount"], "outstanding_amount": job["outstanding_amount"],
                     "customer": job["customer"], "party_ledger": job["party_ledger"],
                     "tax_mode": job["tax_mode"], "created_by": user_id,
@@ -2233,7 +2292,10 @@ async def submit_tally_invoice_draft(
             "error": stored.get("error"), "updated_at": now,
         }}
     )
-    return serialize_mongo(stored), created
+    return serialize_mongo({
+        key: value for key, value in stored.items()
+        if key not in {"_id", "request_xml", "readback_request_xml", "tally_response"}
+    }), created
 
 
 def _default_reminder_time(due_date: str, days_after: int, settings: dict) -> datetime:
@@ -2638,7 +2700,11 @@ async def authenticate_connector(raw_key: str | None, capabilities: str = "", ve
             "connector_capabilities": sorted({item.strip() for item in capabilities.split(",") if item.strip()}),
         }},
     )
-    integration["last_seen_at"] = now
+    integration.update({
+        "last_seen_at": now,
+        "connector_version": version[:40],
+        "connector_capabilities": sorted({item.strip() for item in capabilities.split(",") if item.strip()}),
+    })
     if _snapshot_is_stale(integration, now):
         await queue_tally_sync(integration["org_id"], force=True)
     return integration
@@ -2648,7 +2714,7 @@ async def list_bills(org_id: str, conversation_id: str, user_id: str, role: str)
     await require_conversation_access(org_id, conversation_id, user_id, role)
     rows = await db.tally_bill_jobs.find(
         {"org_id": org_id, "conversation_id": conversation_id},
-        {"_id": 0, "request_xml": 0, "connector_key_hash": 0, "tally_response": 0},
+        {"_id": 0, "request_xml": 0, "readback_request_xml": 0, "connector_key_hash": 0, "tally_response": 0},
     ).sort("created_at", -1).to_list(length=100)
     return serialize_mongo(rows)
 
@@ -2660,12 +2726,20 @@ async def retry_bill(org_id: str, job_id: str, user_id: str, role: str) -> dict:
     await require_conversation_access(org_id, job["conversation_id"], user_id, role)
     if job.get("status") not in {"failed", "delivery_unknown"}:
         raise HTTPException(status_code=409, detail="Only a failed or unconfirmed Tally bill can be retried")
+    integration = await get_integration(org_id)
+    if not _supports_invoice_readback(integration):
+        raise HTTPException(status_code=409, detail="Download and restart Tally connector version 8 before retrying invoices")
+    created_at = job.get("created_at")
+    invoice_date = created_at.date().isoformat() if isinstance(created_at, datetime) else date.today().isoformat()
     updated = await db.tally_bill_jobs.find_one_and_update(
         {"_id": job["_id"], "status": job["status"]},
-        {"$set": {"status": "pending", "error": None, "updated_at": datetime.now(timezone.utc)},
+        {"$set": {
+            "status": "pending", "error": None, "updated_at": datetime.now(timezone.utc),
+            "readback_request_xml": build_invoice_readback_xml(integration, invoice_date),
+        },
          "$unset": {"claim_id": "", "claimed_at": ""}},
         return_document=ReturnDocument.AFTER,
-        projection={"_id": 0, "request_xml": 0, "tally_response": 0},
+        projection={"_id": 0, "request_xml": 0, "readback_request_xml": 0, "tally_response": 0},
     )
     if not updated:
         raise HTTPException(status_code=409, detail="This Tally bill changed. Refresh before retrying")
@@ -2685,18 +2759,27 @@ async def claim_next_job(integration: dict) -> dict | None:
     )
     if job:
         return serialize_mongo(job)
-    job = await db.tally_bill_jobs.find_one_and_update(
-        {"org_id": integration["org_id"], "status": "pending"},
-        {"$set": {"status": "processing", "claim_id": claim_id, "claimed_at": now, "updated_at": now},
-         "$inc": {"attempts": 1}},
-        sort=[("created_at", 1)],
-        return_document=ReturnDocument.AFTER,
-        projection={"_id": 0},
-    )
-    if job:
-        job["job_type"] = "invoice_create"
-        job["requests"] = [{"key": "invoice", "xml": job.pop("request_xml")}]
-        return serialize_mongo(job)
+    if _supports_invoice_readback(integration):
+        job = await db.tally_bill_jobs.find_one_and_update(
+            {"org_id": integration["org_id"], "status": "pending"},
+            {"$set": {"status": "processing", "claim_id": claim_id, "claimed_at": now, "updated_at": now},
+             "$inc": {"attempts": 1}},
+            sort=[("created_at", 1)],
+            return_document=ReturnDocument.AFTER,
+            projection={"_id": 0},
+        )
+        if job:
+            if not job.get("readback_request_xml"):
+                created_at = job.get("created_at")
+                invoice_date = created_at.date().isoformat() if isinstance(created_at, datetime) else date.today().isoformat()
+                job["readback_request_xml"] = build_invoice_readback_xml(integration, invoice_date)
+                await db.tally_bill_jobs.update_one(
+                    {"org_id": integration["org_id"], "job_id": job["job_id"], "claim_id": claim_id},
+                    {"$set": {"readback_request_xml": job["readback_request_xml"]}},
+                )
+            job["job_type"] = "invoice_create"
+            job["requests"] = [{"key": "invoice", "xml": job.pop("request_xml")}]
+            return serialize_mongo(job)
     job = await db.tally_command_jobs.find_one_and_update(
         {"org_id": integration["org_id"], "status": "pending", "job_type": "sync_snapshot"},
         {"$set": {"status": "processing", "claim_id": claim_id, "claimed_at": now, "updated_at": now},
@@ -2823,6 +2906,18 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                 {"$set": {"readback_job_id": readback["job_id"], "updated_at": now}},
             )
         return await get_tally_command_job(integration["org_id"], job_id)
+    invoice_job = await db.tally_bill_jobs.find_one({"org_id": integration["org_id"], "job_id": job_id})
+    if invoice_job and status == "completed":
+        try:
+            confirmed_invoice = validate_invoice_creation_readback(invoice_job, result)
+            result = {
+                **result,
+                "master_id": confirmed_invoice["master_id"],
+                "voucher_number": confirmed_invoice["voucher_number"],
+            }
+        except HTTPException as exc:
+            status = "delivery_unknown"
+            error = f"Tally accepted the invoice, but HeidelAI could not verify it: {exc.detail}"[:500]
     updated = await db.tally_bill_jobs.find_one_and_update(
         {"org_id": integration["org_id"], "job_id": job_id, "status": "processing", "claim_id": claim_id},
         {"$set": {
@@ -2835,12 +2930,12 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
             "updated_at": now,
         }, "$unset": {"claim_id": "", "claimed_at": ""}},
         return_document=ReturnDocument.AFTER,
-        projection={"_id": 0, "request_xml": 0, "tally_response": 0},
+        projection={"_id": 0, "request_xml": 0, "readback_request_xml": 0, "tally_response": 0},
     )
     if not updated:
         existing = await db.tally_bill_jobs.find_one(
             {"org_id": integration["org_id"], "job_id": job_id},
-            {"_id": 0, "request_xml": 0, "tally_response": 0},
+            {"_id": 0, "request_xml": 0, "readback_request_xml": 0, "tally_response": 0},
         )
         if existing and existing.get("status") == status:
             if status == "completed":
