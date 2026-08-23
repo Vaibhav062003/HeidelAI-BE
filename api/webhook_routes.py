@@ -1039,10 +1039,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             reply_context_message_id=replied_message_id,
                                             message_id=wa_message_id,
                                         )
-                                        logger.info(f"[AI_ROUTING] [{conversation_id}] ✅ AI agent responded. Sending WhatsApp reply.")
                                         if not await is_effective_ai_enabled(org_id, conversation_id):
-                                            logger.info(f"[AI_ROUTING] [{conversation_id}] ⛔ AI disabled mid-flight after agent response. Dropping reply.")
                                             return {"status": "ok"}
+                                        
+                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
+                                        
                                         await send_whatsapp_message({
                                             "conversation_id": conversation_id,
                                             "content": chatbot_response["final_response"],
@@ -1061,9 +1062,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             source_message_id=wa_message_id,
                                         )
                                         return {"status": "ok"}
-                                    await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
-                                else:
-                                    logger.info(f"[AI_ROUTING] [{conversation_id}] ⛔ AI NOT sent. ai_enabled={ai_enabled}, is_heidelai={is_heidelai}")
                                 # Check and send OOS dealer messages if a recent request was logged
                                 try:
                                     from services.oos_service import send_oos_to_dealers
