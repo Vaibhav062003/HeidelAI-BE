@@ -5,7 +5,7 @@ from config.settings import X_INTERNAL_SECRET
 from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
 
 # Base URL for the chatbot API
-CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app/"
+CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app"
 #CHATBOT_BASE_URL = "http://localhost:8001"  For local testing with self-signed certs, ensure to disable SSL verification in httpx client
 
 def _reported_usage(value) -> Dict[str, int]:
