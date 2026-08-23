@@ -46,7 +46,7 @@ async def get_org_memberships(org_id: str) -> list:
         "Content-Type": "application/json"
     }
     try:
-        resp = await _http_client.get(url, headers=headers)
+        resp = await _http_client.get(url, headers=headers, params={"limit": 500})
         if resp.status_code != 200:
             logger.error(f"Clerk memberships fetch failed: {resp.text}")
             raise HTTPException(500, "Clerk service error")
@@ -59,6 +59,21 @@ async def get_org_memberships(org_id: str) -> list:
 
     _clerk_cache[org_id] = data
     return data
+
+
+def membership_public_data(membership: dict) -> dict:
+    """Clerk explicitly allows public_user_data to be null."""
+    return membership.get("public_user_data") or {}
+
+
+def assignment_target_id(entry) -> Optional[str]:
+    if not isinstance(entry, dict):
+        return None
+    return (
+        (entry.get("to_team") or {}).get("id")
+        or (entry.get("to_agent") or {}).get("id")
+        or entry.get("id")
+    )
 
 
 
@@ -114,7 +129,7 @@ async def check_transfer_loop(conversation_id: str, target_agent_id: str, org_id
     if not conv:
         return False
 
-    history = conv.get("assignment_history", [])
+    history = conv.get("assignment_history") or []
     if not history:
         return False
 
@@ -122,11 +137,7 @@ async def check_transfer_loop(conversation_id: str, target_agent_id: str, org_id
 
     for entry in history:
         # Support both new format (to_agent.id) and legacy format (id field directly)
-        entry_agent_id = (
-            entry.get("to_team", {}).get("id")
-            or entry.get("to_agent", {}).get("id")
-            or entry.get("id")
-        )
+        entry_agent_id = assignment_target_id(entry)
         if entry_agent_id != target_agent_id:
             continue
 
@@ -188,13 +199,13 @@ async def transfer_conversation(
         memberships_data = await get_org_memberships(user.org_id)
         target_member = next((
             membership for membership in memberships_data
-            if membership.get("public_user_data", {}).get("user_id") == payload.target_agent_id
+            if membership_public_data(membership).get("user_id") == payload.target_agent_id
         ), None)
-        if not target_member or target_member.get("public_user_data", {}).get("banned"):
+        if not target_member or membership_public_data(target_member).get("banned"):
             raise HTTPException(400, "Target team member was not found or is inactive")
         if team and payload.target_agent_id not in team.get("member_ids", []):
             raise HTTPException(422, "That person is not a member of the selected team")
-        public_data = target_member.get("public_user_data", {})
+        public_data = membership_public_data(target_member)
         target_name = (
             f"{public_data.get('first_name', '')} {public_data.get('last_name', '')}".strip()
             or public_data.get("identifier")
@@ -357,10 +368,10 @@ async def reclaim_conversation(
     )
 
     # Check user was previous owner
-    history = conv.get("assignment_history", [])
+    history = conv.get("assignment_history") or []
     was_owner = any(
-        entry.get("from_agent", {}).get("id") == user.user_id
-        for entry in history
+        (entry.get("from_agent") or {}).get("id") == user.user_id
+        for entry in history if isinstance(entry, dict)
     )
 
     if not was_owner:
@@ -457,7 +468,7 @@ async def create_mentions(
     # Build username -> agent ID map (case insensitive)
     agent_map = {}
     for m in memberships_data:
-        public_data = m.get("public_user_data", {})
+        public_data = membership_public_data(m)
         user_id = public_data.get("user_id")
         
         email = public_data.get("identifier", "").lower()
@@ -529,7 +540,7 @@ async def get_pending_mentions(
     try:
         memberships_data = await get_org_memberships(user.org_id)
         for m in memberships_data:
-            public_data = m.get("public_user_data", {})
+            public_data = membership_public_data(m)
             u_id = public_data.get("user_id")
             name = f"{public_data.get('first_name', '')} {public_data.get('last_name', '')}".strip() or public_data.get("identifier") or "Agent"
             members_map[u_id] = name
@@ -728,7 +739,7 @@ async def get_team_agents(
 
     result = []
     for m in memberships_data:
-        public_data = m.get("public_user_data", {})
+        public_data = membership_public_data(m)
         if public_data.get("banned"):
             continue
             
