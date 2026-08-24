@@ -204,6 +204,7 @@ async def create_conversation_work(
             org_id, conversation["_id"], collection, existing,
             assigned_agent_id, payload.get("assigned_agent_name"),
         )
+        existing = await _update_open_work_context(collection, existing, payload)
         await _attach_conversation_work(org_id, conversation["_id"], existing)
         await broadcast_org_ws(org_id, "conversation_work_updated", {
             "conversation_id": conversation_id,
@@ -226,6 +227,7 @@ async def create_conversation_work(
         "quote_id": quote_id,
         "quote_revision": payload.get("quote_revision"),
         "note": (payload.get("note") or "").strip() or None,
+        "referenced_message_ids": list(payload.get("referenced_message_ids") or []),
         "result": None,
         "invoice_reference": None,
         "version": 1,
@@ -244,6 +246,7 @@ async def create_conversation_work(
             org_id, conversation["_id"], collection, existing,
             assigned_agent_id, payload.get("assigned_agent_name"),
         )
+        existing = await _update_open_work_context(collection, existing, payload)
         await _attach_conversation_work(org_id, conversation["_id"], existing)
         await broadcast_org_ws(org_id, "conversation_work_updated", {
             "conversation_id": conversation_id,
@@ -260,6 +263,23 @@ async def create_conversation_work(
         "status": "pending",
     })
     return serialize_mongo(work), True
+
+
+async def _update_open_work_context(collection, work: dict, payload: dict) -> dict:
+    updated = await collection.find_one_and_update(
+        {"work_id": work["work_id"], "version": work.get("version", 1)},
+        {
+            "$set": {
+                "note": (payload.get("note") or "").strip() or None,
+                "referenced_message_ids": list(payload.get("referenced_message_ids") or []),
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$inc": {"version": 1},
+        },
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 0},
+    )
+    return updated or work
 
 
 async def _assign_open_work(
@@ -298,7 +318,14 @@ async def _assign_open_work(
 
 async def _attach_conversation_work(org_id: str, conversation_id, work: dict) -> None:
     embedded = {key: value for key, value in work.items() if key not in {"_id", "open_key", "created_by"}}
-    await get_async_mongo_db()[f"conversations_{org_id}"].update_one(
+    conversations = get_async_mongo_db()[f"conversations_{org_id}"]
+    updated = await conversations.update_one(
+        {"_id": conversation_id, "active_work.work_id": work["work_id"]},
+        {"$set": {"active_work.$": embedded}},
+    )
+    if updated.matched_count:
+        return
+    await conversations.update_one(
         {"_id": conversation_id, "active_work.work_id": {"$ne": work["work_id"]}},
         {"$push": {"active_work": embedded}},
     )

@@ -13,6 +13,7 @@ from services.pricing_service import ensure_pricing_indexes
 from services.sales_offer_service import ensure_sales_offer_indexes
 from services.tally_service import ensure_tally_indexes
 from services.entitlement_service import ensure_entitlement_indexes
+from services.transfer_notification_service import ensure_transfer_notification_indexes
 from services.push_notification_service import (
     ensure_push_notification_indexes,
     start_push_notification_workers,
@@ -30,6 +31,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_whatsapp_outbound_indexes)
     await asyncio.to_thread(recover_stale_bulk_jobs)
     await asyncio.to_thread(ensure_push_notification_indexes)
+    await asyncio.to_thread(ensure_transfer_notification_indexes)
     load_agents()
     load_prompts_into_cache()
     await ensure_followup_indexes()

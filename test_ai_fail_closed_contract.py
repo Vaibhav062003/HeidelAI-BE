@@ -95,6 +95,7 @@ def _load_agent_service():
     loguru.logger = _Logger()
     settings = types.ModuleType("config.settings")
     settings.X_INTERNAL_SECRET = "test-secret"
+    settings.INTERNAL_HMAC_SECRET = "s" * 32
     config = types.ModuleType("config")
     config.settings = settings
     sys.modules["loguru"] = loguru
@@ -172,8 +173,9 @@ def test_all_clients_use_shared_guard():
         assert "technical difficulties" not in source
     for path in ("services/agent_service.py", "services/pma_chatbot.py"):
         source = (ROOT / path).read_text()
-        assert "X-Internal-Secret" in source
-        assert "configuration_error" in source
+        assert "INTERNAL_HMAC_SECRET" in source
+        assert "signed_json" in source
+    assert "configuration_error" in (ROOT / "services/internal_request.py").read_text()
 
 
 def test_effective_ai_state_fails_closed():
@@ -226,8 +228,8 @@ def test_channel_and_scheduler_contract():
     assert "Instagram AI downstream claim was replaced" in webhook
     assert 'mode not in {"reply", "ai"}' in reply_claim
     assert "is_effective_ai_enabled" in sender
-    assert "len(joined_content) > 4096" in sender
-    assert "not joined_content.strip()" in sender
+    assert "any(len(content) > 4096 for content in contents)" in sender
+    assert "not all(content.strip() for content in contents)" in sender
     pending_resume = webhook.index("pending_ai_failure = messages_collection.find_one")
     text_dispatch = webhook.index('if message_type == "text":', pending_resume)
     assert pending_resume < text_dispatch
