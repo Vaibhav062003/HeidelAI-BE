@@ -34,6 +34,10 @@ def ensure_entitlement_indexes() -> None:
     db.feature_automation_reservations.create_index("expires_at", expireAfterSeconds=0)
     db.feature_capacity_reservations.create_index("expires_at", expireAfterSeconds=0)
     migrate_legacy_free_grace()
+    if enforcement_enabled():
+        gaps = ai_enforcement_gaps()
+        if gaps:
+            raise RuntimeError(f"AI entitlement enforcement has {len(gaps)} unresolved organization(s); synchronize grants or deploy with ENTITLEMENT_ENFORCEMENT_MODE=observe.")
 
 
 def migrate_legacy_free_grace() -> int:
@@ -66,7 +70,32 @@ def migrate_legacy_free_grace() -> int:
 
 
 def enforcement_enabled() -> bool:
-    return os.getenv("ENTITLEMENT_ENFORCEMENT_MODE", "enforce").strip().lower() == "enforce"
+    return os.getenv("ENTITLEMENT_ENFORCEMENT_MODE", "observe").strip().lower() == "enforce"
+
+
+def entitlement_row_active(row: dict | None, now: datetime) -> bool:
+    if not row or row.get("state") != "ACTIVE":
+        return False
+    starts_at = row.get("starts_at")
+    expires_at = row.get("expires_at")
+    if starts_at and starts_at.tzinfo is None:
+        starts_at = starts_at.replace(tzinfo=timezone.utc)
+    if expires_at and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return not ((starts_at and starts_at > now) or (expires_at and expires_at <= now))
+
+
+def ai_enforcement_gaps(limit: int = 20) -> list[str]:
+    now = datetime.now(timezone.utc)
+    gaps = []
+    for organization in db.organizations.find({"is_ai_enabled": True}, {"org_id": 1}):
+        account_id = organization.get("org_id")
+        row = account_id and db.feature_entitlements.find_one({"account_id": account_id, "product": {"$in": ["AI", "CHATBOT"]}})
+        if account_id and not entitlement_row_active(row, now):
+            gaps.append(account_id)
+            if len(gaps) >= limit:
+                break
+    return gaps
 
 
 def period_window(now: datetime | None = None) -> tuple[str, datetime]:
@@ -101,8 +130,8 @@ def validate_limits(product: str, limits: dict | None) -> dict:
         raise HTTPException(status_code=422, detail={"code": "invalid_limits", "message": f"Unsupported limits for {product}."})
     normalized = {}
     for key, value in limits.items():
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
-            raise HTTPException(status_code=422, detail={"code": "invalid_limits", "message": f"{key} must be a positive integer or null."})
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise HTTPException(status_code=422, detail={"code": "invalid_limits", "message": f"{key} must be a non-negative integer or null."})
         normalized[key] = value
     if product == "BROADCASTING" and all(normalized.get(key) is not None for key in ("max_batch_recipients", "monthly_recipients")):
         if normalized["max_batch_recipients"] > normalized["monthly_recipients"]:
@@ -179,7 +208,7 @@ def feature_access(account_id: str, product: str, now: datetime | None = None) -
         starts_at = starts_at.replace(tzinfo=timezone.utc)
     if expires_at and expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if row.get("state") != "ACTIVE" or (starts_at and starts_at > now) or (expires_at and expires_at <= now):
+    if not entitlement_row_active(row, now):
         state = "read_only" if starts_at is None or starts_at <= now else "locked"
     else:
         state = "active"
