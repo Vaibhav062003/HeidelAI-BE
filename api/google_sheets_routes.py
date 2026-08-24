@@ -1020,6 +1020,10 @@ async def _sync_sheet(org_id: str, sheet_id: str, client: Optional[httpx.AsyncCl
             "synced_at": now,
         })
 
+        # Yield to the event loop every 100 rows to prevent health check starvation
+        if idx % 100 == 99:
+            await asyncio.sleep(0)
+
     # --- Reconcile MongoDB with the live sheet ---
     # Step 1: Delete all rows for this sheet that are NOT in the current data
     #         (handles rows removed from the sheet)
