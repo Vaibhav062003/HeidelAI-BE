@@ -14,6 +14,7 @@ from schemas.models import PlatformDisconnectRequest, MessageRole
 from services.cloudinary_service import upload_media_to_cloudinary
 from services.common_service import validate_outbound_attachment
 from services.ai_policy_service import set_conversation_ai_state
+from services.entitlement_service import release_capacity, reserve_capacity
 from services.work_team_service import conversation_access_condition, require_conversation_access
 import requests
 
@@ -48,7 +49,6 @@ def exchange_for_long_lived_token(short_lived_token):
         response = requests.get(url, params=params)
         
         logger.info(f"Long-lived token exchange status: {response.status_code}")
-        logger.info(f"Long-lived token exchange response: {response.text}")
         
         # Check for successful response
         if response.status_code == 200:
@@ -62,7 +62,7 @@ def exchange_for_long_lived_token(short_lived_token):
         else:
             return {
                 "success": False,
-                "error": response.text
+                "error": "Instagram token exchange failed"
             }
     except Exception as e:
         logger.error(f"Error exchanging token: {str(e)}")
@@ -135,6 +135,7 @@ async def get_instagram_profile(request: Request, user: CurrentUser):
 @router.post("/auth")
 @limiter.limit("10/minute")
 async def instagram_auth(request: Request, req: dict, user: CurrentUser):
+    reservation_id = None
     try:
         # Extract authorization code from frontend
         code = req.get("code")
@@ -158,13 +159,9 @@ async def instagram_auth(request: Request, req: dict, user: CurrentUser):
         token_response = requests.post(token_url, data=token_data)
         
         if token_response.status_code != 200:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Failed to exchange authorization code: {token_response.text}"
-            )
+            raise HTTPException(status_code=400, detail="Failed to exchange the Instagram authorization code")
         
         token_info = token_response.json()
-        logger.info(f"Instagram token response: {token_info}")
         access_token = token_info.get("access_token")
         user_id = token_info.get("user_id")
         
@@ -200,6 +197,7 @@ async def instagram_auth(request: Request, req: dict, user: CurrentUser):
                 status_code=403, 
                 detail="This Instagram account is already connected to another organization. If you think this is incorrect, please contact us at support@heidelai.com for further assistance."
             )
+        reservation_id = reserve_capacity(org_id, "CHANNELS", "instagram_accounts", str(instagram_id))
 
         # subscribe user to our webhook
         webhook_response = requests.post(
@@ -263,8 +261,10 @@ async def instagram_auth(request: Request, req: dict, user: CurrentUser):
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        logger.error(f"Instagram authentication error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Instagram authentication error: {str(e)}")
+        logger.error("Instagram authentication failed for org {} ({})", user.org_id, type(e).__name__)
+        raise HTTPException(status_code=502, detail="Instagram authentication failed") from e
+    finally:
+        release_capacity(reservation_id)
 
 @router.post("/disconnect")
 @limiter.limit("10/minute")

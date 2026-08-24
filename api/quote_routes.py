@@ -4,7 +4,7 @@ from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pymongo import ReturnDocument
 
 from auth.auth_utils import admin_required
@@ -69,6 +69,37 @@ class QuoteComponentCategory(BaseModel):
     enabled: bool = True
 
 
+class QuoteSectionLayout(BaseModel):
+    id: Literal[
+        "customer", "metadata", "build", "items", "totals", "seller",
+        "payment", "notes", "terms",
+    ]
+    label: str = Field(min_length=1, max_length=40)
+    enabled: bool = True
+
+
+class QuoteColumnLayout(BaseModel):
+    id: Literal["category", "description", "sku", "quantity", "rate", "gst", "total"]
+    label: str = Field(min_length=1, max_length=30)
+    enabled: bool = True
+
+
+def _default_quote_sections() -> list[QuoteSectionLayout]:
+    return [QuoteSectionLayout(id=id, label=label) for id, label in (
+        ("customer", "Customer"), ("metadata", "Quote details"), ("build", "Build summary"),
+        ("items", "Items"), ("totals", "Totals"), ("seller", "Seller"),
+        ("payment", "Payment"), ("notes", "Notes"), ("terms", "Terms"),
+    )]
+
+
+def _default_quote_columns() -> list[QuoteColumnLayout]:
+    return [QuoteColumnLayout(id=id, label=label, enabled=enabled) for id, label, enabled in (
+        ("category", "Category", True), ("description", "Description", True),
+        ("sku", "SKU", True), ("quantity", "Qty", True), ("rate", "Rate", False),
+        ("gst", "GST", True), ("total", "Total", False),
+    )]
+
+
 class QuoteDesign(BaseModel):
     name: str = Field(default="Custom", min_length=1, max_length=40)
     headerColor: str = Field(default="#111315", pattern=r"^#[0-9A-Fa-f]{6}$")
@@ -88,6 +119,18 @@ class QuoteDesign(BaseModel):
     showNotes: bool = True
     showTerms: bool = True
     showPageNumbers: bool = True
+    sections: list[QuoteSectionLayout] = Field(default_factory=_default_quote_sections, min_length=1, max_length=9)
+    columns: list[QuoteColumnLayout] = Field(default_factory=_default_quote_columns, min_length=1, max_length=7)
+
+    @model_validator(mode="after")
+    def validate_layout(self):
+        for name, entries in (("sections", self.sections), ("columns", self.columns)):
+            ids = [entry.id for entry in entries]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"Quote {name} cannot contain duplicates")
+            if not any(entry.enabled for entry in entries):
+                raise ValueError(f"At least one quote {name[:-1]} must be visible")
+        return self
 
 
 class QuoteBranding(BaseModel):
@@ -105,6 +148,7 @@ class QuoteBranding(BaseModel):
 class QuoteSettingsPayload(BaseModel):
     logo_url: Optional[str] = Field(default=None, min_length=1, max_length=2048)
     seller: Optional[QuoteParty] = None
+    pdf_design: Optional[QuoteDesign] = None
 
 
 class QuotePayload(BaseModel):
@@ -237,6 +281,7 @@ async def get_quote_settings(request: Request, user: CurrentUser):
                 "address": seller.get("address", ""),
                 "payment_details": seller.get("payment_details", ""),
             },
+            "pdf_design": (settings or {}).get("pdf_design") or QuoteDesign().model_dump(),
             "can_edit": user.role in {"admin", "org:admin"},
         }
     }
@@ -255,8 +300,10 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
         updates["logo_url"] = payload.logo_url
     if payload.seller is not None:
         updates["seller"] = payload.seller.model_dump()
+    if payload.pdf_design is not None:
+        updates["pdf_design"] = payload.pdf_design.model_dump()
     if not updates:
-        raise HTTPException(status_code=422, detail="Add a logo or seller profile to update")
+        raise HTTPException(status_code=422, detail="Add a logo, seller profile or PDF design to update")
     settings = await _settings_collection(user.org_id).find_one_and_update(
         {"_id": "branding"},
         {"$set": {
@@ -268,7 +315,12 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
-    return {"settings": {"logo_url": settings.get("logo_url", ""), "seller": settings.get("seller", {}), "can_edit": True}}
+    return {"settings": {
+        "logo_url": settings.get("logo_url", ""),
+        "seller": settings.get("seller", {}),
+        "pdf_design": settings.get("pdf_design") or QuoteDesign().model_dump(),
+        "can_edit": True,
+    }}
 
 
 @router.put("/{quote_id}")

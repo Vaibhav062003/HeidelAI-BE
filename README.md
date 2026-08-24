@@ -4,7 +4,7 @@ This is the backend for the HeidelAI project.
 
 ## Product entitlements
 
-Set `ENTITLEMENT_HMAC_SECRET` to the same secret used by the CRM product adapter. Deploy first with `ENTITLEMENT_ENFORCEMENT_MODE=observe` so organizations without grants keep grandfathered access; after grants are synchronized, switch it to `enforce`. Trial and monthly quota boundaries use `Asia/Kolkata`.
+Set `ENTITLEMENT_HMAC_SECRET` to the same secret used by the CRM product adapter, `INTERNAL_HMAC_SECRET` to the Math API signing secret, and `CRM_COMMERCIAL_BASE_URL` to the CRM origin. Enforcement defaults to `observe` so a deployment cannot interrupt legacy organizations before grants are synchronized. Set `ENTITLEMENT_ENFORCEMENT_MODE=enforce` only after the CRM entitlement import reports every AI-enabled organization in sync; startup refuses enforcement while an AI organization is missing an active AI or legacy CHATBOT grant. Trial and monthly quota boundaries use `Asia/Kolkata`.
 
 ## Run a script or command
 

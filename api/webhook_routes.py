@@ -18,7 +18,7 @@ from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
 from services.heidelai_bot import send_to_chatbot
 from services.agent_service import send_to_agent
-from services.ai_policy_service import is_effective_ai_enabled
+from services.ai_policy_service import ai_access_state, is_effective_ai_enabled
 from services.ai_reply_guard import AIProviderUnavailable, log_ai_failure
 from services.pricing_service import is_price_signal, is_pricing_enabled, observe_customer_message, validate_ai_pricing_response
 from services.wa_service import *
@@ -112,12 +112,7 @@ def validate_signature(raw_body: bytes, signature: str) -> bool:
     our_sig = f"sha256={expected}"
 
     if not hmac.compare_digest(our_sig, signature):
-        logger.error("🚨 SIGNATURE MISMATCH DETECTED 🚨")
-        logger.error(f"1. Platform:          {platform}")
-        logger.error(f"2. Secret Prefix:     {secret[:4]}*** (Length: {len(secret)})")
-        logger.error(f"3. Meta's Signature:  {signature}")
-        logger.error(f"4. Our Signature:     {our_sig}")
-        logger.error(f"5. Raw Bytes Length:  {len(raw_body)}")
+        logger.error(f"Webhook signature mismatch for {platform or 'unknown'}")
         return False
 
     return True
@@ -187,6 +182,9 @@ async def _handle_ai_provider_failure(
     resume_pending: bool = False,
 ) -> None:
     log_ai_failure(error, org_id=org_id, conversation_id=conversation_id)
+    if error.category == "quota_exhausted":
+        await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform=platform, customer_number=customer_number, customer_name=customer_name)
+        return
     if not error.escalation_required:
         return
     if not state_already_checked and not await is_effective_ai_enabled(org_id, conversation_id):
@@ -321,6 +319,62 @@ async def _handle_ai_provider_failure(
             if not completed:
                 raise RuntimeError("AI failure retry state changed before completion")
 
+
+async def _send_quota_handoff(
+    *,
+    org_id: str,
+    conversation_id: str,
+    platform: str,
+    customer_number: str,
+    customer_name: str | None,
+) -> bool:
+    if await ai_access_state(org_id, conversation_id) != "quota_exhausted":
+        return False
+    from services.entitlement_service import period_window
+
+    period, _ = period_window()
+    marker_id = hashlib.sha256(f"{org_id}\0{conversation_id}\0{period}\0quota-handoff".encode()).hexdigest()
+    now = datetime.now(timezone.utc)
+    marker = db.ai_quota_handoffs.update_one(
+        {"_id": marker_id},
+        {"$setOnInsert": {"org_id": org_id, "conversation_id": conversation_id, "period": period, "status": "sending", "created_at": now}},
+        upsert=True,
+    )
+    if marker.upserted_id is None:
+        return True
+    text = "AI limit reached. A team member will reply shortly."
+    try:
+        if platform == "whatsapp":
+            organization = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}) or {}
+            if not organization.get("wa_id"):
+                raise RuntimeError("WhatsApp connection not found")
+            await send_whatsapp_message(
+                {"conversation_id": conversation_id, "content": text, "sender_id": organization["wa_id"], "customer_name": customer_name, "recipient_override": customer_number},
+                org_id,
+                "reply",
+                temp_id=f"quota-handoff:{period}:{conversation_id}",
+                sender_name="HeidelAI",
+            )
+        else:
+            organization = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}) or {}
+            if not organization.get("ig_id"):
+                raise RuntimeError("Instagram connection not found")
+            await send_ig_message(
+                id=customer_number,
+                message_text=text,
+                instagram_id=organization["ig_id"],
+                mode="reply",
+                org_id=org_id,
+                temp_id=f"quota-handoff:{period}:{conversation_id}",
+                conversation_id=conversation_id,
+                sender_name="HeidelAI",
+            )
+        db.ai_quota_handoffs.update_one({"_id": marker_id}, {"$set": {"status": "sent", "sent_at": datetime.now(timezone.utc)}})
+    except Exception:
+        db.ai_quota_handoffs.delete_one({"_id": marker_id, "status": "sending"})
+        raise
+    return True
+
 @router.get("")
 async def verify_webhook(request: Request):
     # This is for the webhook verification (GET request)
@@ -381,10 +435,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         for entry in payload.get("entry", [])
         for change in entry.get("changes", [])
     )
-    if is_call_webhook:
-        logger.info("Incoming WhatsApp Calling webhook (SDP redacted)")
-    else:
-        logger.info(f"Incoming webhook payload:\n{json.dumps(payload, indent=2)}")
+    logger.info("Incoming WhatsApp calling webhook" if is_call_webhook else "Incoming messaging webhook")
 
     if payload["object"] == "whatsapp_business_account":
         if "entry" in payload and len(payload["entry"]) > 0:
@@ -999,7 +1050,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
 
                                 #  Don't execute for heidel_ai as it is not on whatsapp flow yet but has AI
-        
+
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     # Runs on all environments and regardless of AI toggle
                                 if whatsapp_flow:
@@ -1041,9 +1092,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         )
                                         if not await is_effective_ai_enabled(org_id, conversation_id):
                                             return {"status": "ok"}
-                                        
+
                                         await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
-                                        
+
                                         await send_whatsapp_message({
                                             "conversation_id": conversation_id,
                                             "content": chatbot_response["final_response"],
@@ -1062,6 +1113,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             source_message_id=wa_message_id,
                                         )
                                         return {"status": "ok"}
+                                else:
+                                    await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform="whatsapp", customer_number=customer_phone_no, customer_name=sender_name2)
                                 # Check and send OOS dealer messages if a recent request was logged
                                 try:
                                     from services.oos_service import send_oos_to_dealers
@@ -1143,10 +1196,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             sender_id=whatsapp_business_id,
                                             interactive_message=flow_response
                                         )
-                                    
-                                return {"status": "ok"}
+
+                                    return {"status": "ok"}
 
                                 if not await is_effective_ai_enabled(org_id, conversation_id):
+                                    await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform="whatsapp", customer_number=customer_phone_no, customer_name=sender_name2)
                                     return {"status": "ok"}
                                 try:
                                     chatbot_response = await send_to_pma_chatbot(
@@ -1184,6 +1238,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
 
                                 if not await is_effective_ai_enabled(org_id, conversation_id):
+                                    await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform="whatsapp", customer_number=customer_phone_no, customer_name=sender_name2)
                                     return {"status": "ok"}
                                 try:
                                     chatbot_response = await send_to_agent(
@@ -2319,6 +2374,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         )
                                         if not ai_result.get("success"):
                                             raise AIProviderUnavailable("delivery_error")
+                                else:
+                                    await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform="instagram", customer_number=sender_id, customer_name=name or username)
                                 ai_processing_complete = True
                             except AIProviderUnavailable as exc:
                                 try:
@@ -2461,7 +2518,7 @@ async def cashfree_webhook(request: Request):
 
     raw_body = await request.body()
     payload = json.loads(raw_body)
-    logger.info(f"Cashfree Webhook Received:\n{json.dumps(payload, indent=2)}")
+    logger.info("Cashfree webhook received")
 
 
     event_type = payload["type"]
