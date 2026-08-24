@@ -1,4 +1,10 @@
 import httpx
+import json
+import uuid
+import time
+import base64
+import hmac
+import hashlib
 from typing import Dict, Optional
 from loguru import logger
 from config.settings import X_INTERNAL_SECRET
@@ -68,9 +74,20 @@ async def send_to_agent(
 
     if not X_INTERNAL_SECRET:
         raise AIProviderUnavailable("configuration_error")
+    
+    # Generate request signature headers for v2 chat API
+    request_id = uuid.uuid4().hex
+    timestamp = str(int(time.time() * 1000))
+    body_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    canonical = f"POST\n/api/v2/chat\n{timestamp}\n{request_id}\n".encode() + body_bytes
+    signature = base64.b64encode(hmac.new(X_INTERNAL_SECRET.encode(), canonical, hashlib.sha256).digest()).decode()
+
     headers = {
         "Content-Type": "application/json",
         "X-Internal-Secret": X_INTERNAL_SECRET,
+        "X-Request-Id": request_id,
+        "X-Timestamp": timestamp,
+        "X-Signature": signature,
     }
     
     # API endpoint

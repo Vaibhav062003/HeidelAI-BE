@@ -166,12 +166,12 @@ def test_provider_contract():
 
 def test_all_clients_use_shared_guard():
     for path in ("services/agent_service.py", "services/pma_chatbot.py", "services/heidelai_bot.py"):
-        source = (ROOT / path).read_text()
+        source = (ROOT / path).read_text(encoding="utf-8")
         assert "validate_ai_reply" in source
         assert "AIProviderUnavailable" in source
         assert "technical difficulties" not in source
     for path in ("services/agent_service.py", "services/pma_chatbot.py"):
-        source = (ROOT / path).read_text()
+        source = (ROOT / path).read_text(encoding="utf-8")
         assert "X-Internal-Secret" in source
         assert "configuration_error" in source
 
@@ -202,11 +202,11 @@ def test_effective_ai_state_fails_closed():
 
 
 def test_channel_and_scheduler_contract():
-    webhook = (ROOT / "api/webhook_routes.py").read_text()
-    scheduler = (ROOT / "core/scheduler.py").read_text()
-    sender = (ROOT / "services/wa_service.py").read_text()
-    instagram = (ROOT / "services/ig_service.py").read_text()
-    reply_claim = (ROOT / "services/whatsapp_reply_idempotency.py").read_text()
+    webhook = (ROOT / "api/webhook_routes.py").read_text(encoding="utf-8")
+    scheduler = (ROOT / "core/scheduler.py").read_text(encoding="utf-8")
+    sender = (ROOT / "services/wa_service.py").read_text(encoding="utf-8")
+    instagram = (ROOT / "services/ig_service.py").read_text(encoding="utf-8")
+    reply_claim = (ROOT / "services/whatsapp_reply_idempotency.py").read_text(encoding="utf-8")
     assert webhook.count("except AIProviderUnavailable") >= 5
     assert webhook.count("is_effective_ai_enabled") >= 10
     assert '"reason": "ai_provider_unavailable"' in webhook
