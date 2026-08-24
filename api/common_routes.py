@@ -57,7 +57,8 @@ from services.ai_policy_service import get_org_ai_policy, update_org_ai_policy
 from auth.auth_utils import admin_required
 from services.work_team_service import require_conversation_access
 from services.products_service import (
-    get_products_for_org, 
+    count_products_for_org,
+    get_products_for_org,
     bulk_upload_products_from_file, 
     add_single_product,
     get_product_by_id,
@@ -565,14 +566,33 @@ async def update_contact_labels_endpoint(request: Request, body: UpdateLabelsReq
 
 @router.get("/api/products")
 @limiter.limit("60/minute")
-def list_products(request: Request, user: CurrentUser):
-    """
-    """
+def list_products(
+    request: Request,
+    user: CurrentUser,
+    q: str = Query("", max_length=120),
+    page: Optional[int] = Query(None, ge=1),
+    page_size: Optional[int] = Query(None, ge=1, le=100),
+):
     org_id = user.org_id
-
-    products = get_products_for_org(org_id)
-    
-    return {"products": products}
+    legacy = page is None and page_size is None and not q.strip()
+    resolved_page = page or 1
+    resolved_page_size = page_size or (100 if legacy else 50)
+    products = get_products_for_org(
+        org_id,
+        limit=resolved_page_size,
+        skip=(resolved_page - 1) * resolved_page_size,
+        query=q,
+    )
+    if legacy:
+        return {"products": products}
+    total = count_products_for_org(org_id, q)
+    return {
+        "products": products,
+        "total": total,
+        "page": resolved_page,
+        "page_size": resolved_page_size,
+        "has_more": resolved_page * resolved_page_size < total,
+    }
 
 @router.post("/api/products/bulk-upload")
 @limiter.limit("15/minute")

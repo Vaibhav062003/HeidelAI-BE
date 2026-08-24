@@ -1620,13 +1620,25 @@ async def list_tally_ledgers(org_id: str, kind: str = "", query: str = "") -> li
     return serialize_mongo(rows)
 
 
-async def list_tally_stock_items(org_id: str, query: str = "") -> list[dict]:
+def _tally_stock_match(org_id: str, query: str = "") -> dict:
     match: dict = {"org_id": org_id}
     if query.strip():
         pattern = {"$regex": re.escape(query.strip()), "$options": "i"}
         match["$or"] = [{"name": pattern}, {"model_number": pattern}, {"aliases": pattern}]
-    rows = await db.tally_stock_items.find(match, {"_id": 0, "sync_id": 0}).sort("name", 1).to_list(length=500)
+    return match
+
+
+async def list_tally_stock_items(
+    org_id: str, query: str = "", page: int = 1, page_size: int = 500
+) -> list[dict]:
+    rows = await db.tally_stock_items.find(
+        _tally_stock_match(org_id, query), {"_id": 0, "sync_id": 0}
+    ).sort("name", 1).skip((page - 1) * page_size).limit(page_size).to_list(length=page_size)
     return serialize_mongo(rows)
+
+
+async def count_tally_stock_items(org_id: str, query: str = "") -> int:
+    return await db.tally_stock_items.count_documents(_tally_stock_match(org_id, query))
 
 
 async def list_tally_units(org_id: str) -> list[dict]:
