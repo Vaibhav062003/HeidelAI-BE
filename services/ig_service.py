@@ -271,6 +271,8 @@ async def send_ig_message(
         mode: The mode of the message (reply or private message)
         org_id: The organization ID
     """
+    from services.entitlement_service import require_feature
+    require_feature(org_id, "CHANNELS")
     request_id = claim_token = quota_event_key = None
     quota_consumed = False
     try:
@@ -315,7 +317,7 @@ async def send_ig_message(
             # Send the message
             if enforce_ai_state:
                 from services.ai_policy_service import is_effective_ai_enabled
-                from services.entitlement_service import consume_quota_async
+                from services.entitlement_service import reserve_quota_async
 
                 if not await is_effective_ai_enabled(org_id, conversation_id):
                     db[f"instagram_outbox_{org_id}"].delete_one({
@@ -326,8 +328,8 @@ async def send_ig_message(
                     raise AIProviderUnavailable("ai_disabled", escalation_required=False)
                 quota_event_key = f"ai:{request_id or temp_id or conversation_id}"
                 try:
-                    quota = await consume_quota_async(org_id, "AI", "monthly_messages", 1, quota_event_key)
-                    quota_consumed = not quota.get("duplicate", False)
+                    await reserve_quota_async(org_id, "AI", "monthly_messages", 1, quota_event_key)
+                    quota_consumed = True
                 except HTTPException as exc:
                     raise AIProviderUnavailable("quota_exhausted", escalation_required=False) from exc
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -347,7 +349,9 @@ async def send_ig_message(
             _finish_instagram_send(org_id, request_id, claim_token, result)
             if enforce_ai_state:
                 try:
-                    from services.entitlement_service import record_ai_usage_async
+                    from services.entitlement_service import commit_quota_async, record_ai_usage_async
+
+                    await commit_quota_async(org_id, "monthly_messages", quota_event_key, "0")
 
                     usage = ai_usage if isinstance(ai_usage, dict) else {}
                     await record_ai_usage_async(

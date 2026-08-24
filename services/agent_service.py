@@ -1,8 +1,9 @@
 import httpx
 from typing import Dict, Optional
 from loguru import logger
-from config.settings import X_INTERNAL_SECRET
+from config.settings import INTERNAL_HMAC_SECRET
 from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
+from services.internal_request import signed_json
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app"
@@ -66,15 +67,9 @@ async def send_to_agent(
         payload["reply_context_message_id"] = reply_context_message_id
 
 
-    if not X_INTERNAL_SECRET:
-        raise AIProviderUnavailable("configuration_error")
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": X_INTERNAL_SECRET,
-    }
-    
     # API endpoint
     endpoint = f"{CHATBOT_BASE_URL}/api/v2/chat"
+    body, headers = signed_json(payload, "/api/v2/chat", INTERNAL_HMAC_SECRET, message_id)
     
     try:
         logger.info(f"Sending message to chatbot for ...{conversation_id[-6:]}")
@@ -87,7 +82,7 @@ async def send_to_agent(
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 endpoint,
-                json=payload,
+                content=body,
                 headers=headers,
             )
             

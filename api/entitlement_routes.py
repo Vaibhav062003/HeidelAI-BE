@@ -8,9 +8,11 @@ from services.entitlement_auth import verify_entitlement_request
 from services.entitlement_service import (
     access_snapshot,
     apply_entitlement,
+    commit_quota,
     consume_quota,
     record_ai_usage,
     release_quota,
+    reserve_quota,
 )
 
 
@@ -86,7 +88,7 @@ async def post_entitlement_usage_event(
         raise HTTPException(status_code=422, detail="Invalid usage event JSON") from exc
     action = payload.get("action") if isinstance(payload, dict) else None
     event_key = payload.get("event_key") if isinstance(payload, dict) else None
-    if action not in {"consume", "release", "record"} or not isinstance(event_key, str) or not event_key.strip() or len(event_key) > 200:
+    if action not in {"consume", "reserve", "commit", "release", "record"} or not isinstance(event_key, str) or not event_key.strip() or len(event_key) > 200:
         raise HTTPException(status_code=422, detail="Usage event action or key is invalid")
     quantity = payload.get("quantity", 1)
     numbers = {name: payload.get(name, 0) for name in ("input_tokens", "output_tokens", "recorded_cost_microusd")}
@@ -95,6 +97,13 @@ async def post_entitlement_usage_event(
     event_key = event_key.strip()
     if action == "consume":
         return consume_quota(account_id, "AI", "monthly_messages", quantity, event_key)
+    if action == "reserve":
+        return reserve_quota(account_id, "AI", "monthly_messages", quantity, event_key)
+    if action == "commit":
+        part_key = payload.get("part_key")
+        if not isinstance(part_key, str) or not part_key.strip() or len(part_key) > 200:
+            raise HTTPException(status_code=422, detail="Usage commit part_key is invalid")
+        return {"committed": commit_quota(account_id, "monthly_messages", event_key, part_key.strip())}
     if action == "release":
         return {"released": release_quota(account_id, "monthly_messages", event_key)}
     try:

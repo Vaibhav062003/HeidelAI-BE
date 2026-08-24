@@ -102,7 +102,7 @@ async def create_organization(org_name: str, session_id: str, owner: OwnerPayloa
                     
                 }
             )
-            logger.info(f"Clerk create organization response: {response.json()}")
+            logger.info(f"Clerk create organization status: {response.status_code}")
             if response.status_code != 200:
                 raise Exception(f"Failed to create organization: {response.text}")
 
