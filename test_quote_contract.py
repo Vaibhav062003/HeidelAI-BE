@@ -45,6 +45,7 @@ def test_quote_routes_are_authenticated_and_store_private_pricing():
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert {"logo_url", "seller", "payment_details", "org_name"} <= settings_strings
+    assert {"pdf_design", "sections", "columns"} <= settings_strings
 
     update_quote = next(function for function in route_functions if function.name == "update_quote")
     update_strings = {
@@ -70,3 +71,4 @@ def test_quote_math_handles_inclusive_and_extra_gst():
 if __name__ == "__main__":
     test_quote_routes_are_authenticated_and_store_private_pricing()
     test_quote_math_handles_inclusive_and_extra_gst()
+    print("Quote contract checks passed.")
