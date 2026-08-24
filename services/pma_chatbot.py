@@ -15,6 +15,7 @@ from schemas.models import (
 from services.utils import get_first_name
 from services.wa_service import send_whatsapp_message
 from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
+from services.internal_request import signed_json
 
 db = get_async_mongo_db()
 
@@ -62,8 +63,7 @@ async def send_to_pma_chatbot(
     endpoint = f"{CHATBOT_BASE_URL}/api/v1/chat"
 
     try:
-        if not settings.X_INTERNAL_SECRET:
-            raise AIProviderUnavailable("configuration_error")
+        body, headers = signed_json(payload, "/api/v1/chat", settings.INTERNAL_HMAC_SECRET, message_id)
         logger.info(f"Sending message to chatbot for ...{conversation_id[-6:]}")
         logger.debug(
             f"PMA chatbot payload org={org_id}, conversation=...{conversation_id[-4:]}, "
@@ -73,8 +73,8 @@ async def send_to_pma_chatbot(
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 endpoint,
-                json=payload,
-                headers={"X-Internal-Secret": settings.X_INTERNAL_SECRET},
+                content=body,
+                headers=headers,
             )
 
             response.raise_for_status()

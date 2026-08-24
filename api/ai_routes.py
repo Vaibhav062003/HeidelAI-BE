@@ -1,5 +1,6 @@
 # === Third-party Modules ===
 from typing import Literal, Optional
+import uuid
 
 from pymongo.errors import PyMongoError
 from bson import ObjectId
@@ -18,7 +19,8 @@ from services.followup_service import (
     schedule_followup_message,
     transition_scheduled_followup,
 )
-from services.entitlement_service import require_feature
+from services.entitlement_service import commit_quota_async, record_ai_usage_async, release_quota_async, require_feature, reserve_quota_async
+from services.agent_service import send_to_agent
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required
@@ -67,6 +69,13 @@ class ConversationAIStateRequest(BaseModel):
     duration_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
 
 
+class PlaygroundChatRequest(BaseModel):
+    conversation_id: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=12_000)
+    persona: str = Field(default="fallback", max_length=100)
+    location: str = Field(default="india", max_length=100)
+
+
 @router.get("/policy")
 @limiter.limit("60/minute")
 async def get_ai_policy(request: Request, user: CurrentUser):
@@ -83,6 +92,33 @@ async def put_ai_policy(request: Request, payload: AIPolicyRequest, user: Curren
         payload.pause_minutes,
         payload.quote_followup_prompt_enabled,
     )
+
+
+@router.post("/playground/chat")
+@limiter.limit("30/minute")
+async def playground_chat(request: Request, payload: PlaygroundChatRequest, user: CurrentUser):
+    require_feature(user.org_id, "AI")
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    event_key = f"playground:{user.user_id}:{request_id}"
+    await reserve_quota_async(user.org_id, "AI", "monthly_messages", 1, event_key)
+    try:
+        result = await send_to_agent(
+            conversation_id=payload.conversation_id,
+            user_input=payload.message,
+            persona=payload.persona,
+            location=payload.location,
+            customer_name=user.full_name or "User",
+            org_id=user.org_id,
+            source="ai_playground",
+            message_id=request_id,
+        )
+    except Exception:
+        await release_quota_async(user.org_id, "monthly_messages", event_key)
+        raise
+    await commit_quota_async(user.org_id, "monthly_messages", event_key, "0")
+    usage = result.get("usage") or {}
+    await record_ai_usage_async(user.org_id, event_key, "playground", 1, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)), int(usage.get("recorded_cost_microusd", 0)))
+    return {"response": result["final_response"]}
 
 
 @router.post("/conversations/{conversation_id}/state")

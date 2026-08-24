@@ -62,38 +62,45 @@ async def update_org_ai_policy(
     return await get_org_ai_policy(org_id)
 
 
-async def is_effective_ai_enabled(org_id: str, conversation_id: str) -> bool:
+async def ai_access_state(org_id: str, conversation_id: str) -> str:
     try:
         from services.entitlement_service import quota_status
 
         quota = await asyncio.to_thread(quota_status, org_id, "AI", "monthly_messages")
         if quota["remaining"] == 0:
-            return False
+            return "quota_exhausted"
         organization = await db.organizations.find_one(
             {"org_id": org_id},
             {"_id": 0, "is_ai_enabled": 1},
         )
         if not organization or not organization.get("is_ai_enabled", False):
-            return False
+            return "organization_disabled"
         conversation = await db[f"conversations_{org_id}"].find_one(
             {"conversation_id": conversation_id},
             {"_id": 0, "is_ai_enabled": 1, "auto_ai_disabled": 1, "auto_ai_disabled_until": 1},
         )
         if not conversation or not conversation.get("is_ai_enabled", True):
-            return False
+            return "conversation_disabled"
         paused_until = conversation.get("auto_ai_disabled_until")
         if conversation.get("auto_ai_disabled") and paused_until:
             if paused_until.tzinfo is None:
                 paused_until = paused_until.replace(tzinfo=timezone.utc)
-            return paused_until <= datetime.now(timezone.utc)
-        return not conversation.get("auto_ai_disabled", False)
+            return "active" if paused_until <= datetime.now(timezone.utc) else "conversation_paused"
+        return "active" if not conversation.get("auto_ai_disabled", False) else "conversation_paused"
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        return "commercial_unavailable" if detail.get("code") == "feature_unavailable" else "error"
     except Exception:
         logger.exception(
             "AI policy check failed closed org=%s conversation=...%s",
             org_id,
             conversation_id[-6:],
         )
-        return False
+        return "error"
+
+
+async def is_effective_ai_enabled(org_id: str, conversation_id: str) -> bool:
+    return await ai_access_state(org_id, conversation_id) == "active"
 
 
 async def set_conversation_ai_state(
