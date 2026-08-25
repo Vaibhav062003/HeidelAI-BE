@@ -346,7 +346,7 @@ def build_snapshot_requests(settings: dict) -> list[dict]:
         ])},
         {"key": "stock_items", "xml": _export_collection_xml(settings, "StockItem", [
             "Name", "Alias", "Parent", "GUID", "MasterID", "AlterID", "BaseUnits", "ClosingBalance",
-            "ClosingValue", "StandardPrice", "GSTApplicable", "GSTTaxability", "GSTHSNName", "GSTIGSTRate",
+            "ClosingValue", "StandardPrice", "Description", "BatchAllocations", "GSTApplicable", "GSTTaxability", "GSTHSNName", "GSTIGSTRate",
         ])},
         {"key": "units", "xml": _export_collection_xml(settings, "Unit", [
             "Name", "GUID", "MasterID", "AlterID", "OriginalName", "GSTRepUOM",
@@ -517,6 +517,16 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                 })
             elif key == "stock_items":
                 aliases = [value.strip() for value in _node_text(node, "ALIAS").split(",") if value.strip()]
+                allocations = []
+                for allocation in node.iter():
+                    if _tag(allocation) != "BATCHALLOCATIONS.LIST":
+                        continue
+                    quantity = float(_decimal_text(_node_text(allocation, "CLOSINGBALANCE", "ACTUALQTY", "BILLEDQTY")))
+                    allocations.append({
+                        "godown": _node_text(allocation, "GODOWNNAME") or "Main Location",
+                        "batch": _node_text(allocation, "BATCHNAME") or "Primary Batch",
+                        "quantity": abs(quantity),
+                    })
                 parsed[key].append({**common,
                     "aliases": aliases,
                     "model_number": aliases[0] if aliases else name,
@@ -525,6 +535,8 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                     "closing_quantity": float(_decimal_text(_node_text(node, "CLOSINGBALANCE"))),
                     "closing_value": float(_decimal_text(_node_text(node, "CLOSINGVALUE"))),
                     "standard_rate": float(_decimal_text(_node_text(node, "STANDARDPRICE"))),
+                    "description": _node_text(node, "DESCRIPTION"),
+                    "allocations": allocations,
                     "hsn": _node_text(node, "GSTHSNNAME", "HSNCODE"),
                     "gst_rate": float(_decimal_text(_node_text(node, "GSTIGSTRATE"))),
                     "gst_applicable": _node_text(node, "GSTAPPLICABLE"),
@@ -1406,6 +1418,7 @@ def build_master_xml(
             f"<STOCKITEM NAME=\"{_xml(target)}\" ACTION=\"{action}\"><NAME>{_xml(name)}</NAME>"
             f"<PARENT>{_xml(value.get('parent') or 'Primary')}</PARENT>"
             f"<ALIAS>{_xml(value.get('model_number'))}</ALIAS><BASEUNITS>{_xml(value.get('unit'))}</BASEUNITS>"
+            f"<DESCRIPTION>{_xml(value.get('description'))}</DESCRIPTION>"
             f"<GSTAPPLICABLE>{_xml(value.get('gst_applicable') or 'Applicable')}</GSTAPPLICABLE>"
             f"<GSTHSNNAME>{_xml(value.get('hsn'))}</GSTHSNNAME>"
             f"<STANDARDPRICELIST.LIST><DATE>{date.today().strftime('%Y%m%d')}</DATE>"
@@ -1420,6 +1433,42 @@ def build_master_xml(
         "<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA>"
         f"<REQUESTDESC><REPORTNAME>All Masters</REPORTNAME>{static_variables}</REQUESTDESC><REQUESTDATA>"
         f"<TALLYMESSAGE xmlns:UDF=\"TallyUDF\">{body}</TALLYMESSAGE>"
+        "</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>"
+    )
+
+
+def build_physical_stock_xml(settings: dict, item: dict, quantity: float, allocations: list[dict]) -> str:
+    """Build a location/batch-aware Physical Stock voucher for actual quantity."""
+    unit = item.get("unit") or normalized_settings(settings)["stock_unit"]
+    allocations = allocations or [{"godown": "Main Location", "batch": "Primary Batch", "quantity": quantity}]
+    total = sum(float(row.get("quantity") or 0) for row in allocations)
+    if abs(total - float(quantity)) > 0.001:
+        raise HTTPException(status_code=422, detail="Location and batch quantities must equal the total stock quantity")
+    batch_xml = "".join(
+        "<BATCHALLOCATIONS.LIST>"
+        f"<GODOWNNAME>{_xml(row.get('godown') or 'Main Location')}</GODOWNNAME>"
+        f"<BATCHNAME>{_xml(row.get('batch') or 'Primary Batch')}</BATCHNAME>"
+        f"<ACTUALQTY>{_number(row.get('quantity'))} {_xml(unit)}</ACTUALQTY>"
+        f"<BILLEDQTY>{_number(row.get('quantity'))} {_xml(unit)}</BILLEDQTY>"
+        "</BATCHALLOCATIONS.LIST>"
+        for row in allocations
+    )
+    company = _xml(normalized_settings(settings)["company_name"])
+    body = (
+        '<VOUCHER VCHTYPE="Physical Stock" ACTION="Create" OBJVIEW="Inventory Voucher View">'
+        f"<DATE>{date.today().strftime('%Y%m%d')}</DATE><EFFECTIVEDATE>{date.today().strftime('%Y%m%d')}</EFFECTIVEDATE>"
+        "<VOUCHERTYPENAME>Physical Stock</VOUCHERTYPENAME><PERSISTEDVIEW>Inventory Voucher View</PERSISTEDVIEW>"
+        "<ALLINVENTORYENTRIES.LIST>"
+        f"<STOCKITEMNAME>{_xml(item.get('name'))}</STOCKITEMNAME>"
+        f"<ACTUALQTY>{_number(quantity)} {_xml(unit)}</ACTUALQTY>"
+        f"<BILLEDQTY>{_number(quantity)} {_xml(unit)}</BILLEDQTY>{batch_xml}"
+        "</ALLINVENTORYENTRIES.LIST></VOUCHER>"
+    )
+    return (
+        "<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA>"
+        "<REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{company}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA>"
+        f'<TALLYMESSAGE xmlns:UDF="TallyUDF">{body}</TALLYMESSAGE>'
         "</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>"
     )
 
@@ -2831,6 +2880,21 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                     {"org_id": integration["org_id"], "job_id": job_id},
                     {"$set": {"sync": command["sync"], "updated_at": now}},
                 )
+                if command.get("triggered_by_job_id"):
+                    parent = await db.tally_command_jobs.find_one({
+                        "org_id": integration["org_id"], "job_id": command["triggered_by_job_id"], "job_type": "stock_change",
+                    })
+                    if parent:
+                        from services.stock_service import fail_tally_stock_readback, finish_tally_stock_change
+                        try:
+                            await finish_tally_stock_change(
+                                integration["org_id"], parent["job_id"], True, after_readback=True,
+                            )
+                        except Exception as stock_exc:
+                            logger.exception("Tally stock read-back processing failed for %s", parent["job_id"])
+                            await fail_tally_stock_readback(
+                                integration["org_id"], parent["job_id"], type(stock_exc).__name__,
+                            )
             except Exception as exc:
                 status = "failed"
                 error = str(exc.detail) if isinstance(exc, HTTPException) else f"HeidelAI could not store the Tally snapshot: {type(exc).__name__}"
@@ -2842,6 +2906,12 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                     {"org_id": integration["org_id"]}, {"$set": {"last_sync_error": error}}
                 )
                 command.update({"status": status, "error": error})
+        elif command["job_type"] == "stock_change":
+            from services.stock_service import finish_tally_stock_change
+            await finish_tally_stock_change(
+                integration["org_id"], command["job_id"], status == "completed", error,
+                delivery_unknown=status == "delivery_unknown",
+            )
         elif status == "completed" and command["job_type"] == "profit_loss_report":
             response = next((item for item in result.get("responses") or [] if item.get("key") == "profit_loss"), None)
             try:
@@ -2916,6 +2986,12 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
             await db.tally_command_jobs.update_one(
                 {"org_id": integration["org_id"], "job_id": job_id},
                 {"$set": {"readback_job_id": readback["job_id"], "updated_at": now}},
+            )
+        elif existing_command.get("job_type") == "stock_change":
+            from services.stock_service import finish_tally_stock_change
+            await finish_tally_stock_change(
+                integration["org_id"], existing_command["job_id"], status == "completed", existing_command.get("error"),
+                delivery_unknown=status == "delivery_unknown",
             )
         return await get_tally_command_job(integration["org_id"], job_id)
     invoice_job = await db.tally_bill_jobs.find_one({"org_id": integration["org_id"], "job_id": job_id})

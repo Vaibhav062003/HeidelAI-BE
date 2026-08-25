@@ -152,6 +152,10 @@ async def connect_product_sheet(request: ConnectProductSheetRequest, user: Curre
         )
 
         now = datetime.now(timezone.utc)
+        has_primary = await asyncio.to_thread(
+            db.product_sheet_connections.find_one,
+            {"org_id": org_id, "status": "active", "is_primary": True},
+        )
         connection_doc = {
             "org_id": org_id,
             "sheet_id": request.sheet_id,
@@ -163,6 +167,7 @@ async def connect_product_sheet(request: ConnectProductSheetRequest, user: Curre
             "last_sync_count": 0,
             "sync_errors": [],
             "status": "active",
+            "is_primary": not bool(has_primary),
             "connected_at": now,
             "updated_at": now,
         }
@@ -237,6 +242,7 @@ async def list_product_sheet_connections(user: CurrentUser):
                     "last_sync_count": 1,
                     "sync_errors": 1,
                     "status": 1,
+                    "is_primary": 1,
                 }
             ).sort("connected_at", -1))
         )
@@ -253,6 +259,31 @@ async def list_product_sheet_connections(user: CurrentUser):
     except Exception as e:
         logger.error(f"Error listing product sheet connections for org {user.org_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list product sheet connections: {str(e)}")
+
+
+@router.put("/connections/{sheet_id}/primary")
+async def set_primary_product_sheet(sheet_id: str, user: CurrentUser):
+    """Choose the only Sheet that inventory edits may write back to."""
+    if user.role not in {"admin", "org:admin"}:
+        raise HTTPException(status_code=403, detail="Only organization admins can change the primary stock sheet")
+    connection = await asyncio.to_thread(
+        db.product_sheet_connections.find_one,
+        {"org_id": user.org_id, "sheet_id": sheet_id, "status": "active"},
+    )
+    if not connection:
+        raise HTTPException(status_code=404, detail="Active product sheet connection not found")
+    now = datetime.now(timezone.utc)
+    await asyncio.to_thread(
+        db.product_sheet_connections.update_many,
+        {"org_id": user.org_id},
+        {"$set": {"is_primary": False, "updated_at": now}},
+    )
+    await asyncio.to_thread(
+        db.product_sheet_connections.update_one,
+        {"org_id": user.org_id, "sheet_id": sheet_id},
+        {"$set": {"is_primary": True, "updated_at": now}},
+    )
+    return {"status": "success", "sheet_id": sheet_id}
 
 
 # ─── DELETE /connections/{sheet_id} ────────────────────────────────────────────
@@ -283,7 +314,13 @@ async def disconnect_product_sheet(sheet_id: str, user: CurrentUser):
         await asyncio.to_thread(
             lambda: products_col.update_many(
                 {"source_sheet_ids": sheet_id},
-                {"$pull": {"source_sheet_ids": sheet_id}}
+                {
+                    "$pull": {"source_sheet_ids": sheet_id},
+                    "$unset": {
+                        f"source_rows.{sheet_id}": "",
+                        f"source_values.{sheet_id}": "",
+                    },
+                }
             )
         )
 
