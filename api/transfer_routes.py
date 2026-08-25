@@ -87,6 +87,11 @@ class TransferRequest(BaseModel):
     referenced_message_ids: List[str] = Field(default_factory=list, max_length=5)
 
 
+class ApprovalRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+    referenced_message_ids: List[str] = Field(default_factory=list, max_length=5)
+
+
 class MentionCreate(BaseModel):
     mentioned_usernames: List[str]
     message_content: str
@@ -101,6 +106,37 @@ def normalize_referenced_message_ids(values: List[str]) -> List[str]:
     if len(set(message_ids)) != len(message_ids):
         raise HTTPException(422, "Referenced messages must be unique")
     return message_ids
+
+
+def approval_recipient_ids(memberships: list, requester_id: str) -> List[str]:
+    recipients = []
+    for membership in memberships:
+        public_data = membership_public_data(membership)
+        user_id = public_data.get("user_id")
+        role = str(membership.get("role") or "").removeprefix("org:").lower()
+        if role in {"admin", "manager"} and user_id and user_id != requester_id and not public_data.get("banned"):
+            recipients.append(user_id)
+    return list(dict.fromkeys(recipients))
+
+
+def approval_contact_details(conversation: dict, contact: Optional[dict] = None) -> dict:
+    contact = contact or {}
+    tally = contact.get("tally") or {}
+    conversation_id = str(conversation.get("conversation_id") or "")
+    fallback_number = conversation_id.removeprefix("whatsapp_") if conversation_id.startswith("whatsapp_") else ""
+    return {
+        "customer_name": str(
+            contact.get("full_name") or contact.get("company") or contact.get("company_name") or tally.get("legal_name")
+            or conversation.get("customer_name") or "Customer"
+        ).strip(),
+        "customer_phone": str(
+            contact.get("phone_number") or contact.get("phone") or conversation.get("customer_id")
+            or conversation.get("phone_number") or fallback_number
+        ).strip(),
+        "customer_gstin": str(
+            contact.get("gstin") or tally.get("gstin") or conversation.get("gstin") or ""
+        ).strip().upper(),
+    }
 
 
 async def require_referenced_messages(org_id: str, conversation_id: str, values: List[str]) -> List[str]:
@@ -324,7 +360,7 @@ async def read_transfer_notification(
         projection={"_id": 0},
     )
     if not notification:
-        raise HTTPException(404, "Transfer notification not found")
+        raise HTTPException(404, "Notification not found")
     return {"notification": serialize_mongo(notification)}
 
 
@@ -336,6 +372,82 @@ async def read_all_transfer_notifications(request: Request, user: CurrentUser):
         {"$set": {"read_at": datetime.now(timezone.utc)}},
     )
     return {"status": "success", "updated": result.modified_count}
+
+
+@router.post("/api/conversations/{conversation_id}/approval-requests")
+@limiter.limit("10/minute")
+async def request_conversation_approval(
+    request: Request,
+    conversation_id: str,
+    payload: ApprovalRequest,
+    user: CurrentUser,
+):
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(422, "Describe what needs approval")
+
+    conversation = await require_conversation_access(
+        user.org_id, conversation_id, user.user_id, user.role
+    )
+    referenced_message_ids = await require_referenced_messages(
+        user.org_id, conversation_id, payload.referenced_message_ids
+    )
+    recipients = approval_recipient_ids(await get_org_memberships(user.org_id), user.user_id)
+    if not recipients:
+        raise HTTPException(409, "No other admin or manager is available to approve this request")
+
+    async_db = get_async_mongo_db()
+    contact = await async_db[f"contacts_{user.org_id}"].find_one(
+        {"conversation_id": conversation_id},
+        {"_id": 0, "full_name": 1, "phone_number": 1, "company": 1, "gstin": 1, "tally": 1},
+    )
+    tally_link = await async_db.tally_customer_links.find_one(
+        {"org_id": user.org_id, "conversation_id": conversation_id},
+        {"_id": 0, "company_name": 1, "phone": 1, "gstin": 1},
+    )
+    contact_details = dict(tally_link or {})
+    contact_details.update({key: value for key, value in (contact or {}).items() if value})
+    details = approval_contact_details(conversation, contact_details)
+    now = datetime.now(timezone.utc)
+    documents = [{
+        "notification_id": str(uuid.uuid4()),
+        "notification_type": "approval_request",
+        "org_id": user.org_id,
+        "recipient_id": recipient_id,
+        "conversation_id": conversation_id,
+        **details,
+        "from_agent_id": user.user_id,
+        "from_agent_name": user.full_name or "Team member",
+        "reason": message,
+        "referenced_message_ids": referenced_message_ids,
+        "created_at": now,
+        "read_at": None,
+        "expires_at": now + timedelta(days=30),
+    } for recipient_id in recipients]
+    await async_db.transfer_notifications.insert_many(documents)
+
+    for document in documents:
+        try:
+            await send_to_user(document["recipient_id"], {
+                "type": "conversation_transferred",
+                **{key: value for key, value in document.items() if key not in {"org_id", "expires_at"}},
+            }, org_id=user.org_id)
+        except Exception as error:
+            logger.warning(f"Approval request was saved but its live notification failed: {error}")
+
+    await log_audit(
+        conversation_id,
+        user.org_id,
+        "approval_requested",
+        user.user_id,
+        None,
+        user.user_id,
+        request.client.host if request.client else "unknown",
+        reason=message,
+        referenced_message_ids=referenced_message_ids,
+    )
+    return {"status": "success", "recipient_count": len(documents)}
+
 
 @router.post("/api/conversations/{conversation_id}/transfer")
 @limiter.limit("20/minute")
