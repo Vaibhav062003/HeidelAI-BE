@@ -1137,7 +1137,27 @@ async def observe_customer_message(
     customer_name: str,
 ) -> dict:
     """Observe an inbound turn and return whether normal automation must stop."""
-    if not is_pricing_enabled(org_id) or not content:
+    if not content:
+        return {"intercept": False}
+    if re.search(r"\b(price|quote|quotation|available|availability|stock|buy|need|want|qty|quantity)\b", content, re.I) or _has_product_identifier(content):
+        interest_product = await _resolve_product(org_id, content)
+        interest_sku = _sku(interest_product)
+        if interest_sku:
+            await _record(org_id, {
+                "event_key": f"{source_message_id}:buyer_product_interest",
+                "event_type": "buyer_product_interest",
+                "direction": "inbound",
+                "actor": "buyer",
+                "counterparty_role": "buyer",
+                "dealer_phone": _phone(conversation_id),
+                "conversation_id": conversation_id,
+                "sku": interest_sku,
+                "product_context": _product_context(interest_product, content),
+                "raw_text": content,
+                "source_message_id": source_message_id,
+                "reply_to_message_id": reply_to_message_id,
+            })
+    if not is_pricing_enabled(org_id):
         return {"intercept": False}
     dealer_phone = _phone(conversation_id)
     reply_event = await _event_for_message(org_id, reply_to_message_id)
