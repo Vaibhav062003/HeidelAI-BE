@@ -1,4 +1,5 @@
 import unittest
+import ast
 import sys
 import types
 import base64
@@ -8,6 +9,7 @@ import os
 import uuid
 from unittest.mock import patch
 from datetime import datetime, timezone
+from pathlib import Path
 
 class HTTPException(Exception):
     def __init__(self, status_code, detail):
@@ -20,7 +22,8 @@ sys.modules.setdefault("pymongo", types.SimpleNamespace(ReturnDocument=types.Sim
 sys.modules.setdefault("pymongo.errors", types.SimpleNamespace(DuplicateKeyError=type("DuplicateKeyError", (Exception,), {})))
 
 import services.entitlement_service as entitlement_service
-from services.entitlement_service import ai_enforcement_gaps, enforcement_enabled, entitlement_row_active, period_window, recent_periods, validate_limits
+from services.entitlement_service import ai_enforcement_gaps, enforcement_enabled, entitlement_row_active, feature_access, period_window, recent_periods, validate_limits
+from services.commercial_mode import billing_enabled
 from services.entitlement_auth import verify_entitlement_request
 from services.internal_request import signed_json
 
@@ -45,6 +48,37 @@ class EntitlementContractTest(unittest.TestCase):
             self.assertFalse(enforcement_enabled())
         with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "enforce"}, clear=True):
             self.assertTrue(enforcement_enabled())
+
+    def test_disabled_commercial_mode_is_open_but_enforcement_still_works(self):
+        stored = {"state": "SUSPENDED", "grant_type": "PAID", "limits": {"monthly_messages": 0}}
+        entitlements = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: stored)
+        unreadable = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: self.fail("observe mode must not read stored limits"))
+        with patch.object(entitlement_service, "db", types.SimpleNamespace(feature_entitlements=unreadable)):
+            with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "observe"}, clear=True):
+                self.assertEqual(feature_access("org_1", "AI")["state"], "active")
+                self.assertEqual(feature_access("org_1", "AI")["limits"], {})
+                self.assertEqual(feature_access("org_1", "TALLY")["state"], "active")
+        with patch.object(entitlement_service, "db", types.SimpleNamespace(feature_entitlements=entitlements)):
+            with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "enforce"}, clear=True):
+                self.assertEqual(feature_access("org_1", "AI")["state"], "read_only")
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(billing_enabled())
+        with patch.dict(os.environ, {"BILLING_PROXY_ENABLED": "true"}, clear=True):
+            self.assertTrue(billing_enabled())
+
+    def test_billing_proxy_fails_before_reading_request_credentials(self):
+        tree = ast.parse(Path("api/billing_routes.py").read_text())
+        crm = next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_crm")
+        first = crm.body[0]
+        self.assertIsInstance(first, ast.If)
+        self.assertEqual(ast.unparse(first.test), "not billing_enabled()")
+        self.assertIn("Billing is temporarily unavailable.", ast.unparse(first))
+        router = next(node for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "router" for target in node.targets))
+        self.assertIn("Depends(require_billing_enabled)", ast.unparse(router.value))
+
+        signup = Path("api/signup_routes.py").read_text()
+        self.assertIn('workspace_plan = "trial_pending" if billing_enabled() else "free"', signup)
 
     def test_entitlement_activity_honors_state_and_window(self):
         now = datetime(2026, 8, 24, tzinfo=timezone.utc)

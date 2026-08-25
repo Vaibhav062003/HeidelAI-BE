@@ -30,7 +30,8 @@ class TallyContactSyncContract(unittest.TestCase):
         self.assertIn('"/api/tally/access"', routes)
         self.assertIn("check_tally_contact_sync_health", scheduler)
         entitlements = pathlib.Path("services/entitlement_service.py").read_text()
-        self.assertIn('if product == "TALLY":', entitlements)
+        self.assertIn("if not enforcement_enabled():", entitlements)
+        self.assertIn('return {"state": "locked"', entitlements)
 
 
 if __name__ == "__main__":

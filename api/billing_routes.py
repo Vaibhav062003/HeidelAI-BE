@@ -3,13 +3,19 @@ import uuid
 from typing import Literal, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 
 from auth.dependencies import CurrentUser
 from core.limiter import limiter
+from services.commercial_mode import billing_enabled
 
-router = APIRouter(prefix="/api/billing", tags=["Billing"])
+def require_billing_enabled() -> None:
+    if not billing_enabled():
+        raise HTTPException(status_code=503, detail="Billing is temporarily unavailable.")
+
+
+router = APIRouter(prefix="/api/billing", tags=["Billing"], dependencies=[Depends(require_billing_enabled)])
 
 
 class BillingProfileRequest(BaseModel):
@@ -37,6 +43,8 @@ def _base_url() -> str:
 
 
 async def _crm(request: Request, method: str, path: str, body: dict | None = None, authenticated: bool = True):
+    if not billing_enabled():
+        raise HTTPException(status_code=503, detail="Billing is temporarily unavailable.")
     headers = {"accept": "application/json"}
     if authenticated:
         authorization = request.headers.get("authorization")

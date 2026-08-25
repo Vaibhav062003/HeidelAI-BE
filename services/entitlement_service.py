@@ -192,15 +192,13 @@ def apply_entitlement(account_id: str, payload: dict) -> dict:
 
 def feature_access(account_id: str, product: str, now: datetime | None = None) -> dict:
     product = normalize_product(product)
+    if not enforcement_enabled():
+        return {"state": "active", "grant_type": "GRANDFATHERED", "starts_at": None, "expires_at": None, "limits": {}, "observed": True}
     now = now or datetime.now(timezone.utc)
     row = db.feature_entitlements.find_one({"account_id": account_id, "product": product})
     if product == "AI" and not row:
         row = db.feature_entitlements.find_one({"account_id": account_id, "product": "CHATBOT"})
     if not row:
-        if product == "TALLY":
-            return {"state": "locked", "grant_type": None, "starts_at": None, "expires_at": None, "limits": {}}
-        if not enforcement_enabled():
-            return {"state": "active", "grant_type": "GRANDFATHERED", "starts_at": None, "expires_at": None, "limits": {}, "observed": True}
         return {"state": "locked", "grant_type": None, "starts_at": None, "expires_at": None, "limits": {}}
     starts_at = row.get("starts_at")
     expires_at = row.get("expires_at")
