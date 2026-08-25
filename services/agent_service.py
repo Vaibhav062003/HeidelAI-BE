@@ -1,4 +1,5 @@
 import httpx
+import uuid
 from typing import Dict, Optional
 from loguru import logger
 from config.settings import INTERNAL_HMAC_SECRET
@@ -31,7 +32,8 @@ async def send_to_agent(
     timeout: int = 30,
     reply_context_message_id: str = None,
     message_id: str = None,
-    version: str = None
+    version: str = None,
+    message_type: str = "text",
 ) -> Dict:
 
     """
@@ -48,6 +50,14 @@ async def send_to_agent(
     Returns:
         A dictionary containing the key ``"final_response"`` on success.
     """
+    from services.sales_case_service import apply_sales_decision, get_sales_context
+
+    try:
+        current_sales_context = await get_sales_context(org_id, conversation_id)
+    except Exception as exc:
+        logger.warning(f"Could not load sales context for {conversation_id}: {exc}")
+        current_sales_context = {"version": 0, "stage": "new", "facts": {}}
+
     # Prepare the request payload
     payload = {
             "conversation_id": conversation_id,
@@ -56,7 +66,9 @@ async def send_to_agent(
             "location": location,
             "customer_name": customer_name,
             "org_id": org_id,
-            "source": source
+            "source": source,
+            "message_type": message_type,
+            "sales_context": current_sales_context,
         }
     
     if message_id:
@@ -100,7 +112,56 @@ async def send_to_agent(
             # Extract the chatbot's response
             final_response = validate_ai_reply(response_data.get("response"))
             logger.info(f"Received response from chatbot for ...{conversation_id[-6:]}")
-            return {"final_response": final_response, "usage": _reported_usage(response_data.get("usage"))}
+            result = {
+                "final_response": final_response,
+                "usage": _reported_usage(response_data.get("usage")),
+            }
+            reply_to_message_id = response_data.get("reply_to_message_id")
+            if reply_to_message_id:
+                result["reply_to_message_id"] = reply_to_message_id
+            sales_decision = response_data.get("sales_decision")
+            if sales_decision:
+                result["sales_decision"] = sales_decision
+                try:
+                    sales_event_id = message_id or f"agent_{uuid.uuid4()}"
+                    applied = await apply_sales_decision(
+                        org_id=org_id,
+                        conversation_id=conversation_id,
+                        source_message_id=sales_event_id,
+                        customer_name=customer_name,
+                        decision=sales_decision,
+                        source_message_text=user_input,
+                    )
+                    if applied.get("duplicate"):
+                        result["duplicate_event"] = True
+                        result["sales_case"] = await get_sales_context(org_id, conversation_id)
+                        return result
+                    action_type = str(
+                        (sales_decision.get("requested_action") or {}).get("type") or "none"
+                    )
+                    from services.sales_action_service import execute_sales_action
+
+                    action = None if applied["conflict"] else await execute_sales_action(
+                        case=applied["case"],
+                        source_message_id=sales_event_id,
+                        action_type=action_type,
+                        customer_text=user_input,
+                    )
+                    if action:
+                        result["final_response"] = action["reply"]
+                        result["sales_action"] = action
+                    result["sales_case"] = await get_sales_context(org_id, conversation_id)
+                    result["sales_case_conflict"] = applied["conflict"]
+                    result["sales_case_rebased"] = applied.get("rebased", False)
+                except Exception as exc:
+                    logger.error(
+                        f"Could not save sales decision for {conversation_id}: {exc}",
+                        exc_info=True,
+                    )
+                    result["final_response"] = (
+                        "I could not save that sales step safely. Please try again."
+                    )
+            return result
 
     except AIProviderUnavailable:
         raise
