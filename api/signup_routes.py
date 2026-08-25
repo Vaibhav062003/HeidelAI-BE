@@ -8,6 +8,7 @@ from core.limiter import limiter
 from database import get_mongo_db
 from schemas.models import InitSignupRequest, InviteTeamMembersRequest, SelectPlanRequest, SetPasswordRequest, VerifyOtpRequest
 from services.clerk_service import create_clerk_signup, create_organization, invite_users_to_organization, update_password_and_send_otp, verify_clerk_otp
+from services.commercial_mode import billing_enabled
 
 db = get_mongo_db()
 
@@ -129,15 +130,16 @@ async def select_plan(request: Request, data: SelectPlanRequest, session_id: str
     plan_id = data.plan_id
 
     if plan_id in {"trial", "free"}:
-        # Access starts only after the CRM-authoritative billing profile and trial claim.
+        workspace_plan = "trial_pending" if billing_enabled() else "free"
+        max_allowed_members = 1 if billing_enabled() else None
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
             {"$set": {
                 "status": "PLAN_SELECTED", 
-                "plan": "trial_pending",
+                "plan": workspace_plan,
                 "next_step": "SUCCESS", 
                 "updated_at": datetime.utcnow(), 
-                "max_allowed_members": 1
+                "max_allowed_members": max_allowed_members
             }}, 
             return_document=ReturnDocument.AFTER
         )
@@ -145,7 +147,6 @@ async def select_plan(request: Request, data: SelectPlanRequest, session_id: str
             raise HTTPException(status_code=400, detail="Invalid Session")
 
         org_name = f"{session.get('first_name')}'s Organization"
-        max_allowed_members = 1
         owner = {
             "clerk_user_id": session.get("clerk_user_id"),
             "owner_email": session.get("email"),
@@ -159,7 +160,7 @@ async def select_plan(request: Request, data: SelectPlanRequest, session_id: str
             max_allowed_members=max_allowed_members,
             session_id=session_id,
             owner=owner,
-            plan="trial_pending"
+            plan=workspace_plan
         )
 
         if not organization:
@@ -211,10 +212,10 @@ async def invite_team_members(request: Request, data: InviteTeamMembersRequest, 
     )
     
     clerk_user_id = session.get("clerk_user_id")
-    max_allowed_members = session.get("max_allowed_members", 2)
+    max_allowed_members = session.get("max_allowed_members")
     org_id = organization.get("org_id")
 
-    if team_emails and len(team_emails) > max_allowed_members - 1:
+    if max_allowed_members is not None and team_emails and len(team_emails) > max_allowed_members - 1:
         team_emails = team_emails[:max_allowed_members - 1]  # Limit to max allowed members minus the owner
 
     # 2. Invite team members
