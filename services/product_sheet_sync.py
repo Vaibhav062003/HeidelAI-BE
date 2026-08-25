@@ -12,6 +12,7 @@ from loguru import logger
 
 from database import get_mongo_db
 from api.google_sheets_routes import refresh_google_token, _force_token_refresh, _detect_header_row
+from services.stock_gst import DEFAULT_GST_RATE, normalize_gst_inclusive, normalize_gst_rate
 
 # ─── Field Aliases ─────────────────────────────────────────────────────────────
 # Maps canonical MongoDB field names to possible sheet column name variations.
@@ -26,6 +27,8 @@ FIELD_ALIASES = {
     "model_no":     ["model_no", "model no", "model number", "model", "sku", "item code", "product code", "part number", "part no", "article no"],
     "description":  ["description", "desc", "product description", "details", "short description"],
     "price":        ["price", "mrp", "cost", "rate", "unit price", "selling price", "amount"],
+    "gst_inclusive": ["gst inclusive", "gst_inclusive", "tax inclusive", "price includes gst", "gst treatment"],
+    "gst_rate":      ["gst rate", "gst_rate", "gst percent", "gst percentage", "gst %", "tax rate"],
     "stock":        ["stock", "quantity", "qty", "available", "inventory", "units", "available qty"],
     "image_url":    ["image", "image url", "image_url", "image link", "photo", "picture", "product image"],
     # --- Component-specific aliases (where sheet column ≠ MongoDB field) ---
@@ -283,6 +286,9 @@ def transform_row(
     elif "type" not in doc or not doc.get("type"):
         doc["type"] = product_type
 
+    doc["gst_inclusive"] = normalize_gst_inclusive(doc.get("gst_inclusive"))
+    doc["gst_rate"] = normalize_gst_rate(doc.get("gst_rate"), DEFAULT_GST_RATE)
+
     now = datetime.now(timezone.utc)
     doc["org_id"] = org_id
     doc["updated_at"] = now
@@ -526,7 +532,7 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                            if k not in ("source", "source_sheet_id", "source_sheet_ids", "created_at")}
                 set_doc[f"source_rows.{sheet_id}"] = sheet_row
                 set_doc[f"source_values.{sheet_id}"] = {
-                    key: doc.get(key) for key in ("product_name", "model_no", "sku", "description", "price", "stock")
+                    key: doc.get(key) for key in ("product_name", "model_no", "sku", "description", "price", "stock", "category", "gst_inclusive", "gst_rate")
                     if key in doc
                 }
                 operations.append(
@@ -729,13 +735,49 @@ def _column_letter(index: int) -> str:
 def _sheet_value_equal(field: str, current, expected) -> bool:
     if expected is None:
         return str(current or "").strip() == ""
-    if field in {"price", "stock"}:
+    if field in {"price", "stock", "gst_rate"}:
         try:
             clean = re.sub(r"(?i)\b(?:inr|rs\.?)\b|₹|,|\s", "", str(current))
             return abs(float(clean or 0) - float(expected)) <= 0.001
         except (TypeError, ValueError):
             return False
+    if field == "gst_inclusive":
+        return normalize_gst_inclusive(current) == normalize_gst_inclusive(expected)
     return str(current or "").strip() == str(expected or "").strip()
+
+
+async def _ensure_gst_columns(
+    org_id: str, sheet_id: str, tab_name: str, headers: list[str], header_row: int,
+    access_token: str, fields: set[str],
+) -> tuple[list[str], dict[str, int], str]:
+    by_field = {_sheet_field(header): index for index, header in enumerate(headers)}
+    missing = [field for field in ("gst_inclusive", "gst_rate") if field in fields and field not in by_field]
+    if not missing:
+        return headers, by_field, access_token
+    labels = {"gst_inclusive": "GST Inclusive", "gst_rate": "GST Rate"}
+    encoded_tab = urllib.parse.quote(tab_name, safe="")
+    data = []
+    for field in missing:
+        index = len(headers)
+        headers.append(labels[field])
+        by_field[field] = index
+        data.append({"range": f"{encoded_tab}!{_column_letter(index)}{header_row}", "values": [[labels[field]]]})
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchUpdate",
+            json={"valueInputOption": "RAW", "data": data},
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+        )
+        if response.status_code == 401:
+            access_token = await _force_token_refresh(org_id)
+            response = await client.post(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchUpdate",
+                json={"valueInputOption": "RAW", "data": data},
+                headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+            )
+        if response.status_code not in {200, 201}:
+            raise ValueError(response.json().get("error", {}).get("message", "Google Sheet GST columns could not be created"))
+    return headers, by_field, access_token
 
 
 async def write_product_sheet_values(org_id: str, product: dict, changes: dict) -> dict:
@@ -745,13 +787,17 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
     tab_name = connection.get("tab_name") or "Sheet1"
     access_token = await refresh_google_token(org_id)
     headers, header_row, _ = await _detect_header_row(sheet_id, tab_name, access_token, org_id)
-    by_field = {_sheet_field(header): index for index, header in enumerate(headers)}
     requested = {
         "price": changes.get("price"),
         "description": changes.get("description"),
         "stock": changes.get("quantity"),
+        "gst_inclusive": changes.get("gst_inclusive"),
+        "gst_rate": changes.get("gst_rate"),
     }
     requested = {key: value for key, value in requested.items() if value is not None}
+    headers, by_field, access_token = await _ensure_gst_columns(
+        org_id, sheet_id, tab_name, headers, header_row, access_token, set(requested),
+    )
     missing = [key for key in requested if key not in by_field]
     if missing:
         raise ValueError(f"Primary Sheet is missing column(s): {', '.join(missing)}")
@@ -831,9 +877,16 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
         else:
             row = [""] * len(headers)
             row[by_field[sku_field]] = product.get("sku") or product.get("model_no") or product.get("name")
+            for field, value in {
+                "product_name": product.get("name") or product.get("product_name"),
+                "description": product.get("description"), "price": product.get("price"),
+                "stock": product.get("stock"), "category": product.get("category"),
+            }.items():
+                if field in by_field and value is not None:
+                    row[by_field[field]] = value
             for field, value in requested.items():
                 row[by_field[field]] = value
-            if "product_name" in by_field:
+            if "product_name" in by_field and not row[by_field["product_name"]]:
                 row[by_field["product_name"]] = product.get("name") or product.get("sku")
             response = await client.post(
                 f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A:ZZ:append",
@@ -846,3 +899,111 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
         message = response.json().get("error", {}).get("message", "Google Sheet rejected the stock update")
         raise ValueError(message)
     return {"sheet_id": sheet_id, "row_number": row_number, "updated_fields": sorted(requested)}
+
+
+async def write_product_sheet_gst_bulk(
+    org_id: str, products: list[dict], gst_inclusive: bool, gst_rate: float,
+) -> dict:
+    """Write one GST treatment to existing or new primary-Sheet product rows in batches."""
+    connection = await primary_product_sheet(org_id)
+    sheet_id = connection["sheet_id"]
+    tab_name = connection.get("tab_name") or "Sheet1"
+    access_token = await refresh_google_token(org_id)
+    headers, header_row, _ = await _detect_header_row(sheet_id, tab_name, access_token, org_id)
+    headers, by_field, access_token = await _ensure_gst_columns(
+        org_id, sheet_id, tab_name, headers, header_row, access_token, {"gst_inclusive", "gst_rate"},
+    )
+    sku_field = "model_no" if "model_no" in by_field else "sku" if "sku" in by_field else None
+    if not sku_field:
+        raise ValueError("Primary Sheet needs a Model No or SKU column before GST can be written")
+
+    encoded_tab = urllib.parse.quote(tab_name, safe="")
+    data_start_row = header_row + 1
+    lookup_range = f"{encoded_tab}!A{data_start_row}:ZZ"
+    async with httpx.AsyncClient() as client:
+        lookup = await client.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{lookup_range}",
+            params={"valueRenderOption": "FORMULA"},
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=60,
+        )
+        if lookup.status_code == 401:
+            access_token = await _force_token_refresh(org_id)
+            lookup = await client.get(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{lookup_range}",
+                params={"valueRenderOption": "FORMULA"},
+                headers={"Authorization": f"Bearer {access_token}"}, timeout=60,
+            )
+        if lookup.status_code != 200:
+            raise ValueError("Google Sheet products could not be checked before applying GST")
+        rows = lookup.json().get("values") or []
+        by_sku: dict[str, list[int]] = {}
+        for offset, row in enumerate(rows):
+            value = row[by_field[sku_field]] if by_field[sku_field] < len(row) else ""
+            key = re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+            if key:
+                by_sku.setdefault(key, []).append(data_start_row + offset)
+
+        updates, appends, skipped = [], [], []
+        updated_rows = 0
+        for product in products:
+            sku = str(product.get("sku") or product.get("model_no") or product.get("name") or "").strip()
+            key = re.sub(r"[^a-z0-9]+", "", sku.casefold())
+            source_row = (product.get("source_rows") or {}).get(sheet_id)
+            matches = [int(source_row)] if source_row else by_sku.get(key, [])
+            if len(matches) > 1:
+                skipped.append({"sku": sku, "reason": "duplicate primary-Sheet rows"})
+                continue
+            if matches:
+                row_number = matches[0]
+                current = rows[row_number - data_start_row] if 0 <= row_number - data_start_row < len(rows) else []
+                if any(
+                    by_field[field] < len(current) and str(current[by_field[field]]).startswith("=")
+                    for field in ("gst_inclusive", "gst_rate")
+                ):
+                    skipped.append({"sku": sku, "reason": "formula-protected GST cell"})
+                    continue
+                changed = False
+                for field, value in (("gst_inclusive", gst_inclusive), ("gst_rate", gst_rate)):
+                    current_value = current[by_field[field]] if by_field[field] < len(current) else ""
+                    if not _sheet_value_equal(field, current_value, value):
+                        updates.append({"range": f"{encoded_tab}!{_column_letter(by_field[field])}{row_number}", "values": [[value]]})
+                        changed = True
+                updated_rows += int(changed)
+                continue
+            row = [""] * len(headers)
+            row[by_field[sku_field]] = sku
+            for field, value in {
+                "product_name": product.get("name") or product.get("product_name") or sku,
+                "description": product.get("description"),
+                "price": product.get("price"),
+                "stock": product.get("quantity", product.get("stock")),
+                "category": product.get("category"),
+                "gst_inclusive": gst_inclusive,
+                "gst_rate": gst_rate,
+            }.items():
+                if field in by_field and value is not None:
+                    row[by_field[field]] = value
+            appends.append(row)
+
+        for start in range(0, len(updates), 500):
+            response = await client.post(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchUpdate",
+                json={"valueInputOption": "RAW", "data": updates[start:start + 500]},
+                headers={"Authorization": f"Bearer {access_token}"}, timeout=60,
+            )
+            if response.status_code not in {200, 201}:
+                raise ValueError(response.json().get("error", {}).get("message", "Google Sheet rejected the bulk GST update"))
+        for start in range(0, len(appends), 500):
+            response = await client.post(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A:ZZ:append",
+                params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+                json={"values": appends[start:start + 500]},
+                headers={"Authorization": f"Bearer {access_token}"}, timeout=60,
+            )
+            if response.status_code not in {200, 201}:
+                raise ValueError(response.json().get("error", {}).get("message", "Google Sheet rejected new GST product rows"))
+    await sync_product_sheet(org_id, sheet_id)
+    return {
+        "sheet_id": sheet_id, "updated": updated_rows, "appended": len(appends),
+        "skipped": skipped, "gst_inclusive": gst_inclusive, "gst_rate": gst_rate,
+    }

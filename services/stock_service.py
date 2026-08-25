@@ -8,7 +8,8 @@ from fastapi import HTTPException
 from pymongo import ReturnDocument
 
 from database import get_async_mongo_db
-from services.product_sheet_sync import sync_product_sheet, write_product_sheet_values
+from services.product_sheet_sync import sync_product_sheet, write_product_sheet_gst_bulk, write_product_sheet_values
+from services.stock_gst import DEFAULT_GST_RATE, normalize_category, normalize_gst_inclusive, normalize_gst_rate, select_gst_rows
 from services.tally_service import (
     build_master_xml,
     build_physical_stock_xml,
@@ -22,7 +23,7 @@ from services.websocket_service import broadcast_org_admin_ws, broadcast_org_ws,
 
 db = get_async_mongo_db()
 ADMIN_ROLES = {"admin", "org:admin"}
-EDITABLE_FIELDS = {"price", "description", "quantity"}
+EDITABLE_FIELDS = {"price", "description", "quantity", "gst_inclusive", "gst_rate"}
 FINAL_STATES = {"completed", "rejected"}
 
 
@@ -100,6 +101,13 @@ def _row(sheet_rows: list[dict], tally_rows: list[dict], key: str, tally_availab
         (sheet or {}).get("description") or (sheet or {}).get("product_name")
         or (tally or {}).get("description") or (tally or {}).get("name") or sku
     )
+    category = normalize_category((sheet or {}).get("category") or (sheet or {}).get("type") or (tally or {}).get("parent"))
+    sheet_has_gst_rate = (sheet or {}).get("gst_rate") is not None
+    tally_rate = (tally or {}).get("gst_rate")
+    if tally_rate == 0 and not str((tally or {}).get("gst_applicable") or "").strip():
+        tally_rate = None
+    gst_rate = normalize_gst_rate((sheet or {}).get("gst_rate") if sheet_has_gst_rate else tally_rate, DEFAULT_GST_RATE)
+    gst_inclusive = normalize_gst_inclusive((sheet or {}).get("gst_inclusive"))
     product_id = str((sheet or {}).get("_id") or f"tally:{(tally or {}).get('master_id') or key}")
     allocations = (tally or {}).get("allocations") or []
     if tally and (not allocations or abs(sum(_number(item.get("quantity")) for item in allocations) - quantity) > 0.001):
@@ -110,7 +118,10 @@ def _row(sheet_rows: list[dict], tally_rows: list[dict], key: str, tally_availab
         "normalized_sku": key,
         "name": str((sheet or {}).get("product_name") or (sheet or {}).get("model_name") or (tally or {}).get("name") or sku),
         "description": description,
+        "category": category,
         "price": price,
+        "gst_inclusive": gst_inclusive,
+        "gst_rate": gst_rate,
         "quantity": quantity,
         "unit": (tally or {}).get("unit") or (sheet or {}).get("unit") or "Nos",
         "source": source,
@@ -122,6 +133,9 @@ def _row(sheet_rows: list[dict], tally_rows: list[dict], key: str, tally_availab
             "price": _number(sheet_price) if sheet_price is not None else None,
             "quantity": _sheet_quantity(sheet or {}) if sheet else None,
             "description": (sheet or {}).get("description") or (sheet or {}).get("product_name"),
+            "category": (sheet or {}).get("category"),
+            "gst_inclusive": gst_inclusive,
+            "gst_rate": gst_rate,
             "source_sheet_ids": (sheet or {}).get("source_sheet_ids") or [],
             "source_rows": (sheet or {}).get("source_rows") or {},
         } if sheet else None,
@@ -131,6 +145,7 @@ def _row(sheet_rows: list[dict], tally_rows: list[dict], key: str, tally_availab
             "model_number": (tally or {}).get("model_number"),
             "description": (tally or {}).get("description"),
             "price": _number((tally or {}).get("standard_rate")),
+            "gst_rate": normalize_gst_rate((tally or {}).get("gst_rate"), DEFAULT_GST_RATE),
             "quantity": _number((tally or {}).get("closing_quantity")),
             "alter_id": (tally or {}).get("alter_id"),
             "allocations": allocations,
@@ -148,7 +163,8 @@ async def _merged_stock(org_id: str) -> list[dict]:
         "product_name": 1, "model_name": 1, "model_no": 1, "sku": 1, "sku_full": 1,
         "unique_identifier": 1, "description": 1, "price": 1, "stock": 1, "quantity": 1,
         "available_qty": 1, "in_stock": 1, "unit": 1, "source_sheet_ids": 1,
-        "source_rows": 1, "source_values": 1, "updated_at": 1,
+        "source_rows": 1, "source_values": 1, "category": 1, "type": 1,
+        "gst_inclusive": 1, "gst_rate": 1, "updated_at": 1,
     }).to_list(length=50_000)
     primary = await db.product_sheet_connections.find_one(
         {"org_id": org_id, "status": "active", "is_primary": True}, {"sheet_id": 1},
@@ -217,6 +233,7 @@ async def list_stock(
     status: str = "", low_stock: float | None = None, sort: str = "sku", direction: str = "asc",
 ) -> dict:
     rows = await _merged_stock(org_id)
+    categories = sorted({row["category"] for row in rows}, key=str.casefold)
     needle = query.strip().casefold()
     if needle:
         rows = [row for row in rows if needle in " ".join((row["sku"], row["name"], row["description"])).casefold()]
@@ -235,6 +252,7 @@ async def list_stock(
     return {
         "items": [_public(row) for row in rows[start:start + page_size]],
         "total": total, "page": page, "page_size": page_size,
+        "categories": categories,
         "pending_changes": pending,
         "tally_connected": _tally_online(integration),
         "last_tally_sync_at": serialize_mongo((integration or {}).get("last_sync_at")),
@@ -433,11 +451,18 @@ async def create_stock_change(org_id: str, user: dict, product_id: str, version:
         raise HTTPException(status_code=422, detail="Price must be between 0 and 1,000,000,000")
     if "quantity" in changes and not 0 <= float(changes["quantity"]) <= 10_000_000:
         raise HTTPException(status_code=422, detail="Quantity must be between 0 and 10,000,000")
+    if "gst_inclusive" in changes and not isinstance(changes["gst_inclusive"], bool):
+        raise HTTPException(status_code=422, detail="GST inclusive must be true or false")
+    if "gst_rate" in changes:
+        changes["gst_rate"] = normalize_gst_rate(changes["gst_rate"], -1)
+        if changes["gst_rate"] < 0:
+            raise HTTPException(status_code=422, detail="GST rate must be between 0 and 100")
     now = datetime.now(timezone.utc)
     change = {
         "change_id": str(uuid.uuid4()), "org_id": org_id, "product_id": product_id, "sku": row["sku"],
         "source": row["source"], "base_version": version, "before": {
             "price": row["price"], "description": row["description"], "quantity": row["quantity"],
+            "gst_inclusive": row["gst_inclusive"], "gst_rate": row["gst_rate"],
         }, "changes": changes, "allocations": allocation_values, "reason": reason.strip(),
         "status": "approved" if user["role"] in ADMIN_ROLES else "pending_approval",
         "requested_by": user["user_id"], "requested_by_name": user.get("full_name") or "Team member",
@@ -511,7 +536,9 @@ async def _queue_tally_change(change: dict, row: dict, actor_id: str) -> dict:
 
 async def _apply_sheet(change: dict, row: dict) -> dict:
     product = row["_sheet_document"] or {
-        "sku": row["sku"], "name": row["name"], "model_no": row["sku"], "source_rows": {},
+        "sku": row["sku"], "name": row["name"], "model_no": row["sku"],
+        "description": row["description"], "price": row["price"], "stock": row["quantity"],
+        "category": row["category"], "source_rows": {},
     }
     result = await write_product_sheet_values(change["org_id"], product, change["changes"])
     if row["_sheet_document"] and ObjectId.is_valid(row["id"]):
@@ -522,6 +549,10 @@ async def _apply_sheet(change: dict, row: dict) -> dict:
             update["description"] = change["changes"]["description"]
         if "quantity" in change["changes"]:
             update["stock"] = float(change["changes"]["quantity"])
+        if "gst_inclusive" in change["changes"]:
+            update["gst_inclusive"] = change["changes"]["gst_inclusive"] is True
+        if "gst_rate" in change["changes"]:
+            update["gst_rate"] = float(change["changes"]["gst_rate"])
         sheet_id = result["sheet_id"]
         for field, value in update.copy().items():
             if field != "updated_at":
@@ -537,7 +568,7 @@ async def apply_stock_change(change: dict, actor_id: str, role: str) -> dict:
     row = await _find_stock(change["org_id"], change["product_id"])
     if change["base_version"] != row["version"]:
         return serialize_mongo(await _set_status(change, "needs_review", actor_id, role, error="Stock changed before this request was applied"))
-    if row["_tally_document"]:
+    if row["_tally_document"] and {"price", "description", "quantity"}.intersection(change["changes"]):
         try:
             job = await _queue_tally_change(change, row, actor_id)
         except HTTPException as exc:
@@ -675,6 +706,51 @@ async def sync_all_stock(org_id: str, user_id: str) -> dict:
     except HTTPException:
         pass
     return {"sheets": sheet_results, "tally": tally_job}
+
+
+async def bulk_update_stock_gst(
+    org_id: str, user_id: str, role: str, *, scope: str, category: str,
+    gst_inclusive: bool, gst_rate: float,
+) -> dict:
+    if role not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Only organization admins can apply GST settings in bulk")
+    if not isinstance(gst_inclusive, bool):
+        raise HTTPException(status_code=422, detail="GST inclusive must be true or false")
+    gst_rate = normalize_gst_rate(gst_rate, -1)
+    if gst_rate < 0:
+        raise HTTPException(status_code=422, detail="GST rate must be between 0 and 100")
+    rows = select_gst_rows(await _merged_stock(org_id), scope, category)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No products match this GST scope")
+    conflicts = [row for row in rows if row["conflicts"]]
+    eligible = [row for row in rows if not row["conflicts"]]
+    if not eligible:
+        raise HTTPException(status_code=409, detail="Resolve duplicate SKU conflicts before applying GST settings")
+    products = [row["_sheet_document"] or {
+        "sku": row["sku"], "model_no": row["sku"], "name": row["name"],
+        "description": row["description"], "price": row["price"], "quantity": row["quantity"],
+        "category": row["category"], "source_rows": {},
+    } for row in eligible]
+    result = await write_product_sheet_gst_bulk(org_id, products, gst_inclusive, gst_rate)
+    skipped_skus = {str(item["sku"]).casefold() for item in result["skipped"]}
+    applied = [row for row in eligible if row["sku"].casefold() not in skipped_skus]
+    now = datetime.now(timezone.utc)
+    if applied:
+        await db.stock_change_audit.insert_many([{
+            "audit_id": str(uuid.uuid4()), "org_id": org_id, "change_id": f"bulk-gst:{uuid.uuid4()}",
+            "product_id": row["id"], "sku": row["sku"], "action": "bulk_gst_updated",
+            "status": "completed", "actor_id": user_id, "actor_role": role,
+            "details": {"scope": scope, "category": category if scope == "category" else "", "gst_inclusive": gst_inclusive, "gst_rate": gst_rate},
+            "created_at": now,
+        } for row in applied])
+    await broadcast_org_ws(org_id, "stock_updated", {
+        "bulk": True, "scope": scope, "category": category if scope == "category" else "",
+        "updated": len(applied), "gst_inclusive": gst_inclusive, "gst_rate": gst_rate,
+    })
+    return {
+        **result, "matched": len(rows), "applied": len(applied),
+        "skipped_conflicts": len(conflicts), "category": category if scope == "category" else None,
+    }
 
 
 async def link_stock_products(org_id: str, sheet_product_id: str, tally_master_id: str, user_id: str) -> dict:
