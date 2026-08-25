@@ -102,6 +102,8 @@ class Product(BaseModel):
     description: Optional[str] = None
     price: float = None
     stock: Optional[int] = None
+    gst_inclusive: bool = False
+    gst_rate: float = Field(default=18, ge=0, le=100)
     product_image: Optional[str] = None
     image_url: Optional[str] = None
     model_no: Optional[str] = None

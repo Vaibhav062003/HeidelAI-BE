@@ -1,13 +1,14 @@
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
 
 from auth.dependencies import CurrentUser
 from core.limiter import limiter
 from services.entitlement_service import feature_access, require_feature
 from services.stock_service import (
     create_stock_change,
+    bulk_update_stock_gst,
     get_stock,
     link_stock_products,
     list_stock,
@@ -38,7 +39,16 @@ class StockChangeValues(BaseModel):
     price: float | None = Field(default=None, ge=0, le=1_000_000_000)
     description: str | None = Field(default=None, max_length=2000)
     quantity: float | None = Field(default=None, ge=0, le=10_000_000)
+    gst_inclusive: StrictBool | None = None
+    gst_rate: float | None = Field(default=None, ge=0, le=100)
     allocations: list[StockAllocation] = Field(default_factory=list, max_length=100)
+
+    @field_validator("gst_rate", mode="before")
+    @classmethod
+    def reject_boolean_rate(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("GST rate must be a number")
+        return value
 
     @model_validator(mode="after")
     def allocations_match_quantity(self):
@@ -62,6 +72,27 @@ class ReviewPayload(BaseModel):
 class LinkPayload(BaseModel):
     sheet_product_id: str = Field(min_length=1, max_length=120)
     tally_master_id: str = Field(min_length=1, max_length=120)
+
+
+class StockGstPayload(BaseModel):
+    scope: Literal["all", "category"] = "all"
+    category: str = Field(default="", max_length=120)
+    gst_inclusive: StrictBool = False
+    gst_rate: float = Field(default=18, ge=0, le=100)
+
+    @field_validator("gst_rate", mode="before")
+    @classmethod
+    def reject_boolean_rate(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("GST rate must be a number")
+        return value
+
+    @model_validator(mode="after")
+    def category_required_for_category_scope(self):
+        self.category = self.category.strip()
+        if self.scope == "category" and not self.category:
+            raise ValueError("Choose a category")
+        return self
 
 
 @router.get("")
@@ -103,6 +134,16 @@ async def link_stock(request: Request, payload: LinkPayload, user: CurrentUser):
     if user.role not in ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Only organization admins can link stock sources")
     return await link_stock_products(user.org_id, payload.sheet_product_id, payload.tally_master_id, user.user_id)
+
+
+@router.put("/gst")
+@limiter.limit("5/minute")
+async def apply_stock_gst(request: Request, payload: StockGstPayload, user: CurrentUser):
+    require_stock_access(user, write=True)
+    return await bulk_update_stock_gst(
+        user.org_id, user.user_id, user.role, scope=payload.scope, category=payload.category,
+        gst_inclusive=payload.gst_inclusive, gst_rate=payload.gst_rate,
+    )
 
 
 @router.get("/{product_id}")
