@@ -14,11 +14,11 @@ def signed_json(payload: dict, path: str, secret: str | None, request_id: str | 
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
     if request_id:
         try:
-            request_id = str(uuid.UUID(request_id))
+            request_id = uuid.UUID(request_id).hex
         except ValueError:
-            request_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"heidelai:{path}:{request_id}"))
+            request_id = uuid.uuid5(uuid.NAMESPACE_URL, f"heidelai:{path}:{request_id}").hex
     else:
-        request_id = str(uuid.uuid4())
+        request_id = uuid.uuid4().hex
     timestamp = str(int(time.time() * 1000))
     canonical = f"POST\n{path}\n{timestamp}\n{request_id}\n".encode() + body
     signature = base64.b64encode(hmac.new(secret.encode(), canonical, hashlib.sha256).digest()).decode()
