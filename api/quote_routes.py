@@ -12,7 +12,7 @@ from auth.dependencies import CurrentUser
 from core.limiter import limiter
 from database import get_async_mongo_db
 from services.cloudinary_service import upload_media_to_cloudinary
-from services.quote_math import quote_line_amounts
+from services.quote_service import build_quote_document
 from services.utils import serialize_mongo
 from services.work_team_service import require_conversation_access
 from services.entitlement_service import require_feature
@@ -177,38 +177,10 @@ def _settings_collection(org_id: str):
 
 
 def _document(payload: QuotePayload, user: CurrentUser) -> dict:
-    data = payload.model_dump(mode="json")
-    stored_items = []
-    subtotal = 0.0
-    gst_total = 0.0
-    for item in data["items"]:
-        unit_price = item.pop("unit_price")
-        base, gst, line_total = quote_line_amounts(
-            item["quantity"], unit_price, item["gst_rate"], item["gst_inclusive"]
-        )
-        subtotal += base
-        gst_total += gst
-        stored_items.append({
-            **item,
-            "private_unit_price": round(unit_price, 2),
-            "private_line_subtotal": base,
-            "public_line_total": line_total,
-        })
-    subtotal = round(subtotal, 2)
-    gst_total = round(gst_total, 2)
-    discount = min(data["discount"], subtotal + gst_total + data["shipping"])
-    return {
-        **data,
-        "org_id": user.org_id,
-        "items": stored_items,
-        "private_subtotal": subtotal,
-        "private_gst_total": gst_total,
-        "discount": round(discount, 2),
-        "public_grand_total": round(subtotal + gst_total + data["shipping"] - discount, 2),
-        "updated_at": datetime.now(timezone.utc),
-        "updated_by": user.user_id,
-        "updated_by_name": user.full_name or "Team member",
-    }
+    return build_quote_document(
+        payload.model_dump(mode="json"), org_id=user.org_id,
+        actor_id=user.user_id, actor_name=user.full_name or "Team member",
+    )
 
 
 async def _require_conversation(user: CurrentUser, conversation_id: str) -> None:
