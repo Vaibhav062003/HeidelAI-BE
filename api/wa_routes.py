@@ -47,6 +47,7 @@ from config.settings import (
 )
 from services.websocket_service import broadcast_main_ws
 from services.ai_policy_service import set_conversation_ai_state
+from services.entitlement_service import release_capacity, reserve_capacity
 from services.work_team_service import conversation_access_condition, require_conversation_access
 from services.whatsapp_call_history import (
     CALL_HISTORY_PROJECTION,
@@ -471,6 +472,7 @@ async def update_whatsapp_call(request: Request, body: dict, user: CurrentUser):
 @router.post("/auth")
 @limiter.limit("10/minute")
 async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, user: CurrentUser):
+    reservation_id = None
     try:
         # Extract authorization code from request
         code = req.code
@@ -495,13 +497,9 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         token_response = requests.post(token_url, json=token_data)
         
         if token_response.status_code != 200:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Failed to exchange authorization code: {token_response.text}"
-            )
+            raise HTTPException(status_code=400, detail="Failed to exchange the WhatsApp authorization code")
         
         token_info = token_response.json()
-        logger.info(f"WhatsApp exchange auth code for token response: {token_info}")
         access_token = token_info.get("access_token")
         
         if not access_token:
@@ -534,10 +532,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         }
         phone_url = f"https://graph.facebook.com/v22.0/{whatsapp_business_id}/phone_numbers"
         phone_response = requests.get(phone_url, params=params)
-        logger.info(f"Phone response: {phone_response.json()}")
-        
         if phone_response.status_code != 200:
-            logger.error(f"get phone number details err: {phone_response.text}")
             raise HTTPException(
                 status_code=400, 
                 detail="Failed to get phone number information"
@@ -547,6 +542,8 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         phone = phones_data.get("display_phone_number")
         phone_verified = phones_data.get("code_verification_status")
         phone_id = phones_data.get("id")
+        if not db.whatsapp_connections.find_one({"org_id": org_id, "wa_id": whatsapp_business_id, "is_active": {"$ne": False}}, {"_id": 1}):
+            reservation_id = reserve_capacity(org_id, "CHANNELS", "whatsapp_accounts", str(whatsapp_business_id))
         
 
         # subscribe user to our webhook
@@ -557,7 +554,6 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         webhook_response = requests.post(webhook_url, json=webhook_params)
 
         if webhook_response.status_code != 200:
-            logger.error(f"Subscribe to webhook err: {webhook_response.text}")
             raise HTTPException(
                 status_code=400, 
                 detail="Failed to subscribe WhatsApp account to webhook"
@@ -582,13 +578,11 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
 
         try:
             phone_register_response = requests.post(phone_register_url, json=phone_register_params)
-            logger.info(f"Phone register response: {phone_register_response.json()}")
-
             if phone_register_response.status_code != 200:
-                logger.error(f"Phone registration failed (non-fatal): {phone_register_response.text}")
+                logger.warning("WhatsApp phone registration returned status {}", phone_register_response.status_code)
             
         except Exception as e:
-            logger.error(f"Phone registration request failed (non-fatal): {str(e)}")
+            logger.warning("WhatsApp phone registration request failed ({})", type(e).__name__)
         
         # Generate a unique user_id for this WhatsApp connection
         user_id = str(uuid.uuid4())
@@ -623,11 +617,12 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         }
         
         # Store in your existing MongoDB database
-        db.whatsapp_connections.update_one(
-            {"wa_id": whatsapp_business_id, "user_id": user_id},
-            {"$set": whatsapp_connection},
+        stored_connection = db.whatsapp_connections.find_one_and_update(
+            {"wa_id": whatsapp_business_id, "org_id": org_id},
+            {"$set": {key: value for key, value in whatsapp_connection.items() if key != "user_id"}, "$setOnInsert": {"user_id": user_id}},
             upsert=True
         )
+        user_id = str((stored_connection or {}).get("user_id") or user_id)
         
         return {
             "status": "success",
@@ -644,8 +639,10 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        logger.error(f"WhatsApp authentication error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"WhatsApp authentication error: {str(e)}")
+        logger.error("WhatsApp authentication failed for org {} ({})", user.org_id, type(e).__name__)
+        raise HTTPException(status_code=502, detail="WhatsApp authentication failed") from e
+    finally:
+        release_capacity(reservation_id)
     
 @router.post("/disconnect")
 @limiter.limit("10/minute")

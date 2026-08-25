@@ -8,6 +8,7 @@ from auth.dependencies import CurrentUser
 from config.settings import CLERK_TOKEN
 from loguru import logger
 from services.push_notification_service import process_member_device_revocation, queue_member_device_revocation
+from services.entitlement_service import release_capacity, require_feature, reserve_capacity
 
 
 
@@ -42,35 +43,53 @@ class WaitList(BaseModel):
 @limiter.limit("30/minute")
 def invite_agent(request: Request, req: InviteAgentRequest, user: CurrentUser):  
     ORG_ID = user.org_id
+    if user.role not in {"admin", "org:admin"}:
+        raise HTTPException(status_code=403, detail="Admins only")
+    require_feature(ORG_ID, "SEATS")
     url = f"{base_url}/organizations/{ORG_ID}/invitations"
-    payload = {"email_address": req.email_address, "role": req.role, "redirect_url": req.redirect_url}
+    payload = {"email_address": str(req.email_address), "role": "org:member", "redirect_url": "https://www.heidelai.com/accept_invitation"}
+    reservation_id = None
     try:
+        memberships = requests.get(f"{base_url}/organizations/{ORG_ID}/memberships", headers=clerk_headers(), params={"limit": 1}, timeout=15)
+        invitations = requests.get(f"{base_url}/organizations/{ORG_ID}/invitations", headers=clerk_headers(), params={"status": "pending", "limit": 1}, timeout=15)
+        if not memberships.ok or not invitations.ok:
+            raise HTTPException(status_code=502, detail="Clerk membership capacity could not be verified")
+        used = int(memberships.json().get("total_count", len(memberships.json().get("data", [])))) + int(invitations.json().get("total_count", len(invitations.json().get("data", []))))
+        reservation_id = reserve_capacity(ORG_ID, "SEATS", "seats", str(req.email_address).lower(), used)
         resp = requests.post(url, headers=clerk_headers(), json=payload)
-        logger.info(f"Clerk API response: {resp.status_code}, {resp.text}")  # Add this line
         data = resp.json()
         if resp.status_code != 200:
             detail = data.get("errors", [{}])[0].get("long_message", "Failed to invite agent")
-            raise HTTPException(status_code=resp.status_code, detail={"error": detail, "details": data})
+            raise HTTPException(status_code=resp.status_code, detail=detail)
         return data
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "Internal server error", "details": str(e)})
+        logger.error("Clerk invitation failed for org {} ({})", ORG_ID, type(e).__name__)
+        raise HTTPException(status_code=502, detail="Clerk invitation failed") from e
+    finally:
+        release_capacity(reservation_id)
 
 @router.post("/revoke-invite")
 @limiter.limit("30/minute")
 def revoke_invite(request: Request, req: RevokeInviteRequest, user: CurrentUser):
     ORG_ID = user.org_id
     url = f"{base_url}/organizations/{ORG_ID}/invitations/{req.invitation_id}/revoke"
-    payload = {"requesting_user_id": req.requesting_user_id}
+    if user.role not in {"admin", "org:admin"}:
+        raise HTTPException(status_code=403, detail="Admins only")
+    payload = {"requesting_user_id": user.user_id}
     try:
         resp = requests.post(url, headers=clerk_headers(), json=payload)
-        logger.info(f"Clerk API response: {resp.status_code}, {resp.text}")
         data = resp.json()
         if resp.status_code != 200:
             detail = data.get("errors", [{}])[0].get("long_message", "Failed to revoke invite")
-            raise HTTPException(status_code=resp.status_code, detail={"error": detail, "details": data})
+            raise HTTPException(status_code=resp.status_code, detail=detail)
         return data
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "Internal server error", "details": str(e)})
+        logger.error("Clerk invitation revoke failed for org {} ({})", ORG_ID, type(e).__name__)
+        raise HTTPException(status_code=502, detail="Clerk invitation revoke failed") from e
 
 @router.delete("/delete-member")
 @limiter.limit("30/minute")
@@ -81,7 +100,6 @@ def delete_member(request: Request, user: CurrentUser, user_id: str = Query(...)
     url = f"{base_url}/organizations/{ORG_ID}/memberships/{user_id}"
     try:
         resp = requests.delete(url, headers=clerk_headers())
-        logger.info(f"Clerk API response: {resp.status_code}, {resp.text}")
         data = resp.json()
         if resp.status_code == 404:
             detail = data.get("errors", [{}])[0].get("long_message", "Member not found")

@@ -16,6 +16,7 @@ from services.tally_service import (
     create_tally_invoice_draft,
     create_payment_reminder,
     cancel_payment_reminder,
+    count_tally_stock_items,
     finish_job,
     get_customer_mapping,
     get_integration,
@@ -358,9 +359,28 @@ async def get_tally_ledgers(request: Request, user: CurrentUser, kind: str = "",
 
 @router.get("/api/tally/stock-items")
 @limiter.limit("60/minute")
-async def get_tally_stock_items(request: Request, user: CurrentUser, q: str = ""):
+async def get_tally_stock_items(
+    request: Request,
+    user: CurrentUser,
+    q: str = Query("", max_length=120),
+    page: Optional[int] = Query(None, ge=1),
+    page_size: Optional[int] = Query(None, ge=1, le=100),
+):
     await _require_accounting_access(user)
-    return {"stock_items": await list_tally_stock_items(user.org_id, q)}
+    legacy = page is None and page_size is None and not q.strip()
+    resolved_page = page or 1
+    resolved_page_size = page_size or (500 if legacy else 50)
+    stock_items = await list_tally_stock_items(user.org_id, q, resolved_page, resolved_page_size)
+    if legacy:
+        return {"stock_items": stock_items}
+    total = await count_tally_stock_items(user.org_id, q)
+    return {
+        "stock_items": stock_items,
+        "total": total,
+        "page": resolved_page,
+        "page_size": resolved_page_size,
+        "has_more": resolved_page * resolved_page_size < total,
+    }
 
 
 @router.get("/api/tally/invoices")

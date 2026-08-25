@@ -94,6 +94,8 @@ PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
 LEE_DEALER_ORG_WA_ID = os.getenv("LEE_DEALER_ORG_WA_ID")
 KARAN_ORG_WA_ID = os.getenv("KARAN_ORG_WA_ID")
 X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making & validating API calls between different koyeb instances
+INTERNAL_HMAC_SECRET = os.getenv("INTERNAL_HMAC_SECRET") or X_INTERNAL_SECRET
+CRM_COMMERCIAL_BASE_URL = os.getenv("CRM_COMMERCIAL_BASE_URL")
 
 # Google OAuth 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")

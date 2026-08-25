@@ -8,6 +8,7 @@ from database import get_mongo_db
 from auth.dependencies import CurrentUser
 from config.settings import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 from loguru import logger
+from services.entitlement_service import release_capacity, reserve_capacity
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/google", tags=["Google"])
@@ -31,6 +32,7 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
     Frontend receives: { email, name, picture, scopes }
     Frontend NEVER receives: access_token, refresh_token, client_secret
     """
+    reservation_id = None
     try:
         org_id = user.org_id
         code = request.code
@@ -56,7 +58,6 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
             token_response = await client.post(token_url, data=token_data, timeout=10)
 
         if token_response.status_code != 200:
-            logger.error(f"Google token exchange failed: {token_response.text}")
             raise HTTPException(
                 status_code=400,
                 detail=f"Failed to exchange authorization code: {token_response.json().get('error_description', 'Unknown error')}"
@@ -93,6 +94,8 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
 
         if not email:
             raise HTTPException(status_code=400, detail="Could not retrieve email from Google profile")
+        if not db.google_connections.find_one({"org_id": org_id, "email": email, "status": "active"}, {"_id": 1}):
+            reservation_id = reserve_capacity(org_id, "CHANNELS", "email_accounts", email.lower())
 
         # Parse scopes from token response
         scopes = [s.strip() for s in scope_str.split() if s.strip()]
@@ -154,8 +157,10 @@ async def google_auth(request: GoogleAuthRequest, user: CurrentUser):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Google auth error for org {user.org_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Google authentication error: {str(e)}")
+        logger.error("Google authentication failed for org {} ({})", user.org_id, type(e).__name__)
+        raise HTTPException(status_code=502, detail="Google authentication failed") from e
+    finally:
+        release_capacity(reservation_id)
 
 
 @router.get("/profile")

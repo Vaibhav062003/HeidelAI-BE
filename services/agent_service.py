@@ -1,14 +1,9 @@
 import httpx
-import json
-import uuid
-import time
-import base64
-import hmac
-import hashlib
 from typing import Dict, Optional
 from loguru import logger
-from config.settings import X_INTERNAL_SECRET
+from config.settings import INTERNAL_HMAC_SECRET
 from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
+from services.internal_request import signed_json
 
 # Base URL for the chatbot API
 CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app"
@@ -72,26 +67,9 @@ async def send_to_agent(
         payload["reply_context_message_id"] = reply_context_message_id
 
 
-    if not X_INTERNAL_SECRET:
-        raise AIProviderUnavailable("configuration_error")
-    
-    # Generate request signature headers for v2 chat API
-    request_id = uuid.uuid4().hex
-    timestamp = str(int(time.time() * 1000))
-    body_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
-    canonical = f"POST\n/api/v2/chat\n{timestamp}\n{request_id}\n".encode() + body_bytes
-    signature = base64.b64encode(hmac.new(X_INTERNAL_SECRET.encode(), canonical, hashlib.sha256).digest()).decode()
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": X_INTERNAL_SECRET,
-        "X-Request-Id": request_id,
-        "X-Timestamp": timestamp,
-        "X-Signature": signature,
-    }
-    
     # API endpoint
     endpoint = f"{CHATBOT_BASE_URL}/api/v2/chat"
+    body, headers = signed_json(payload, "/api/v2/chat", INTERNAL_HMAC_SECRET, message_id)
     
     try:
         logger.info(f"Sending message to chatbot for ...{conversation_id[-6:]}")
@@ -104,7 +82,7 @@ async def send_to_agent(
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 endpoint,
-                json=payload,
+                content=body,
                 headers=headers,
             )
             
