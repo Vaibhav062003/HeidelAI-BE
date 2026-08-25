@@ -289,24 +289,13 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         async with sem:
             try:
                 logger.info(f"[OOS] Sending WhatsApp message to dealer '{dealer_name}' at +{dealer_phone}...")
-                # Not "ai": that mode gates every send behind
-                # is_effective_ai_enabled(org_id, conversation_id) for the
-                # DEALER's own conversation thread - meant for AI-authored
-                # customer replies (quota tracking included), not this
-                # fixed, template-built business notification. A dealer
-                # with no conversation yet (fails closed) or one whose
-                # thread happens to have AI paused for an unrelated reason
-                # both silently blocked this message forever with no
-                # retry and no escalation. "reply" is what
-                # webhook_routes.py's own system/quota-handoff sends use
-                # for the same reason.
                 res = await send_whatsapp_message({
                     "conversation_id": f"whatsapp_{dealer_phone}",
                     "content": dealer_message,
                     "sender_id": wa_id,
                     "recipient_override": dealer_phone,
                     "customer_name": dealer_name,
-                }, org_id, "reply")
+                }, org_id, "ai")
                 message_ids = res.get("message_ids", []) if res else []
                 logger.success(f"[OOS] WhatsApp successfully sent to dealer '{dealer_name}' at +{dealer_phone} (message_ids={message_ids})")
                 sent_dealers.append({
