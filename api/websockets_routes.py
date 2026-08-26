@@ -1,21 +1,33 @@
+import asyncio
 import json
 from core.managers import manager, manager2
 from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
 from auth.dependencies import get_current_user
-from services.websocket_service import broadcast_on_stats_update, handle_unread_event, handle_typing_event, start_heartbeat, cleanup_client
+from services.websocket_service import (
+    cleanup_client,
+    get_org_presence_snapshot,
+    handle_typing_event,
+    handle_unread_event,
+    start_heartbeat,
+)
 
 from fastapi.security import HTTPAuthorizationCredentials
-import json
-
-from services.websocket_service import *
 from loguru import logger
 
 
 router = APIRouter(tags=["Websockets"])
 
 db = get_mongo_db()
+
+
+def _active_account_ids(default_id, connections, field: str) -> set[str]:
+    ids = {str(connection.get(field) or "") for connection in connections}
+    ids.discard("")
+    if not ids and default_id:
+        ids.add(str(default_id))
+    return ids
 
 # Add a new WebSocket endpoint for Instagram
 @router.websocket("/ws2/instagram/{client_id}")
@@ -168,10 +180,25 @@ async def main_ws(websocket: WebSocket, client_id: str):
     org = db.organizations.find_one(
         {"org_id": user.org_id},
         {"ig_id": 1, "wa_id": 1, "_id": 0}
+    ) or {}
+    ig_ids = _active_account_ids(
+        org.get("ig_id"),
+        db.instagram_connections.find(
+            {"org_id": user.org_id, "is_active": {"$ne": False}},
+            {"instagram_id": 1, "_id": 0},
+        ),
+        "instagram_id",
     )
-
-    ig_id = org.get("ig_id")
-    wa_id = org.get("wa_id")
+    wa_ids = _active_account_ids(
+        org.get("wa_id"),
+        db.whatsapp_connections.find(
+            {"org_id": user.org_id, "is_active": {"$ne": False}},
+            {"wa_id": 1, "_id": 0},
+        ),
+        "wa_id",
+    )
+    ig_id = str(org.get("ig_id") or next(iter(ig_ids), "")) or None
+    wa_id = str(org.get("wa_id") or next(iter(wa_ids), "")) or None
 
 
     # Step 3: Register connection globally
@@ -179,6 +206,8 @@ async def main_ws(websocket: WebSocket, client_id: str):
     services.client_metadata[client_id] = {
         "ig_id": ig_id,
         "wa_id": wa_id,
+        "ig_ids": sorted(ig_ids),
+        "wa_ids": sorted(wa_ids),
         "user_id": user.user_id,
         "org_id": user.org_id,
         "role": user.role,
@@ -193,14 +222,14 @@ async def main_ws(websocket: WebSocket, client_id: str):
     if user.user_id:
         services.agent_clients[user.user_id].add(client_id)
 
-    if ig_id:
-        services.instagram_clients[ig_id].add(client_id)
+    for account_id in ig_ids:
+        services.instagram_clients[account_id].add(client_id)
 
-    if wa_id:
-        services.whatsapp_clients[wa_id].add(client_id)
+    for account_id in wa_ids:
+        services.whatsapp_clients[account_id].add(client_id)
 
     logger.success(f"Connected client: {client_id}")
-    logger.success(f"IG: {ig_id}, WA: {wa_id}")
+    logger.success(f"Registered {len(ig_ids)} Instagram and {len(wa_ids)} WhatsApp account(s)")
 
     # Step 4: Send initial stats
     # asyncio.create_task(broadcast_on_stats_update(user.org_id))

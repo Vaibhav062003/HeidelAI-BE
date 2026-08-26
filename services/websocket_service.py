@@ -8,6 +8,13 @@ from loguru import logger
 db = get_mongo_db()
 
 
+def _payload_conversation_id(payload: dict) -> str | None:
+    for candidate in (payload, payload.get("message"), payload.get("conversation")):
+        if isinstance(candidate, dict) and candidate.get("conversation_id"):
+            return str(candidate["conversation_id"])
+    return None
+
+
 async def _eligible_conversation_clients(client_ids, conversation_id: str | None):
     if not conversation_id:
         return set(client_ids)
@@ -77,8 +84,8 @@ async def cleanup_client(client_id: str):
 
     if not meta:
         return
-    ig_id = meta.get("ig_id")
-    wa_id = meta.get("wa_id")
+    ig_ids = meta.get("ig_ids") or ([meta.get("ig_id")] if meta.get("ig_id") else [])
+    wa_ids = meta.get("wa_ids") or ([meta.get("wa_id")] if meta.get("wa_id") else [])
     user_id = meta.get("user_id")
     org_id = meta.get("org_id")
 
@@ -90,12 +97,12 @@ async def cleanup_client(client_id: str):
         services.org_clients[org_id].remove(client_id)
         if not services.org_clients[org_id]:
             del services.org_clients[org_id]
-    if ig_id and client_id in services.instagram_clients[ig_id]:
-        services.instagram_clients[ig_id].remove(client_id)
+    for ig_id in ig_ids:
+        services.instagram_clients[ig_id].discard(client_id)
         if not services.instagram_clients[ig_id]:
             del services.instagram_clients[ig_id]
-    if wa_id and client_id in services.whatsapp_clients[wa_id]:
-        services.whatsapp_clients[wa_id].remove(client_id)
+    for wa_id in wa_ids:
+        services.whatsapp_clients[wa_id].discard(client_id)
         if not services.whatsapp_clients[wa_id]:
             del services.whatsapp_clients[wa_id]
 
@@ -181,7 +188,14 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
     if not client_ids:
         return
 
-    client_ids = await _eligible_conversation_clients(client_ids, payload.get("conversation_id"))
+    try:
+        client_ids = await _eligible_conversation_clients(
+            client_ids,
+            _payload_conversation_id(payload),
+        )
+    except Exception as error:
+        logger.error(f"WebSocket access filtering failed: {type(error).__name__}")
+        return
     if not client_ids:
         return
 

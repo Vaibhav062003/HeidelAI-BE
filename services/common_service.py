@@ -169,6 +169,27 @@ def _search_snippet(value: object, query: str, limit: int = 160) -> str:
     return f"{'…' if start else ''}{text[start:end]}{'…' if end < len(text) else ''}"
 
 
+def _contact_search_condition(
+    clean_query: str,
+    phone_query: bool,
+    digits: str,
+    name_terms: list[str],
+) -> Dict:
+    if phone_query:
+        suffix = f"{re.escape(digits)}$"
+        return {"$or": [
+            {"phone_number": {"$regex": suffix}},
+            {"conversation_id": {"$regex": suffix}},
+        ]}
+    return {"$and": [
+        {"$or": [
+            {field: {"$regex": re.escape(term), "$options": "i"}}
+            for field in ("full_name", "username", "company", "tally.legal_name")
+        ]}
+        for term in name_terms
+    ]} if name_terms else {"_id": {"$exists": False}}
+
+
 def _lookup_scope(value: object) -> object:
     if isinstance(value, list):
         return [_lookup_scope(item) for item in value]
@@ -365,14 +386,40 @@ async def search_conversations(
     candidate_limit = skip + limit + 1
     digits, _ = phone_search_parts(clean_query)
     phone_query = len(digits) >= 6 and bool(re.fullmatch(r"[+\d\s().-]+", clean_query))
+    name_terms = [] if phone_query else re.findall(r"[^\W_]+", clean_query.casefold())
+    contact_rows = await async_db[f"contacts_{org_id}"].find(
+        _contact_search_condition(clean_query, phone_query, digits, name_terms),
+        {
+            "_id": 0,
+            "conversation_id": 1,
+            "full_name": 1,
+            "username": 1,
+            "company": 1,
+            "phone_number": 1,
+        },
+    ).limit(max(50, candidate_limit * 3)).to_list(length=max(50, candidate_limit * 3))
+    contacts_by_conversation = {
+        str(contact["conversation_id"]): contact
+        for contact in contact_rows
+        if contact.get("conversation_id")
+    }
+    contact_conversation_ids = list(contacts_by_conversation)
     results: Dict[str, tuple[Dict, Dict]] = {}
 
-    def add_result(doc: Dict, match_type: str, snippet: str, message: Optional[Dict] = None) -> None:
+    def add_result(
+        doc: Dict,
+        match_type: str,
+        snippet: str,
+        message: Optional[Dict] = None,
+        contact_name: Optional[str] = None,
+    ) -> None:
         conversation_id = doc.get("conversation_id")
         if not conversation_id or conversation_id in results:
             return
         item = serialize_mongo(doc)
         item["id"] = conversation_id
+        if contact_name:
+            item["customer_name"] = contact_name
         match = {
             "type": match_type,
             "snippet": snippet,
@@ -392,25 +439,54 @@ async def search_conversations(
             {"phone_search_suffixes": digits},
             {"conversation_id": {"$regex": f"^(?:whatsapp|dealer)_\\d*{re.escape(digits)}$"}},
         ]
+        if contact_conversation_ids:
+            phone_conditions.append({"conversation_id": {"$in": contact_conversation_ids}})
         direct_query = {"$and": [*conditions, {"$or": phone_conditions}]}
         direct_docs = await conversations.find(direct_query, projection).sort(
             "last_message_timestamp", -1
         ).limit(candidate_limit).to_list(length=candidate_limit)
         for doc in direct_docs:
-            add_result(doc, "phone", str(doc.get("customer_id") or doc.get("conversation_id") or ""))
+            contact = contacts_by_conversation.get(str(doc.get("conversation_id") or ""))
+            add_result(
+                doc,
+                "contact" if contact else "phone",
+                str((contact or {}).get("phone_number") or doc.get("customer_id") or doc.get("conversation_id") or ""),
+                contact_name=str((contact or {}).get("full_name") or (contact or {}).get("company") or "") or None,
+            )
     else:
-        name_terms = re.findall(r"[^\W_]+", clean_query.casefold())
         direct_docs = []
         if name_terms:
-            direct_query = {"$and": [*conditions, {
-                "customer_name_prefixes": {"$all": name_terms}
-            }]}
+            # ponytail: this legacy-only regex path can be removed after old rows have prefixes.
+            legacy_name_match = {"$and": [
+                {"$or": [
+                    {"customer_name_prefixes": {"$exists": False}},
+                    {"customer_name_prefixes": None},
+                    {"customer_name_prefixes": []},
+                ]},
+                *[
+                    {"customer_name": {"$regex": re.escape(term), "$options": "i"}}
+                    for term in name_terms
+                ],
+            ]}
+            name_matches: List[Dict] = [
+                {"customer_name_prefixes": {"$all": name_terms}},
+                legacy_name_match,
+            ]
+            if contact_conversation_ids:
+                name_matches.append({"conversation_id": {"$in": contact_conversation_ids}})
+            direct_query = {"$and": [*conditions, {"$or": name_matches}]}
             direct_docs = await conversations.find(direct_query, projection).sort(
                 "last_message_timestamp", -1
             ).limit(candidate_limit).to_list(length=candidate_limit)
         for doc in direct_docs:
-            name = str(doc.get("customer_name") or "")
-            add_result(doc, "name", _search_snippet(name, clean_query))
+            contact = contacts_by_conversation.get(str(doc.get("conversation_id") or ""))
+            name = str((contact or {}).get("full_name") or (contact or {}).get("company") or doc.get("customer_name") or "")
+            add_result(
+                doc,
+                "contact" if contact else "name",
+                _search_snippet(name, clean_query),
+                contact_name=name if contact else None,
+            )
 
         message_hits = await messages.aggregate([
             {"$match": {"$text": {"$search": clean_query}}},
