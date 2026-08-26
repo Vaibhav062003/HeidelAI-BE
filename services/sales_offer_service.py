@@ -93,10 +93,6 @@ async def record_outbound_offer(
     *, org_id: str, agent_id: str, agent_name: str, conversation_id: str,
     platform: str, content: str, result: Optional[dict], context: Optional[dict] = None,
 ) -> Optional[dict]:
-    from services.entitlement_service import feature_access
-
-    if feature_access(org_id, "OFFERS")["state"] != "active":
-        return None
     source_message_id = _message_id(result)
     if not source_message_id:
         return None

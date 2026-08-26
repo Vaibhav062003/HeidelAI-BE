@@ -16,6 +16,17 @@ from services.sales_offer_policy import (
 
 
 class SalesOfferContractTest(unittest.TestCase):
+    def test_offer_audit_is_not_entitlement_gated(self):
+        tree = ast.parse(Path("services/sales_offer_service.py").read_text())
+        record = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "record_outbound_offer"
+        )
+        self.assertFalse(any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "feature_access"
+            for node in ast.walk(record)
+        ))
+
     def test_structured_chat_offer_totals_and_validation(self):
         snapshot = structured_offer_snapshot({"offer": {"items": [
             {"description": "Ryzen 7 9700X", "quantity": 1, "unit_price": 32_000, "gst_rate": 18, "gst_inclusive": True},
