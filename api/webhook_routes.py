@@ -788,6 +788,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 if "_id" in broadcast_message:
                                     broadcast_message["_id"] = str(broadcast_message["_id"])
 
+                                try:
+                                    from services.sales_learning_service import record_reaction
+                                    await record_reaction(
+                                        org_id, conversation_id,
+                                        str(message.get("id") or f"wa:{message_id}:{message.get('timestamp')}:{action}:{emoji}"),
+                                        str(message_id), str(emoji or ""), action, "whatsapp",
+                                    )
+                                except Exception as learning_error:
+                                    logger.warning(f"Could not record internal WhatsApp reaction learning: {type(learning_error).__name__}")
+
                                 await broadcast_main_ws(
                                     platform_id=whatsapp_business_id,
                                     platform_type="whatsapp",
@@ -2122,6 +2132,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                         if "_id" in broadcast_message:
                             broadcast_message["_id"] = str(broadcast_message["_id"])
+
+                        try:
+                            from services.sales_learning_service import record_reaction
+                            await record_reaction(
+                                org_id, f"instagram_{sender_id}",
+                                f"ig:{mid}:{sender_id}:{message_timestamp}:{action}:{emoji}",
+                                str(mid), str(emoji or ""), action, "instagram",
+                            )
+                        except Exception as learning_error:
+                            logger.warning(f"Could not record internal Instagram reaction learning: {type(learning_error).__name__}")
 
                         await broadcast_main_ws(
                             platform_id=recipient_id,

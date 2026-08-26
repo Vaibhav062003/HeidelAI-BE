@@ -192,11 +192,6 @@ async def process_cashfree_event(event_type: str, payload: dict):
         case "SUBSCRIPTION_REFUND_STATUS":
             await update_refund_status(data, event_time)
 
-        case "PAYMENT_LINK_EVENT":
-            from services.sales_action_service import apply_sales_payment_webhook
-
-            await apply_sales_payment_webhook(payload)
-
         case _:
             logger.warning(f"Unhandled Cashfree Event Type: {event_type}")
 

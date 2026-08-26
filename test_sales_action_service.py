@@ -60,20 +60,6 @@ class DB:
         return self.jobs
 
 
-class PaymentLinks:
-    def __init__(self, document):
-        self.document = document
-
-    async def find_one(self, query):
-        return self.document if query.get("link_id") == self.document.get("link_id") else None
-
-
-class PaymentDB(DB):
-    def __init__(self, document):
-        super().__init__()
-        self.sales_payment_links = PaymentLinks(document)
-
-
 class ProductCollection:
     def __init__(self, document):
         self.document = document
@@ -84,6 +70,7 @@ class ProductCollection:
 
 class ProductDB:
     def __init__(self):
+        self.organizations = ProductCollection({"sales_catalogue_org_id": "catalogue"})
         self.collections = {
             "product_catalogue": ProductCollection({"product_id": "P1", "model_no": "ABC"}),
             "products_catalogue": ProductCollection({"unique_identifier": "ABC", "stock": 4,
@@ -105,6 +92,36 @@ def test_v5_selection_resolves_to_the_live_sheet_product(monkeypatch):
     product = asyncio.run(actions._product("catalogue", "P1"))
     assert product["unique_identifier"] == "ABC"
     assert product["source"] == "google_sheet"
+
+
+def test_billing_intent_is_explicit_and_handles_hinglish():
+    assert actions.is_invoice_draft_intent("please bill")
+    assert actions.is_invoice_draft_intent("bill karo")
+    assert actions.is_invoice_draft_intent("bill kara do")
+    assert actions.is_invoice_draft_intent("भेजो", has_source=True)
+    assert not actions.is_invoice_draft_intent("bhejo")
+    assert not actions.is_invoice_draft_intent("bill mat bhejo")
+    assert not actions.is_invoice_draft_intent("old bill bhejo")
+    assert not actions.is_invoice_draft_intent("bill kitna hoga?")
+
+
+def test_invoice_action_creates_review_only_tally_draft(monkeypatch):
+    calls = []
+
+    async def create(org_id, user_id, role, conversation_id, payload):
+        calls.append((org_id, user_id, role, conversation_id, payload))
+        return {"draft_id": "d1", "source_message_ids": ["m1"]}
+
+    monkeypatch.setitem(sys.modules, "services.tally_service", SimpleNamespace(
+        create_tally_invoice_draft=create,
+    ))
+    case = {
+        "org_id": "org", "conversation_id": "whatsapp_1", "quote_id": "q1",
+        "action_source_message_ids": ["m1"],
+    }
+    result = asyncio.run(actions._invoice_draft(case, "bill karo"))
+    assert result["fields"] == {"invoice_draft_id": "d1", "invoice_source_message_ids": ["m1"]}
+    assert calls[0][1:3] == ("ai-sales", "admin")
 
 
 def test_same_sales_event_executes_only_once(monkeypatch):
@@ -165,33 +182,3 @@ def test_delivered_quote_schedules_one_existing_followup(monkeypatch):
     assert len(scheduled) == 1
     assert scheduled[0][1]["source"] == "quotation"
     assert scheduled[0][1]["quote_id"] == "quote"
-
-
-def test_only_a_full_matching_payment_marks_the_deal_won(monkeypatch):
-    database = PaymentDB({
-        "link_id": "sale_1", "org_id": "org", "case_id": "case",
-        "conversation_id": "whatsapp_1", "amount": 1180,
-    })
-    states = []
-    aborted = []
-
-    async def set_state(**kwargs):
-        states.append(kwargs)
-
-    async def abort(org_id, conversation_id):
-        aborted.append((org_id, conversation_id))
-
-    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
-    monkeypatch.setattr(actions, "set_sales_action_state", set_state)
-    monkeypatch.setitem(sys.modules, "services.followup_service", SimpleNamespace(
-        abort_scheduled_message=abort,
-    ))
-    partial = {"data": {"link_id": "sale_1", "link_status": "PAID",
-                        "link_amount": 1180, "link_amount_paid": 1000}}
-    full = {"data": {"link_id": "sale_1", "link_status": "PAID",
-                     "link_amount": 1180, "link_amount_paid": 1180}}
-
-    assert asyncio.run(actions.apply_sales_payment_webhook(partial)) is False
-    assert asyncio.run(actions.apply_sales_payment_webhook(full)) is True
-    assert len(states) == 1 and states[0]["stage"] == "won"
-    assert aborted == [("org", "whatsapp_1")]
