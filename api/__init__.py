@@ -29,6 +29,7 @@ from . import tally_routes
 from . import stock_routes
 from . import entitlement_routes
 from . import billing_routes
+from . import internal_sales_learning_routes
 
 router = APIRouter()
 
@@ -61,3 +62,4 @@ router.include_router(tally_routes.router)
 router.include_router(stock_routes.router)
 router.include_router(entitlement_routes.router)
 router.include_router(billing_routes.router)
+router.include_router(internal_sales_learning_routes.router)

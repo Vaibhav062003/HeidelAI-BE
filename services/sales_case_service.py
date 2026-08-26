@@ -13,9 +13,10 @@ from pymongo.errors import DuplicateKeyError
 STAGES = (
     "new", "discovering", "qualified", "evaluating", "selected",
     "negotiating", "commitment_received", "stock_confirmation",
-    "quote_sent", "payment_pending", "won",
+    "quote_sent", "invoice_draft", "billed", "won", "paid",
 )
 SPECIAL_STAGES = frozenset({"nurture", "on_hold", "lost"})
+AI_STAGE_SIGNALS = frozenset({*STAGES[:9], "nurture", "on_hold"})
 MOVES = frozenset({
     "ask_discovery", "confirm_understanding", "recommend_shortlist",
     "explain_best_fit", "compare_options", "explain_tradeoff",
@@ -25,7 +26,7 @@ MOVES = frozenset({
 })
 ACTIONS = frozenset({
     "none", "show_products", "create_quote", "request_stock_confirmation",
-    "create_payment_link", "create_handoff", "schedule_followup",
+    "create_invoice_draft", "create_handoff", "schedule_followup",
 })
 QUESTION_FIELDS = frozenset({
     "", "sales_product", "sales_quantity", "sales_timeline", "sales_budget",
@@ -56,7 +57,10 @@ def _grounded(field: str, value: Any, evidence: str, message: str) -> bool:
         return False
     if field == "quantity":
         numbers = [int(item.replace(",", "")) for item in re.findall(r"\b\d[\d,]{0,5}\b", evidence)]
-        return isinstance(value, (int, float)) and not isinstance(value, bool) and int(value) in numbers and 0 < value <= 9999
+        return (
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            and float(value).is_integer() and int(value) in numbers and 0 < value <= 9999
+        )
     if field == "delivery_pincode":
         return str(value) in re.findall(r"\b[1-9]\d{5}\b", evidence)
     if field == "budget":
@@ -116,6 +120,8 @@ def normalize_sales_decision(raw: Any, source_message_text: str = "") -> dict[st
     stage = str(raw.get("stage_signal") or "discovering")
     if stage not in STAGES and stage not in SPECIAL_STAGES:
         raise ValueError("invalid sales stage")
+    if stage not in AI_STAGE_SIGNALS:
+        stage = "discovering"  # Verified billing/payment outcomes are backend-owned.
     move = dict(raw.get("sales_move") or {})
     move_type = str(move.get("type") or "confirm_understanding")
     if move_type not in MOVES:
@@ -126,9 +132,14 @@ def normalize_sales_decision(raw: Any, source_message_text: str = "") -> dict[st
     question_field = str(raw.get("question_field") or "")
     if question_field not in QUESTION_FIELDS:
         raise ValueError("invalid sales question")
-    catalogue_org_id = str(raw.get("catalogue_org_id") or "")[:120]
-    if catalogue_org_id and not re.fullmatch(r"[A-Za-z0-9_-]+", catalogue_org_id):
-        raise ValueError("invalid sales catalogue")
+    requested = raw.get("requested_action") if isinstance(raw.get("requested_action"), dict) else {}
+    source_message_ids = []
+    for value in requested.get("source_message_ids") or []:
+        value = str(value).strip()
+        if value and len(value) <= 240 and value not in source_message_ids:
+            source_message_ids.append(value)
+        if len(source_message_ids) == 20:
+            break
 
     updates = []
     for item in raw.get("fact_updates") or []:
@@ -161,9 +172,14 @@ def normalize_sales_decision(raw: Any, source_message_text: str = "") -> dict[st
             "type": move_type,
             "reason_code": str(move.get("reason_code") or "")[:120],
         },
-        "requested_action": {"type": action_type},
+        "requested_action": {"type": action_type, "source_message_ids": source_message_ids},
         "question_field": question_field,
-        "catalogue_org_id": catalogue_org_id,
+        # Catalogue ownership is derived from the organisation by the backend.
+        "catalogue_org_id": "",
+        "learning_trace": {
+            "policy_version": str((raw.get("learning_trace") or {}).get("policy_version") or "default")[:80],
+            "cohort": str((raw.get("learning_trace") or {}).get("cohort") or "control")[:20],
+        } if isinstance(raw.get("learning_trace"), dict) else {},
         "signals": {
             key: str(signals.get(key) or default)[:120]
             for key, default in {
@@ -175,6 +191,10 @@ def normalize_sales_decision(raw: Any, source_message_text: str = "") -> dict[st
 
 
 def _later_stage(current: str, proposed: str) -> str:
+    if current in {"won", "paid"}:
+        return "paid" if proposed == "paid" else current
+    if current == "lost":
+        return current
     if proposed in SPECIAL_STAGES:
         return proposed
     if current in SPECIAL_STAGES:
@@ -202,8 +222,7 @@ def sales_context(case: dict[str, Any] | None) -> dict[str, Any]:
         "catalogue_org_id": case.get("catalogue_org_id") or "",
         "action_status": case.get("action_status") or "idle",
         "quote_id": case.get("quote_id"),
-        "payment_order_id": case.get("payment_order_id"),
-        "payment_link_id": case.get("payment_link_id"),
+        "invoice_draft_id": case.get("invoice_draft_id"),
     }
 
 
@@ -238,7 +257,7 @@ async def apply_sales_decision(
             "org_id": org_id, "conversation_id": conversation_id,
             "customer_name": customer_name, "status": "active", "stage": "new",
             "version": 0, "facts": {}, "signals": {}, "last_move": {},
-            "catalogue_org_id": checked["catalogue_org_id"], "question_field": "",
+            "catalogue_org_id": "", "question_field": "",
             "next_action": "none", "processed_events": [], "stage_history": [],
             "created_at": now, "updated_at": now,
         }
@@ -265,13 +284,14 @@ async def apply_sales_decision(
             "customer_name": customer_name or case.get("customer_name") or "",
             "updated_at": now,
         }
-        if checked["catalogue_org_id"]:
-            updates["catalogue_org_id"] = checked["catalogue_org_id"]
         if action_type != "none":
             updates.update({
                 "action_status": "pending", "action_error": "",
                 "action_source_message_id": source_message_id,
+                "action_source_message_ids": checked["requested_action"]["source_message_ids"],
             })
+        if checked["learning_trace"]:
+            updates["learning_trace"] = checked["learning_trace"]
         for item in checked["fact_updates"]:
             updates[f"facts.{item['field']}"] = {
                 "value": item["value"], "evidence": item["evidence"],

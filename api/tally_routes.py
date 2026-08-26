@@ -151,9 +151,18 @@ class TallyMasterPayload(BaseModel):
 
 
 class InvoiceDraftCreatePayload(BaseModel):
-    source: Literal["command", "quote"]
+    source: Literal["command", "quote", "messages"]
     command: str = Field(default="", max_length=3500)
     quote_id: str = Field(default="", max_length=120)
+    source_message_ids: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("source_message_ids")
+    @classmethod
+    def clean_source_message_ids(cls, values: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(value.strip() for value in values if value.strip()))
+        if any(len(value) > 240 for value in cleaned):
+            raise ValueError("A source message ID is too long")
+        return cleaned
 
 
 class InvoiceDraftItemPayload(BaseModel):

@@ -50,6 +50,23 @@ poisoned = sales.normalize_sales_decision({
     "fact_updates": [{"field": "quantity", "value": 999, "evidence": "2 units"}],
 }, "I need 2 units")
 assert poisoned["fact_updates"] == []
+fractional = sales.normalize_sales_decision({
+    "version": 1, "stage_signal": "selected",
+    "sales_move": {"type": "ask_micro_commitment"},
+    "requested_action": {"type": "none"},
+    "fact_updates": [{"field": "quantity", "value": 2.5, "evidence": "2 units"}],
+}, "I need 2 units")
+assert fractional["fact_updates"] == []
+privileged = sales.normalize_sales_decision({
+    "version": 1, "stage_signal": "won", "sales_move": {"type": "ask_for_order"},
+    "requested_action": {"type": "none"},
+})
+assert privileged["stage_signal"] == "discovering"
+assert sales.normalize_sales_decision({
+    "version": 1, "stage_signal": "commitment_received",
+    "sales_move": {"type": "start_checkout"},
+    "requested_action": {"type": "create_invoice_draft", "source_message_ids": ["m1", "m1", "m2"]},
+})["requested_action"] == {"type": "create_invoice_draft", "source_message_ids": ["m1", "m2"]}
 grounded_budget = sales.normalize_sales_decision({
     "version": 1, "stage_signal": "negotiating",
     "sales_move": {"type": "negotiate"}, "requested_action": {"type": "none"},
@@ -141,20 +158,17 @@ assert webhook.count('chatbot_response.get("duplicate_event")') >= 3
 
 actions = (root / "services/sales_action_service.py").read_text()
 assert '"$setOnInsert"' in actions and 'status") in {"ready", "delivered"}' in actions
-assert "floor_snapshot(product)" in actions and "link_partial_payments" in actions
+assert "floor_snapshot(product)" in actions and "create_tally_invoice_draft" in actions
 assert "_floor_tax_basis(product)" in actions and '"gst_inclusive": tax_basis == "included"' in actions
 assert "default_gst_rate" not in actions
+assert "create_payment_link" not in actions and "Cashfree" not in actions
 
 routes = (root / "api/sales_case_routes.py").read_text()
 assert "user: CurrentUser" in routes and "await require_conversation_access(" in routes
 assert "sales_case_routes.router" in (root / "api/__init__.py").read_text()
 
-payment = (root / "services/payment_service.py").read_text()
-assert 'case "PAYMENT_LINK_EVENT"' in payment
-assert "await apply_sales_payment_webhook(payload)" in payment
-
-cashfree = (root / "api/webhook_routes.py").read_text()
-assert '"processing": False' in cashfree
-assert "Cashfree event processing failed" in cashfree
+learning = (root / "services/sales_learning_service.py").read_text()
+assert "expires_at" in learning and "choose_guidance" in learning
+assert "internal_sales_learning_routes.router" in (root / "api/__init__.py").read_text()
 
 print("SALES_INTELLIGENCE_BACKEND_OK")

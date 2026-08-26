@@ -51,12 +51,27 @@ async def send_to_agent(
         A dictionary containing the key ``"final_response"`` on success.
     """
     from services.sales_case_service import apply_sales_decision, get_sales_context
+    sales_event_id = message_id or f"agent_{uuid.uuid4()}"
 
     try:
         current_sales_context = await get_sales_context(org_id, conversation_id)
     except Exception as exc:
         logger.warning(f"Could not load sales context for {conversation_id}: {exc}")
         current_sales_context = {"version": 0, "stage": "new", "facts": {}}
+
+    try:
+        from services.sales_learning_service import get_sales_guidance, record_customer_response
+        await record_customer_response(
+            org_id, conversation_id, sales_event_id, user_input,
+            target_message_id=reply_context_message_id or "",
+            channel="instagram" if conversation_id.startswith("instagram_") else "whatsapp",
+        )
+        sales_guidance = await get_sales_guidance(
+            org_id, conversation_id, current_sales_context, user_input,
+        )
+    except Exception as exc:
+        logger.warning(f"Could not load internal sales guidance for {conversation_id}: {exc}")
+        sales_guidance = {"policy_version": "default", "cohort": "control", "recommended_moves": []}
 
     # Prepare the request payload
     payload = {
@@ -69,6 +84,7 @@ async def send_to_agent(
             "source": source,
             "message_type": message_type,
             "sales_context": current_sales_context,
+            "sales_guidance": sales_guidance,
         }
     
     if message_id:
@@ -123,7 +139,6 @@ async def send_to_agent(
             if sales_decision:
                 result["sales_decision"] = sales_decision
                 try:
-                    sales_event_id = message_id or f"agent_{uuid.uuid4()}"
                     applied = await apply_sales_decision(
                         org_id=org_id,
                         conversation_id=conversation_id,
@@ -133,9 +148,42 @@ async def send_to_agent(
                         source_message_text=user_input,
                     )
                     if applied.get("duplicate"):
+                        pending_action = str(applied["case"].get("next_action") or "none")
+                        if applied["case"].get("action_status") == "ready" and pending_action != "none":
+                            from services.sales_action_service import execute_sales_action
+                            action = await execute_sales_action(
+                                case=applied["case"], source_message_id=sales_event_id,
+                                action_type=pending_action, customer_text=user_input,
+                            )
+                            if action:
+                                result["final_response"] = action["reply"]
+                                result["sales_action"] = action
+                                result["sales_case"] = await get_sales_context(org_id, conversation_id)
+                                return result
                         result["duplicate_event"] = True
                         result["sales_case"] = await get_sales_context(org_id, conversation_id)
                         return result
+                    try:
+                        from services.sales_learning_service import record_customer_response, record_sales_learning_event
+                        await record_customer_response(
+                            org_id, conversation_id, sales_event_id, user_input,
+                            target_message_id=reply_context_message_id or "",
+                            channel="instagram" if conversation_id.startswith("instagram_") else "whatsapp",
+                        )
+                        await record_sales_learning_event(
+                            org_id=org_id, event_type="ai_decision",
+                            conversation_id=conversation_id, source_id=sales_event_id,
+                            case=applied["case"],
+                            channel="instagram" if conversation_id.startswith("instagram_") else "whatsapp",
+                        )
+                        if applied["case"].get("stage") == "commitment_received":
+                            await record_sales_learning_event(
+                                org_id=org_id, event_type="commitment",
+                                conversation_id=conversation_id,
+                                source_id=f"{sales_event_id}:commitment", case=applied["case"],
+                            )
+                    except Exception as exc:
+                        logger.warning(f"Could not record internal sales decision: {exc}")
                     action_type = str(
                         (sales_decision.get("requested_action") or {}).get("type") or "none"
                     )

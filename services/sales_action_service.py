@@ -7,12 +7,10 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-import httpx
 from loguru import logger
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from config.settings import CASHFREE_APP_ID, CASHFREE_SECRET_KEY, CASHFREE_URL, CASHFREE_VERSION
 from database import get_async_mongo_db
 from services.pricing_service import _floor_tax_basis, floor_snapshot
 from services.quote_service import build_quote_document
@@ -24,6 +22,31 @@ class SalesActionBlocked(Exception):
         super().__init__(customer_message)
         self.customer_message = customer_message
         self.escalate = escalate
+
+
+_BILL_REQUEST = re.compile(
+    r"\b(?:please\s+bill|(?:bill|invoice)\s*(?:karo|kara|kara\s+do|kar\s+do|bana\s+do|banao|bhejo|send|create|raise|generate)|"
+    r"(?:send|create|raise|generate)\s+(?:the\s+)?(?:bill|invoice))\b|"
+    r"(?:बिल|इनवॉइस)\s*(?:बना\s*दो|बनाओ|भेजो)", re.I,
+)
+_BILL_NEGATION = re.compile(
+    r"\b(?:mat|nahi|nahin|cancel|old|previous|duplicate|copy|do\s+not|don['’]?t|not)\b|(?:मत|नहीं)",
+    re.I,
+)
+_BARE_SEND = frozenset({"bhejo", "send", "send it", "भेजो"})
+
+
+def is_invoice_draft_intent(text: str, *, has_source: bool = False) -> bool:
+    value = " ".join(str(text or "").casefold().split())
+    if not value or _BILL_NEGATION.search(value):
+        return False
+    if value in _BARE_SEND:
+        return has_source
+    if not _BILL_REQUEST.search(value):
+        return False
+    return "?" not in value or bool(re.search(
+        r"\b(?:can|could|will|would)\s+you\s+(?:please\s+)?(?:send|create|raise)", value,
+    ))
 
 
 def _fact(case: dict[str, Any], field: str) -> Any:
@@ -85,12 +108,10 @@ async def _checked_product(case: dict[str, Any]) -> tuple[dict[str, Any], int, f
         quantity = 0
     if not selected_id or not 1 <= quantity <= 9999:
         raise SalesActionBlocked("I still need the exact product and quantity before I can continue.")
-    catalogue_org_id = str(case.get("catalogue_org_id") or "")
-    if not catalogue_org_id:
-        organization = await get_async_mongo_db().organizations.find_one(
-            {"org_id": case["org_id"]}, {"sales_catalogue_org_id": 1},
-        ) or {}
-        catalogue_org_id = str(organization.get("sales_catalogue_org_id") or case["org_id"])
+    organization = await get_async_mongo_db().organizations.find_one(
+        {"org_id": case["org_id"]}, {"sales_catalogue_org_id": 1},
+    ) or {}
+    catalogue_org_id = str(organization.get("sales_catalogue_org_id") or case["org_id"])
     if not re.fullmatch(r"[A-Za-z0-9_-]+", catalogue_org_id):
         raise SalesActionBlocked("The sales catalogue configuration is invalid.", escalate=True)
     product = await _product(catalogue_org_id, selected_id)
@@ -210,7 +231,7 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
             f"{_name(product)}\n"
             f"Quantity: {quantity}\nUnit price: Rs.{unit_price:,.2f}\n"
             f"GST: Rs.{gst:,.2f}\n*Total: Rs.{float(quote['public_grand_total']):,.2f}*\n"
-            f"Valid until: {quote['valid_until']}\n\nReply *proceed* when you are ready to pay."
+            f"Valid until: {quote['valid_until']}\n\nReply *proceed* when you are ready for billing."
         ),
         "fields": {"quote_id": quote_id, "quote_number": quote_number},
         "ready_stage": "stock_confirmation", "delivered_stage": "quote_sent",
@@ -226,100 +247,43 @@ async def _stock_confirmation(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _payment_link(case: dict[str, Any], source_message_id: str) -> dict[str, Any]:
-    from services.entitlement_service import require_feature
-
-    require_feature(str(case["org_id"]), "OFFERS")
-    if case.get("stage") not in {"quote_sent", "payment_pending"} or not case.get("quote_id"):
-        raise SalesActionBlocked("I need to send and confirm the quote before creating a payment link.")
-    await _checked_product(case)  # Stock and floor must still be current.
-    db = get_async_mongo_db()
-    quote = await db[f"quotes_{case['org_id']}"].find_one({
-        "quote_id": case["quote_id"], "conversation_id": case["conversation_id"],
-    })
-    if not quote:
-        raise SalesActionBlocked("I could not find the saved quote for this payment.", escalate=True)
-    existing_url = str(case.get("payment_link_url") or "")
-    if case.get("stage") == "payment_pending" and existing_url:
-        return {
-            "reply": (
-                f"Secure payment link for *{quote['quote_number']}*\n"
-                f"Amount: *Rs.{float(quote['public_grand_total']):,.2f}*\n{existing_url}\n\n"
-                "The order is confirmed only after payment succeeds."
-            ),
-            "fields": {
-                "quote_id": case["quote_id"],
-                "payment_order_id": case.get("payment_order_id") or "",
-                "payment_link_id": case.get("payment_link_id") or "",
-                "payment_link_url": existing_url,
-            },
-            "ready_stage": "payment_pending", "delivered_stage": "payment_pending",
-        }
-    if not CASHFREE_URL or not CASHFREE_APP_ID or not CASHFREE_SECRET_KEY:
-        raise SalesActionBlocked(
-            "The secure payment link is not configured yet. Your quote remains saved.", escalate=True,
-        )
-    customer = dict(quote.get("customer") or {})
-    phone = re.sub(r"\D", "", str(customer.get("phone") or case["conversation_id"]))[-10:]
-    if len(phone) != 10:
-        raise SalesActionBlocked(
-            "I need a valid 10-digit mobile number before I can create the secure payment link."
-        )
-    link_id = "sale_" + uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"{case['org_id']}:{case['quote_id']}:{quote.get('revision_number', 1)}",
-    ).hex[:32]
-    payload = {
-        "link_id": link_id, "link_amount": float(quote["public_grand_total"]),
-        "link_currency": "INR", "link_purpose": f"Payment for {quote['quote_number']}",
-        "customer_details": {
-            "customer_name": customer.get("name") or case.get("customer_name") or "Customer",
-            "customer_phone": phone,
-            **({"customer_email": customer["email"]} if customer.get("email") else {}),
-        },
-        "link_partial_payments": False, "link_auto_reminders": True,
-        "link_notes": {"org_id": str(case["org_id"]), "case_id": str(case["case_id"]),
-                       "quote_id": str(case["quote_id"])},
-    }
-    request_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{link_id}:{source_message_id}"))
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(
-            f"{CASHFREE_URL.rstrip('/')}/links", json=payload,
-            headers={
-                "x-client-id": CASHFREE_APP_ID, "x-client-secret": CASHFREE_SECRET_KEY,
-                "x-api-version": CASHFREE_VERSION or "2025-01-01",
-                "x-request-id": request_id, "x-idempotency-key": request_id,
-                "Content-Type": "application/json",
-            },
-        )
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("link_url"):
-        raise SalesActionBlocked("Cashfree did not return a payment link. Your quote remains saved.", escalate=True)
-    await db.sales_payment_links.update_one(
-        {"link_id": link_id},
-        {"$setOnInsert": {"org_id": case["org_id"], "case_id": case["case_id"],
-                          "quote_id": case["quote_id"], "conversation_id": case["conversation_id"],
-                          "amount": float(quote["public_grand_total"]),
-                          "cf_link_id": str(result.get("cf_link_id") or ""), "created_at": datetime.now(timezone.utc)}},
-        upsert=True,
+async def _invoice_draft(case: dict[str, Any], customer_text: str) -> dict[str, Any]:
+    source_ids = [str(value) for value in case.get("action_source_message_ids") or [] if value]
+    if not is_invoice_draft_intent(customer_text, has_source=bool(source_ids or case.get("quote_id"))):
+        raise SalesActionBlocked("Please confirm which quoted products you want me to send for billing.")
+    from services.tally_service import create_tally_invoice_draft
+    draft = await create_tally_invoice_draft(
+        str(case["org_id"]), "ai-sales", "admin", str(case["conversation_id"]),
+        {"source": "messages", "source_message_ids": source_ids},
     )
     return {
-        "reply": (
-            f"Secure payment link for *{quote['quote_number']}*\n"
-            f"Amount: *Rs.{float(quote['public_grand_total']):,.2f}*\n{result['link_url']}\n\n"
-            "The order is confirmed only after payment succeeds."
-        ),
+        "reply": "I have prepared the order and sent it for billing review. The invoice will be shared after Billing confirms it in Tally.",
         "fields": {
-            "quote_id": case["quote_id"],
-            "payment_order_id": link_id, "payment_link_id": str(result.get("cf_link_id") or ""),
-            "payment_link_url": result["link_url"],
+            "invoice_draft_id": draft["draft_id"],
+            "invoice_source_message_ids": draft.get("source_message_ids") or [],
         },
-        "ready_stage": "quote_sent", "delivered_stage": "payment_pending",
+        "ready_stage": "invoice_draft", "delivered_stage": "invoice_draft",
+    }
+
+
+async def _schedule_followup(case: dict[str, Any]) -> dict[str, Any]:
+    from services.followup_service import schedule_followup_message
+    scheduled = await schedule_followup_message(
+        str(case["org_id"]), str(case["conversation_id"]), source="manual",
+        requested_by="ai-sales", requested_by_name="AI Sales Agent",
+    )
+    if scheduled.get("requires_agent_time"):
+        raise SalesActionBlocked(str(scheduled.get("message") or "Please confirm when I should follow up."))
+    return {
+        "reply": "Done. I will follow up at the right time.",
+        "fields": {"followup_id": scheduled.get("id") or scheduled.get("message_id")},
+        "ready_stage": "nurture", "delivered_stage": "nurture",
     }
 
 
 async def _handoff(case: dict[str, Any], source_message_id: str, customer_text: str) -> dict[str, Any]:
+    if not re.search(r"\b(?:human|person|agent|manager|executive|sales\s+team|call\s+me|insaan|aadmi)\b", customer_text, re.I):
+        raise SalesActionBlocked("I can continue helping with the product, price, quote, and billing here.")
     from services.team_service import create_ai_escalation
     phone = re.sub(r"\D", "", str(case["conversation_id"]))
     await create_ai_escalation(str(case["org_id"]), {
@@ -355,7 +319,7 @@ async def execute_sales_action(
     *, case: dict[str, Any], source_message_id: str, action_type: str,
     customer_text: str,
 ) -> dict[str, Any] | None:
-    if action_type in {"none", "show_products", "schedule_followup"}:
+    if action_type in {"none", "show_products"}:
         return None
     db = get_async_mongo_db()
     job_id = sales_action_job_id(str(case["case_id"]), source_message_id, action_type)
@@ -402,8 +366,10 @@ async def execute_sales_action(
             result = await _create_quote(case, source_message_id)
         elif action_type == "request_stock_confirmation":
             result = await _stock_confirmation(case)
-        elif action_type == "create_payment_link":
-            result = await _payment_link(case, source_message_id)
+        elif action_type == "create_invoice_draft":
+            result = await _invoice_draft(case, customer_text)
+        elif action_type == "schedule_followup":
+            result = await _schedule_followup(case)
         elif action_type == "create_handoff":
             result = await _handoff(case, source_message_id, customer_text)
         else:
@@ -444,6 +410,16 @@ async def execute_sales_action(
         source_message_id=source_message_id, action_type=action_type, status="ready",
         fields=result.get("fields"), stage=result.get("ready_stage"),
     )
+    if action_type == "create_invoice_draft":
+        try:
+            from services.sales_learning_service import record_verified_tally_outcome
+            await record_verified_tally_outcome(
+                str(case["org_id"]), str(case["conversation_id"]),
+                str((result.get("fields") or {}).get("invoice_draft_id") or job_id),
+                "invoice_draft",
+            )
+        except Exception as exc:
+            logger.warning(f"Could not record internal invoice-draft learning event: {exc}")
     return result
 
 
@@ -466,6 +442,17 @@ async def mark_sales_action_delivered(
         action_type=str(action["action_type"]), status="completed",
         stage=action.get("delivered_stage"),
     )
+    try:
+        from services.sales_learning_service import record_sales_learning_event
+        case = await get_async_mongo_db()[f"sales_cases_{org_id}"].find_one({"case_id": str(action["case_id"])})
+        if case:
+            await record_sales_learning_event(
+                org_id=org_id, event_type="message_delivered",
+                conversation_id=str(action.get("conversation_id") or ""),
+                source_id=str(action["job_id"]), case=case, channel=platform,
+            )
+    except Exception as exc:
+        logger.warning(f"Could not record internal delivery learning event: {exc}")
     quote_id = (action.get("fields") or {}).get("quote_id")
     if quote_id and delivery_result:
         try:
@@ -479,39 +466,14 @@ async def mark_sales_action_delivered(
             )
         except Exception as exc:
             logger.error(f"Could not audit delivered AI quote: {exc}")
-    if action.get("action_type") in {"create_quote", "create_payment_link"}:
+    if action.get("action_type") == "create_quote":
         try:
             from services.followup_service import schedule_followup_message
             await schedule_followup_message(
                 org_id, str(action.get("conversation_id") or ""),
-                source="payment" if action["action_type"] == "create_payment_link" else "quotation",
+                source="quotation",
                 quote_id=str(quote_id or (action.get("fields") or {}).get("quote_id") or ""),
                 requested_by="ai-sales", requested_by_name="AI Sales Agent",
             )
         except Exception as exc:
             logger.error(f"Could not schedule AI sales follow-up: {exc}")
-
-
-async def apply_sales_payment_webhook(payload: dict[str, Any]) -> bool:
-    """Mark a deal won only for a full Cashfree success event."""
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    link_id = data.get("link_id")
-    paid = data.get("link_status") == "PAID" and float(data.get("link_amount_paid") or 0) >= float(data.get("link_amount") or 0) > 0
-    if not link_id or not paid:
-        return False
-    db = get_async_mongo_db()
-    link = await db.sales_payment_links.find_one({"link_id": link_id})
-    if not link or float(link.get("amount") or 0) != float(data.get("link_amount") or 0):
-        return False
-    await set_sales_action_state(
-        org_id=str(link["org_id"]), case_id=str(link["case_id"]),
-        source_message_id=f"cashfree:{link_id}", action_type="create_payment_link",
-        status="completed", fields={"payment_status": "paid", "paid_at": datetime.now(timezone.utc)},
-        stage="won",
-    )
-    try:
-        from services.followup_service import abort_scheduled_message
-        await abort_scheduled_message(str(link["org_id"]), str(link.get("conversation_id") or ""))
-    except Exception as exc:
-        logger.error(f"Could not cancel paid sales follow-up: {exc}")
-    return True
