@@ -325,9 +325,6 @@ async def store_whatsapp_message(
 
     logger.success(f"Whatsapp conversation updated: {conversation_id}")
     
-    if status == "sending":
-        return message_id
-    
     # Format message for WebSocket broadcast
     broadcast_message = {
         "id": message_id,
@@ -832,11 +829,24 @@ async def send_whatsapp_message(
                 payload={"conversation": final_conversation}
             )
 
-        result = {"message": "Messages sent", "message_ids": all_message_ids, "message_id": last_stored_id}
+        result = {
+            "message": "Messages sent",
+            "message_ids": all_message_ids,
+            "message_id": last_stored_id,
+            "delivery_state": "sent",
+            "local_sync_pending": False,
+        }
         if len(contents) == 1 and not complete_reply(db.whatsapp_outbound_sends, outbound_operation, result):
             existing_operation = db.whatsapp_outbound_sends.find_one({"_id": outbound_operation["_id"], "org_id": org_id}) if outbound_operation else None
             if existing_operation and existing_operation.get("status") == "completed" and isinstance(existing_operation.get("result"), dict):
                 return existing_operation["result"]
+            if mode == "reply" and last_stored_id:
+                return {
+                    **result,
+                    "message": "Message accepted; delivery status is still synchronizing",
+                    "delivery_state": "accepted_pending_sync",
+                    "local_sync_pending": True,
+                }
             raise HTTPException(status_code=409, detail="The reply was delivered and is still being synchronized. Refresh the conversation.")
         return result
 

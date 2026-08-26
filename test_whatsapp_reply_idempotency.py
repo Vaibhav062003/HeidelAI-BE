@@ -109,5 +109,8 @@ lifespan = Path("core/lifespan.py").read_text()
 service = Path("services/wa_service.py").read_text()
 assert "ensure_whatsapp_outbound_indexes" in lifespan
 assert 'create_index("expires_at", expireAfterSeconds=0)' in service
+assert '"delivery_state": "accepted_pending_sync"' in service
+assert '"local_sync_pending": True' in service
+assert 'if status == "sending":\n        return message_id' not in service
 
 print("WhatsApp reply idempotency behavior passed.")
