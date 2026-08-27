@@ -1,6 +1,8 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
-from services.sales_learning_service import choose_guidance, detect_language
+from services.sales_learning_service import choose_guidance, detect_language, record_reaction
 
 
 def test_language_detection_keeps_hinglish_and_hindi_separate():
@@ -59,3 +61,23 @@ def test_unsafe_profile_is_not_used():
         "first_outcome_at": now - timedelta(days=30),
     }], "c1", now)
     assert result["policy_version"] == "default"
+
+
+def test_negative_customer_reaction_records_a_complaint_for_the_sales_case():
+    case = {"case_id": "case-1", "stage": "qualified"}
+    recorder = AsyncMock(return_value=True)
+
+    async def record_reactions():
+        await record_reaction("org-1", "conversation-1", "event-1", "message-1", "👎🏽", "react", "whatsapp")
+        await record_reaction("org-1", "conversation-1", "event-2", "message-1", "❤️", "react", "whatsapp")
+
+    with patch("services.sales_case_service.get_active_sales_case", AsyncMock(return_value=case)), \
+            patch("services.sales_learning_service.record_sales_learning_event", recorder):
+        asyncio.run(record_reactions())
+
+    assert [call.kwargs["event_type"] for call in recorder.await_args_list] == [
+        "reaction_added", "complaint", "reaction_added",
+    ]
+    complaint = recorder.await_args_list[1].kwargs
+    assert complaint["case"] == case
+    assert complaint["source_id"] == "event-1"

@@ -18,6 +18,7 @@ RESOLVED_EVENTS = frozenset({"billed", "paid", "lost", "complaint"})
 MIN_RESOLVED = 30
 MIN_EVIDENCE_DAYS = 7
 MAX_COMPLAINT_RATE = 0.2
+NEGATIVE_REACTIONS = ("👎", "😠", "😡")
 _INDEXED_ORGS: set[str] = set()
 
 
@@ -225,6 +226,12 @@ async def record_reaction(
             target_message_id=target_message_id, case=case, channel=channel,
             value=emoji or "removed",
         )
+        if action == "react" and emoji.startswith(NEGATIVE_REACTIONS):
+            await record_sales_learning_event(
+                org_id=org_id, event_type="complaint", conversation_id=conversation_id,
+                source_id=provider_event_id, target_message_id=target_message_id,
+                case=case, channel=channel, value=emoji,
+            )
 
 
 async def record_verified_tally_outcome(
