@@ -133,6 +133,7 @@ def start_scheduler():
     from services.pricing_service import process_pending_pricing_escalations
     from services.sales_offer_service import process_pending_sales_offer_audits
     from services.tally_service import check_tally_contact_sync_health, cleanup_expired_tally_pdfs, process_tally_payment_reminders, reconcile_stale_tally_jobs
+    from services.shopify_service import process_shopify_reminders, process_shopify_syncs
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
@@ -152,6 +153,8 @@ def start_scheduler():
     scheduler.add_job(reconcile_stale_tally_jobs, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_tally_payment_reminders, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(check_tally_contact_sync_health, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(process_shopify_reminders, "interval", seconds=30, max_instances=1, coalesce=True)
+    scheduler.add_job(process_shopify_syncs, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_pricing_escalations, "interval", minutes=1, max_instances=1, coalesce=True)
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)

@@ -188,7 +188,7 @@ async def create_or_update_whatsapp_conversation(
         return_document=ReturnDocument.AFTER
     )
 
-    logger.success(f"Whatsapp conversation updated: {updated_conversation}")
+    logger.success("Whatsapp conversation updated: org=...{} conversation=...{}", org_id[-6:], conversation_id[-6:])
 
     # Format the timestamp for JSON serialization
     broadcast_conversation = dict(updated_conversation)

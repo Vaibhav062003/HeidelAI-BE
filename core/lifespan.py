@@ -15,6 +15,7 @@ from services.tally_service import ensure_tally_indexes
 from services.stock_service import ensure_stock_indexes
 from services.entitlement_service import ensure_entitlement_indexes
 from services.transfer_notification_service import ensure_transfer_notification_indexes
+from services.shopify_service import ensure_shopify_indexes
 from services.push_notification_service import (
     ensure_push_notification_indexes,
     start_push_notification_workers,
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
     await ensure_tally_indexes()
     await ensure_stock_indexes()
     await asyncio.to_thread(ensure_entitlement_indexes)
+    await ensure_shopify_indexes()
     await start_push_notification_workers()
     await startup_intent_worker()
     yield
