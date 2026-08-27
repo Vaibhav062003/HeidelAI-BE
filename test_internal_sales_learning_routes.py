@@ -4,7 +4,7 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -34,9 +34,11 @@ class _Collection:
     def __init__(self, documents=None):
         self.documents = {str(item["_id"]): dict(item) for item in (documents or [])}
 
-    async def find_one(self, query):
-        item = self.documents.get(str(query.get("_id")))
-        return dict(item) if item and all(key.startswith("$") or key == "_id" or item.get(key) == value for key, value in query.items()) else None
+    async def find_one(self, query, *_args):
+        for item in self.documents.values():
+            if all(key.startswith("$") or item.get(key) == value for key, value in query.items()):
+                return dict(item)
+        return None
 
     async def update_one(self, query, update, upsert=False):
         key = str(query["_id"])
@@ -108,14 +110,27 @@ def test_private_boundary_and_batch_validation():
         routes.LearningReportsPayload(org_ids=["org-1.$bad"])
 
 
+def test_approval_route_returns_forbidden_for_a_non_owner():
+    routes = _load_routes()
+    with patch.object(routes, "approve_sales_learning_policy", new=AsyncMock(side_effect=PermissionError("owner required"))):
+        with pytest.raises(HTTPException) as denied:
+            asyncio.run(routes.approve_policy(
+                "ready", routes.ApprovePolicyPayload(org_id="org-1", actor_user_id="user-other"), "secret",
+            ))
+    assert denied.value.status_code == 403
+
+
 def test_policy_approval_is_idempotent_and_rejects_unsafe_candidates():
     db = _Database({
+        "organizations": _Collection([{"_id": "org-document", "org_id": "org-1", "owner": {"clerk_user_id": "owner-1"}}]),
         "sales_learning_profiles_org-1": _Collection([_ready_profile(), _ready_profile("unsafe", 12)]),
         "sales_learning_policy_approvals_org-1": _Collection(),
     })
     with patch("services.sales_learning_service._database", return_value=db):
         first = asyncio.run(approve_sales_learning_policy("org-1", "ready", "owner-1"))
-        second = asyncio.run(approve_sales_learning_policy("org-1", "ready", "owner-2"))
+        second = asyncio.run(approve_sales_learning_policy("org-1", "ready", "owner-1"))
+        with pytest.raises(PermissionError):
+            asyncio.run(approve_sales_learning_policy("org-1", "ready", "owner-2"))
         with pytest.raises(ValueError):
             asyncio.run(approve_sales_learning_policy("org-1", "unsafe", "owner-1"))
     assert first == second

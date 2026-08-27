@@ -79,8 +79,15 @@ def _policy_summary(profile: dict[str, Any], approved: bool, now: datetime) -> d
     }
 
 
-def _best_policy(profiles: list[dict[str, Any]], now: datetime) -> dict[str, Any] | None:
-    eligible = [profile for profile in profiles if _policy_summary(profile, False, now)["eligible"]]
+def _best_policy(
+    profiles: list[dict[str, Any]], now: datetime,
+    approved_policy_ids: set[str] | frozenset[str],
+) -> dict[str, Any] | None:
+    eligible = [
+        profile for profile in profiles
+        if str(profile.get("_id") or "") in approved_policy_ids
+        and _policy_summary(profile, False, now)["eligible"]
+    ]
     if not eligible:
         return None
     eligible.sort(key=lambda item: (
@@ -95,8 +102,8 @@ def choose_guidance(
     approved_policy_ids: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
-    best = _best_policy(profiles, now)
-    if not best or str(best.get("_id") or "") not in approved_policy_ids:
+    best = _best_policy(profiles, now, approved_policy_ids)
+    if not best:
         return {"policy_version": "default", "cohort": "control", "recommended_moves": []}
     resolved = int(best.get("resolved") or 0)
     rollout = 10 if resolved < 120 else 50 if resolved < 240 else 100
@@ -258,6 +265,14 @@ async def get_sales_guidance(org_id: str, conversation_id: str, sales_context: d
 
 async def approve_sales_learning_policy(org_id: str, policy_id: str, actor_user_id: str) -> dict[str, Any]:
     db = _database()
+    organization = await db["organizations"].find_one(
+        {"org_id": org_id}, {"owner.clerk_user_id": 1},
+    )
+    if not organization:
+        raise LookupError("Organization was not found")
+    owner_user_id = str((organization.get("owner") or {}).get("clerk_user_id") or "")
+    if not owner_user_id or actor_user_id != owner_user_id:
+        raise PermissionError("Only the organization owner can approve sales learning policies")
     approvals = db[f"sales_learning_policy_approvals_{org_id}"]
     existing = await approvals.find_one({"_id": policy_id, "org_id": org_id, "status": "APPROVED"})
     if existing:
@@ -271,7 +286,7 @@ async def approve_sales_learning_policy(org_id: str, policy_id: str, actor_user_
         raise ValueError("Sales learning policy is not ready for approval")
     document = {
         "_id": policy_id, "org_id": org_id, "status": "APPROVED",
-        "approved_by": actor_user_id[:120], "approved_at": now,
+        "approved_by": owner_user_id[:120], "approved_at": now,
         "evidence": {
             "resolved": evidence["resolved"], "billed": evidence["billed"],
             "paid": evidence["paid"], "complaint": evidence["complaint"],

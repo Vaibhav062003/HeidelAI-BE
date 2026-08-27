@@ -40,6 +40,17 @@ def test_ready_policy_stays_off_until_owner_approval():
     assert choose_guidance(profiles, "customer", now, {"another-policy"})["policy_version"] == "default"
 
 
+def test_unapproved_winner_does_not_suppress_an_approved_policy():
+    now = datetime.now(timezone.utc)
+    profiles = [
+        {"_id": "unapproved-winner", "move": "discount", "resolved": 240, "billed": 220, "paid": 200, "complaint": 2, "first_outcome_at": now - timedelta(days=30)},
+        {"_id": "approved-runner", "move": "prove_value", "resolved": 240, "billed": 120, "paid": 80, "complaint": 2, "first_outcome_at": now - timedelta(days=30)},
+    ]
+    result = choose_guidance(profiles, "customer", now, {"approved-runner"})
+    assert result["policy_version"] == "approved-runner"
+    assert result["recommended_moves"] == ["prove_value"]
+
+
 def test_unsafe_profile_is_not_used():
     now = datetime.now(timezone.utc)
     result = choose_guidance([{

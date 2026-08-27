@@ -71,6 +71,8 @@ async def approve_policy(
         approval = await approve_sales_learning_policy(payload.org_id, policy_id, payload.actor_user_id)
     except LookupError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return serialize_mongo(approval)
