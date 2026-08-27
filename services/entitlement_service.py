@@ -12,7 +12,7 @@ from pymongo.errors import DuplicateKeyError
 from database import get_mongo_client, get_mongo_db
 
 
-PRODUCTS = ("AI", "TALLY", "FOLLOW_UPS", "OFFERS", "AUTOMATIONS", "BROADCASTING", "SEATS", "CHANNELS")
+PRODUCTS = ("AI", "TALLY", "FOLLOW_UPS", "OFFERS", "AUTOMATIONS", "BROADCASTING", "SEATS", "CHANNELS", "SELLER_INTELLIGENCE")
 WIRE_PRODUCTS = PRODUCTS + ("CHATBOT",)
 LIMIT_KEYS = {
     "AI": {"monthly_messages"},
