@@ -22,11 +22,22 @@ def test_guidance_needs_evidence_and_uses_a_stable_cohort():
         "billed": 120, "paid": 80, "complaint": 2,
         "first_outcome_at": now - timedelta(days=30),
     }]
-    first = choose_guidance(profiles, "same-conversation", now)
-    second = choose_guidance(profiles, "same-conversation", now)
+    first = choose_guidance(profiles, "same-conversation", now, {"safe-policy"})
+    second = choose_guidance(profiles, "same-conversation", now, {"safe-policy"})
     assert first == second
     assert first["policy_version"] == "safe-policy"
     assert first["cohort"] == "test" and first["recommended_moves"] == ["ask_for_order"]
+
+
+def test_ready_policy_stays_off_until_owner_approval():
+    now = datetime.now(timezone.utc)
+    profiles = [{
+        "_id": "ready", "move": "ask_for_order", "resolved": 240,
+        "billed": 120, "paid": 80, "complaint": 2,
+        "first_outcome_at": now - timedelta(days=30),
+    }]
+    assert choose_guidance(profiles, "customer", now)["policy_version"] == "default"
+    assert choose_guidance(profiles, "customer", now, {"another-policy"})["policy_version"] == "default"
 
 
 def test_unsafe_profile_is_not_used():
