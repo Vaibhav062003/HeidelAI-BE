@@ -4,7 +4,7 @@ import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -150,10 +150,25 @@ def test_internal_report_returns_aggregate_learning_proof_without_lead_identity(
         "sales_learning_profiles_org-1": _ReportRows([profile]),
         "sales_learning_policy_approvals_org-1": _ReportRows([{"_id": "ready", "approved_by": "owner-1", "approved_at": now}]),
     })
-    with patch("services.sales_learning_service._database", return_value=db):
+    entitlement = types.ModuleType("services.entitlement_service")
+    entitlement.require_feature = lambda *_args: {"state": "active"}
+    with patch.dict(sys.modules, {"services.entitlement_service": entitlement}), \
+            patch("services.sales_learning_service._database", return_value=db):
         report = asyncio.run(internal_learning_report("org-1"))
     assert report["status"] == "TESTING_10"
     assert report["cohort_comparison_ready"] == ["ready"]
     assert report["rates"]["paid"] == 0.25
     assert "phone" in _all_keys({"nested": {"phone": "positive control"}})
     assert not {"conversation_id", "source_id", "target_message_id", "text", "phone"} & _all_keys(report)
+
+
+def test_internal_report_checks_active_ai_access_before_tenant_data():
+    denied = HTTPException(status_code=403, detail="AI is not active")
+    entitlement = types.ModuleType("services.entitlement_service")
+    entitlement.require_feature = Mock(side_effect=denied)
+    with patch.dict(sys.modules, {"services.entitlement_service": entitlement}), \
+            patch("services.sales_learning_service._database") as database:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(internal_learning_report("org-1"))
+    assert error.value is denied
+    database.assert_not_called()

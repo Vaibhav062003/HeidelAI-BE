@@ -22,7 +22,7 @@ sys.modules.setdefault("pymongo", types.SimpleNamespace(ReturnDocument=types.Sim
 sys.modules.setdefault("pymongo.errors", types.SimpleNamespace(DuplicateKeyError=type("DuplicateKeyError", (Exception,), {})))
 
 import services.entitlement_service as entitlement_service
-from services.entitlement_service import ai_enforcement_gaps, enforcement_enabled, entitlement_row_active, feature_access, period_window, recent_periods, validate_limits
+from services.entitlement_service import ai_enforcement_gaps, enforcement_enabled, entitlement_row_active, feature_access, period_window, recent_periods, require_feature, validate_limits
 from services.commercial_mode import billing_enabled
 from services.entitlement_auth import verify_entitlement_request
 from services.internal_request import signed_json
@@ -85,6 +85,14 @@ class EntitlementContractTest(unittest.TestCase):
         self.assertTrue(entitlement_row_active({"state": "ACTIVE", "starts_at": now}, now))
         self.assertFalse(entitlement_row_active({"state": "SUSPENDED"}, now))
         self.assertFalse(entitlement_row_active({"state": "ACTIVE", "expires_at": now}, now))
+
+    def test_require_feature_rejects_unknown_organizations(self):
+        organizations = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: None)
+        unreadable = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: self.fail("unknown organizations must stop before entitlement lookup"))
+        with patch.object(entitlement_service, "db", types.SimpleNamespace(organizations=organizations, feature_entitlements=unreadable)):
+            with self.assertRaises(HTTPException) as denied:
+                require_feature("missing-org", "AI")
+        self.assertEqual(denied.exception.status_code, 404)
 
     def test_enforcement_gap_check_finds_enabled_organizations_without_active_ai(self):
         organizations = types.SimpleNamespace(find=lambda *_args, **_kwargs: [{"org_id": "org_active"}, {"org_id": "org_missing"}])

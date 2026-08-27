@@ -214,6 +214,8 @@ def feature_access(account_id: str, product: str, now: datetime | None = None) -
 
 
 def require_feature(account_id: str, product: str) -> dict:
+    if not db.organizations.find_one({"org_id": account_id}, {"_id": 1}):
+        raise HTTPException(status_code=404, detail={"code": "organization_not_found", "message": "HeidelAI organization not found."})
     access = feature_access(account_id, product)
     if access["state"] != "active":
         raise HTTPException(status_code=403, detail={"code": "feature_unavailable", "feature": normalize_product(product), "state": access["state"], "message": f"{normalize_product(product).replace('_', ' ').title()} is not active for this organization."})

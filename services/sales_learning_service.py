@@ -307,6 +307,8 @@ async def approve_sales_learning_policy(org_id: str, policy_id: str, actor_user_
 
 
 async def internal_learning_report(org_id: str) -> dict[str, Any]:
+    from services.entitlement_service import require_feature
+    require_feature(org_id, "AI")
     db = _database()
     events = db[f"sales_learning_events_{org_id}"]
     event_rows, conversation_rows, cohort_rows, profiles, approvals = await asyncio.gather(
