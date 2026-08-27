@@ -24,7 +24,6 @@ from . import push_routes
 from . import quote_routes
 from . import sales_offer_routes
 from . import sales_case_routes
-from . import seller_intelligence_routes
 from . import work_team_routes
 from . import tally_routes
 from . import stock_routes
@@ -58,7 +57,6 @@ router.include_router(push_routes.router)
 router.include_router(quote_routes.router)
 router.include_router(sales_offer_routes.router)
 router.include_router(sales_case_routes.router)
-router.include_router(seller_intelligence_routes.router)
 router.include_router(work_team_routes.router)
 router.include_router(tally_routes.router)
 router.include_router(stock_routes.router)
