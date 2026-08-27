@@ -101,6 +101,11 @@ CRM_COMMERCIAL_BASE_URL = os.getenv("CRM_COMMERCIAL_BASE_URL")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
+# Shopify OAuth and webhooks
+SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip()
+SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip()
+SHOPIFY_PUBLIC_BASE_URL = os.getenv("SHOPIFY_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
 # Google Drive Webhook (push notifications for sheet changes)
 # GOOGLE_WEBHOOK_BASE_URL: Public HTTPS URL where Google sends notifications
 #   e.g. "https://api.yourapp.com" → webhook receives POSTs at /api/google-sheets/webhook
