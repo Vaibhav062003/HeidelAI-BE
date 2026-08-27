@@ -190,9 +190,9 @@ def apply_entitlement(account_id: str, payload: dict) -> dict:
     return {"account_id": account_id, "state": state, "version": version}
 
 
-def feature_access(account_id: str, product: str, now: datetime | None = None) -> dict:
+def feature_access(account_id: str, product: str, now: datetime | None = None, *, strict: bool = False) -> dict:
     product = normalize_product(product)
-    if not enforcement_enabled():
+    if not strict and not enforcement_enabled():
         return {"state": "active", "grant_type": "GRANDFATHERED", "starts_at": None, "expires_at": None, "limits": {}, "observed": True}
     now = now or datetime.now(timezone.utc)
     row = db.feature_entitlements.find_one({"account_id": account_id, "product": product})
@@ -213,8 +213,10 @@ def feature_access(account_id: str, product: str, now: datetime | None = None) -
     return {"state": state, "grant_type": row.get("grant_type"), "starts_at": starts_at, "expires_at": expires_at, "limits": row.get("limits") or {}, "version": row.get("version")}
 
 
-def require_feature(account_id: str, product: str) -> dict:
-    access = feature_access(account_id, product)
+def require_feature(account_id: str, product: str, *, strict: bool = False) -> dict:
+    if strict and not db.organizations.find_one({"org_id": account_id}, {"_id": 1}):
+        raise HTTPException(status_code=404, detail={"code": "organization_not_found", "message": "HeidelAI organization not found."})
+    access = feature_access(account_id, product, strict=strict)
     if access["state"] != "active":
         raise HTTPException(status_code=403, detail={"code": "feature_unavailable", "feature": normalize_product(product), "state": access["state"], "message": f"{normalize_product(product).replace('_', ' ').title()} is not active for this organization."})
     return access
