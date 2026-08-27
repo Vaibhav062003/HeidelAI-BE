@@ -91,8 +91,22 @@ class EntitlementContractTest(unittest.TestCase):
         unreadable = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: self.fail("unknown organizations must stop before entitlement lookup"))
         with patch.object(entitlement_service, "db", types.SimpleNamespace(organizations=organizations, feature_entitlements=unreadable)):
             with self.assertRaises(HTTPException) as denied:
-                require_feature("missing-org", "AI")
+                require_feature("missing-org", "AI", strict=True)
         self.assertEqual(denied.exception.status_code, 404)
+
+    def test_strict_feature_access_requires_entitlement_without_changing_normal_calls(self):
+        unreadable = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: self.fail("normal observe-mode access must not query MongoDB"))
+        with patch.object(entitlement_service, "db", types.SimpleNamespace(organizations=unreadable, feature_entitlements=unreadable)):
+            with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "observe"}, clear=True):
+                self.assertEqual(require_feature("org-1", "AI")["state"], "active")
+
+        organizations = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: {"_id": "org-1"})
+        entitlements = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: None)
+        with patch.object(entitlement_service, "db", types.SimpleNamespace(organizations=organizations, feature_entitlements=entitlements)):
+            with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "observe"}, clear=True):
+                with self.assertRaises(HTTPException) as denied:
+                    require_feature("org-1", "AI", strict=True)
+        self.assertEqual(denied.exception.status_code, 403)
 
     def test_enforcement_gap_check_finds_enabled_organizations_without_active_ai(self):
         organizations = types.SimpleNamespace(find=lambda *_args, **_kwargs: [{"org_id": "org_active"}, {"org_id": "org_missing"}])

@@ -151,7 +151,7 @@ def test_internal_report_returns_aggregate_learning_proof_without_lead_identity(
         "sales_learning_policy_approvals_org-1": _ReportRows([{"_id": "ready", "approved_by": "owner-1", "approved_at": now}]),
     })
     entitlement = types.ModuleType("services.entitlement_service")
-    entitlement.require_feature = lambda *_args: {"state": "active"}
+    entitlement.require_feature = lambda *_args, **_kwargs: {"state": "active"}
     with patch.dict(sys.modules, {"services.entitlement_service": entitlement}), \
             patch("services.sales_learning_service._database", return_value=db):
         report = asyncio.run(internal_learning_report("org-1"))
