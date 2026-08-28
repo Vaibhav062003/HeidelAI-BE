@@ -109,6 +109,7 @@ async def shopify_webhook(
     x_shopify_shop_domain: str = Header(default=""),
     x_shopify_webhook_id: str = Header(default=""),
     x_shopify_topic: str = Header(default=""),
+    x_shopify_triggered_at: str = Header(default=""),
 ):
     length = request.headers.get("content-length")
     if length:
@@ -130,6 +131,7 @@ async def shopify_webhook(
         "x-shopify-shop-domain": x_shopify_shop_domain,
         "x-shopify-webhook-id": x_shopify_webhook_id,
         "x-shopify-topic": x_shopify_topic,
+        "x-shopify-triggered-at": x_shopify_triggered_at,
     })
     return {"status": status}
 
