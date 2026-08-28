@@ -135,6 +135,10 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _iso_utc(value: datetime) -> str:
+    return value.replace(tzinfo=value.tzinfo or timezone.utc).astimezone(timezone.utc).isoformat()
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value.replace(tzinfo=value.tzinfo or timezone.utc)
@@ -340,7 +344,7 @@ def _safe_document(document: dict | None, *, include_url: bool = False) -> dict 
     value = {key: item for key, item in document.items() if key not in internal}
     for key, item in list(value.items()):
         if isinstance(item, datetime):
-            value[key] = item.isoformat()
+            value[key] = _iso_utc(item)
     if not include_url:
         value.pop("recovery_url", None)
     return value
@@ -1151,7 +1155,7 @@ async def get_connection(org_id: str) -> dict:
     ) if connection.get(key) is not None}
     for key, value in list(safe.items()):
         if isinstance(value, datetime):
-            safe[key] = value.isoformat()
+            safe[key] = _iso_utc(value)
     safe["connected"] = connection.get("status") == "connected"
     safe["last_error"] = connection.get("reminder_error") or connection.get("webhook_error") or connection.get("sync_error") or connection.get("last_error")
     safe["configured"] = bool(SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET and SHOPIFY_PUBLIC_BASE_URL)

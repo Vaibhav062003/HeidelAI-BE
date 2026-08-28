@@ -31,7 +31,7 @@ def pure_namespace():
         "_record_phone_and_consent", "_phone_key", "_message_preference",
         "_provider_reports_block", "_eligibility_status",
         "_provider_time", "_provider_sort_key", "_reminder_due", "_sync_retry_at",
-        "_product_summary", "_template_compatible", "verify_callback_hmac",
+        "_product_summary", "_template_compatible", "verify_callback_hmac", "_iso_utc",
     }
     tree = ast.parse(SERVICE)
     nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted]
@@ -103,6 +103,7 @@ def main():
     assert ns["_reminder_due"](provider_time, 30, provider_time + timedelta(hours=24)) == provider_time + timedelta(hours=24)
     assert ns["_sync_retry_at"](1, provider_time) == provider_time + timedelta(minutes=1)
     assert ns["_sync_retry_at"](20, provider_time) == provider_time + timedelta(minutes=30)
+    assert ns["_iso_utc"](datetime(2026, 8, 28, 13, 2, 14)) == "2026-08-28T13:02:14+00:00"
     assert SERVICE.count("shippingAddress { phone }") >= 2
     assert SERVICE.count("billingAddress { phone }") >= 2
     assert ns["_product_summary"]([{"name": "A"}, {"name": "B"}, {"name": "C"}, {"name": "D"}]) == "A, B, C +1 more"
