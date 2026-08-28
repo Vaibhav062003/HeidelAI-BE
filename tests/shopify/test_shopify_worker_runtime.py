@@ -674,10 +674,76 @@ async def test_acceptance_precedes_inbox_and_reconciles_once(service):
     assert posts == 1
 
 
+async def test_order_event_sends_approved_template_once(service):
+    job = {
+        "_id": "order-job", "org_id": "org", "order_provider_id": "gid://shopify/Order/1",
+        "event": "received", "event_at": NOW, "status": "sending", "claim_token": "claim",
+    }
+    notifications = FakeCollection([job])
+    service.db = FakeDB(
+        shopify_order_notifications=notifications,
+        shopify_orders=FakeCollection([{
+            "_id": "order", "org_id": "org", "provider_id": job["order_provider_id"], "record_status": "active",
+            "phone": "+14155550100", "customer_name": "Customer", "order_number": "#1001",
+            "products": [{"name": "Board", "quantity": 2}],
+        }]),
+        shopify_connections=FakeCollection([{
+            "org_id": "org", "status": "connected", "order_notifications_enabled": True,
+            "whatsapp_id": "waba", "whatsapp_phone_id": "phone",
+            "order_templates": {"received": {"name": "order_received", "language": "en", "status": "APPROVED"}},
+        }]),
+        whatsapp_connections=FakeCollection([{"_id": "wa", "org_id": "org", "wa_id": "waba", "phone_id": "phone", "is_active": True}]),
+    )
+    service._is_whatsapp_suppressed = lambda *_args, **_kwargs: _false()
+    service._selected_whatsapp_connection = lambda *_args, **_kwargs: _value({"wa_id": "waba", "phone_id": "phone", "access_token": "token"})
+    service._commerce_event = async_noop
+    posts = []
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"messages": [{"id": "wamid.order.1"}]}
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, **kwargs):
+            posts.append(kwargs["json"])
+            return Response()
+
+    service.httpx.AsyncClient = Client
+    await service._send_order_notification(job.copy(), "claim")
+    stored = notifications.documents[0]
+    assert stored["status"] == "sent", stored
+    assert stored["provider_message_id"] == "wamid.order.1"
+    assert len(posts) == 1
+    assert posts[0]["template"]["name"] == "order_received"
+    assert [item["text"] for item in posts[0]["template"]["components"][0]["parameters"]] == ["Customer", "#1001", "Board x 2"]
+
+
 def test_delays_and_product_summary(service):
     assert {5, 10, 15}.issubset(service.ALLOWED_DELAYS)
     default = getattr(service, "DEFAULT_REMINDER_DELAY_MINUTES", 30)
     assert default == 10
+    assert "read_fulfillments" in service.OAUTH_SCOPES
+    assert service.ORDER_EVENT_TOPICS == {
+        "orders/create": "received", "fulfillments/create": "shipped",
+        "orders/fulfilled": "fulfilled", "orders/cancelled": "cancelled",
+    }
+    assert service._template_compatible({
+        "status": "APPROVED", "category": "UTILITY",
+        "components": [{"type": "BODY", "text": "Hi {{1}}, order {{2}} for {{3}}"}],
+    }, "order")
     summary = service._product_summary([
         {"name": "Board", "quantity": 6},
         {"name": "Wax", "quantity": 1},
@@ -703,6 +769,7 @@ async def main():
     await test_websocket_hang_is_bounded(load_service())
     await test_provider_fence_timeout_is_unknown_and_not_retried(load_service())
     await test_acceptance_precedes_inbox_and_reconciles_once(load_service())
+    await test_order_event_sends_approved_template_once(load_service())
     print("SHOPIFY_WORKER_RUNTIME_OK")
 
 

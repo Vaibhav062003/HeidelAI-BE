@@ -28,7 +28,7 @@ from services.websocket_service import broadcast_org_admin_ws, broadcast_org_ws
 
 
 API_VERSION = "2025-10"
-OAUTH_SCOPES = "read_orders,read_customers"
+OAUTH_SCOPES = "read_orders,read_customers,read_fulfillments"
 DEFAULT_REMINDER_DELAY_MINUTES = 10
 ALLOWED_DELAYS = {5, 10, 15, 30, 60, 120, 240, 1440}
 SHOP_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
@@ -54,6 +54,13 @@ REMINDER_ATTEMPT_TIMEOUT_SECONDS = 45
 WORKER_STALE_SECONDS = 90
 OVERDUE_GRACE_SECONDS = 90
 INBOX_RETRY_MINUTES = (1, 5, 15)
+ORDER_EVENTS = ("received", "shipped", "fulfilled", "cancelled")
+ORDER_EVENT_TOPICS = {
+    "orders/create": "received",
+    "fulfillments/create": "shipped",
+    "orders/fulfilled": "fulfilled",
+    "orders/cancelled": "cancelled",
+}
 
 db = get_async_mongo_db()
 sync_db = get_mongo_db()
@@ -135,7 +142,8 @@ mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: String!) {
 
 WEBHOOK_TOPICS = (
     "CHECKOUTS_CREATE", "CHECKOUTS_UPDATE", "CHECKOUTS_DELETE",
-    "ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_CANCELLED", "ORDERS_DELETE",
+    "ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_FULFILLED", "ORDERS_CANCELLED", "ORDERS_DELETE",
+    "FULFILLMENTS_CREATE",
     "CUSTOMERS_UPDATE", "APP_UNINSTALLED",
 )
 
@@ -247,6 +255,12 @@ def _cancel_suppressed_shopify_reminders(org_id: str, phone_key: str, now: datet
         ]},
         {"$set": {"reminder_status": "opted_out", "failure_category": "customer_opt_out", "reminder_due_at": None, "status_updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
     )
+    order_ids = sync_db.shopify_orders.distinct("provider_id", {"org_id": org_id, "phone": {"$in": [phone_key, f"+{phone_key}"]}})
+    if order_ids:
+        sync_db.shopify_order_notifications.update_many(
+            {"org_id": org_id, "order_provider_id": {"$in": order_ids}, "status": {"$in": ["pending", "retryable", "sending"]}, "provider_started_at": {"$exists": False}},
+            {"$set": {"status": "opted_out", "failure_category": "customer_opt_out", "updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        )
 
 
 def record_whatsapp_preference(org_id: str, phone: Any, content: Any) -> None:
@@ -459,6 +473,12 @@ async def ensure_shopify_indexes() -> None:
     await db.shopify_orders.create_index([("org_id", 1), ("updated_at", -1), ("provider_id", -1)])
     await db.shopify_orders.create_index([("org_id", 1), ("payment_status", 1), ("updated_at", -1)])
     await db.shopify_orders.create_index([("shop", 1), ("provider_id", 1)])
+    await db.shopify_order_notifications.create_index([("org_id", 1), ("order_provider_id", 1), ("event", 1)], unique=True)
+    await db.shopify_order_notifications.create_index([("status", 1), ("due_at", 1), ("claim_expires_at", 1)])
+    await db.shopify_order_notifications.create_index(
+        [("org_id", 1), ("provider_message_id", 1)], unique=True,
+        partialFilterExpression={"provider_message_id": {"$type": "string"}},
+    )
     await db.shopify_webhook_receipts.create_index("received_at", expireAfterSeconds=WEBHOOK_TTL_DAYS * 86400)
     await db.shopify_webhook_receipts.create_index([("shop", 1), ("webhook_id", 1)], unique=True)
     await db.whatsapp_suppressions.create_index([("org_id", 1), ("phone", 1)], unique=True)
@@ -552,6 +572,7 @@ async def complete_oauth(params: dict[str, str]) -> str:
         update.update({
             "automation_enabled": False, "reminder_delay_minutes": DEFAULT_REMINDER_DELAY_MINUTES,
             "whatsapp_id": None, "template_name": None, "template_status": None,
+            "order_notifications_enabled": False, "order_templates": {},
             "sync_cursor": {}, "import_counts": {"checkouts": 0, "orders": 0},
         })
     if token.get("refresh_token"):
@@ -1038,6 +1059,9 @@ async def sync_shopify_org(org_id: str) -> None:
                     break
         if connection.get("whatsapp_id") and connection.get("template_name"):
             await list_compatible_templates(org_id, connection["whatsapp_id"], phone_id=connection.get("whatsapp_phone_id"))
+        if connection.get("whatsapp_id") and connection.get("order_templates"):
+            await list_compatible_templates(org_id, connection["whatsapp_id"], phone_id=connection.get("whatsapp_phone_id"), purpose="order")
+        if connection.get("whatsapp_id") and (connection.get("template_name") or connection.get("order_templates")):
             connection = await db.shopify_connections.find_one({"org_id": org_id, "sync_claim_token": token}) or connection
         await _repair_org_checkout_states(org_id, connection, None if full_sync else touched_phones)
         counts = {
@@ -1140,6 +1164,22 @@ async def process_webhook(raw_body: bytes, headers: dict[str, str]) -> str:
         raise
 
 
+async def _queue_order_notification(connection: dict, event: str, order_provider_id: str, event_time: datetime) -> None:
+    template = (connection.get("order_templates") or {}).get(event) or {}
+    if not connection.get("order_notifications_enabled") or template.get("status") != "APPROVED":
+        return
+    now = utcnow()
+    try:
+        await db.shopify_order_notifications.insert_one({
+            "org_id": connection["org_id"], "shop": connection["shop"],
+            "order_provider_id": order_provider_id, "event": event,
+            "status": "pending", "due_at": now, "event_at": event_time,
+            "attempt_count": 0, "created_at": now, "updated_at": now,
+        })
+    except DuplicateKeyError:
+        pass
+
+
 async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time: datetime) -> None:
     org_id = connection["org_id"]
     if topic == "app/uninstalled":
@@ -1150,10 +1190,25 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
             await disconnect_shopify(org_id, provider_uninstall=True)
         else:
             customer_id = str(payload.get("customer", {}).get("id") or payload.get("customer_id") or "")
+            customer_ids = [customer_id, f"gid://shopify/Customer/{customer_id}"]
+            order_ids = await db.shopify_orders.distinct("provider_id", {"org_id": org_id, "customer_id": {"$in": customer_ids}})
             await db.shopify_checkouts.delete_many({"org_id": org_id, "customer_id": {"$in": [customer_id, f"gid://shopify/Customer/{customer_id}"]}})
             await db.shopify_orders.delete_many({"org_id": org_id, "customer_id": {"$in": [customer_id, f"gid://shopify/Customer/{customer_id}"]}})
+            if order_ids:
+                await db.shopify_order_notifications.delete_many({"org_id": org_id, "order_provider_id": {"$in": order_ids}})
         return
     if topic in {"customers/data_request"}:
+        return
+    if topic == "fulfillments/create":
+        if not payload.get("order_id"):
+            return
+        order_provider_id = _provider_gid("Order", payload["order_id"])
+        await db.shopify_orders.update_one(
+            {"org_id": org_id, "provider_id": order_provider_id},
+            {"$set": {"latest_fulfillment_at": event_time, "status_updated_at": utcnow()}},
+        )
+        await _queue_order_notification(connection, "shipped", order_provider_id, event_time)
+        await _commerce_event(org_id, "order", order_provider_id)
         return
     if topic.startswith("orders/"):
         if topic.endswith("delete"):
@@ -1171,6 +1226,9 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
         touched = await _mark_order_conversion(org_id, order)
         if touched:
             await _repair_org_checkout_states(org_id, connection, touched)
+        event = ORDER_EVENT_TOPICS.get(topic)
+        if event:
+            await _queue_order_notification(connection, event, order["provider_id"], event_time)
         await _commerce_event(org_id, "order", order["provider_id"])
         return
     if topic.startswith("checkouts/"):
@@ -1342,7 +1400,7 @@ async def get_connection(org_id: str) -> dict:
     safe = {key: connection.get(key) for key in (
         "org_id", "shop", "status", "connected_at", "updated_at", "sync_status", "last_sync_at",
         "sync_error", "webhook_error", "reminder_error", "import_counts", "whatsapp_id", "whatsapp_phone_id", "template_name", "template_language",
-        "template_status", "reminder_delay_minutes", "automation_enabled",
+        "template_status", "reminder_delay_minutes", "automation_enabled", "order_notifications_enabled", "order_templates", "scopes",
     ) if connection.get(key) is not None}
     for key, value in list(safe.items()):
         if isinstance(value, datetime):
@@ -1356,11 +1414,16 @@ async def get_connection(org_id: str) -> dict:
         "whatsapp": bool(await _selected_whatsapp_connection(connection, {"_id": 1})),
         "template": bool(connection.get("template_status") == "APPROVED"),
         "automation": bool(connection.get("automation_enabled")),
+        "order_notifications": bool(connection.get("order_notifications_enabled")),
+        "fulfillments_scope": "read_fulfillments" in (connection.get("scopes") or []),
     }
     return safe
 
 
-async def list_compatible_templates(org_id: str, wa_id: str | None = None, *, phone_id: str | None = None, raise_unavailable: bool = False) -> list[dict]:
+async def list_compatible_templates(
+    org_id: str, wa_id: str | None = None, *, phone_id: str | None = None,
+    purpose: str = "cart", raise_unavailable: bool = False,
+) -> list[dict]:
     connection = await _whatsapp_connection_for_selector(
         org_id, phone_id=phone_id, wa_id=wa_id, projection={"wa_id": 1, "phone_id": 1, "access_token": 1},
     )
@@ -1389,32 +1452,60 @@ async def list_compatible_templates(org_id: str, wa_id: str | None = None, *, ph
             raise HTTPException(status_code=503, detail="Meta template status is temporarily unavailable") from exc
         return []
     selected_connection = await db.shopify_connections.find_one(
-        {"org_id": org_id, "whatsapp_id": connection["wa_id"], "$or": [{"whatsapp_phone_id": connection["phone_id"]}, {"whatsapp_phone_id": {"$exists": False}}]}, {"template_name": 1, "template_language": 1},
+        {"org_id": org_id, "whatsapp_id": connection["wa_id"], "$or": [{"whatsapp_phone_id": connection["phone_id"]}, {"whatsapp_phone_id": {"$exists": False}}]},
+        {"template_name": 1, "template_language": 1, "order_templates": 1},
     )
+    updates: dict[str, Any] = {}
     if selected_connection and selected_connection.get("template_name"):
         current = next((item for item in templates if item.get("name") == selected_connection.get("template_name") and item.get("language") == selected_connection.get("template_language")), None)
-        status = str((current or {}).get("status") or "UNAVAILABLE").upper()
+        compatible = bool(current and _template_compatible(current, "cart"))
+        updates.update({
+            "template_status": str((current or {}).get("status") or "UNAVAILABLE").upper() if compatible else "INCOMPATIBLE",
+            "reminder_error": None if compatible else "The selected abandoned-cart template is not approved and compatible",
+        })
+    for event, selected in ((selected_connection or {}).get("order_templates") or {}).items():
+        if event not in ORDER_EVENTS or not selected.get("name"):
+            continue
+        current = next((item for item in templates if item.get("name") == selected.get("name") and item.get("language") == selected.get("language")), None)
+        updates[f"order_templates.{event}.status"] = "APPROVED" if current and _template_compatible(current, "order") else "INCOMPATIBLE"
+    if updates:
+        updates["updated_at"] = utcnow()
         await db.shopify_connections.update_one(
-            {"org_id": org_id, "whatsapp_id": connection["wa_id"], "$or": [{"whatsapp_phone_id": connection["phone_id"]}, {"whatsapp_phone_id": {"$exists": False}}], "template_name": selected_connection.get("template_name")},
-            {"$set": {"template_status": status, "reminder_error": None if current and _template_compatible(current) else "The selected WhatsApp template is not approved and compatible", "updated_at": utcnow()}},
+            {"org_id": org_id, "whatsapp_id": connection["wa_id"], "$or": [{"whatsapp_phone_id": connection["phone_id"]}, {"whatsapp_phone_id": {"$exists": False}}]},
+            {"$set": updates},
         )
-    return [{"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category")} for item in templates if _template_compatible(item)]
+    return [
+        {"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category")}
+        for item in templates if _template_compatible(item, purpose)
+    ]
 
 
-async def create_default_template(org_id: str, phone_id: str = "", language: str = "en", *, wa_id: str = "") -> dict:
+async def create_default_template(
+    org_id: str, phone_id: str = "", language: str = "en", *, wa_id: str = "", event: str = "abandoned_cart",
+) -> dict:
     connection = await _whatsapp_connection_for_selector(
         org_id, phone_id=phone_id or None, wa_id=wa_id or None, projection={"wa_id": 1, "phone_id": 1, "access_token": 1},
     )
     if not connection:
         raise HTTPException(status_code=404, detail="Active WhatsApp connection not found")
+    definitions = {
+        "abandoned_cart": ("heidelai_abandoned_cart_v1", "MARKETING", "Hi {{1}}, you left {{2}} in your cart. Complete your order here: {{3}}"),
+        "received": ("heidelai_order_received_v1", "UTILITY", "Hi {{1}}, we received order {{2}} for {{3}}."),
+        "shipped": ("heidelai_order_shipped_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has shipped."),
+        "fulfilled": ("heidelai_order_fulfilled_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has been fulfilled."),
+        "cancelled": ("heidelai_order_cancelled_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has been cancelled."),
+    }
+    if event not in definitions:
+        raise HTTPException(status_code=422, detail="Unsupported Shopify template event")
+    name, category, text = definitions[event]
     payload = {
-        "name": "heidelai_abandoned_cart_v1",
+        "name": name,
         "language": language,
-        "category": "MARKETING",
+        "category": category,
         "components": [{
             "type": "BODY",
-            "text": "Hi {{1}}, you left {{2}} in your cart. Complete your order here: {{3}}",
-            "example": {"body_text": [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
+            "text": text,
+            "example": {"body_text": [["Aarav", "#1001", "Laptop stand, keyboard"]] if event != "abandoned_cart" else [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
         }],
     }
     try:
@@ -1425,20 +1516,29 @@ async def create_default_template(org_id: str, phone_id: str = "", language: str
                 json=payload,
             )
         if response.status_code not in {200, 201}:
-            raise HTTPException(status_code=409, detail="Meta could not create the abandoned-cart template")
+            try:
+                already_exists = "already exists" in str((response.json().get("error") or {}).get("message") or "").lower()
+            except (ValueError, AttributeError):
+                already_exists = False
+            if not already_exists:
+                raise HTTPException(status_code=409, detail="Meta could not create the Shopify template")
     except HTTPException:
         raise
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail="Meta is temporarily unavailable") from exc
-    await db.shopify_connections.update_one(
-        {"org_id": org_id, "status": "connected"},
-        {"$set": {"whatsapp_id": connection["wa_id"], "whatsapp_phone_id": connection["phone_id"], "template_name": payload["name"], "template_language": language, "template_status": "PENDING", "updated_at": utcnow()}},
-    )
-    return {"name": payload["name"], "language": language, "status": "PENDING", "category": "MARKETING"}
+    selected = {"name": payload["name"], "language": language, "status": "PENDING"}
+    fields = {"whatsapp_id": connection["wa_id"], "whatsapp_phone_id": connection["phone_id"], "updated_at": utcnow()}
+    if event == "abandoned_cart":
+        fields.update({"template_name": payload["name"], "template_language": language, "template_status": "PENDING"})
+    else:
+        fields[f"order_templates.{event}"] = selected
+    await db.shopify_connections.update_one({"org_id": org_id, "status": "connected"}, {"$set": fields})
+    return {**selected, "category": category}
 
 
-def _template_compatible(template: dict) -> bool:
-    if str(template.get("status") or "").upper() != "APPROVED" or str(template.get("category") or "").upper() != "MARKETING":
+def _template_compatible(template: dict, purpose: str = "cart") -> bool:
+    expected_category = "UTILITY" if purpose == "order" else "MARKETING"
+    if str(template.get("status") or "").upper() != "APPROVED" or str(template.get("category") or "").upper() != expected_category:
         return False
     components = template.get("components") or []
     bodies = [part for part in components if str(part.get("type") or "").upper() == "BODY"]
@@ -1457,12 +1557,19 @@ async def update_settings(org_id: str, settings: dict) -> dict:
     template_name = str(settings.get("template_name") or "").strip()
     template_language = str(settings.get("template_language") or "en").strip()
     enabled = bool(settings.get("automation_enabled"))
+    existing = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected"})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Connect Shopify before changing settings")
+    order_enabled = bool(existing.get("order_notifications_enabled")) if settings.get("order_notifications_enabled") is None else bool(settings["order_notifications_enabled"])
+    requested_order_templates = (existing.get("order_templates") or {}) if settings.get("order_templates") is None else settings["order_templates"]
+    if order_enabled and "read_fulfillments" not in (existing.get("scopes") or []):
+        raise HTTPException(status_code=409, detail="Reconnect Shopify once to enable shipment notifications")
     whatsapp = await _whatsapp_connection_for_selector(
         org_id,
         phone_id=requested_phone_id or None,
         wa_id=requested_wa_id or None,
         projection={"wa_id": 1, "phone_id": 1, "automation_enabled": 1},
-        require_automation=enabled,
+        require_automation=enabled or order_enabled,
     ) if requested_phone_id or requested_wa_id else None
     wa_id = str((whatsapp or {}).get("wa_id") or "")
     phone_id = str((whatsapp or {}).get("phone_id") or "")
@@ -1470,13 +1577,24 @@ async def update_settings(org_id: str, settings: dict) -> dict:
     selected = next((item for item in templates if item["name"] == template_name and item["language"] == template_language), None)
     if enabled and (not phone_id or not selected):
         raise HTTPException(status_code=409, detail="Choose an active WhatsApp number and approved three-variable Marketing template")
-    existing = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected"})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Connect Shopify before changing settings")
+    utility_templates = await list_compatible_templates(
+        org_id, wa_id or None, phone_id=phone_id or None, purpose="order", raise_unavailable=order_enabled,
+    ) if requested_order_templates and whatsapp else []
+    approved_utility = {(item["name"], item["language"]) for item in utility_templates}
+    order_templates: dict[str, dict[str, str]] = {}
+    for event in ORDER_EVENTS:
+        requested = requested_order_templates.get(event) or {}
+        name = str(requested.get("name") or "").strip()
+        language = str(requested.get("language") or "en").strip()
+        if name:
+            order_templates[event] = {"name": name, "language": language, "status": "APPROVED" if (name, language) in approved_utility else "INCOMPATIBLE"}
+    if order_enabled and (not phone_id or len(order_templates) != len(ORDER_EVENTS) or any(item["status"] != "APPROVED" for item in order_templates.values())):
+        raise HTTPException(status_code=409, detail="Choose four approved three-variable Utility templates for Shopify order updates")
     settings_update = {
         "whatsapp_id": wa_id or None, "whatsapp_phone_id": phone_id or None, "template_name": template_name or None, "template_language": template_language,
         "template_status": "APPROVED" if selected else None, "reminder_delay_minutes": delay,
         "automation_enabled": enabled, "updated_at": utcnow(), "reminder_error": None, "last_error": None,
+        "order_notifications_enabled": order_enabled, "order_templates": order_templates,
     }
     if enabled and (not existing.get("automation_enabled") or not existing.get("automation_enabled_at")):
         settings_update["automation_enabled_at"] = utcnow()
@@ -1494,6 +1612,11 @@ async def update_settings(org_id: str, settings: dict) -> dict:
             {"org_id": org_id, "$or": [{"reminder_status": {"$in": ["pending", "retryable"]}}, {"reminder_status": "sending", "provider_started_at": {"$exists": False}}]},
             {"$set": {"reminder_status": "cancelled", "failure_category": "automation_disabled", "reminder_due_at": None, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
         )
+    if not order_enabled:
+        await db.shopify_order_notifications.update_many(
+            {"org_id": org_id, "status": {"$in": ["pending", "retryable", "sending"]}, "provider_started_at": {"$exists": False}},
+            {"$set": {"status": "cancelled", "failure_category": "automation_disabled", "updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        )
     await _commerce_event(org_id, "settings", org_id)
     return await get_connection(org_id)
 
@@ -1502,7 +1625,7 @@ async def disconnect_shopify(org_id: str, *, provider_uninstall: bool = False) -
     now = utcnow()
     result = await db.shopify_connections.update_one(
         {"org_id": org_id, "status": {"$in": ["connected", "cleanup_pending"]}},
-        {"$set": {"status": "cleanup_pending" if provider_uninstall else "connected", "cleanup_pending": provider_uninstall, "automation_enabled": False, "updated_at": now}},
+        {"$set": {"status": "cleanup_pending" if provider_uninstall else "connected", "cleanup_pending": provider_uninstall, "automation_enabled": False, "order_notifications_enabled": False, "updated_at": now}},
     )
     if not result.matched_count:
         raise HTTPException(status_code=404, detail="Shopify is not connected")
@@ -1513,6 +1636,10 @@ async def disconnect_shopify(org_id: str, *, provider_uninstall: bool = False) -
         ]},
         {"$set": {"reminder_status": "cancelled", "failure_category": "shopify_disconnected", "reminder_due_at": None, "status_updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
     )
+    await db.shopify_order_notifications.update_many(
+        {"org_id": org_id, "status": {"$in": ["pending", "retryable", "sending"]}, "provider_started_at": {"$exists": False}},
+        {"$set": {"status": "cancelled", "failure_category": "shopify_disconnected", "updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+    )
     accepted = db.shopify_checkouts.find({"org_id": org_id, "$or": [
         {"reminder_status": "provider_accepted"},
         {"reminder_status": "sent", "$or": [
@@ -1522,6 +1649,11 @@ async def disconnect_shopify(org_id: str, *, provider_uninstall: bool = False) -
     ]})
     async for checkout in accepted:
         await _reconcile_accepted(checkout)
+    order_accepted = db.shopify_order_notifications.find({"org_id": org_id, "status": "sent", "$or": [
+        {"inbox_sync_status": {"$in": ["pending", "retryable"]}}, {"inbox_sync_status": {"$exists": False}},
+    ]})
+    async for notification in order_accepted:
+        await _reconcile_order_notification(notification)
     in_flight = await db.shopify_checkouts.find_one(
         {"org_id": org_id, "$or": [
             {"reminder_status": "sending", "provider_started_at": {"$exists": True}},
@@ -1534,6 +1666,16 @@ async def disconnect_shopify(org_id: str, *, provider_uninstall: bool = False) -
         if provider_uninstall:
             return
         raise HTTPException(status_code=409, detail="A Shopify reminder is finishing. Retry disconnect shortly")
+    order_in_flight = await db.shopify_order_notifications.find_one(
+        {"org_id": org_id, "$or": [
+            {"status": "sending", "provider_started_at": {"$exists": True}},
+            {"status": "sent", "inbox_sync_status": {"$in": ["pending", "retryable"]}},
+        ]}, {"_id": 1},
+    )
+    if order_in_flight:
+        if provider_uninstall:
+            return
+        raise HTTPException(status_code=409, detail="A Shopify order update is finishing. Retry disconnect shortly")
     await _finish_shopify_disconnect(org_id, provider_uninstall=provider_uninstall)
 
 
@@ -1544,20 +1686,28 @@ async def _finish_shopify_disconnect(org_id: str, *, provider_uninstall: bool = 
     )
     await db.shopify_checkouts.delete_many({"org_id": org_id})
     await db.shopify_orders.delete_many({"org_id": org_id})
+    await db.shopify_order_notifications.delete_many({"org_id": org_id})
     await _commerce_event(org_id, "connection", org_id)
 
 
 async def _finish_pending_disconnects() -> None:
     cursor = db.shopify_connections.find({"status": "cleanup_pending", "cleanup_pending": True}, {"org_id": 1}).limit(10)
     async for connection in cursor:
-        if not await db.shopify_checkouts.find_one(
+        checkout_in_flight = await db.shopify_checkouts.find_one(
             {"org_id": connection["org_id"], "$or": [
                 {"reminder_status": "sending", "provider_started_at": {"$exists": True}},
                 {"reminder_status": "provider_accepted"},
                 {"reminder_status": "sent", "inbox_sync_status": {"$in": ["pending", "retryable"]}},
             ]},
             {"_id": 1},
-        ):
+        )
+        order_in_flight = await db.shopify_order_notifications.find_one(
+            {"org_id": connection["org_id"], "$or": [
+                {"status": "sending", "provider_started_at": {"$exists": True}},
+                {"status": "sent", "inbox_sync_status": {"$in": ["pending", "retryable"]}},
+            ]}, {"_id": 1},
+        )
+        if not checkout_in_flight and not order_in_flight:
             await _finish_shopify_disconnect(connection["org_id"], provider_uninstall=True)
 
 
@@ -1792,6 +1942,7 @@ async def process_shopify_reminders() -> None:
                 await _reconcile_accepted(checkout)
             except Exception as exc:
                 logger.warning("Shopify Inbox reconciliation failed for checkout suffix {}: {}", str(checkout.get("provider_id") or "")[-8:], type(exc).__name__)
+        await _process_order_notifications()
         await _finish_pending_disconnects()
         await db.shopify_worker_heartbeats.update_one(
             {"_id": "recovery"}, {"$set": {"last_completed_at": utcnow(), "claimed_count": len(claimed), "last_error_code": None}}, upsert=True,
@@ -2041,6 +2192,254 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         await _fail_claim(checkout, token, "failed", "pre_provider_failure", retry=retry)
 
 
+async def _finish_order_notification(job: dict, token: str, status: str, reason: str | None = None, *, retry: bool = False) -> None:
+    attempts = int(job.get("pre_provider_attempts") or 0)
+    update: dict[str, Any] = {
+        "status": "retryable" if retry else status,
+        "failure_category": reason,
+        "updated_at": utcnow(),
+    }
+    if retry:
+        update["due_at"] = utcnow() + timedelta(minutes=INBOX_RETRY_MINUTES[min(attempts, len(INBOX_RETRY_MINUTES) - 1)])
+    operation: dict[str, Any] = {"$set": update, "$unset": {"claim_token": "", "claim_expires_at": ""}}
+    if retry:
+        operation["$inc"] = {"pre_provider_attempts": 1}
+    await db.shopify_order_notifications.update_one({"_id": job["_id"], "claim_token": token}, operation)
+    await _commerce_event(job["org_id"], "order", job["order_provider_id"])
+
+
+async def _run_order_notification(job: dict, token: str, semaphore: asyncio.Semaphore) -> None:
+    async with semaphore:
+        try:
+            await asyncio.wait_for(_send_order_notification(job, token), timeout=REMINDER_ATTEMPT_TIMEOUT_SECONDS)
+        except TimeoutError:
+            current = await db.shopify_order_notifications.find_one(
+                {"_id": job["_id"], "claim_token": token}, {"provider_started_at": 1, "pre_provider_attempts": 1},
+            )
+            if not current:
+                return
+            if current.get("provider_started_at"):
+                await _finish_order_notification(job, token, "delivery_unknown", "provider_outcome_unknown")
+            else:
+                await _finish_order_notification(job, token, "failed", "pre_provider_timeout", retry=int(current.get("pre_provider_attempts") or 0) < 3)
+
+
+async def _process_order_notifications() -> None:
+    now = utcnow()
+    stale = {"$or": [{"claim_expires_at": {"$lte": now}}, {"claim_expires_at": None}, {"claim_expires_at": {"$exists": False}}]}
+    await db.shopify_order_notifications.update_many(
+        {"status": "sending", "provider_started_at": {"$exists": False}, **stale},
+        {"$set": {"status": "retryable", "due_at": now, "updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+    )
+    await db.shopify_order_notifications.update_many(
+        {"status": "sending", "provider_started_at": {"$exists": True}, **stale},
+        {"$set": {"status": "delivery_unknown", "failure_category": "provider_outcome_unknown", "updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+    )
+    claimed: list[tuple[dict, str]] = []
+    for _ in range(REMINDER_BATCH_SIZE):
+        token = secrets.token_urlsafe(16)
+        current = utcnow()
+        job = await db.shopify_order_notifications.find_one_and_update(
+            {"status": {"$in": ["pending", "retryable"]}, "due_at": {"$lte": current}, "$or": [{"claim_expires_at": {"$lte": current}}, {"claim_expires_at": None}, {"claim_expires_at": {"$exists": False}}]},
+            {"$set": {"status": "sending", "claim_token": token, "claim_expires_at": current + timedelta(minutes=CLAIM_LEASE_MINUTES), "last_attempt_at": current, "updated_at": current}, "$inc": {"attempt_count": 1}},
+            sort=[("event_at", 1)], return_document=ReturnDocument.AFTER,
+        )
+        if not job:
+            break
+        claimed.append((job, token))
+    semaphore = asyncio.Semaphore(REMINDER_CONCURRENCY)
+    await asyncio.gather(*(_run_order_notification(job, token, semaphore) for job, token in claimed))
+    cursor = db.shopify_order_notifications.find({
+        "status": "sent", "provider_message_id": {"$exists": True},
+        "$and": [
+            {"$or": [{"inbox_sync_status": {"$in": ["pending", "retryable"]}}, {"inbox_sync_status": {"$exists": False}}]},
+            {"$or": [{"inbox_next_attempt_at": {"$lte": utcnow()}}, {"inbox_next_attempt_at": None}, {"inbox_next_attempt_at": {"$exists": False}}]},
+        ],
+    }).sort([("inbox_next_attempt_at", 1), ("provider_accepted_at", 1)]).limit(10)
+    async for job in cursor:
+        try:
+            await _reconcile_order_notification(job)
+        except Exception as exc:
+            logger.warning("Shopify order Inbox reconciliation failed: {}", type(exc).__name__)
+
+
+async def _send_order_notification(job: dict, token: str) -> None:
+    provider_started = False
+    try:
+        org_id = job["org_id"]
+        event = job["event"]
+        connection = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "order_notifications_enabled": True})
+        template = ((connection or {}).get("order_templates") or {}).get(event) or {}
+        if not connection or template.get("status") != "APPROVED" or not template.get("name") or not template.get("language"):
+            await _finish_order_notification(job, token, "configuration_failure", "order_template_unavailable")
+            return
+        earlier = await db.shopify_order_notifications.find_one({
+            "org_id": org_id, "order_provider_id": job["order_provider_id"], "event_at": {"$lt": job["event_at"]},
+            "status": {"$in": ["pending", "retryable", "sending"]}, "_id": {"$ne": job["_id"]},
+        }, {"_id": 1})
+        if earlier:
+            await db.shopify_order_notifications.update_one(
+                {"_id": job["_id"], "claim_token": token},
+                {"$set": {"status": "pending", "due_at": utcnow() + timedelta(seconds=30), "updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+            )
+            return
+        order = await db.shopify_orders.find_one({"org_id": org_id, "provider_id": job["order_provider_id"], "record_status": {"$ne": "deleted"}})
+        if not order:
+            await _finish_order_notification(job, token, "failed", "order_unavailable", retry=int(job.get("pre_provider_attempts") or 0) < 3)
+            return
+        phone = normalize_phone(order.get("phone"))
+        if not phone:
+            await _finish_order_notification(job, token, "phone_missing", "phone_missing")
+            return
+        wa = await _selected_whatsapp_connection(connection, {"wa_id": 1, "phone_id": 1, "access_token": 1})
+        if not wa:
+            await _finish_order_notification(job, token, "configuration_failure", "whatsapp_unavailable")
+            return
+        current_connection, current_wa, opted_out = await asyncio.gather(
+            db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "order_notifications_enabled": True}),
+            db.whatsapp_connections.find_one({"org_id": org_id, "wa_id": wa["wa_id"], "phone_id": wa["phone_id"], "is_active": {"$ne": False}, "automation_enabled": {"$ne": False}}, {"_id": 1}),
+            _is_whatsapp_suppressed(org_id, phone),
+        )
+        current_template = ((current_connection or {}).get("order_templates") or {}).get(event) or {}
+        if not current_wa or current_template != template:
+            await _finish_order_notification(job, token, "cancelled", "configuration_changed")
+            return
+        if opted_out:
+            await _finish_order_notification(job, token, "opted_out", "customer_opt_out")
+            return
+        first_name = str(order.get("customer_name") or "").split(" ", 1)[0][:80] or "there"
+        order_number = str(order.get("order_number") or "Order")[:80]
+        product_summary = _product_summary(order.get("products") or [])
+        if not product_summary:
+            await _finish_order_notification(job, token, "failed", "order_content_unavailable")
+            return
+        if await _is_whatsapp_suppressed(org_id, phone):
+            await _finish_order_notification(job, token, "opted_out", "customer_opt_out")
+            return
+        started = await db.shopify_order_notifications.find_one_and_update(
+            {"_id": job["_id"], "claim_token": token, "status": "sending", "provider_started_at": {"$exists": False}},
+            {"$set": {
+                "provider_started_at": utcnow(), "send_whatsapp_id": wa["wa_id"], "send_phone_id": wa["phone_id"],
+                "send_template_name": template["name"], "send_template_language": template["language"],
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not started:
+            return
+        provider_started = True
+        body = {
+            "messaging_product": "whatsapp", "to": phone.lstrip("+"), "type": "template",
+            "template": {
+                "name": template["name"], "language": {"code": template["language"]},
+                "components": [{"type": "body", "parameters": [{"type": "text", "text": value} for value in (first_name, order_number, product_summary)]}],
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.post(
+                    f"https://graph.facebook.com/{WA_VERSION or 'v24.0'}/{wa['phone_id']}/messages",
+                    headers={"Authorization": f"Bearer {wa['access_token']}", "Content-Type": "application/json"}, json=body,
+                )
+        except httpx.RequestError:
+            await _finish_order_notification(job, token, "delivery_unknown", "provider_outcome_unknown")
+            return
+        if response.status_code not in {200, 201}:
+            try:
+                provider_error = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            except ValueError:
+                provider_error = {}
+            if _provider_reports_block(provider_error):
+                await db.whatsapp_suppressions.update_one(
+                    {"org_id": org_id, "phone": _phone_key(phone)},
+                    {"$set": {"reason": "provider_block", "source": "send_response", "updated_at": utcnow()}, "$setOnInsert": {"created_at": utcnow()}}, upsert=True,
+                )
+                await _finish_order_notification(job, token, "opted_out", "provider_block")
+            else:
+                await _finish_order_notification(job, token, "failed", "provider_rejected")
+            return
+        try:
+            message_id = response.json()["messages"][0]["id"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            await _finish_order_notification(job, token, "delivery_unknown", "provider_response_invalid")
+            return
+        accepted = None
+        for attempt in range(3):
+            try:
+                accepted = await db.shopify_order_notifications.find_one_and_update(
+                    {"_id": job["_id"], "claim_token": token, "status": "sending"},
+                    {"$set": {
+                        "status": "sent", "provider_message_id": message_id, "provider_accepted_at": utcnow(),
+                        "sent_at": utcnow(), "delivery_status": "accepted", "delivery_rank": 0,
+                        "inbox_sync_status": "pending", "inbox_next_attempt_at": utcnow(), "updated_at": utcnow(),
+                    }, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+                    return_document=ReturnDocument.AFTER,
+                )
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.25 * (attempt + 1))
+        if accepted:
+            await _commerce_event(org_id, "order", job["order_provider_id"])
+    except HTTPException as exc:
+        if provider_started:
+            await _finish_order_notification(job, token, "delivery_unknown", "provider_outcome_unknown")
+            return
+        await _finish_order_notification(job, token, "failed", "pre_provider_failure", retry=exc.status_code in {502, 503, 504} and int(job.get("pre_provider_attempts") or 0) < 3)
+    except Exception as exc:
+        logger.warning("Shopify order notification failed before completion: {}", type(exc).__name__)
+        if provider_started:
+            await _finish_order_notification(job, token, "delivery_unknown", "provider_outcome_unknown")
+            return
+        await _finish_order_notification(job, token, "failed", "pre_provider_failure", retry=int(job.get("pre_provider_attempts") or 0) < 3)
+
+
+async def _reconcile_order_notification(job: dict) -> None:
+    message_id = job.get("provider_message_id")
+    if not message_id or job.get("inbox_sync_status") == "complete":
+        return
+    try:
+        order = await db.shopify_orders.find_one({"org_id": job["org_id"], "provider_id": job["order_provider_id"]})
+        phone = str((order or {}).get("phone") or "").lstrip("+")
+        whatsapp_id = job.get("send_whatsapp_id")
+        if not order or not phone or not whatsapp_id:
+            raise RuntimeError("inbox_identity_unavailable")
+        event_text = {
+            "received": "we received order {order} for {products}.",
+            "shipped": "order {order} for {products} has shipped.",
+            "fulfilled": "order {order} for {products} has been fulfilled.",
+            "cancelled": "order {order} for {products} has been cancelled.",
+        }[job["event"]]
+        name = str(order.get("customer_name") or "there").split(" ", 1)[0]
+        content = f"Hi {name}, {event_text.format(order=order.get('order_number') or 'Order', products=_product_summary(order.get('products') or []))}"
+        if not sync_db[f"messages_{job['org_id']}"].find_one({"message_id": message_id}, {"_id": 1}):
+            conversation_id = await create_or_update_whatsapp_conversation(
+                org_id=job["org_id"], recipient_id=whatsapp_id, customer_phone_no=phone,
+                customer_name=order.get("customer_name") or phone, last_message=content,
+                last_sender="agent", is_auto_followup=True,
+                extra_updates={"last_message_source": f"shopify_order_{job['event']}"}, idempotency_key=message_id,
+            )
+            await store_whatsapp_message(
+                org_id=job["org_id"], content=content, conversation_id=conversation_id, customer_phone_no=phone,
+                type="template", payload=None, recipient_id=whatsapp_id, role=MessageRole.AGENT,
+                sender_name="Shopify order updates", message_id=message_id, status="sent",
+                bot_context={"source": f"shopify_order_{job['event']}", "order_id": job["order_provider_id"]},
+            )
+    except DuplicateKeyError:
+        pass
+    except Exception:
+        attempts = int(job.get("inbox_attempts") or 0)
+        await db.shopify_order_notifications.update_one(
+            {"_id": job["_id"], "provider_message_id": message_id, "status": "sent"},
+            {"$set": {"inbox_sync_status": "retryable", "inbox_next_attempt_at": utcnow() + timedelta(minutes=INBOX_RETRY_MINUTES[min(attempts, len(INBOX_RETRY_MINUTES) - 1)]), "updated_at": utcnow()}, "$inc": {"inbox_attempts": 1}},
+        )
+        raise
+    await db.shopify_order_notifications.update_one(
+        {"_id": job["_id"], "provider_message_id": message_id, "status": "sent"},
+        {"$set": {"inbox_sync_status": "complete", "inbox_synced_at": utcnow(), "updated_at": utcnow()}, "$unset": {"inbox_next_attempt_at": ""}},
+    )
+
+
 async def _reconcile_accepted(checkout: dict) -> None:
     message_id = checkout.get("provider_message_id")
     if not message_id:
@@ -2121,6 +2520,18 @@ async def update_shopify_reminder_delivery(org_id: str, message_id: str, status:
     )
     if checkout:
         await _commerce_event(org_id, "checkout", checkout["provider_id"])
+        return
+    order_update = {"delivery_status": delivery_status, "delivery_rank": rank, "updated_at": now}
+    if delivery_status == "failed":
+        order_update.update({"status": "failed", "failure_category": "provider_delivery_failed", "failed_at": now})
+    else:
+        order_update[f"{delivery_status}_at"] = now
+    notification = await db.shopify_order_notifications.find_one_and_update(
+        {"org_id": org_id, "provider_message_id": message_id, **rank_filter},
+        {"$set": order_update}, return_document=ReturnDocument.AFTER,
+    )
+    if notification:
+        await _commerce_event(org_id, "order", notification["order_provider_id"])
 
 
 async def _commerce_event(org_id: str, record_type: str, record_id: str) -> None:

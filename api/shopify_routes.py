@@ -32,6 +32,11 @@ class OAuthStartPayload(BaseModel):
     shop: str = Field(min_length=15, max_length=255)
 
 
+class ShopifyTemplateSelection(BaseModel):
+    name: str = Field(default="", max_length=512)
+    language: str = Field(default="en", min_length=1, max_length=20)
+
+
 class ShopifySettingsPayload(BaseModel):
     whatsapp_id: str = Field(default="", max_length=200)
     whatsapp_phone_id: str = Field(default="", max_length=200)
@@ -39,17 +44,27 @@ class ShopifySettingsPayload(BaseModel):
     template_language: str = Field(default="en", min_length=1, max_length=20)
     reminder_delay_minutes: int = 10
     automation_enabled: bool = False
+    order_notifications_enabled: bool | None = None
+    order_templates: dict[str, ShopifyTemplateSelection] | None = None
 
     @field_validator("whatsapp_id", "whatsapp_phone_id", "template_name", "template_language")
     @classmethod
     def strip_text(cls, value: str) -> str:
         return value.strip()
 
+    @field_validator("order_templates")
+    @classmethod
+    def validate_order_template_keys(cls, value: dict[str, ShopifyTemplateSelection] | None):
+        if value is not None and set(value) - {"received", "shipped", "fulfilled", "cancelled"}:
+            raise ValueError("Unsupported Shopify order template event")
+        return value
+
 
 class TemplateCreatePayload(BaseModel):
     whatsapp_id: str = Field(default="", max_length=200)
     whatsapp_phone_id: str = Field(default="", max_length=200)
     language: str = Field(default="en", min_length=1, max_length=20)
+    event: Literal["abandoned_cart", "received", "shipped", "fulfilled", "cancelled"] = "abandoned_cart"
 
 
 class CheckoutRetryPayload(BaseModel):
@@ -83,8 +98,9 @@ async def shopify_templates(
     user: CurrentUser,
     whatsapp_id: str = Query(default="", max_length=200),
     whatsapp_phone_id: str = Query(default="", max_length=200),
+    purpose: Literal["cart", "order"] = Query(default="cart"),
 ):
-    return {"templates": await list_compatible_templates(user.org_id, whatsapp_id or None, phone_id=whatsapp_phone_id or None, raise_unavailable=True)}
+    return {"templates": await list_compatible_templates(user.org_id, whatsapp_id or None, phone_id=whatsapp_phone_id or None, purpose=purpose, raise_unavailable=True)}
 
 
 @router.post("/api/integrations/shopify/template")
@@ -92,7 +108,7 @@ async def shopify_create_template(payload: TemplateCreatePayload, user: CurrentU
     await admin_required(user)
     if not payload.whatsapp_phone_id and not payload.whatsapp_id:
         raise HTTPException(status_code=422, detail="Choose an active WhatsApp number")
-    return await create_default_template(user.org_id, payload.whatsapp_phone_id, payload.language, wa_id=payload.whatsapp_id)
+    return await create_default_template(user.org_id, payload.whatsapp_phone_id, payload.language, wa_id=payload.whatsapp_id, event=payload.event)
 
 
 @router.put("/api/integrations/shopify/settings")
