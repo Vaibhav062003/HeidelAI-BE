@@ -68,7 +68,7 @@ def main():
     assert "get_broadcast_suppressed_phone_keys" in WA_ROUTES
     assert "get_broadcast_suppressed_phone_keys" in source
     assert "is_broadcast_suppressed" in SHEETS
-    assert "record_whatsapp_preference(org_id, customer_phone_no, content)" in WEBHOOK
+    assert "await asyncio.to_thread(record_whatsapp_preference, org_id, customer_phone_no, content)" in WEBHOOK
     assert '"marketing_opted_out": True' in SHOPIFY
     assert '"status": "skipped"' in source
     print("BROADCAST_SUPPRESSION_CONTRACT_OK")

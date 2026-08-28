@@ -269,7 +269,7 @@ async def create_or_update_whatsapp_conversation(
     broadcast_conversation = dict(updated_conversation)
     if "last_message_timestamp" in broadcast_conversation:
         broadcast_conversation["last_message_timestamp"] = broadcast_conversation["last_message_timestamp"].isoformat()
-    if broadcast_conversation["next_action_at"] is not None:
+    if broadcast_conversation.get("next_action_at") is not None:
         broadcast_conversation["next_action_at"] = broadcast_conversation["next_action_at"].isoformat()
     if "started_at" in broadcast_conversation:
         broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
@@ -33,19 +33,21 @@ class OAuthStartPayload(BaseModel):
 
 class ShopifySettingsPayload(BaseModel):
     whatsapp_id: str = Field(default="", max_length=200)
+    whatsapp_phone_id: str = Field(default="", max_length=200)
     template_name: str = Field(default="", max_length=512)
     template_language: str = Field(default="en", min_length=1, max_length=20)
     reminder_delay_minutes: int = 30
     automation_enabled: bool = False
 
-    @field_validator("whatsapp_id", "template_name", "template_language")
+    @field_validator("whatsapp_id", "whatsapp_phone_id", "template_name", "template_language")
     @classmethod
     def strip_text(cls, value: str) -> str:
         return value.strip()
 
 
 class TemplateCreatePayload(BaseModel):
-    whatsapp_id: str = Field(min_length=1, max_length=200)
+    whatsapp_id: str = Field(default="", max_length=200)
+    whatsapp_phone_id: str = Field(default="", max_length=200)
     language: str = Field(default="en", min_length=1, max_length=20)
 
 
@@ -72,14 +74,20 @@ async def shopify_oauth_callback(request: Request):
 
 
 @router.get("/api/integrations/shopify/templates")
-async def shopify_templates(user: CurrentUser, whatsapp_id: str = Query(default="", max_length=200)):
-    return {"templates": await list_compatible_templates(user.org_id, whatsapp_id or None)}
+async def shopify_templates(
+    user: CurrentUser,
+    whatsapp_id: str = Query(default="", max_length=200),
+    whatsapp_phone_id: str = Query(default="", max_length=200),
+):
+    return {"templates": await list_compatible_templates(user.org_id, whatsapp_id or None, phone_id=whatsapp_phone_id or None, raise_unavailable=True)}
 
 
 @router.post("/api/integrations/shopify/template")
 async def shopify_create_template(payload: TemplateCreatePayload, user: CurrentUser):
     await admin_required(user)
-    return await create_default_template(user.org_id, payload.whatsapp_id, payload.language)
+    if not payload.whatsapp_phone_id and not payload.whatsapp_id:
+        raise HTTPException(status_code=422, detail="Choose an active WhatsApp number")
+    return await create_default_template(user.org_id, payload.whatsapp_phone_id, payload.language, wa_id=payload.whatsapp_id)
 
 
 @router.put("/api/integrations/shopify/settings")
@@ -152,6 +160,8 @@ async def shopify_records(
     cursor: str | None = Query(default=None, max_length=1000),
     limit: int = Query(default=30, ge=1, le=50),
 ):
+    start = start.replace(tzinfo=start.tzinfo or timezone.utc).astimezone(timezone.utc) if start else None
+    end = end.replace(tzinfo=end.tzinfo or timezone.utc).astimezone(timezone.utc) if end else None
     if start and end and start > end:
         raise HTTPException(status_code=422, detail="Start date must be before end date")
     return await list_records(user.org_id, type, status=status, search=search, start=start, end=end, cursor=cursor, limit=limit)
