@@ -13,8 +13,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SERVICE_PATH = ROOT / "services/shopify_service.py"
 ROUTES_PATH = ROOT / "api/shopify_routes.py"
+WEBHOOK_PATH = ROOT / "api/webhook_routes.py"
 SERVICE = SERVICE_PATH.read_text()
 ROUTES = ROUTES_PATH.read_text()
+WEBHOOK = WEBHOOK_PATH.read_text()
 
 
 class HTTPException(Exception):
@@ -26,7 +28,8 @@ class HTTPException(Exception):
 def pure_namespace():
     wanted = {
         "_parse_datetime", "normalize_shop", "normalize_phone", "_phone_and_consent",
-        "_record_phone_and_consent",
+        "_record_phone_and_consent", "_phone_key", "_message_preference",
+        "_provider_reports_block", "_eligibility_status",
         "_product_summary", "_template_compatible", "verify_callback_hmac",
     }
     tree = ast.parse(SERVICE)
@@ -36,6 +39,8 @@ def pure_namespace():
         "HTTPException": HTTPException, "hashlib": hashlib, "hmac": hmac, "json": json,
         "SHOPIFY_CLIENT_SECRET": "contract-secret", "SHOP_RE": re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$"),
         "PHONE_RE": re.compile(r"^\+[1-9]\d{7,14}$"),
+        "OPT_OUT_COMMANDS": {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"},
+        "OPT_IN_COMMANDS": {"start", "subscribe"},
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVICE_PATH), "exec"), namespace)
     return namespace
@@ -81,6 +86,14 @@ def main():
     assert resolve_phone({}, {"phone": "+14155550002"}, {"phone": "+14155550003"})[0] == "+14155550002"
     assert resolve_phone({}, {}, {"phone": "+14155550003"})[0] == "+14155550003"
     assert resolve_phone({}, {}, {}, "+14155550004")[0] == "+14155550004"
+    assert ns["_eligibility_status"]("+14155550004", [{"name": "Cart item"}]) == "pending"
+    assert ns["_message_preference"](" STOP! ") == "opted_out"
+    assert ns["_message_preference"]("unsubscribe") == "opted_out"
+    assert ns["_message_preference"]("START") == "subscribed"
+    assert ns["_message_preference"]("please stop by tomorrow") is None
+    assert ns["_provider_reports_block"]({"errors": [{"message": "The user blocked your business"}]})
+    assert ns["_provider_reports_block"]({"error": {"message": "The recipient blocked your business"}})
+    assert not ns["_provider_reports_block"]({"errors": [{"message": "Template was paused"}]})
     assert SERVICE.count("shippingAddress { phone }") >= 2
     assert SERVICE.count("billingAddress { phone }") >= 2
     assert ns["_product_summary"]([{"name": "A"}, {"name": "B"}, {"name": "C"}, {"name": "D"}]) == "A, B, C +1 more"
@@ -106,7 +119,9 @@ def main():
     for required in (
         'find_one_and_delete({', 'hmac.compare_digest', 'create_index("shop", unique=True',
         'create_index([("shop", 1), ("webhook_id", 1)], unique=True)',
-        'CUSTOMERS_WHATS_APP_MARKETING_CONSENT_UPDATE', 'consent != "SUBSCRIBED"',
+        'create_index([("org_id", 1), ("phone", 1)], unique=True)', '"opted_out"',
+        '"automation_enabled_at"', 'timedelta(minutes=5)', '"updated_at"', '"UPDATED_AT"',
+        'await _register_webhooks(connection)',
         '"claim_expires_at": now + timedelta(minutes=CLAIM_LEASE_MINUTES)',
         'consent_event = "whatsapp_marketing_consent" in topic',
         'Disconnect the current Shopify store before connecting another',
@@ -115,6 +130,9 @@ def main():
         '"record_type": record_type, "record_id": record_id',
     ):
         assert required in SERVICE, f"missing boundary: {required}"
+    assert 'consent != "SUBSCRIBED"' not in SERVICE
+    assert "record_whatsapp_preference(org_id, customer_phone_no, content)" in WEBHOOK
+    assert "record_whatsapp_provider_block(" in WEBHOOK
     assert 'order_matches.append({"phone"' not in SERVICE
 
     logger_lines = [line for line in SERVICE.splitlines() if "logger." in line]

@@ -37,6 +37,66 @@ db = get_mongo_db()
 mongo_client = get_mongo_client()
 
 
+def broadcast_phone_key(value) -> str:
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    return digits if 7 <= len(digits) <= 15 else ""
+
+
+def broadcast_message_preference(content) -> str | None:
+    command = "".join(character for character in str(content or "").casefold() if character.isalpha())
+    if command in {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"}:
+        return "opted_out"
+    if command in {"start", "subscribe"}:
+        return "subscribed"
+    return None
+
+
+def get_broadcast_suppressed_phone_keys(org_id: str, phones: list[str]) -> set[str]:
+    keys = {broadcast_phone_key(phone) for phone in phones}
+    keys.discard("")
+    if not keys:
+        return set()
+    suppressed = {
+        str(item.get("phone") or "")
+        for item in db.whatsapp_suppressions.find(
+            {"org_id": org_id, "phone": {"$in": list(keys)}},
+            {"_id": 0, "phone": 1},
+        )
+    }
+    unchecked = keys - suppressed
+    if unchecked:
+        conversation_ids = [f"whatsapp_{phone}" for phone in unchecked]
+        preference_messages = db[f"messages_{org_id}"].aggregate([
+            {"$match": {
+                "conversation_id": {"$in": conversation_ids},
+                "role": "customer",
+                "mode": {"$ne": "private"},
+                "content": {"$regex": r"^\s*(?:stop(?:\s*all)?|unsubscribe|cancel|end|quit|start|subscribe)\s*[.!]?\s*$", "$options": "i"},
+            }},
+            {"$sort": {"timestamp": -1}},
+            {"$group": {"_id": "$conversation_id", "content": {"$first": "$content"}}},
+        ])
+        now = datetime.now(timezone.utc)
+        operations = []
+        for item in preference_messages:
+            phone = broadcast_phone_key(str(item.get("_id") or "").removeprefix("whatsapp_"))
+            if phone and broadcast_message_preference(item.get("content")) == "opted_out":
+                suppressed.add(phone)
+                operations.append(UpdateOne(
+                    {"org_id": org_id, "phone": phone},
+                    {"$set": {"reason": "customer_opt_out", "source": "message_history", "updated_at": now}, "$setOnInsert": {"created_at": now}},
+                    upsert=True,
+                ))
+        if operations:
+            db.whatsapp_suppressions.bulk_write(operations, ordered=False)
+    return suppressed
+
+
+def is_broadcast_suppressed(org_id: str, phone: str) -> bool:
+    key = broadcast_phone_key(phone)
+    return bool(key and db.whatsapp_suppressions.find_one({"org_id": org_id, "phone": key}, {"_id": 1}))
+
+
 async def create_or_update_whatsapp_conversation(
     org_id: str, 
     recipient_id, 
@@ -2169,6 +2229,7 @@ def create_bulk_job(
         "total": total,
         "sent": 0,
         "failed": 0,
+        "skipped": 0,
         # RESULTS SHOULD BE STORED IN A SEPARATE COLLECTION TO AVOID 16MB LIMIT
         "created_at": now,
         "updated_at": now,
@@ -2375,14 +2436,33 @@ async def run_bulk_send_job(
                 
                 logger.info(f"Bulk WA | job={job_id} | processing batch {current_batch}/{total_batches} | size={len(chunk)}")
                 
-                tasks = [send_to_recipient(i + idx, r, client) for idx, r in enumerate(chunk)]
-                batch_results = await asyncio.gather(*tasks)
+                suppressed = await asyncio.to_thread(
+                    get_broadcast_suppressed_phone_keys,
+                    org_id,
+                    [recipient.phone_number for recipient in chunk],
+                )
+                tasks = []
+                batch_results = []
+                for idx, recipient in enumerate(chunk):
+                    if broadcast_phone_key(recipient.phone_number) in suppressed:
+                        batch_results.append(({
+                            "job_id": job_id,
+                            "phone_number": recipient.phone_number,
+                            "status": "skipped",
+                            "error": "Recipient opted out",
+                            "created_at": datetime.now(timezone.utc),
+                        }, {"$inc": {"skipped": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}))
+                    else:
+                        tasks.append(send_to_recipient(i + idx, recipient, client))
+                if tasks:
+                    batch_results.extend(await asyncio.gather(*tasks))
                 
                 # Batch DB operations
                 entries = [res[0] for res in batch_results]
                 
                 total_sent = sum(res[1]["$inc"].get("sent", 0) for res in batch_results)
                 total_failed = sum(res[1]["$inc"].get("failed", 0) for res in batch_results)
+                total_skipped = sum(res[1]["$inc"].get("skipped", 0) for res in batch_results)
                 
                 # Prepare message and conversation bulk operations for successful sends
                 message_docs = []
@@ -2454,6 +2534,7 @@ async def run_bulk_send_job(
                 }
                 if total_sent > 0: combined_update["$inc"]["sent"] = total_sent
                 if total_failed > 0: combined_update["$inc"]["failed"] = total_failed
+                if total_skipped > 0: combined_update["$inc"]["skipped"] = total_skipped
 
                 db_tasks = [
                     asyncio.to_thread(db.bulk_job_results.insert_many, entries),
