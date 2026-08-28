@@ -19,6 +19,7 @@ from services.shopify_service import (
     list_records,
     process_webhook,
     request_sync,
+    retry_checkout_reminder,
     update_settings,
 )
 
@@ -36,7 +37,7 @@ class ShopifySettingsPayload(BaseModel):
     whatsapp_phone_id: str = Field(default="", max_length=200)
     template_name: str = Field(default="", max_length=512)
     template_language: str = Field(default="en", min_length=1, max_length=20)
-    reminder_delay_minutes: int = 30
+    reminder_delay_minutes: int = 10
     automation_enabled: bool = False
 
     @field_validator("whatsapp_id", "whatsapp_phone_id", "template_name", "template_language")
@@ -49,6 +50,10 @@ class TemplateCreatePayload(BaseModel):
     whatsapp_id: str = Field(default="", max_length=200)
     whatsapp_phone_id: str = Field(default="", max_length=200)
     language: str = Field(default="en", min_length=1, max_length=20)
+
+
+class CheckoutRetryPayload(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=512)
 
 
 @router.get("/api/integrations/shopify")
@@ -165,6 +170,12 @@ async def shopify_records(
     if start and end and start > end:
         raise HTTPException(status_code=422, detail="Start date must be before end date")
     return await list_records(user.org_id, type, status=status, search=search, start=start, end=end, cursor=cursor, limit=limit)
+
+
+@router.post("/api/commerce/shopify/checkouts/retry")
+async def shopify_checkout_retry(payload: CheckoutRetryPayload, user: CurrentUser):
+    await admin_required(user)
+    return await retry_checkout_reminder(user.org_id, payload.provider_id)
 
 
 @router.get("/api/conversations/{conversation_id}/shopify-activity")

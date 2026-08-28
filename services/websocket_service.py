@@ -221,10 +221,11 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
                     **safe_payload
                 }
             })
-        except Exception as e:
-            logger.error(f"Failed to send to {client_id}: {e}, marking as disconnected")
         except WebSocketDisconnect:
             logger.error(f"Client {client_id} disconnected, marking as disconnected")
+            disconnected_clients.append(client_id)
+        except Exception as e:
+            logger.error(f"Failed to send to {client_id}: {e}, marking as disconnected")
             disconnected_clients.append(client_id)
 
     # Cleanup

@@ -14,6 +14,7 @@ from loguru import logger
 
 
 db = get_mongo_db()
+_scheduler = None
 # mapping of platforms -> service instance
 messaging_services = {
     "instagram": instagram_service.InstagramService(),
@@ -127,6 +128,9 @@ async def update_ai_status(org_type: str = "all"):
 
 
 def start_scheduler():
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        return _scheduler
     from services.cloudinary_service import cleanup_expired_audio_notes
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests, process_pending_oos_reply_steps
     from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
@@ -153,7 +157,7 @@ def start_scheduler():
     scheduler.add_job(reconcile_stale_tally_jobs, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_tally_payment_reminders, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(check_tally_contact_sync_health, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(process_shopify_reminders, "interval", seconds=30, max_instances=1, coalesce=True)
+    scheduler.add_job(process_shopify_reminders, "interval", seconds=30, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
     scheduler.add_job(process_shopify_syncs, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_pricing_escalations, "interval", minutes=1, max_instances=1, coalesce=True)
     # OOS: expire stale requests and escalate (check every hour)
@@ -163,4 +167,13 @@ def start_scheduler():
     scheduler.add_job(cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
     scheduler.add_job(cleanup_expired_tally_pdfs, "cron", hour=3, minute=45, max_instances=1, coalesce=True)
     scheduler.start()
+    _scheduler = scheduler
     logger.success("APScheduler started (interval = 6 hours).")
+    return scheduler
+
+
+def stop_scheduler():
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        _scheduler.shutdown(wait=False)
+    _scheduler = None
