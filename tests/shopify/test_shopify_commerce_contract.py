@@ -32,7 +32,7 @@ def pure_namespace():
         "_provider_reports_block", "_eligibility_status",
         "_provider_time", "_provider_sort_key", "_reminder_due", "_sync_retry_at",
         "_recovery_activity_time", "_checkout_changed_for_send",
-        "_product_summary", "_template_compatible", "verify_callback_hmac", "_iso_utc",
+        "_product_summary", "_template_compatible", "_checkout_status_clause", "verify_callback_hmac", "_iso_utc",
     }
     tree = ast.parse(SERVICE)
     nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted]
@@ -43,6 +43,7 @@ def pure_namespace():
         "PHONE_RE": re.compile(r"^\+[1-9]\d{7,14}$"),
         "OPT_OUT_COMMANDS": {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"},
         "OPT_IN_COMMANDS": {"start", "subscribe"},
+        "OVERDUE_GRACE_SECONDS": 90,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVICE_PATH), "exec"), namespace)
     return namespace
@@ -52,7 +53,7 @@ def assert_admin_writes():
     tree = ast.parse(ROUTES)
     write_functions = {
         "shopify_oauth_start", "shopify_create_template", "shopify_settings",
-        "shopify_sync", "shopify_disconnect",
+        "shopify_sync", "shopify_disconnect", "shopify_checkout_retry",
     }
     functions = {node.name: node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)}
     for name in write_functions:
@@ -111,6 +112,8 @@ def main():
     assert ns["_sync_retry_at"](1, provider_time) == provider_time + timedelta(minutes=1)
     assert ns["_sync_retry_at"](20, provider_time) == provider_time + timedelta(minutes=30)
     assert ns["_iso_utc"](datetime(2026, 8, 28, 13, 2, 14)) == "2026-08-28T13:02:14+00:00"
+    assert ns["_checkout_status_clause"]("overdue", provider_time)["reminder_due_at"]["$lte"] == provider_time - timedelta(seconds=90)
+    assert ns["_checkout_status_clause"]("accepted", provider_time)["$or"][1]["delivery_status"] == "accepted"
     assert SERVICE.count("shippingAddress { phone }") >= 2
     assert SERVICE.count("billingAddress { phone }") >= 2
     assert ns["_product_summary"]([{"name": "A"}, {"name": "B"}, {"name": "C"}, {"name": "D"}]) == "A, B, C +1 more"
@@ -129,6 +132,7 @@ def main():
         "/api/integrations/shopify/oauth/callback", "/api/integrations/shopify/settings",
         "/api/integrations/shopify/sync", "/api/webhooks/shopify",
         "/api/commerce/shopify/summary", "/api/commerce/shopify/records",
+        "/api/commerce/shopify/checkouts/retry",
         "/api/conversations/{conversation_id}/shopify-activity",
     ):
         assert endpoint in ROUTES
@@ -156,7 +160,7 @@ def main():
     assert 'idempotency_key=message_id' in SERVICE
     assert '"reminder_status": {"$in": ["sent", "delivery_unknown"]}' in SERVICE
     assert 'await list_compatible_templates(org_id, connection["whatsapp_id"], phone_id=connection.get("whatsapp_phone_id"))' in SERVICE
-    assert 'current_checkout, current_connection, current_wa, current_opted_out = await asyncio.gather' in SERVICE
+    assert 'current, current_connection, current_wa, opted_out = await asyncio.gather' in SERVICE
     assert '"whatsapp_phone_id": wa["phone_id"]' in SERVICE
     assert '"automation_enabled": {"$ne": False}' in SERVICE
     assert 'update_shopify_reminder_delivery' in SERVICE
@@ -172,6 +176,11 @@ def main():
     assert "await asyncio.to_thread(record_whatsapp_preference, org_id, customer_phone_no, content)" in WEBHOOK
     assert "await asyncio.to_thread(\n                                record_whatsapp_provider_block," in WEBHOOK
     assert 'order_matches.append({"phone"' not in SERVICE
+    assert 'asyncio.Semaphore(REMINDER_CONCURRENCY)' in SERVICE
+    assert 'asyncio.wait_for(_send_claimed_checkout' in SERVICE
+    assert '"inbox_sync_status": "pending"' in SERVICE
+    assert '"inbox_sync_status": "complete"' in SERVICE
+    assert '"reminder_status": "sent", "inbox_sync_status": {"$in": ["pending", "retryable"]}' in SERVICE
 
     logger_lines = [line for line in SERVICE.splitlines() if "logger." in line]
     assert not any(word in line for line in logger_lines for word in ("access_token", "recovery_url", "customer_name", "phone", "products", "raw_body"))

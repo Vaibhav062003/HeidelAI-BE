@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import asyncio
-from core.scheduler import start_scheduler
+from core.scheduler import start_scheduler, stop_scheduler
 from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cache
 from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, recover_stale_bulk_jobs
 from services.automation_scheduler import startup_scheduler, shutdown_scheduler
@@ -15,7 +15,7 @@ from services.tally_service import ensure_tally_indexes
 from services.stock_service import ensure_stock_indexes
 from services.entitlement_service import ensure_entitlement_indexes
 from services.transfer_notification_service import ensure_transfer_notification_indexes
-from services.shopify_service import ensure_shopify_indexes
+from services.shopify_service import ensure_shopify_runtime_ready
 from services.push_notification_service import (
     ensure_push_notification_indexes,
     start_push_notification_workers,
@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI):
     load_agents()
     load_prompts_into_cache()
     await ensure_followup_indexes()
+    await ensure_shopify_runtime_ready()
     start_scheduler()
     await startup_scheduler()
     await startup_google_scheduler()
@@ -46,11 +47,11 @@ async def lifespan(app: FastAPI):
     await ensure_tally_indexes()
     await ensure_stock_indexes()
     await asyncio.to_thread(ensure_entitlement_indexes)
-    await ensure_shopify_indexes()
     await start_push_notification_workers()
     await startup_intent_worker()
     yield
     # Shutdown
+    stop_scheduler()
     await stop_push_notification_workers()
     await shutdown_intent_worker()
     await shutdown_scheduler()
