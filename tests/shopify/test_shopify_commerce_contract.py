@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -30,12 +30,13 @@ def pure_namespace():
         "_parse_datetime", "normalize_shop", "normalize_phone", "_phone_and_consent",
         "_record_phone_and_consent", "_phone_key", "_message_preference",
         "_provider_reports_block", "_eligibility_status",
+        "_provider_time", "_provider_sort_key", "_reminder_due", "_sync_retry_at",
         "_product_summary", "_template_compatible", "verify_callback_hmac",
     }
     tree = ast.parse(SERVICE)
     nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted]
     namespace = {
-        "Any": object, "datetime": datetime, "timezone": timezone, "re": re,
+        "Any": object, "datetime": datetime, "timedelta": timedelta, "timezone": timezone, "re": re,
         "HTTPException": HTTPException, "hashlib": hashlib, "hmac": hmac, "json": json,
         "SHOPIFY_CLIENT_SECRET": "contract-secret", "SHOP_RE": re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$"),
         "PHONE_RE": re.compile(r"^\+[1-9]\d{7,14}$"),
@@ -94,6 +95,14 @@ def main():
     assert ns["_provider_reports_block"]({"errors": [{"message": "The user blocked your business"}]})
     assert ns["_provider_reports_block"]({"error": {"message": "The recipient blocked your business"}})
     assert not ns["_provider_reports_block"]({"errors": [{"message": "Template was paused"}]})
+    provider_time = datetime(2026, 8, 28, 10, tzinfo=timezone.utc)
+    local_status_time = datetime(2026, 8, 29, 10, tzinfo=timezone.utc)
+    older_provider_time = datetime(2026, 8, 27, 10, tzinfo=timezone.utc)
+    assert ns["_provider_sort_key"]({"provider_id": "new", "provider_updated_at": provider_time, "status_updated_at": older_provider_time}) > ns["_provider_sort_key"]({"provider_id": "old", "provider_updated_at": older_provider_time, "status_updated_at": local_status_time})
+    assert ns["_reminder_due"](provider_time, 30) == provider_time + timedelta(minutes=30)
+    assert ns["_reminder_due"](provider_time, 30, provider_time + timedelta(hours=24)) == provider_time + timedelta(hours=24)
+    assert ns["_sync_retry_at"](1, provider_time) == provider_time + timedelta(minutes=1)
+    assert ns["_sync_retry_at"](20, provider_time) == provider_time + timedelta(minutes=30)
     assert SERVICE.count("shippingAddress { phone }") >= 2
     assert SERVICE.count("billingAddress { phone }") >= 2
     assert ns["_product_summary"]([{"name": "A"}, {"name": "B"}, {"name": "C"}, {"name": "D"}]) == "A, B, C +1 more"
@@ -131,12 +140,28 @@ def main():
     ):
         assert required in SERVICE, f"missing boundary: {required}"
     assert 'consent != "SUBSCRIBED"' not in SERVICE
+    assert 'API_VERSION = "2025-10"' in SERVICE
+    assert 'sort_key = "CREATED_AT" if kind == "checkouts"' in SERVICE
+    assert 'mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: String!)' in SERVICE
+    assert 'data = await _graphql(connection, CHECKOUT_NODE_QUERY' in SERVICE
+    assert SERVICE.index('data = await _graphql(connection, CHECKOUT_NODE_QUERY') < SERVICE.index('"provider_started_at": utcnow(), **frozen')
+    assert 'idempotency_key=message_id' in SERVICE
+    assert '"reminder_status": {"$in": ["sent", "delivery_unknown"]}' in SERVICE
+    assert 'await list_compatible_templates(org_id, connection["whatsapp_id"])' in SERVICE
+    assert 'current_checkout, current_connection, current_wa, current_opted_out = await asyncio.gather' in SERVICE
+    assert '"customer_updated_at": customer_updated' in SERVICE
+    assert 'update = {"provider_updated_at": provider_updated' not in SERVICE
+    assert 'headers.get("x-shopify-triggered-at")' in SERVICE
+    assert '"record_status": {"$ne": "deleted"}' in SERVICE
+    assert '"record_status": "deleted", "provider_updated_at": event_time' in SERVICE
+    assert '{"provider_updated_at": {"$lt": provider_time}}' in SERVICE
     assert "record_whatsapp_preference(org_id, customer_phone_no, content)" in WEBHOOK
     assert "record_whatsapp_provider_block(" in WEBHOOK
     assert 'order_matches.append({"phone"' not in SERVICE
 
     logger_lines = [line for line in SERVICE.splitlines() if "logger." in line]
     assert not any(word in line for line in logger_lines for word in ("access_token", "recovery_url", "customer_name", "phone", "products", "raw_body"))
+    print("SHOPIFY_REMINDER_BEHAVIOR_OK")
     print("SHOPIFY_COMMERCE_CONTRACT_OK")
 
 

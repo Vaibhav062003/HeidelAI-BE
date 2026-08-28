@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from fastapi import HTTPException
 from pymongo import ReturnDocument, UpdateOne
+from pymongo.errors import DuplicateKeyError
 
 # Internal modules
 from core.managers import manager
@@ -109,6 +110,7 @@ async def create_or_update_whatsapp_conversation(
     is_auto_followup: bool = False,
     mode: Optional[str] = None,
     extra_updates: Optional[dict] = None,
+    idempotency_key: Optional[str] = None,
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -234,6 +236,8 @@ async def create_or_update_whatsapp_conversation(
         "$setOnInsert": update_set_on_insert,
         "$inc": update_inc
     }
+    if idempotency_key:
+        mongo_update["$addToSet"] = {"applied_outbound_message_ids": idempotency_key}
 
     # Safely apply $max ONLY if we have a valid expiry from the customer
     if last_sender == "customer" and reply_window_expiry:
@@ -241,12 +245,23 @@ async def create_or_update_whatsapp_conversation(
         update_set["is_ad_referral"] = is_ad_referral 
 
     # Execute atomic update
-    updated_conversation = conversations_collection.find_one_and_update(
-        {"conversation_id": conversation_id},
-        mongo_update,
-        upsert=True,
-        return_document=ReturnDocument.AFTER
-    )
+    update_filter = {"conversation_id": conversation_id}
+    if idempotency_key:
+        update_filter["applied_outbound_message_ids"] = {"$ne": idempotency_key}
+    try:
+        updated_conversation = conversations_collection.find_one_and_update(
+            update_filter,
+            mongo_update,
+            upsert=True,
+            return_document=ReturnDocument.AFTER
+        )
+    except DuplicateKeyError:
+        if idempotency_key and conversations_collection.find_one(
+            {"conversation_id": conversation_id, "applied_outbound_message_ids": idempotency_key},
+            {"_id": 1},
+        ):
+            return conversation_id
+        raise
 
     logger.success("Whatsapp conversation updated: org=...{} conversation=...{}", org_id[-6:], conversation_id[-6:])
 

@@ -27,12 +27,17 @@ from services.wa_service import create_or_update_whatsapp_conversation, store_wh
 from services.websocket_service import broadcast_org_admin_ws, broadcast_org_ws
 
 
-API_VERSION = "2026-07"
+API_VERSION = "2025-10"
 OAUTH_SCOPES = "read_orders,read_customers"
 ALLOWED_DELAYS = {15, 30, 60, 120, 240, 1440}
 SHOP_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 ACTIVE_REMINDERS = {"pending", "retryable", "sending", "provider_accepted"}
+PROVIDER_STARTED_REMINDERS = {"sending", "provider_accepted", "delivery_unknown", "sent"}
+RECONCILABLE_REMINDERS = {
+    "pending", "retryable", "historical", "permission_missing", "phone_missing",
+    "configuration_failure", "cancelled", "superseded", "opted_out",
+}
 TERMINAL_REMINDERS = {
     "sent", "converted", "cancelled", "delivery_unknown", "permission_missing",
     "phone_missing", "configuration_failure", "failed", "historical", "superseded", "opted_out",
@@ -68,11 +73,31 @@ query ShopifyCheckouts($first: Int!, $after: String, $query: String!, $sortKey: 
 }
 """
 
+CHECKOUT_NODE_QUERY = """
+query ShopifyCheckout($id: ID!) {
+  node(id: $id) {
+    ... on AbandonedCheckout {
+      id abandonedCheckoutUrl createdAt updatedAt completedAt
+      customer {
+        id firstName lastName
+        defaultPhoneNumber { phoneNumber }
+      }
+      shippingAddress { phone }
+      billingAddress { phone }
+      lineItems(first: 50) {
+        nodes { id title quantity originalTotalPriceSet { shopMoney { amount currencyCode } } }
+      }
+      totalPriceSet { shopMoney { amount currencyCode } }
+    }
+  }
+}
+"""
+
 ORDERS_QUERY = """
 query ShopifyOrders($first: Int!, $after: String, $query: String!, $sortKey: OrderSortKeys!) {
   orders(first: $first, after: $after, query: $query, sortKey: $sortKey) {
     nodes {
-      id name createdAt updatedAt cancelledAt cartToken checkoutToken
+      id name createdAt updatedAt cancelledAt
       displayFinancialStatus displayFulfillmentStatus
       customer {
         id firstName lastName
@@ -91,7 +116,7 @@ query ShopifyOrders($first: Int!, $after: String, $query: String!, $sortKey: Ord
 """
 
 WEBHOOK_CREATE_MUTATION = """
-mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: URL!) {
+mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: String!) {
   webhookSubscriptionCreate(topic: $topic, webhookSubscription: { uri: $uri, format: JSON }) {
     webhookSubscription { id topic }
     userErrors { field message }
@@ -119,6 +144,35 @@ def _parse_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+
+
+def _provider_time(document: dict) -> datetime:
+    return (
+        _parse_datetime(document.get("provider_updated_at"))
+        or _parse_datetime(document.get("updated_at"))
+        or _parse_datetime(document.get("provider_created_at"))
+        or _parse_datetime(document.get("created_at"))
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+
+def _provider_sort_key(document: dict) -> tuple[datetime, datetime, str]:
+    return (
+        _provider_time(document),
+        _parse_datetime(document.get("provider_created_at") or document.get("created_at"))
+        or datetime.min.replace(tzinfo=timezone.utc),
+        str(document.get("provider_id") or ""),
+    )
+
+
+def _reminder_due(provider_updated_at: Any, delay_minutes: int, frequency_after: Any = None) -> datetime:
+    due = (_parse_datetime(provider_updated_at) or utcnow()) + timedelta(minutes=delay_minutes)
+    frequency_due = _parse_datetime(frequency_after)
+    return max(due, frequency_due) if frequency_due else due
+
+
+def _sync_retry_at(failures: int, now: datetime | None = None) -> datetime:
+    return (now or utcnow()) + timedelta(minutes=min(2 ** max(failures - 1, 0), 30))
 
 
 def normalize_shop(value: str) -> str:
@@ -159,7 +213,7 @@ def _cancel_suppressed_shopify_reminders(org_id: str, phone_key: str, now: datet
             {"reminder_status": {"$in": ["pending", "retryable"]}},
             {"reminder_status": "sending", "provider_started_at": {"$exists": False}},
         ]},
-        {"$set": {"reminder_status": "opted_out", "failure_category": "customer_opt_out", "reminder_due_at": None, "updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        {"$set": {"reminder_status": "opted_out", "failure_category": "customer_opt_out", "reminder_due_at": None, "status_updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
     )
 
 
@@ -280,7 +334,8 @@ def _safe_document(document: dict | None, *, include_url: bool = False) -> dict 
     internal = {
         "_id", "access_token", "refresh_token", "claim_token", "claim_expires_at", "claimed_at",
         "customer_id", "checkout_token", "cart_token", "provider_message_id", "provider_started_at", "provider_accepted_at",
-        "provider_updated_at", "consent_updated_at", "attempts", "shop",
+        "consent_updated_at", "attempts", "pre_provider_attempts", "shop", "send_whatsapp_id", "send_phone_id",
+        "send_template_name", "send_template_language",
     }
     value = {key: item for key, item in document.items() if key not in internal}
     for key, item in list(value.items()):
@@ -297,6 +352,7 @@ async def ensure_shopify_indexes() -> None:
     await db.shopify_connections.create_index("shop", unique=True, sparse=True)
     await db.shopify_checkouts.create_index([("org_id", 1), ("provider_id", 1)], unique=True)
     await db.shopify_checkouts.create_index([("org_id", 1), ("phone", 1), ("updated_at", -1)])
+    await db.shopify_checkouts.create_index([("org_id", 1), ("phone", 1), ("provider_updated_at", -1), ("provider_id", -1)])
     await db.shopify_checkouts.create_index([("org_id", 1), ("checkout_token", 1)])
     await db.shopify_checkouts.create_index([("org_id", 1), ("updated_at", -1), ("provider_id", -1)])
     await db.shopify_checkouts.create_index([("org_id", 1), ("reminder_status", 1), ("updated_at", -1)])
@@ -304,6 +360,7 @@ async def ensure_shopify_indexes() -> None:
     await db.shopify_checkouts.create_index([("reminder_status", 1), ("reminder_due_at", 1)])
     await db.shopify_orders.create_index([("org_id", 1), ("provider_id", 1)], unique=True)
     await db.shopify_orders.create_index([("org_id", 1), ("phone", 1), ("created_at", -1)])
+    await db.shopify_orders.create_index([("org_id", 1), ("provider_updated_at", -1), ("provider_id", -1)])
     await db.shopify_orders.create_index([("org_id", 1), ("updated_at", -1), ("provider_id", -1)])
     await db.shopify_orders.create_index([("org_id", 1), ("payment_status", 1), ("updated_at", -1)])
     await db.shopify_orders.create_index([("shop", 1), ("provider_id", 1)])
@@ -393,7 +450,8 @@ async def complete_oauth(params: dict[str, str]) -> str:
         "access_token": _seal(token["access_token"]),
         "scopes": sorted(set(str(token.get("scope") or OAUTH_SCOPES).split(","))),
         "connected_by": state_doc["user_id"], "connected_at": now, "updated_at": now,
-        "sync_status": "pending", "sync_requested_at": now, "sync_full": True, "last_error": None,
+        "sync_status": "pending", "sync_requested_at": now, "sync_full": True,
+        "sync_error": None, "webhook_error": None, "reminder_error": None, "last_error": None,
     }
     if not existing or existing.get("status") == "disconnected":
         update.update({
@@ -448,27 +506,41 @@ async def _access_token(connection: dict) -> str:
 
 async def _graphql(connection: dict, query: str, variables: dict, *, timeout: float = 20) -> dict:
     headers = {"X-Shopify-Access-Token": await _access_token(connection), "Content-Type": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"https://{connection['shop']}/admin/api/{API_VERSION}/graphql.json",
-                headers=headers, json={"query": query, "variables": variables},
-            )
-        if response.status_code == 429:
-            retry = min(int(response.headers.get("Retry-After", "2") or 2), 30)
-            await asyncio.sleep(max(retry, 1))
-            raise HTTPException(status_code=503, detail="Shopify is busy; synchronization will resume")
-        response.raise_for_status()
-        payload = response.json()
-    except HTTPException:
-        raise
-    except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("Shopify GraphQL request failed: {}", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Shopify is temporarily unavailable") from exc
-    if payload.get("errors"):
-        logger.warning("Shopify GraphQL returned {} error(s)", len(payload["errors"]))
-        raise HTTPException(status_code=502, detail="Shopify could not complete the request")
-    return payload.get("data") or {}
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"https://{connection['shop']}/admin/api/{API_VERSION}/graphql.json",
+                    headers=headers, json={"query": query, "variables": variables},
+                )
+            if response.status_code == 429:
+                retry = min(int(response.headers.get("Retry-After", "2") or 2), 30)
+                if attempt < 2:
+                    await asyncio.sleep(max(retry, 1))
+                    continue
+                raise HTTPException(status_code=503, detail="Shopify is busy; synchronization will resume")
+            response.raise_for_status()
+            payload = response.json()
+        except HTTPException:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Shopify GraphQL request failed: {}", type(exc).__name__)
+            raise HTTPException(status_code=502, detail="Shopify is temporarily unavailable") from exc
+        errors = payload.get("errors") or []
+        throttled = errors and all(str((item.get("extensions") or {}).get("code") or "").upper() == "THROTTLED" for item in errors)
+        if throttled and attempt < 2:
+            cost = (payload.get("extensions") or {}).get("cost") or {}
+            throttle = cost.get("throttleStatus") or {}
+            requested = float(cost.get("requestedQueryCost") or cost.get("actualQueryCost") or 1)
+            available = float(throttle.get("currentlyAvailable") or 0)
+            restore = max(float(throttle.get("restoreRate") or 1), 1)
+            await asyncio.sleep(min(max((requested - available) / restore, 1), 30))
+            continue
+        if errors:
+            logger.warning("Shopify GraphQL returned {} error(s)", len(errors))
+            raise HTTPException(status_code=503 if throttled else 502, detail="Shopify could not complete the request")
+        return payload.get("data") or {}
+    raise HTTPException(status_code=503, detail="Shopify is busy; synchronization will resume")
 
 
 async def _register_webhooks(connection: dict) -> None:
@@ -486,11 +558,13 @@ async def _register_webhooks(connection: dict) -> None:
 
     failures = sum(await asyncio.gather(*(register(topic) for topic in WEBHOOK_TOPICS)))
     if failures:
-        await db.shopify_connections.update_one({"org_id": connection["org_id"]}, {"$set": {"last_error": "Some Shopify webhooks require attention", "updated_at": utcnow()}})
+        await db.shopify_connections.update_one({"org_id": connection["org_id"]}, {"$set": {"webhook_error": "Some Shopify webhooks require attention", "updated_at": utcnow()}})
         await _admin_warning(connection["org_id"], "webhook_configuration")
+    else:
+        await db.shopify_connections.update_one({"org_id": connection["org_id"]}, {"$set": {"webhook_error": None, "updated_at": utcnow()}})
 
 
-def _checkout_from_graphql(org_id: str, shop: str, node: dict, historical: bool) -> dict:
+def _checkout_from_graphql(org_id: str, shop: str, node: dict, historical: bool, delay_minutes: int = 30) -> dict:
     customer = node.get("customer") or {}
     phone, consent, consent_at = _record_phone_and_consent(
         customer, node.get("shippingAddress"), node.get("billingAddress"),
@@ -499,6 +573,7 @@ def _checkout_from_graphql(org_id: str, shop: str, node: dict, historical: bool)
     for item in ((node.get("lineItems") or {}).get("nodes") or []):
         items.append({"id": item.get("id"), "name": item.get("title") or "Product", "quantity": int(item.get("quantity") or 0), "total": _money(item.get("originalTotalPriceSet"))})
     updated = _parse_datetime(node.get("updatedAt")) or utcnow()
+    created = _parse_datetime(node.get("createdAt")) or updated
     recovery_url = str(node.get("abandonedCheckoutUrl") or "")
     token_match = re.search(r"/([^/?]+)/recover(?:[/?]|$)", recovery_url)
     return {
@@ -508,11 +583,12 @@ def _checkout_from_graphql(org_id: str, shop: str, node: dict, historical: bool)
         "whatsapp_consent": consent, "consent_updated_at": consent_at,
         "products": items, "total": _money(node.get("totalPriceSet")),
         "recovery_url": recovery_url,
-        "created_at": _parse_datetime(node.get("createdAt")) or updated,
+        "created_at": created, "provider_created_at": created,
         "updated_at": updated, "provider_updated_at": updated, "completed_at": _parse_datetime(node.get("completedAt")),
         "record_status": "converted" if node.get("completedAt") else "abandoned",
-        "reminder_status": "historical" if historical else _eligibility_status(phone, items),
-        "reminder_due_at": None if historical else updated + timedelta(minutes=30),
+        "reminder_status": "converted" if node.get("completedAt") else ("historical" if historical else _eligibility_status(phone, items)),
+        "reminder_due_at": None if historical or node.get("completedAt") else _reminder_due(updated, delay_minutes),
+        "status_updated_at": utcnow(),
     }
 
 
@@ -525,16 +601,17 @@ def _order_from_graphql(org_id: str, shop: str, node: dict) -> dict:
     for item in ((node.get("lineItems") or {}).get("nodes") or []):
         items.append({"id": item.get("id"), "name": item.get("name") or "Product", "quantity": int(item.get("quantity") or 0), "total": _money(item.get("originalTotalSet"))})
     provider_id = str(node.get("id"))
+    created = _parse_datetime(node.get("createdAt")) or utcnow()
+    updated = _parse_datetime(node.get("updatedAt")) or created
     return {
         "org_id": org_id, "shop": shop, "provider_id": provider_id, "order_number": node.get("name") or "",
         "order_url": f"https://{shop}/admin/orders/{provider_id.rsplit('/', 1)[-1]}",
-        "cart_token": node.get("cartToken") or "", "checkout_token": node.get("checkoutToken") or "",
         "customer_id": customer.get("id"), "customer_name": _name(customer), "phone": phone,
         "products": items, "total": _money(node.get("totalPriceSet")),
         "payment_status": node.get("displayFinancialStatus") or "", "fulfillment_status": node.get("displayFulfillmentStatus") or "",
-        "cancelled_at": _parse_datetime(node.get("cancelledAt")), "created_at": _parse_datetime(node.get("createdAt")) or utcnow(),
-        "updated_at": _parse_datetime(node.get("updatedAt")) or utcnow(),
-        "provider_updated_at": _parse_datetime(node.get("updatedAt")) or utcnow(),
+        "cancelled_at": _parse_datetime(node.get("cancelledAt")), "record_status": "active",
+        "created_at": created, "provider_created_at": created,
+        "updated_at": updated, "provider_updated_at": updated, "status_updated_at": utcnow(),
     }
 
 
@@ -550,12 +627,23 @@ async def request_sync(org_id: str) -> None:
     connection = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected"})
     if not connection:
         raise HTTPException(status_code=404, detail="Connect Shopify before synchronizing")
+    if connection.get("sync_status") == "syncing" and (_parse_datetime(connection.get("sync_claimed_at")) or utcnow()) > utcnow() - timedelta(minutes=CLAIM_LEASE_MINUTES):
+        await db.shopify_connections.update_one(
+            {"org_id": org_id, "status": "connected", "sync_status": "syncing"},
+            {"$set": {"resync_requested": True, "sync_error": None, "updated_at": utcnow()}},
+        )
+        return
     result = await db.shopify_connections.update_one(
-        {"org_id": org_id, "status": "connected"},
-        {"$set": {"sync_status": "pending", "sync_requested_at": utcnow(), "sync_full": True, "sync_cursor": {}, "import_counts": {"checkouts": 0, "orders": 0}, "last_error": None, "updated_at": utcnow()}},
+        {"org_id": org_id, "status": "connected", "$or": [{"sync_status": {"$ne": "syncing"}}, {"sync_claimed_at": {"$lte": utcnow() - timedelta(minutes=CLAIM_LEASE_MINUTES)}}]},
+        {"$set": {"sync_status": "pending", "sync_requested_at": utcnow(), "sync_full": True, "sync_cursor": {}, "sync_completed_resources": [], "import_counts": {"checkouts": 0, "orders": 0}, "sync_error": None, "sync_failures": 0, "updated_at": utcnow()}, "$unset": {"sync_cutoff_at": "", "sync_filter_field": "", "next_sync_attempt_at": ""}},
     )
     if not result.matched_count:
-        raise HTTPException(status_code=404, detail="Connect Shopify before synchronizing")
+        queued = await db.shopify_connections.update_one(
+            {"org_id": org_id, "status": "connected", "sync_status": "syncing"},
+            {"$set": {"resync_requested": True, "sync_error": None, "updated_at": utcnow()}},
+        )
+        if not queued.matched_count:
+            raise HTTPException(status_code=404, detail="Connect Shopify before synchronizing")
     await _register_webhooks(connection)
     await _commerce_event(org_id, "sync", org_id)
 
@@ -563,7 +651,7 @@ async def request_sync(org_id: str) -> None:
 async def _upsert_newer(collection, key: dict, fields: dict, *, on_insert: dict | None = None) -> bool:
     provider_time = fields.get("provider_updated_at") or utcnow()
     result = await collection.update_one(
-        {**key, "$or": [{"provider_updated_at": {"$lte": provider_time}}, {"provider_updated_at": {"$exists": False}}]},
+        {**key, "$or": [{"provider_updated_at": {"$lt": provider_time}}, {"provider_updated_at": {"$exists": False}}]},
         {"$set": fields},
     )
     if result.matched_count:
@@ -577,28 +665,149 @@ async def _upsert_newer(collection, key: dict, fields: dict, *, on_insert: dict 
         return False
 
 
+def _delivery_started(checkout: dict) -> bool:
+    return bool(checkout.get("provider_started_at") or checkout.get("reminder_status") in PROVIDER_STARTED_REMINDERS)
+
+
+async def _configuration_ready(connection: dict) -> bool:
+    if not (
+        connection.get("status") == "connected"
+        and connection.get("automation_enabled")
+        and connection.get("whatsapp_id")
+        and connection.get("template_name")
+        and connection.get("template_status") == "APPROVED"
+    ):
+        return False
+    return bool(await db.whatsapp_connections.find_one(
+        {"org_id": connection["org_id"], "wa_id": connection["whatsapp_id"], "is_active": {"$ne": False}},
+        {"_id": 1},
+    ))
+
+
+async def _reconcile_phone_checkouts(org_id: str, phone: str, connection: dict, *, configured: bool | None = None) -> None:
+    if not phone:
+        return
+    latest = await db.shopify_checkouts.find_one(
+        {"org_id": org_id, "phone": phone},
+        sort=[("provider_updated_at", -1), ("provider_created_at", -1), ("provider_id", -1)],
+    )
+    if not latest:
+        return
+    now = utcnow()
+    await db.shopify_checkouts.update_many(
+        {
+            "org_id": org_id, "phone": phone, "_id": {"$ne": latest["_id"]},
+            "reminder_status": {"$in": list(RECONCILABLE_REMINDERS)},
+            "provider_started_at": {"$exists": False},
+        },
+        {"$set": {"reminder_status": "superseded", "failure_category": "newer_checkout", "reminder_due_at": None, "status_updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+    )
+    if _delivery_started(latest) or latest.get("reminder_status") not in RECONCILABLE_REMINDERS:
+        return
+    status = "pending"
+    reason = None
+    activation = _parse_datetime(connection.get("automation_enabled_at"))
+    if latest.get("record_status") == "converted" or latest.get("completed_at"):
+        status, reason = "converted", "order_created"
+    elif latest.get("record_status") == "deleted" or not latest.get("products"):
+        status, reason = "cancelled", "checkout_unavailable"
+    elif not normalize_phone(latest.get("phone")):
+        status, reason = "phone_missing", "phone_missing"
+    elif await _is_whatsapp_suppressed(org_id, phone):
+        status, reason = "opted_out", "customer_opt_out"
+    elif not connection.get("automation_enabled"):
+        status, reason = "cancelled", "automation_disabled"
+    elif not activation or _provider_time(latest) < activation:
+        status, reason = "historical", "before_automation_activation"
+    elif not (configured if configured is not None else await _configuration_ready(connection)):
+        status, reason = "configuration_failure", "whatsapp_or_template_unavailable"
+    due = None
+    if status == "pending":
+        prior = await db.shopify_checkouts.find_one(
+            {"org_id": org_id, "phone": phone, "_id": {"$ne": latest["_id"]}, "reminder_status": {"$in": ["sent", "delivery_unknown"]}, "provider_started_at": {"$exists": True}},
+            {"provider_started_at": 1}, sort=[("provider_started_at", -1)],
+        )
+        frequency_after = (_parse_datetime((prior or {}).get("provider_started_at")) + timedelta(hours=24)) if prior and _parse_datetime(prior.get("provider_started_at")) else None
+        due = _reminder_due(_provider_time(latest), int(connection.get("reminder_delay_minutes") or 30), frequency_after)
+        if frequency_after and frequency_after > now:
+            reason = "phone_frequency_cap"
+    update = {"reminder_status": status, "reminder_due_at": due, "status_updated_at": now}
+    if reason:
+        update["failure_category"] = reason
+        unset = {"claim_token": "", "claim_expires_at": ""}
+    else:
+        unset = {"claim_token": "", "claim_expires_at": "", "failure_category": ""}
+    await db.shopify_checkouts.update_one(
+        {"_id": latest["_id"], "provider_started_at": {"$exists": False}, "reminder_status": {"$in": list(RECONCILABLE_REMINDERS)}},
+        {"$set": update, "$unset": unset},
+    )
+
+
+async def _repair_org_checkout_states(org_id: str, connection: dict | None = None, phones: set[str] | None = None) -> None:
+    connection = connection or await db.shopify_connections.find_one({"org_id": org_id})
+    if not connection:
+        return
+    configured = await _configuration_ready(connection)
+    phone_values = phones if phones is not None else set(await db.shopify_checkouts.distinct("phone", {"org_id": org_id, "phone": {"$ne": ""}}))
+    for phone in phone_values:
+        await _reconcile_phone_checkouts(org_id, phone, connection, configured=configured)
+    await db.shopify_checkouts.update_many(
+        {"org_id": org_id, "phone": "", "record_status": "abandoned", "reminder_status": {"$in": list(RECONCILABLE_REMINDERS)}, "provider_started_at": {"$exists": False}},
+        {"$set": {"reminder_status": "phone_missing", "failure_category": "phone_missing", "reminder_due_at": None, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+    )
+
+
+async def _mark_order_conversion(org_id: str, order: dict) -> set[str]:
+    tokens = [value for value in {order.get("cart_token"), order.get("checkout_token")} if value]
+    if not tokens:
+        return set()
+    query = {"org_id": org_id, "checkout_token": {"$in": tokens}}
+    affected = set(await db.shopify_checkouts.distinct("phone", query))
+    now = utcnow()
+    await db.shopify_checkouts.update_many(
+        {**query, "$or": [
+            {"reminder_status": {"$in": ["pending", "retryable"]}},
+            {"reminder_status": "sending", "provider_started_at": {"$exists": False}},
+        ]},
+        {"$set": {"record_status": "converted", "reminder_status": "converted", "failure_category": "order_created", "converted_order_id": order["provider_id"], "reminder_due_at": None, "status_updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+    )
+    await db.shopify_checkouts.update_many(
+        {**query, "reminder_status": {"$in": ["sending", "provider_accepted", "delivery_unknown", "sent"]}},
+        {"$set": {"record_status": "converted", "converted_order_id": order["provider_id"], "status_updated_at": now}},
+    )
+    return {phone for phone in affected if phone}
+
+
 async def sync_shopify_org(org_id: str) -> None:
     token = secrets.token_urlsafe(16)
     lease_before = utcnow() - timedelta(minutes=CLAIM_LEASE_MINUTES)
     connection = await db.shopify_connections.find_one_and_update(
-        {"org_id": org_id, "status": "connected", "sync_status": {"$in": ["pending", "failed", "syncing"]}, "$or": [{"sync_claimed_at": {"$lt": lease_before}}, {"sync_claimed_at": None}, {"sync_status": {"$ne": "syncing"}}]},
-        {"$set": {"sync_status": "syncing", "sync_claim_token": token, "sync_claimed_at": utcnow(), "last_error": None}},
+        {"org_id": org_id, "status": "connected", "sync_status": {"$in": ["pending", "failed", "syncing"]}, "next_sync_attempt_at": {"$not": {"$gt": utcnow()}}, "$or": [{"sync_claimed_at": {"$lt": lease_before}}, {"sync_claimed_at": None}, {"sync_status": {"$ne": "syncing"}}]},
+        {"$set": {"sync_status": "syncing", "sync_claim_token": token, "sync_claimed_at": utcnow(), "sync_error": None}},
         return_document=ReturnDocument.AFTER,
     )
     if not connection:
         return
     full_sync = bool(connection.get("sync_full"))
     last_sync = _parse_datetime(connection.get("last_sync_at"))
-    cutoff_time = utcnow() - timedelta(days=60) if full_sync or not last_sync else last_sync - timedelta(minutes=10)
+    cutoff_time = _parse_datetime(connection.get("sync_cutoff_at")) or (utcnow() - timedelta(days=60) if full_sync or not last_sync else last_sync - timedelta(minutes=10))
     cutoff = cutoff_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-    cursor_state: dict[str, Any] = {}
-    counts = {"checkouts": 0, "orders": 0}
+    cursor_state: dict[str, Any] = dict(connection.get("sync_cursor") or {})
+    completed = set(connection.get("sync_completed_resources") or [])
+    counts = dict(connection.get("import_counts") or {"checkouts": 0, "orders": 0})
     activation = _parse_datetime(connection.get("automation_enabled_at") or connection.get("connected_at"))
-    filter_field = "created_at" if full_sync or not last_sync else "updated_at"
-    sort_key = "CREATED_AT" if filter_field == "created_at" else "UPDATED_AT"
+    filter_field = str(connection.get("sync_filter_field") or ("created_at" if full_sync or not last_sync else "updated_at"))
+    touched_phones: set[str] = set()
+    await db.shopify_connections.update_one(
+        {"org_id": org_id, "sync_claim_token": token},
+        {"$set": {"sync_cutoff_at": cutoff_time, "sync_filter_field": filter_field}},
+    )
     try:
         for kind, query, root in (("checkouts", CHECKOUTS_QUERY, "abandonedCheckouts"), ("orders", ORDERS_QUERY, "orders")):
+            if kind in completed:
+                continue
             cursor = cursor_state.get(kind)
+            sort_key = "CREATED_AT" if kind == "checkouts" or filter_field == "created_at" else "UPDATED_AT"
             while True:
                 data = await _graphql(connection, query, {"first": 50, "after": cursor, "query": f"{filter_field}:>={cutoff}", "sortKey": sort_key}, timeout=30)
                 page = data.get(root) or {}
@@ -607,9 +816,16 @@ async def sync_shopify_org(org_id: str) -> None:
                     if kind == "checkouts":
                         updated = _parse_datetime(node.get("updatedAt")) or utcnow()
                         historical = not (connection.get("automation_enabled") and activation and updated >= activation)
-                        document = _checkout_from_graphql(org_id, connection["shop"], node, historical=historical)
+                        document = _checkout_from_graphql(org_id, connection["shop"], node, historical=historical, delay_minutes=int(connection.get("reminder_delay_minutes") or 30))
                         if not any(document.get(field) for field in ("customer_id", "phone", "customer_name")):
                             continue
+                        existing = await db.shopify_checkouts.find_one(
+                            {"org_id": org_id, "provider_id": document["provider_id"]}, {"phone": 1},
+                        )
+                        if existing and existing.get("phone"):
+                            touched_phones.add(existing["phone"])
+                        if document.get("phone"):
+                            touched_phones.add(document["phone"])
                         reminder_status = document.pop("reminder_status")
                         reminder_due_at = document.pop("reminder_due_at")
                         await _upsert_newer(
@@ -618,34 +834,44 @@ async def sync_shopify_org(org_id: str) -> None:
                             document,
                             on_insert={"reminder_status": reminder_status, "reminder_due_at": reminder_due_at, "imported_at": utcnow()},
                         )
-                        if not historical:
-                            await db.shopify_checkouts.update_one(
-                                {"org_id": org_id, "provider_id": document["provider_id"], "record_status": "abandoned", "reminder_status": {"$in": ["historical", "permission_missing", "cancelled"]}},
-                                {"$set": {"reminder_status": _eligibility_status(document.get("phone", ""), document.get("products") or []), "reminder_due_at": updated + timedelta(minutes=int(connection.get("reminder_delay_minutes") or 30)), "updated_at": updated}},
-                            )
                     else:
                         document = _order_from_graphql(org_id, connection["shop"], node)
                         await _upsert_newer(db.shopify_orders, {"org_id": org_id, "provider_id": document["provider_id"]}, document, on_insert={"imported_at": utcnow()})
+                        touched_phones.update(await _mark_order_conversion(org_id, document))
                     counts[kind] = counts.get(kind, 0) + 1
                 info = page.get("pageInfo") or {}
                 cursor = info.get("endCursor")
                 cursor_state[kind] = cursor
                 await db.shopify_connections.update_one({"org_id": org_id, "sync_claim_token": token}, {"$set": {"sync_cursor": cursor_state, "import_counts": counts, "sync_claimed_at": utcnow()}})
                 if not info.get("hasNextPage"):
+                    completed.add(kind)
+                    await db.shopify_connections.update_one(
+                        {"org_id": org_id, "sync_claim_token": token},
+                        {"$set": {"sync_completed_resources": sorted(completed), "sync_claimed_at": utcnow()}},
+                    )
                     break
+        if connection.get("whatsapp_id") and connection.get("template_name"):
+            await list_compatible_templates(org_id, connection["whatsapp_id"])
+            connection = await db.shopify_connections.find_one({"org_id": org_id, "sync_claim_token": token}) or connection
+        await _repair_org_checkout_states(org_id, connection, None if full_sync else touched_phones)
         counts = {
             "checkouts": await db.shopify_checkouts.count_documents({"org_id": org_id}),
             "orders": await db.shopify_orders.count_documents({"org_id": org_id}),
         }
         await db.shopify_connections.update_one(
             {"org_id": org_id, "sync_claim_token": token},
-            {"$set": {"sync_status": "complete", "last_sync_at": utcnow(), "last_error": None, "import_counts": counts, "updated_at": utcnow()}, "$unset": {"sync_claim_token": "", "sync_claimed_at": "", "sync_full": ""}},
+            {"$set": {"sync_status": "complete", "last_sync_at": utcnow(), "sync_error": None, "sync_failures": 0, "last_error": None, "import_counts": counts, "updated_at": utcnow()}, "$unset": {"sync_claim_token": "", "sync_claimed_at": "", "sync_full": "", "sync_cursor": "", "sync_cutoff_at": "", "sync_filter_field": "", "sync_completed_resources": "", "next_sync_attempt_at": ""}},
+        )
+        await db.shopify_connections.update_one(
+            {"org_id": org_id, "sync_status": "complete", "resync_requested": True},
+            {"$set": {"sync_status": "pending", "sync_full": True, "sync_requested_at": utcnow(), "sync_cursor": {}, "sync_completed_resources": [], "import_counts": {"checkouts": 0, "orders": 0}}, "$unset": {"resync_requested": ""}},
         )
     except Exception as exc:
         logger.warning("Shopify sync failed for org suffix {}: {}", org_id[-6:], type(exc).__name__)
+        failures = int(connection.get("sync_failures") or 0) + 1
         await db.shopify_connections.update_one(
             {"org_id": org_id, "sync_claim_token": token},
-            {"$set": {"sync_status": "failed", "last_error": "Shopify sync paused and will resume automatically", "updated_at": utcnow()}, "$unset": {"sync_claim_token": "", "sync_claimed_at": ""}},
+            {"$set": {"sync_status": "failed", "sync_error": "Shopify sync paused and will resume automatically", "sync_failures": failures, "next_sync_attempt_at": _sync_retry_at(failures), "updated_at": utcnow()}, "$unset": {"sync_claim_token": "", "sync_claimed_at": ""}},
         )
         await _admin_warning(org_id, "sync_failed")
     await _commerce_event(org_id, "sync", org_id)
@@ -654,9 +880,12 @@ async def sync_shopify_org(org_id: str) -> None:
 async def process_shopify_syncs() -> None:
     await db.shopify_connections.update_many(
         {"status": "connected", "sync_status": "complete", "last_sync_at": {"$lte": utcnow() - timedelta(minutes=5)}},
-        {"$set": {"sync_status": "pending", "sync_full": False, "sync_requested_at": utcnow()}},
+        {"$set": {"sync_status": "pending", "sync_full": False, "sync_requested_at": utcnow(), "sync_cursor": {}, "sync_completed_resources": []}, "$unset": {"sync_cutoff_at": "", "sync_filter_field": "", "next_sync_attempt_at": ""}},
     )
-    cursor = db.shopify_connections.find({"status": "connected", "sync_status": {"$in": ["pending", "failed", "syncing"]}}, {"org_id": 1}).limit(5)
+    cursor = db.shopify_connections.find(
+        {"status": "connected", "sync_status": {"$in": ["pending", "failed", "syncing"]}, "next_sync_attempt_at": {"$not": {"$gt": utcnow()}}},
+        {"org_id": 1},
+    ).sort([("next_sync_attempt_at", 1), ("sync_requested_at", 1)]).limit(5)
     async for item in cursor:
         await sync_shopify_org(item["org_id"])
 
@@ -711,7 +940,8 @@ async def process_webhook(raw_body: bytes, headers: dict[str, str]) -> str:
                 {"$set": {"status": "processed", "processed_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
             )
             return "ignored"
-        await _apply_webhook(connection, topic, payload)
+        event_time = _parse_datetime(headers.get("x-shopify-triggered-at")) or _parse_datetime(payload.get("updated_at")) or now
+        await _apply_webhook(connection, topic, payload, event_time)
         completed = await db.shopify_webhook_receipts.update_one(
             {"shop": shop, "webhook_id": webhook_id, "claim_token": claim_token},
             {"$set": {"status": "processed", "processed_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
@@ -724,7 +954,7 @@ async def process_webhook(raw_body: bytes, headers: dict[str, str]) -> str:
         raise
 
 
-async def _apply_webhook(connection: dict, topic: str, payload: dict) -> None:
+async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time: datetime) -> None:
     org_id = connection["org_id"]
     if topic == "app/uninstalled":
         await disconnect_shopify(org_id, provider_uninstall=True)
@@ -742,25 +972,19 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict) -> None:
     if topic.startswith("orders/"):
         if topic.endswith("delete"):
             provider_id = _provider_gid("Order", payload.get("admin_graphql_api_id") or payload.get("id"))
-            await db.shopify_orders.delete_one({"org_id": org_id, "provider_id": provider_id})
+            await _upsert_newer(
+                db.shopify_orders,
+                {"org_id": org_id, "provider_id": provider_id},
+                {"shop": connection["shop"], "record_status": "deleted", "provider_updated_at": event_time, "updated_at": event_time, "status_updated_at": utcnow()},
+                on_insert={"created_at": event_time, "provider_created_at": event_time},
+            )
             await _commerce_event(org_id, "order", provider_id)
             return
         order = _order_from_webhook(org_id, connection["shop"], payload)
         await _upsert_newer(db.shopify_orders, {"org_id": org_id, "provider_id": order["provider_id"]}, order)
-        match = {"org_id": org_id, "reminder_status": {"$in": list(ACTIVE_REMINDERS)}}
-        tokens = [value for value in {order.get("cart_token"), order.get("checkout_token"), payload.get("checkout_token")} if value]
-        if tokens:
-            match["checkout_token"] = {"$in": tokens}
-        else:
-            match["provider_id"] = "__none__"
-        await db.shopify_checkouts.update_many(
-            {**match, "$or": [
-                {"reminder_status": {"$in": ["pending", "retryable"]}},
-                {"reminder_status": "sending", "provider_started_at": {"$exists": False}},
-            ]},
-            {"$set": {"record_status": "converted", "reminder_status": "converted", "converted_order_id": order["provider_id"], "updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
-        )
-        await db.shopify_checkouts.update_many(match, {"$set": {"record_status": "converted", "converted_order_id": order["provider_id"], "updated_at": utcnow()}})
+        touched = await _mark_order_conversion(org_id, order)
+        if touched:
+            await _repair_org_checkout_states(org_id, connection, touched)
         await _commerce_event(org_id, "order", order["provider_id"])
         return
     if topic.startswith("checkouts/"):
@@ -770,10 +994,17 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict) -> None:
             identifiers = [{"provider_id": provider_id}]
             if checkout_token:
                 identifiers.append({"checkout_token": checkout_token})
-            await db.shopify_checkouts.update_one(
-                {"org_id": org_id, "$or": identifiers},
-                {"$set": {"record_status": "deleted", "reminder_status": "cancelled", "updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+            deleted = await db.shopify_checkouts.find_one_and_update(
+                {"org_id": org_id, "$or": identifiers, "provider_started_at": {"$exists": False}, "reminder_status": {"$nin": ["provider_accepted", "delivery_unknown", "sent"]}, "$and": [{"$or": [{"provider_updated_at": {"$lte": event_time}}, {"provider_updated_at": {"$exists": False}}]}]},
+                {"$set": {"record_status": "deleted", "reminder_status": "cancelled", "failure_category": "checkout_deleted", "reminder_due_at": None, "updated_at": event_time, "provider_updated_at": event_time, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+                return_document=ReturnDocument.AFTER,
             )
+            await db.shopify_checkouts.update_one(
+                {"org_id": org_id, "$and": [{"$or": identifiers}, {"$or": [{"provider_started_at": {"$exists": True}}, {"reminder_status": {"$in": ["provider_accepted", "delivery_unknown", "sent"]}}]}, {"$or": [{"provider_updated_at": {"$lte": event_time}}, {"provider_updated_at": {"$exists": False}}]}]},
+                {"$set": {"record_status": "deleted", "updated_at": event_time, "provider_updated_at": event_time, "status_updated_at": utcnow()}},
+            )
+            if deleted and deleted.get("phone"):
+                await _reconcile_phone_checkouts(org_id, deleted["phone"], connection)
         else:
             checkout = _checkout_from_webhook(org_id, connection["shop"], payload, connection)
             if not any(checkout.get(field) for field in ("customer_id", "phone", "customer_name")):
@@ -785,10 +1016,13 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict) -> None:
                 if imported:
                     checkout["provider_id"] = imported["provider_id"]
             key = {"org_id": org_id, "provider_id": checkout["provider_id"]}
+            existing = await db.shopify_checkouts.find_one(key, {"phone": 1})
+            existing_phone = (existing or {}).get("phone")
             provider_time = checkout["provider_updated_at"]
             update = await db.shopify_checkouts.update_one(
                 {
                     **key,
+                    "record_status": {"$ne": "deleted"},
                     "reminder_status": {"$nin": ["sent", "provider_accepted", "delivery_unknown", "converted"]},
                     "$nor": [{"reminder_status": "sending", "provider_started_at": {"$exists": True}}],
                     "$or": [{"provider_updated_at": {"$lte": provider_time}}, {"provider_updated_at": {"$exists": False}}],
@@ -798,20 +1032,27 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict) -> None:
             if not update.matched_count:
                 existing = await db.shopify_checkouts.find_one(key, {"_id": 1})
                 if existing:
-                    provider_fields = {key: value for key, value in checkout.items() if key not in {"reminder_status", "reminder_due_at"}}
+                    provider_fields = {key: value for key, value in checkout.items() if key not in {"reminder_status", "reminder_due_at", "record_status", "completed_at"}}
+                    if checkout.get("record_status") == "converted":
+                        provider_fields.update({"record_status": "converted", "completed_at": checkout.get("completed_at")})
                     await _upsert_newer(db.shopify_checkouts, key, provider_fields)
                 else:
                     try:
                         await db.shopify_checkouts.insert_one(checkout)
                     except DuplicateKeyError:
                         pass
+            phones = {value for value in (existing_phone, checkout.get("phone")) if value}
+            for phone in phones:
+                await _reconcile_phone_checkouts(org_id, phone, connection)
         await _commerce_event(org_id, "checkout", provider_id)
         return
     if topic.startswith("customers/") or topic.startswith("customers_"):
         customer_id = _provider_gid("Customer", payload.get("admin_graphql_api_id") or payload.get("customer_id") or payload.get("id"))
+        affected = set(await db.shopify_checkouts.distinct("phone", {"org_id": org_id, "customer_id": customer_id}))
         phone, consent, consent_at = _phone_and_consent(payload)
         consent_event = "whatsapp_marketing_consent" in topic or "whats_app_marketing_consent" in payload
-        update = {"updated_at": utcnow()}
+        customer_updated = _parse_datetime(payload.get("updated_at")) or utcnow()
+        update = {"customer_updated_at": customer_updated, "status_updated_at": utcnow()}
         if phone:
             update["phone"] = phone
         customer_name = _name(payload)
@@ -823,7 +1064,10 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict) -> None:
         if consent_event and consent_at:
             consent_filter["$or"] = [{"consent_updated_at": {"$lte": consent_at}}, {"consent_updated_at": {"$exists": False}}]
         await db.shopify_checkouts.update_many(consent_filter, {"$set": update})
-        await db.shopify_orders.update_many({"org_id": org_id, "customer_id": customer_id}, {"$set": {key: value for key, value in update.items() if key in {"phone", "customer_name", "updated_at"}}})
+        await db.shopify_orders.update_many({"org_id": org_id, "customer_id": customer_id}, {"$set": {key: value for key, value in update.items() if key in {"phone", "customer_name", "customer_updated_at", "status_updated_at"}}})
+        if phone:
+            affected.add(phone)
+        await _repair_org_checkout_states(org_id, connection, {value for value in affected if value})
         await _commerce_event(org_id, "customer", customer_id)
 
 
@@ -845,7 +1089,8 @@ def _checkout_from_webhook(org_id: str, shop: str, payload: dict, connection: di
         items.append({"id": str(item.get("admin_graphql_api_id") or item.get("id") or ""), "name": item.get("title") or item.get("name") or "Product", "quantity": int(item.get("quantity") or 0), "total": {"amount": float(item.get("line_price") or item.get("price") or 0), "currency": payload.get("currency") or ""}})
     updated = _parse_datetime(payload.get("updated_at")) or utcnow()
     customer_id = _provider_gid("Customer", customer.get("admin_graphql_api_id") or customer.get("id")) if customer.get("id") or customer.get("admin_graphql_api_id") else ""
-    status = _eligibility_status(phone, items) if connection.get("automation_enabled") else "cancelled"
+    activation = _parse_datetime(connection.get("automation_enabled_at"))
+    status = _eligibility_status(phone, items) if connection.get("automation_enabled") and activation and updated >= activation else ("cancelled" if not connection.get("automation_enabled") else "historical")
     if payload.get("completed_at"):
         status = "converted"
     return {
@@ -857,10 +1102,10 @@ def _checkout_from_webhook(org_id: str, shop: str, payload: dict, connection: di
         "phone": phone, "whatsapp_consent": consent, "consent_updated_at": consent_at,
         "products": items, "total": {"amount": float(payload.get("total_price") or 0), "currency": payload.get("currency") or ""},
         "recovery_url": payload.get("abandoned_checkout_url") or payload.get("web_url") or "",
-        "created_at": _parse_datetime(payload.get("created_at")) or updated, "updated_at": updated,
-        "provider_updated_at": updated,
+        "created_at": _parse_datetime(payload.get("created_at")) or updated, "provider_created_at": _parse_datetime(payload.get("created_at")) or updated,
+        "updated_at": updated, "provider_updated_at": updated, "status_updated_at": utcnow(),
         "completed_at": _parse_datetime(payload.get("completed_at")), "record_status": "converted" if payload.get("completed_at") else "abandoned",
-        "reminder_status": status, "reminder_due_at": None if status != "pending" else updated + timedelta(minutes=int(connection.get("reminder_delay_minutes") or 30)),
+        "reminder_status": status, "reminder_due_at": None if status != "pending" else _reminder_due(updated, int(connection.get("reminder_delay_minutes") or 30)),
     }
 
 
@@ -874,6 +1119,8 @@ def _order_from_webhook(org_id: str, shop: str, payload: dict) -> dict:
     )
     items = [{"id": str(item.get("admin_graphql_api_id") or item.get("id") or ""), "name": item.get("name") or item.get("title") or "Product", "quantity": int(item.get("quantity") or 0), "total": {"amount": float(item.get("price") or 0) * int(item.get("quantity") or 0), "currency": payload.get("currency") or ""}} for item in payload.get("line_items") or []]
     provider_id = _provider_gid("Order", payload.get("admin_graphql_api_id") or payload.get("id"))
+    created = _parse_datetime(payload.get("created_at")) or utcnow()
+    updated = _parse_datetime(payload.get("updated_at")) or created
     return {
         "org_id": org_id, "shop": shop, "provider_id": provider_id,
         "order_url": f"https://{shop}/admin/orders/{provider_id.rsplit('/', 1)[-1]}",
@@ -883,8 +1130,9 @@ def _order_from_webhook(org_id: str, shop: str, payload: dict) -> dict:
         "customer_name": " ".join(part for part in (customer.get("first_name") or address.get("first_name"), customer.get("last_name") or address.get("last_name")) if part).strip(),
         "phone": phone, "products": items, "total": {"amount": float(payload.get("total_price") or 0), "currency": payload.get("currency") or ""},
         "payment_status": str(payload.get("financial_status") or "").upper(), "fulfillment_status": str(payload.get("fulfillment_status") or "UNFULFILLED").upper(),
-        "cancelled_at": _parse_datetime(payload.get("cancelled_at")), "created_at": _parse_datetime(payload.get("created_at")) or utcnow(), "updated_at": _parse_datetime(payload.get("updated_at")) or utcnow(),
-        "provider_updated_at": _parse_datetime(payload.get("updated_at")) or utcnow(),
+        "cancelled_at": _parse_datetime(payload.get("cancelled_at")), "record_status": "active",
+        "created_at": created, "provider_created_at": created,
+        "updated_at": updated, "provider_updated_at": updated, "status_updated_at": utcnow(),
     }
 
 
@@ -898,13 +1146,14 @@ async def get_connection(org_id: str) -> dict:
         return {"connected": False, "configured": bool(SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET and SHOPIFY_PUBLIC_BASE_URL), "whatsapp_connections": whatsapp_connections}
     safe = {key: connection.get(key) for key in (
         "org_id", "shop", "status", "connected_at", "updated_at", "sync_status", "last_sync_at",
-        "last_error", "import_counts", "whatsapp_id", "template_name", "template_language",
+        "sync_error", "webhook_error", "reminder_error", "import_counts", "whatsapp_id", "template_name", "template_language",
         "template_status", "reminder_delay_minutes", "automation_enabled",
     ) if connection.get(key) is not None}
     for key, value in list(safe.items()):
         if isinstance(value, datetime):
             safe[key] = value.isoformat()
     safe["connected"] = connection.get("status") == "connected"
+    safe["last_error"] = connection.get("reminder_error") or connection.get("webhook_error") or connection.get("sync_error") or connection.get("last_error")
     safe["configured"] = bool(SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET and SHOPIFY_PUBLIC_BASE_URL)
     safe["whatsapp_connections"] = whatsapp_connections
     safe["readiness"] = {
@@ -924,18 +1173,37 @@ async def list_compatible_templates(org_id: str, wa_id: str | None = None, *, ra
     if not connection:
         return []
     try:
+        templates: list[dict] = []
+        after = None
         async with httpx.AsyncClient(timeout=12) as client:
-            response = await client.get(
-                f"https://graph.facebook.com/{WA_VERSION or 'v24.0'}/{connection['wa_id']}/message_templates",
-                headers={"Authorization": f"Bearer {connection['access_token']}"},
-                params={"fields": "name,language,status,category,components", "limit": 100},
-            )
-        response.raise_for_status()
-        templates = response.json().get("data") or []
+            for _ in range(10):
+                params = {"fields": "name,language,status,category,components", "limit": 100}
+                if after:
+                    params["after"] = after
+                response = await client.get(
+                    f"https://graph.facebook.com/{WA_VERSION or 'v24.0'}/{connection['wa_id']}/message_templates",
+                    headers={"Authorization": f"Bearer {connection['access_token']}"}, params=params,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                templates.extend(payload.get("data") or [])
+                after = ((payload.get("paging") or {}).get("cursors") or {}).get("after")
+                if not after or not (payload.get("paging") or {}).get("next"):
+                    break
     except (httpx.HTTPError, ValueError) as exc:
         if raise_unavailable:
             raise HTTPException(status_code=503, detail="Meta template status is temporarily unavailable") from exc
         return []
+    selected_connection = await db.shopify_connections.find_one(
+        {"org_id": org_id, "whatsapp_id": connection["wa_id"]}, {"template_name": 1, "template_language": 1},
+    )
+    if selected_connection and selected_connection.get("template_name"):
+        current = next((item for item in templates if item.get("name") == selected_connection.get("template_name") and item.get("language") == selected_connection.get("template_language")), None)
+        status = str((current or {}).get("status") or "UNAVAILABLE").upper()
+        await db.shopify_connections.update_one(
+            {"org_id": org_id, "whatsapp_id": connection["wa_id"], "template_name": selected_connection.get("template_name")},
+            {"$set": {"template_status": status, "reminder_error": None if current and _template_compatible(current) else "The selected WhatsApp template is not approved and compatible", "updated_at": utcnow()}},
+        )
     return [{"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category")} for item in templates if _template_compatible(item)]
 
 
@@ -999,15 +1267,15 @@ async def update_settings(org_id: str, settings: dict) -> dict:
     selected = next((item for item in templates if item["name"] == template_name and item["language"] == template_language), None)
     if enabled and (not wa_id or not selected):
         raise HTTPException(status_code=409, detail="Choose an active WhatsApp number and approved three-variable Marketing template")
-    existing = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected"}, {"automation_enabled": 1, "automation_enabled_at": 1})
+    existing = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected"})
     if not existing:
         raise HTTPException(status_code=404, detail="Connect Shopify before changing settings")
     settings_update = {
         "whatsapp_id": wa_id or None, "template_name": template_name or None, "template_language": template_language,
         "template_status": "APPROVED" if selected else None, "reminder_delay_minutes": delay,
-        "automation_enabled": enabled, "updated_at": utcnow(), "last_error": None,
+        "automation_enabled": enabled, "updated_at": utcnow(), "reminder_error": None, "last_error": None,
     }
-    if enabled and not existing.get("automation_enabled"):
+    if enabled and (not existing.get("automation_enabled") or not existing.get("automation_enabled_at")):
         settings_update["automation_enabled_at"] = utcnow()
     result = await db.shopify_connections.update_one(
         {"org_id": org_id, "status": "connected"},
@@ -1015,20 +1283,13 @@ async def update_settings(org_id: str, settings: dict) -> dict:
     )
     if not result.matched_count:
         raise HTTPException(status_code=404, detail="Connect Shopify before changing settings")
+    connection = await db.shopify_connections.find_one({"org_id": org_id})
     if enabled:
-        next_due = utcnow() + timedelta(minutes=delay)
-        await db.shopify_checkouts.update_many(
-            {"org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}},
-            {"$set": {"reminder_due_at": next_due}},
-        )
-        await db.shopify_checkouts.update_many(
-            {"org_id": org_id, "reminder_status": "sending", "provider_started_at": {"$exists": False}},
-            {"$set": {"reminder_status": "pending", "reminder_due_at": next_due}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
-        )
+        await _repair_org_checkout_states(org_id, connection)
     else:
         await db.shopify_checkouts.update_many(
             {"org_id": org_id, "$or": [{"reminder_status": {"$in": ["pending", "retryable"]}}, {"reminder_status": "sending", "provider_started_at": {"$exists": False}}]},
-            {"$set": {"reminder_status": "cancelled", "reminder_due_at": None}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+            {"$set": {"reminder_status": "cancelled", "failure_category": "automation_disabled", "reminder_due_at": None, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
         )
     await _commerce_event(org_id, "settings", org_id)
     return await get_connection(org_id)
@@ -1037,8 +1298,8 @@ async def update_settings(org_id: str, settings: dict) -> dict:
 async def disconnect_shopify(org_id: str, *, provider_uninstall: bool = False) -> None:
     now = utcnow()
     result = await db.shopify_connections.update_one(
-        {"org_id": org_id, "status": {"$in": ["connected", "disconnecting"]}},
-        {"$set": {"status": "disconnecting", "automation_enabled": False, "updated_at": now}},
+        {"org_id": org_id, "status": {"$in": ["connected", "cleanup_pending"]}},
+        {"$set": {"status": "cleanup_pending" if provider_uninstall else "connected", "cleanup_pending": provider_uninstall, "automation_enabled": False, "updated_at": now}},
     )
     if not result.matched_count:
         raise HTTPException(status_code=404, detail="Shopify is not connected")
@@ -1047,17 +1308,40 @@ async def disconnect_shopify(org_id: str, *, provider_uninstall: bool = False) -
             {"reminder_status": {"$in": ["pending", "retryable"]}},
             {"reminder_status": "sending", "provider_started_at": {"$exists": False}},
         ]},
-        {"$set": {"reminder_status": "cancelled", "reminder_due_at": None, "updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        {"$set": {"reminder_status": "cancelled", "failure_category": "shopify_disconnected", "reminder_due_at": None, "status_updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
     )
     accepted = db.shopify_checkouts.find({"org_id": org_id, "reminder_status": "provider_accepted"})
     async for checkout in accepted:
         await _reconcile_accepted(checkout)
-    if await db.shopify_checkouts.find_one({"org_id": org_id, "reminder_status": "sending", "provider_started_at": {"$exists": True}}, {"_id": 1}):
+    in_flight = await db.shopify_checkouts.find_one(
+        {"org_id": org_id, "$or": [{"reminder_status": "sending", "provider_started_at": {"$exists": True}}, {"reminder_status": "provider_accepted"}]},
+        {"_id": 1},
+    )
+    if in_flight:
+        if provider_uninstall:
+            return
         raise HTTPException(status_code=409, detail="A Shopify reminder is finishing. Retry disconnect shortly")
-    await db.shopify_connections.update_one({"org_id": org_id, "status": "disconnecting"}, {"$set": {"status": "disconnected", "updated_at": now, "last_error": "Shopify app was uninstalled" if provider_uninstall else None}, "$unset": {"shop": "", "access_token": "", "refresh_token": "", "token_expires_at": "", "sync_claim_token": "", "sync_claimed_at": ""}})
+    await _finish_shopify_disconnect(org_id, provider_uninstall=provider_uninstall)
+
+
+async def _finish_shopify_disconnect(org_id: str, *, provider_uninstall: bool = False) -> None:
+    await db.shopify_connections.update_one(
+        {"org_id": org_id, "status": {"$in": ["connected", "cleanup_pending"]}},
+        {"$set": {"status": "disconnected", "updated_at": utcnow(), "last_error": "Shopify app was uninstalled" if provider_uninstall else None}, "$unset": {"shop": "", "access_token": "", "refresh_token": "", "token_expires_at": "", "sync_claim_token": "", "sync_claimed_at": "", "cleanup_pending": ""}},
+    )
     await db.shopify_checkouts.delete_many({"org_id": org_id})
     await db.shopify_orders.delete_many({"org_id": org_id})
     await _commerce_event(org_id, "connection", org_id)
+
+
+async def _finish_pending_disconnects() -> None:
+    cursor = db.shopify_connections.find({"status": "cleanup_pending", "cleanup_pending": True}, {"org_id": 1}).limit(10)
+    async for connection in cursor:
+        if not await db.shopify_checkouts.find_one(
+            {"org_id": connection["org_id"], "$or": [{"reminder_status": "sending", "provider_started_at": {"$exists": True}}, {"reminder_status": "provider_accepted"}]},
+            {"_id": 1},
+        ):
+            await _finish_shopify_disconnect(connection["org_id"], provider_uninstall=True)
 
 
 async def commerce_summary(org_id: str) -> dict:
@@ -1065,14 +1349,14 @@ async def commerce_summary(org_id: str) -> dict:
     if not connection.get("connected"):
         return {"connected": False, "counts": {"carts": 0, "orders": 0}, "connection": connection}
     carts, orders, pending, sent = await asyncio.gather(
-        db.shopify_checkouts.count_documents({"org_id": org_id}), db.shopify_orders.count_documents({"org_id": org_id}),
+        db.shopify_checkouts.count_documents({"org_id": org_id}), db.shopify_orders.count_documents({"org_id": org_id, "record_status": {"$ne": "deleted"}}),
         db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}}),
         db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": "sent"}),
     )
     return {"connected": True, "counts": {"carts": carts, "orders": orders, "pending": pending, "sent": sent}, "connection": connection}
 
 
-def _cursor_query(cursor: str | None) -> dict:
+def _cursor_query(cursor: str | None, field: str = "provider_updated_at") -> dict:
     if not cursor:
         return {}
     try:
@@ -1083,25 +1367,26 @@ def _cursor_query(cursor: str | None) -> dict:
         raise HTTPException(status_code=422, detail="Invalid pagination cursor")
     if not moment or not provider_id:
         raise HTTPException(status_code=422, detail="Invalid pagination cursor")
-    return {"$or": [{"updated_at": {"$lt": moment}}, {"updated_at": moment, "provider_id": {"$lt": provider_id}}]}
+    return {"$or": [{field: {"$lt": moment}}, {field: moment, "provider_id": {"$lt": provider_id}}]}
 
 
 async def list_records(org_id: str, record_type: str, *, status: str = "", search: str = "", start: datetime | None = None, end: datetime | None = None, cursor: str | None = None, limit: int = 30) -> dict:
     collection = db.shopify_checkouts if record_type == "checkout" else db.shopify_orders
-    query: dict[str, Any] = {"org_id": org_id, **_cursor_query(cursor)}
+    sort_field = "provider_updated_at"
+    query: dict[str, Any] = {"org_id": org_id, **({"record_status": {"$ne": "deleted"}} if record_type == "order" else {}), **_cursor_query(cursor, sort_field)}
     if status:
         query["reminder_status" if record_type == "checkout" else "payment_status"] = status
     if start or end:
-        query["updated_at"] = {**({"$gte": start} if start else {}), **({"$lte": end} if end else {})}
+        query[sort_field] = {**({"$gte": start} if start else {}), **({"$lte": end} if end else {})}
     if search:
         value = re.escape(search.strip()[:80])
         query["$and"] = [{"$or": [{"customer_name": {"$regex": value, "$options": "i"}}, {"phone": {"$regex": value}}, {"products.name": {"$regex": value, "$options": "i"}}, {"order_number": {"$regex": value, "$options": "i"}}]}]
-    items = await collection.find(query).sort([("updated_at", -1), ("provider_id", -1)]).limit(min(limit, 50) + 1).to_list(length=min(limit, 50) + 1)
+    items = await collection.find(query).sort([(sort_field, -1), ("provider_id", -1)]).limit(min(limit, 50) + 1).to_list(length=min(limit, 50) + 1)
     has_more = len(items) > min(limit, 50)
     items = items[: min(limit, 50)]
     next_cursor = None
     if has_more and items:
-        value = json.dumps({"time": items[-1]["updated_at"].isoformat(), "id": items[-1]["provider_id"]}).encode()
+        value = json.dumps({"time": _provider_time(items[-1]).isoformat(), "id": items[-1]["provider_id"]}).encode()
         next_cursor = base64.urlsafe_b64encode(value).decode().rstrip("=")
     return {"items": [_safe_document(item, include_url=True) for item in items], "next_cursor": next_cursor}
 
@@ -1113,8 +1398,8 @@ async def conversation_activity(org_id: str, conversation_id: str) -> dict:
     phone = normalize_phone(conversation.get("customer_id"))
     if not phone:
         return {"checkout": None, "orders": []}
-    checkout = await db.shopify_checkouts.find_one({"org_id": org_id, "phone": phone, "record_status": "abandoned"}, sort=[("updated_at", -1)])
-    orders = await db.shopify_orders.find({"org_id": org_id, "phone": phone}).sort("created_at", -1).limit(3).to_list(length=3)
+    checkout = await db.shopify_checkouts.find_one({"org_id": org_id, "phone": phone, "record_status": "abandoned"}, sort=[("provider_updated_at", -1), ("provider_id", -1)])
+    orders = await db.shopify_orders.find({"org_id": org_id, "phone": phone, "record_status": {"$ne": "deleted"}}).sort("created_at", -1).limit(3).to_list(length=3)
     return {"checkout": _safe_document(checkout, include_url=True), "orders": [_safe_document(item) for item in orders]}
 
 
@@ -1151,18 +1436,18 @@ async def process_shopify_reminders() -> None:
     now = utcnow()
     await db.shopify_checkouts.update_many(
         {"reminder_status": "sending", "claim_expires_at": {"$lte": now}, "provider_started_at": {"$exists": False}},
-        {"$set": {"reminder_status": "retryable", "reminder_due_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        {"$set": {"reminder_status": "retryable", "reminder_due_at": now, "status_updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
     )
     await db.shopify_checkouts.update_many(
         {"reminder_status": "sending", "claim_expires_at": {"$lte": now}, "provider_started_at": {"$exists": True}},
-        {"$set": {"reminder_status": "delivery_unknown", "failure_category": "provider_outcome_unknown", "reminder_due_at": None}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        {"$set": {"reminder_status": "delivery_unknown", "failure_category": "provider_outcome_unknown", "reminder_due_at": None, "status_updated_at": now}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
     )
     for _ in range(10):
         token = secrets.token_urlsafe(16)
         now = utcnow()
         checkout = await db.shopify_checkouts.find_one_and_update(
             {"reminder_status": {"$in": ["pending", "retryable"]}, "reminder_due_at": {"$lte": now}, "$or": [{"claim_expires_at": {"$lte": now}}, {"claim_expires_at": None}]},
-            {"$set": {"reminder_status": "sending", "claim_token": token, "claim_expires_at": now + timedelta(minutes=CLAIM_LEASE_MINUTES), "claimed_at": now}, "$inc": {"attempts": 1}},
+            {"$set": {"reminder_status": "sending", "claim_token": token, "claim_expires_at": now + timedelta(minutes=CLAIM_LEASE_MINUTES), "claimed_at": now, "status_updated_at": now}},
             sort=[("reminder_due_at", 1)], return_document=ReturnDocument.AFTER,
         )
         if not checkout:
@@ -1171,16 +1456,61 @@ async def process_shopify_reminders() -> None:
     cursor = db.shopify_checkouts.find({"reminder_status": "provider_accepted"}).limit(10)
     async for checkout in cursor:
         await _reconcile_accepted(checkout)
+    await _finish_pending_disconnects()
 
 
 async def _fail_claim(checkout: dict, token: str, status: str, reason: str, *, retry: bool = False) -> None:
-    update: dict[str, Any] = {"reminder_status": "retryable" if retry else status, "failure_category": reason, "updated_at": utcnow()}
+    update: dict[str, Any] = {"reminder_status": "retryable" if retry else status, "failure_category": reason, "status_updated_at": utcnow()}
     if retry:
         update["reminder_due_at"] = utcnow() + timedelta(minutes=5)
     else:
         update["reminder_due_at"] = None
-    await db.shopify_checkouts.update_one({"_id": checkout["_id"], "claim_token": token}, {"$set": update, "$unset": {"claim_token": "", "claim_expires_at": ""}})
+    operation: dict[str, Any] = {"$set": update, "$unset": {"claim_token": "", "claim_expires_at": ""}}
+    if retry:
+        operation["$inc"] = {"pre_provider_attempts": 1}
+    await db.shopify_checkouts.update_one({"_id": checkout["_id"], "claim_token": token}, operation)
     await _commerce_event(checkout["org_id"], "checkout", checkout["provider_id"])
+
+
+async def _defer_claim(checkout: dict, token: str, due: datetime, reason: str) -> None:
+    await db.shopify_checkouts.update_one(
+        {"_id": checkout["_id"], "claim_token": token, "provider_started_at": {"$exists": False}},
+        {"$set": {"reminder_status": "pending", "failure_category": reason, "reminder_due_at": due, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+    )
+    await _commerce_event(checkout["org_id"], "checkout", checkout["provider_id"])
+
+
+async def _refresh_checkout_before_send(checkout: dict, token: str, connection: dict) -> dict | None:
+    data = await _graphql(connection, CHECKOUT_NODE_QUERY, {"id": checkout["provider_id"]}, timeout=20)
+    node = data.get("node")
+    if not node:
+        await _fail_claim(checkout, token, "cancelled", "checkout_unavailable")
+        return None
+    fresh = _checkout_from_graphql(
+        checkout["org_id"], connection["shop"], node, historical=False,
+        delay_minutes=int(connection.get("reminder_delay_minutes") or 30),
+    )
+    provider_fields = {key: value for key, value in fresh.items() if key not in {"reminder_status", "reminder_due_at", "status_updated_at"}}
+    if fresh.get("record_status") == "converted":
+        await db.shopify_checkouts.update_one({"_id": checkout["_id"], "claim_token": token}, {"$set": provider_fields})
+        await _fail_claim(checkout, token, "converted", "order_created")
+        return None
+    if not fresh.get("products"):
+        await db.shopify_checkouts.update_one({"_id": checkout["_id"], "claim_token": token}, {"$set": provider_fields})
+        await _fail_claim(checkout, token, "cancelled", "checkout_empty")
+        return None
+    changed = any(fresh.get(key) != checkout.get(key) for key in ("provider_updated_at", "phone", "products", "recovery_url", "completed_at"))
+    if changed:
+        due = _reminder_due(fresh["provider_updated_at"], int(connection.get("reminder_delay_minutes") or 30))
+        await db.shopify_checkouts.update_one(
+            {"_id": checkout["_id"], "claim_token": token, "provider_started_at": {"$exists": False}},
+            {"$set": {**provider_fields, "reminder_status": "pending", "reminder_due_at": due, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": "", "failure_category": ""}},
+        )
+        phones = {value for value in (checkout.get("phone"), fresh.get("phone")) if value}
+        await _repair_org_checkout_states(checkout["org_id"], connection, phones)
+        await _commerce_event(checkout["org_id"], "checkout", checkout["provider_id"])
+        return None
+    return {**checkout, **provider_fields}
 
 
 async def _send_claimed_checkout(checkout: dict, token: str) -> None:
@@ -1191,9 +1521,15 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         if not connection:
             await _fail_claim(checkout, token, "cancelled", "automation_disabled")
             return
-        latest = await db.shopify_checkouts.find_one({"org_id": org_id, "phone": checkout.get("phone"), "record_status": "abandoned"}, sort=[("updated_at", -1)]) if checkout.get("phone") else None
+        latest = await db.shopify_checkouts.find_one(
+            {"org_id": org_id, "phone": checkout.get("phone")},
+            sort=[("provider_updated_at", -1), ("provider_created_at", -1), ("provider_id", -1)],
+        ) if checkout.get("phone") else None
         if latest and latest["_id"] != checkout["_id"]:
             await _fail_claim(checkout, token, "superseded", "newer_checkout")
+            return
+        if latest and (latest.get("record_status") != "abandoned" or latest.get("completed_at")):
+            await _fail_claim(checkout, token, "converted" if latest.get("record_status") == "converted" else "cancelled", "newer_checkout_unavailable")
             return
         order_matches = []
         if checkout.get("checkout_token"):
@@ -1203,6 +1539,10 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         if checkout.get("completed_at") or await db.shopify_orders.find_one(order_match, {"_id": 1}):
             await _fail_claim(checkout, token, "converted", "order_created")
             return
+        refreshed = await _refresh_checkout_before_send(checkout, token, connection)
+        if not refreshed:
+            return
+        checkout = refreshed
         phone = normalize_phone(checkout.get("phone"))
         if not phone:
             await _fail_claim(checkout, token, "phone_missing", "phone_missing")
@@ -1210,9 +1550,9 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         if await _is_whatsapp_suppressed(org_id, phone):
             await _fail_claim(checkout, token, "opted_out", "customer_opt_out")
             return
-        prior = await db.shopify_checkouts.find_one({"org_id": org_id, "phone": phone, "reminder_status": "sent", "sent_at": {"$gte": utcnow() - timedelta(hours=24)}}, {"_id": 1})
+        prior = await db.shopify_checkouts.find_one({"org_id": org_id, "phone": phone, "_id": {"$ne": checkout["_id"]}, "reminder_status": {"$in": ["sent", "delivery_unknown"]}, "provider_started_at": {"$gte": utcnow() - timedelta(hours=24)}}, {"provider_started_at": 1}, sort=[("provider_started_at", -1)])
         if prior:
-            await _fail_claim(checkout, token, "superseded", "phone_frequency_cap")
+            await _defer_claim(checkout, token, _parse_datetime(prior["provider_started_at"]) + timedelta(hours=24), "phone_frequency_cap")
             return
         wa = await db.whatsapp_connections.find_one({"org_id": org_id, "wa_id": connection.get("whatsapp_id"), "is_active": {"$ne": False}}, {"wa_id": 1, "phone_id": 1, "access_token": 1})
         templates = await list_compatible_templates(org_id, connection.get("whatsapp_id"), raise_unavailable=True)
@@ -1232,7 +1572,7 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         # Final fence: checkout claim and connection settings must still be authoritative.
         current, current_connection, opted_out = await asyncio.gather(
             db.shopify_checkouts.find_one({"_id": checkout["_id"], "claim_token": token, "reminder_status": "sending", "record_status": "abandoned", "completed_at": None}, {"_id": 1}),
-            db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "template_name": template["name"], "template_language": template["language"]}, {"_id": 1}),
+            db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "template_name": template["name"], "template_language": template["language"], "template_status": "APPROVED"}, {"_id": 1}),
             _is_whatsapp_suppressed(org_id, phone),
         )
         if not current:
@@ -1243,15 +1583,36 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         if opted_out:
             await _fail_claim(checkout, token, "opted_out", "customer_opt_out")
             return
+        frozen = {
+            "send_whatsapp_id": wa["wa_id"], "send_phone_id": wa["phone_id"],
+            "send_template_name": template["name"], "send_template_language": template["language"],
+        }
+        if not await db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "template_name": template["name"], "template_language": template["language"], "template_status": "APPROVED"}, {"_id": 1}):
+            await _fail_claim(checkout, token, "cancelled", "configuration_changed")
+            return
         started = await db.shopify_checkouts.find_one_and_update(
             {"_id": checkout["_id"], "claim_token": token, "reminder_status": "sending", "provider_started_at": {"$exists": False}},
-            {"$set": {"provider_started_at": utcnow()}},
+            {"$set": {"provider_started_at": utcnow(), **frozen}},
             return_document=ReturnDocument.AFTER,
         )
         if not started:
             return
-        if not await db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "template_name": template["name"], "template_language": template["language"]}, {"_id": 1}):
-            await _fail_claim(checkout, token, "cancelled", "configuration_changed")
+        current_checkout, current_connection, current_wa, current_opted_out = await asyncio.gather(
+            db.shopify_checkouts.find_one({"_id": checkout["_id"], "claim_token": token, "reminder_status": "sending"}, {"record_status": 1, "completed_at": 1}),
+            db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "template_name": template["name"], "template_language": template["language"], "template_status": "APPROVED"}, {"_id": 1}),
+            db.whatsapp_connections.find_one({"org_id": org_id, "wa_id": wa["wa_id"], "phone_id": wa["phone_id"], "is_active": {"$ne": False}}, {"_id": 1}),
+            _is_whatsapp_suppressed(org_id, phone),
+        )
+        if not current_checkout:
+            return
+        checkout_valid = current_checkout.get("record_status") == "abandoned" and not current_checkout.get("completed_at")
+        if not checkout_valid or not current_connection or not current_wa or current_opted_out:
+            converted = current_checkout.get("record_status") == "converted" or bool(current_checkout.get("completed_at"))
+            reason = "customer_opt_out" if current_opted_out else ("order_created" if converted else ("checkout_changed" if not checkout_valid else "configuration_changed"))
+            await db.shopify_checkouts.update_one(
+                {"_id": checkout["_id"], "claim_token": token, "reminder_status": "sending", "record_status": current_checkout.get("record_status")},
+                {"$set": {"reminder_status": "opted_out" if current_opted_out else ("converted" if converted else "cancelled"), "failure_category": reason, "reminder_due_at": None, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": "", "provider_started_at": "", "send_whatsapp_id": "", "send_phone_id": "", "send_template_name": "", "send_template_language": ""}},
+            )
             return
         provider_started = True
         try:
@@ -1286,7 +1647,7 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
             try:
                 accepted = await db.shopify_checkouts.find_one_and_update(
                     {"_id": checkout["_id"], "claim_token": token, "reminder_status": "sending"},
-                    {"$set": {"reminder_status": "provider_accepted", "provider_message_id": message_id, "provider_accepted_at": utcnow(), "updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+                    {"$set": {"reminder_status": "provider_accepted", "provider_message_id": message_id, "provider_accepted_at": utcnow(), "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
                     return_document=ReturnDocument.AFTER,
                 )
                 break
@@ -1300,14 +1661,14 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         if provider_started:
             await _fail_claim(checkout, token, "delivery_unknown", "provider_outcome_unknown")
             return
-        retry = exc.status_code in {502, 503, 504} and int(checkout.get("attempts") or 0) < 3
+        retry = exc.status_code in {502, 503, 504} and int(checkout.get("pre_provider_attempts") or 0) < 3
         await _fail_claim(checkout, token, "failed", "pre_provider_failure", retry=retry)
     except Exception as exc:
         logger.warning("Shopify reminder failed before completion: {}", type(exc).__name__)
         if provider_started:
             await _fail_claim(checkout, token, "delivery_unknown", "provider_outcome_unknown")
             return
-        retry = int(checkout.get("attempts") or 0) < 3
+        retry = int(checkout.get("pre_provider_attempts") or 0) < 3
         await _fail_claim(checkout, token, "failed", "pre_provider_failure", retry=retry)
 
 
@@ -1317,21 +1678,25 @@ async def _reconcile_accepted(checkout: dict) -> None:
         return
     org_id = checkout["org_id"]
     phone = checkout.get("phone", "").lstrip("+")
-    connection = await db.shopify_connections.find_one({"org_id": org_id}, {"whatsapp_id": 1})
-    if not connection or not connection.get("whatsapp_id") or not phone:
+    whatsapp_id = checkout.get("send_whatsapp_id")
+    if not whatsapp_id:
+        connection = await db.shopify_connections.find_one({"org_id": org_id}, {"whatsapp_id": 1})
+        whatsapp_id = (connection or {}).get("whatsapp_id")
+    if not whatsapp_id or not phone:
         return
     if not sync_db[f"messages_{org_id}"].find_one({"message_id": message_id}, {"_id": 1}):
         name = str(checkout.get("customer_name") or "there").split(" ", 1)[0]
         content = f"Hi {name}, you left {_product_summary(checkout.get('products') or [])} in your cart. Complete your order here: {checkout.get('recovery_url') or ''}"
         conversation_id = await create_or_update_whatsapp_conversation(
-            org_id=org_id, recipient_id=connection["whatsapp_id"], customer_phone_no=phone,
+            org_id=org_id, recipient_id=whatsapp_id, customer_phone_no=phone,
             customer_name=checkout.get("customer_name") or phone, last_message=content,
             last_sender="agent", is_auto_followup=True, extra_updates={"last_message_source": "shopify_abandoned_checkout"},
+            idempotency_key=message_id,
         )
         try:
             await store_whatsapp_message(
                 org_id=org_id, content=content, conversation_id=conversation_id, customer_phone_no=phone,
-                type="template", payload=None, recipient_id=connection["whatsapp_id"], role=MessageRole.AGENT,
+                type="template", payload=None, recipient_id=whatsapp_id, role=MessageRole.AGENT,
                 sender_name="Shopify recovery", message_id=message_id, status="sent",
                 bot_context={"source": "shopify_abandoned_checkout", "checkout_id": checkout["provider_id"]},
             )
@@ -1339,7 +1704,7 @@ async def _reconcile_accepted(checkout: dict) -> None:
             pass
     result = await db.shopify_checkouts.update_one(
         {"_id": checkout["_id"], "reminder_status": "provider_accepted", "provider_message_id": message_id},
-        {"$set": {"reminder_status": "sent", "sent_at": checkout.get("provider_accepted_at") or utcnow(), "updated_at": utcnow()}},
+        {"$set": {"reminder_status": "sent", "sent_at": checkout.get("provider_accepted_at") or utcnow(), "status_updated_at": utcnow()}},
     )
     if result.modified_count:
         await _commerce_event(org_id, "checkout", checkout["provider_id"])
@@ -1353,6 +1718,6 @@ async def _admin_warning(org_id: str, category: str) -> None:
     if category == "reminder_configuration":
         await db.shopify_connections.update_one(
             {"org_id": org_id, "status": "connected"},
-            {"$set": {"last_error": "Shopify recovery needs an active WhatsApp number and approved template", "updated_at": utcnow()}},
+            {"$set": {"reminder_error": "Shopify recovery needs an active WhatsApp number and approved template", "updated_at": utcnow()}},
         )
     await broadcast_org_admin_ws(org_id, "shopify_sync_warning", {"org_id": org_id, "record_type": "warning", "record_id": category})
