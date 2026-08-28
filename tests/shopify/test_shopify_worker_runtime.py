@@ -423,6 +423,43 @@ async def test_checkout_update_and_order_races(service):
     assert collection.documents[0]["reminder_status"] == "converted"
 
 
+async def test_refresh_shape_change_does_not_restart_elapsed_timer(service):
+    original = checkout(
+        "cart-shape",
+        reminder_status="sending",
+        claim_token="claim",
+        provider_updated_at=NOW - timedelta(minutes=20),
+        products=[{"name": "Board", "quantity": 1}],
+    )
+    collection = FakeCollection([original])
+    service.db = FakeDB(shopify_checkouts=collection)
+    service._commerce_event = async_noop
+    service._repair_org_checkout_states = async_noop
+
+    async def same_activity_graphql(*_args, **_kwargs):
+        return {"node": {
+            "id": original["provider_id"], "abandonedCheckoutUrl": original["recovery_url"],
+            "createdAt": original["provider_created_at"].isoformat(),
+            "updatedAt": original["provider_updated_at"].isoformat(), "completedAt": None,
+            "customer": {"firstName": "Customer", "lastName": ""},
+            "shippingAddress": {"phone": original["phone"]}, "billingAddress": None,
+            "lineItems": {"nodes": [{
+                "id": "gid://shopify/AbandonedCheckoutLineItem/1", "title": "Board", "quantity": 1,
+                "originalTotalPriceSet": {"shopMoney": {"amount": "20", "currencyCode": "USD"}},
+            }]},
+            "totalPriceSet": {"shopMoney": {"amount": "20", "currencyCode": "USD"}},
+        }}
+
+    service._graphql = same_activity_graphql
+    refreshed = await service._refresh_checkout_before_send(
+        original.copy(), "claim", {"org_id": "org", "shop": "shop.test", "reminder_delay_minutes": 10},
+    )
+    assert refreshed is not None, "equivalent Shopify payload shape restarted an elapsed timer"
+    assert refreshed["reminder_status"] == "sending"
+    assert refreshed["claim_token"] == "claim"
+    assert refreshed["products"][0]["id"].endswith("/1")
+
+
 async def test_newest_checkout_per_phone(service):
     old = checkout("old", provider_updated_at=NOW - timedelta(minutes=5))
     new = checkout("new", provider_updated_at=NOW - timedelta(minutes=1))
@@ -659,6 +696,7 @@ async def main():
     await test_concurrent_workers_claim_once(load_service())
     await test_expired_claim_recovery(load_service())
     await test_checkout_update_and_order_races(load_service())
+    await test_refresh_shape_change_does_not_restart_elapsed_timer(load_service())
     await test_newest_checkout_per_phone(load_service())
     await test_stop_suppression(load_service())
     assert load_service()._provider_reports_block({"error": {"message": "Recipient blocked your business"}})

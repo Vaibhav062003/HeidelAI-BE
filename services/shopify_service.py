@@ -1862,9 +1862,8 @@ async def _refresh_checkout_before_send(checkout: dict, token: str, connection: 
         await db.shopify_checkouts.update_one({"_id": checkout["_id"], "claim_token": token}, {"$set": provider_fields})
         await _fail_claim(checkout, token, "cancelled", "checkout_empty")
         return None
-    changed = any(fresh.get(key) != checkout.get(key) for key in ("provider_updated_at", "phone", "products", "recovery_url", "completed_at"))
-    if changed:
-        due = _reminder_due(fresh["provider_updated_at"], int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES))
+    due = _reminder_due(fresh["provider_updated_at"], int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES))
+    if _provider_time(fresh) > _provider_time(checkout) and due > utcnow():
         await db.shopify_checkouts.update_one(
             {"_id": checkout["_id"], "claim_token": token, "provider_started_at": {"$exists": False}},
             {"$set": {**provider_fields, "reminder_status": "pending", "reminder_due_at": due, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": "", "failure_category": ""}},
@@ -1873,7 +1872,14 @@ async def _refresh_checkout_before_send(checkout: dict, token: str, connection: 
         await _repair_org_checkout_states(checkout["org_id"], connection, phones)
         await _commerce_event(checkout["org_id"], "checkout", checkout["provider_id"])
         return None
-    return {**checkout, **provider_fields}
+    # Shopify can serialize the same checkout differently across webhook and
+    # GraphQL payloads. Refresh those fields without restarting an elapsed timer.
+    current = await db.shopify_checkouts.find_one_and_update(
+        {"_id": checkout["_id"], "claim_token": token, "provider_started_at": {"$exists": False}},
+        {"$set": provider_fields, "$unset": {"failure_category": ""}},
+        return_document=ReturnDocument.AFTER,
+    )
+    return current
 
 
 async def _send_claimed_checkout(checkout: dict, token: str) -> None:
