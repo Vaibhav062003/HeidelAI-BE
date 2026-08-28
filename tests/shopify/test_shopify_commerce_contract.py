@@ -31,6 +31,7 @@ def pure_namespace():
         "_record_phone_and_consent", "_phone_key", "_message_preference",
         "_provider_reports_block", "_eligibility_status",
         "_provider_time", "_provider_sort_key", "_reminder_due", "_sync_retry_at",
+        "_recovery_activity_time", "_checkout_changed_for_send",
         "_product_summary", "_template_compatible", "verify_callback_hmac", "_iso_utc",
     }
     tree = ast.parse(SERVICE)
@@ -101,6 +102,12 @@ def main():
     assert ns["_provider_sort_key"]({"provider_id": "new", "provider_updated_at": provider_time, "status_updated_at": older_provider_time}) > ns["_provider_sort_key"]({"provider_id": "old", "provider_updated_at": older_provider_time, "status_updated_at": local_status_time})
     assert ns["_reminder_due"](provider_time, 30) == provider_time + timedelta(minutes=30)
     assert ns["_reminder_due"](provider_time, 30, provider_time + timedelta(hours=24)) == provider_time + timedelta(hours=24)
+    enabled_at = provider_time
+    assert ns["_recovery_activity_time"](provider_time - timedelta(hours=2), enabled_at) == enabled_at
+    assert ns["_recovery_activity_time"](provider_time - timedelta(days=2), enabled_at) is None
+    unchanged = {"provider_updated_at": provider_time, "phone": "+14155550004", "products": [{"name": "A"}], "recovery_url": "https://example.test", "completed_at": None, "record_status": "abandoned"}
+    assert not ns["_checkout_changed_for_send"](unchanged, dict(unchanged))
+    assert ns["_checkout_changed_for_send"](unchanged, {**unchanged, "products": [{"name": "B"}]})
     assert ns["_sync_retry_at"](1, provider_time) == provider_time + timedelta(minutes=1)
     assert ns["_sync_retry_at"](20, provider_time) == provider_time + timedelta(minutes=30)
     assert ns["_iso_utc"](datetime(2026, 8, 28, 13, 2, 14)) == "2026-08-28T13:02:14+00:00"
@@ -142,22 +149,28 @@ def main():
         assert required in SERVICE, f"missing boundary: {required}"
     assert 'consent != "SUBSCRIBED"' not in SERVICE
     assert 'API_VERSION = "2025-10"' in SERVICE
-    assert 'sort_key = "CREATED_AT" if kind == "checkouts"' in SERVICE
+    assert 'filter_field = "created_at" if kind == "checkouts"' in SERVICE
     assert 'mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: String!)' in SERVICE
     assert 'data = await _graphql(connection, CHECKOUT_NODE_QUERY' in SERVICE
     assert SERVICE.index('data = await _graphql(connection, CHECKOUT_NODE_QUERY') < SERVICE.index('"provider_started_at": utcnow(), **frozen')
     assert 'idempotency_key=message_id' in SERVICE
     assert '"reminder_status": {"$in": ["sent", "delivery_unknown"]}' in SERVICE
-    assert 'await list_compatible_templates(org_id, connection["whatsapp_id"])' in SERVICE
+    assert 'await list_compatible_templates(org_id, connection["whatsapp_id"], phone_id=connection.get("whatsapp_phone_id"))' in SERVICE
     assert 'current_checkout, current_connection, current_wa, current_opted_out = await asyncio.gather' in SERVICE
+    assert '"whatsapp_phone_id": wa["phone_id"]' in SERVICE
+    assert '"automation_enabled": {"$ne": False}' in SERVICE
+    assert 'update_shopify_reminder_delivery' in SERVICE
+    assert '"delivery_status": "accepted"' in SERVICE
+    assert '"provider_updated_at": checkout.get("provider_updated_at")' in SERVICE
+    assert 'await asyncio.to_thread(record_whatsapp_preference' in WEBHOOK
     assert '"customer_updated_at": customer_updated' in SERVICE
     assert 'update = {"provider_updated_at": provider_updated' not in SERVICE
     assert 'headers.get("x-shopify-triggered-at")' in SERVICE
     assert '"record_status": {"$ne": "deleted"}' in SERVICE
     assert '"record_status": "deleted", "provider_updated_at": event_time' in SERVICE
     assert '{"provider_updated_at": {"$lt": provider_time}}' in SERVICE
-    assert "record_whatsapp_preference(org_id, customer_phone_no, content)" in WEBHOOK
-    assert "record_whatsapp_provider_block(" in WEBHOOK
+    assert "await asyncio.to_thread(record_whatsapp_preference, org_id, customer_phone_no, content)" in WEBHOOK
+    assert "await asyncio.to_thread(\n                                record_whatsapp_provider_block," in WEBHOOK
     assert 'order_matches.append({"phone"' not in SERVICE
 
     logger_lines = [line for line in SERVICE.splitlines() if "logger." in line]

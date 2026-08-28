@@ -1,5 +1,5 @@
 # Built-in Modules
-import time, json, hmac, hashlib
+import asyncio, time, json, hmac, hashlib
 from fastapi import APIRouter, HTTPException, Response
 from datetime import datetime, timezone, timedelta
 from fastapi import Request, Header, BackgroundTasks
@@ -43,7 +43,7 @@ from services.whatsapp_call_history import (
     provider_lifecycle_filter,
 )
 from services.intent_queue_worker import enqueue_intent_check
-from services.shopify_service import record_whatsapp_preference, record_whatsapp_provider_block
+from services.shopify_service import record_whatsapp_preference, record_whatsapp_provider_block, update_shopify_reminder_delivery
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -632,7 +632,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             continue
 
                         if status_type == "failed":
-                            record_whatsapp_provider_block(
+                            await asyncio.to_thread(
+                                record_whatsapp_provider_block,
                                 connection.get("org_id"),
                                 status.get("recipient_id"),
                                 status,
@@ -647,6 +648,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             status=status_type,
                             # status_timestamp=status.get("timestamp")
                         )
+
+                        try:
+                            await update_shopify_reminder_delivery(
+                                connection.get("org_id"), message_id, status_type,
+                            )
+                        except Exception as exc:
+                            logger.debug(f"Shopify reminder delivery propagation skipped for {message_id}: {exc}")
 
                         try:
                             from services.sales_offer_service import update_offer_delivery
@@ -947,7 +955,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
                                 try:
-                                    record_whatsapp_preference(org_id, customer_phone_no, content)
+                                    await asyncio.to_thread(record_whatsapp_preference, org_id, customer_phone_no, content)
                                 except Exception:
                                     services.processed_message_ids.pop(wa_message_id, None)
                                     raise
