@@ -43,6 +43,7 @@ from services.whatsapp_call_history import (
     provider_lifecycle_filter,
 )
 from services.intent_queue_worker import enqueue_intent_check
+from services.shopify_service import record_whatsapp_preference, record_whatsapp_provider_block
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -629,6 +630,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         
                         if not message_id or not status_type:
                             continue
+
+                        if status_type == "failed":
+                            record_whatsapp_provider_block(
+                                connection.get("org_id"),
+                                status.get("recipient_id"),
+                                status,
+                            )
                         
                         logger.info(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
                         
@@ -938,6 +946,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
+                                try:
+                                    record_whatsapp_preference(org_id, customer_phone_no, content)
+                                except Exception:
+                                    services.processed_message_ids.pop(wa_message_id, None)
+                                    raise
 
                                 # Check if this is a registered dealer from the conversation doc first
                                 is_dealer = convo_doc.get("is_dealer", False) if convo_doc else False

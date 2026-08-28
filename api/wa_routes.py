@@ -27,7 +27,7 @@ from core.limiter import limiter
 from core.services import services
 from services.utils import serialize_mongo
 from schemas.models import WhatsappAuthRequest, MessageRole, PlatformDisconnectRequest, Template, BulkMessageRequest
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, run_bulk_send_job
+from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, get_broadcast_suppressed_phone_keys, run_bulk_send_job
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_async_mongo_db, get_mongo_db
@@ -1743,10 +1743,17 @@ async def bulk_send_whatsapp_message(
             phone = "".join(character for character in recipient.phone_number if character.isdigit())
             unique_recipients[phone] = recipient.model_copy(update={"phone_number": phone})
         recipients = list(unique_recipients.values())
+        suppressed = await asyncio.to_thread(
+            get_broadcast_suppressed_phone_keys,
+            org_id,
+            [recipient.phone_number for recipient in recipients],
+        )
+        recipients = [recipient for recipient in recipients if recipient.phone_number not in suppressed]
+        excluded_opt_outs = len(unique_recipients) - len(recipients)
         logger.info(f"Bulk WA send request received | org_id={org_id} | recipients={len(recipients)}")
 
         if not recipients:
-            raise HTTPException(status_code=400, detail="At least one recipient is required")
+            raise HTTPException(status_code=409, detail="All selected recipients have opted out of broadcasts")
         batch_limit = feature_access(org_id, "BROADCASTING")["limits"].get("max_batch_recipients")
         if batch_limit is not None and len(recipients) > batch_limit:
             raise HTTPException(status_code=422, detail={"code": "broadcast_batch_limit", "feature": "BROADCASTING", "metric": "max_batch_recipients", "used": len(recipients), "limit": batch_limit, "message": f"This broadcast exceeds the {batch_limit}-recipient batch limit."})
@@ -1817,6 +1824,7 @@ async def bulk_send_whatsapp_message(
             "message": "Bulk send job enqueued.",
             "job_id": job_id,
             "total": len(recipients),
+            "excluded_opt_outs": excluded_opt_outs,
         }
     except HTTPException as http_exc:
         raise http_exc

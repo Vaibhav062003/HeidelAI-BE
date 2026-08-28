@@ -118,11 +118,19 @@ async def process_google_sheet_trigger(
     # 4. Build eligible recipients
     stats = {"sent": 0, "skipped": 0, "errors": 0}
     eligible: list = []
+    from services.wa_service import get_broadcast_suppressed_phone_keys, is_broadcast_suppressed
+
+    candidate_phones = [normalize_phone(str(row.get(column_name, ""))) for row in rows_to_process]
+    suppressed_phones = await asyncio.to_thread(get_broadcast_suppressed_phone_keys, org_id, candidate_phones)
 
     for row_dict in rows_to_process:
         phone_raw = normalize_phone(str(row_dict.get(column_name, "")))
             
         if not phone_raw:
+            continue
+
+        if phone_raw in suppressed_phones:
+            stats["skipped"] += 1
             continue
 
         if not await _try_claim_send(org_id, flow_id, phone_raw):
@@ -213,6 +221,10 @@ async def process_google_sheet_trigger(
             phone = recipient["phone_number"]
             resolved_text = recipient["resolved_text"]
             customer_name = recipient.get("customer_name", phone)
+
+            if await asyncio.to_thread(is_broadcast_suppressed, org_id, phone):
+                await asyncio.to_thread(_mark_suppressed, org_id, flow_id, phone, sheet_id)
+                return {"sent": 0, "skipped": 1, "errors": 0}
 
             # Ensure conversation exists before sending — the centralized send functions
             # use find_one_and_update WITHOUT upsert, so new contacts from sheets would crash.
@@ -360,6 +372,7 @@ async def process_google_sheet_trigger(
             stats["errors"] += 1
         elif res:
             stats["sent"] += res.get("sent", 0)
+            stats["skipped"] += res.get("skipped", 0)
             stats["errors"] += res.get("errors", 0)
 
     logger.info(f"[GoogleSheetAuto] Flow {flow_id}: sent={stats['sent']}, skipped={stats['skipped']}, errors={stats['errors']}")
@@ -870,6 +883,16 @@ def _mark_failed(org_id: str, flow_id: str, phone: str, sheet_id: str):
                 "sheet_id": sheet_id,
             }
         },
+        upsert=True,
+    )
+
+
+def _mark_suppressed(org_id: str, flow_id: str, phone: str, sheet_id: str):
+    """Keep an opted-out recipient terminal for this automation flow."""
+    now = datetime.now(timezone.utc)
+    db[SENT_COLLECTION].update_one(
+        {"org_id": org_id, "flow_id": flow_id, "phone": phone},
+        {"$set": {"status": "suppressed", "updated_at": now, "sheet_id": sheet_id}},
         upsert=True,
     )
 
