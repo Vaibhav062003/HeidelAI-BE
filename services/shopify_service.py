@@ -234,6 +234,11 @@ def _phone_key(value: Any) -> str:
     return digits if 8 <= len(digits) <= 15 else ""
 
 
+def _phone_candidates(*values: Any) -> list[str]:
+    keys = {_phone_key(value) for value in values}
+    return sorted({candidate for key in keys if key for candidate in (key, f"+{key}")})
+
+
 def _message_preference(content: Any) -> str | None:
     command = re.sub(r"[^a-z]", "", str(content or "").casefold())
     if command in OPT_OUT_COMMANDS:
@@ -1856,13 +1861,13 @@ async def list_records(org_id: str, record_type: str, *, status: str = "", searc
 
 async def conversation_activity(org_id: str, conversation_id: str) -> dict:
     conversation = await db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id}, {"customer_id": 1, "platform": 1})
-    if not conversation or conversation.get("platform") != "whatsapp":
+    if not conversation or str(conversation.get("platform") or "").casefold() != "whatsapp":
         raise HTTPException(status_code=404, detail="WhatsApp conversation not found")
-    phone = normalize_phone(conversation.get("customer_id"))
-    if not phone:
+    phones = _phone_candidates(conversation.get("customer_id"), conversation_id)
+    if not phones:
         return {"checkout": None, "orders": []}
-    checkout = await db.shopify_checkouts.find_one({"org_id": org_id, "phone": phone, "record_status": "abandoned"}, sort=[("provider_updated_at", -1), ("provider_id", -1)])
-    orders = await db.shopify_orders.find({"org_id": org_id, "phone": phone, "record_status": {"$ne": "deleted"}}).sort("created_at", -1).limit(3).to_list(length=3)
+    checkout = await db.shopify_checkouts.find_one({"org_id": org_id, "phone": {"$in": phones}, "record_status": "abandoned"}, sort=[("provider_updated_at", -1), ("provider_id", -1)])
+    orders = await db.shopify_orders.find({"org_id": org_id, "phone": {"$in": phones}, "record_status": {"$ne": "deleted"}}).sort("created_at", -1).limit(3).to_list(length=3)
     return {"checkout": _safe_document(checkout, include_url=True), "orders": [_safe_document(item) for item in orders]}
 
 
