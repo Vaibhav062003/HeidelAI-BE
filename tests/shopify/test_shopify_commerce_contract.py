@@ -122,8 +122,11 @@ def main():
     for event in ("abandoned_cart", "received", "shipped", "fulfilled", "cancelled"):
         payload = ns["_default_template_payload"](event, "en")
         assert payload["language"] == "en_US"
-        assert sorted(re.findall(r"{{\s*(\d+)\s*}}", payload["components"][0]["text"])) == ["1", "2", "3"]
+        body = payload["components"][0]["text"]
+        assert sorted(re.findall(r"{{\s*(\d+)\s*}}", body)) == ["1", "2", "3"]
         assert payload["category"] == ("MARKETING" if event == "abandoned_cart" else "UTILITY")
+        if event != "abandoned_cart":
+            assert len(re.sub(r"{{\s*\d+\s*}}", "", body)) >= 150
 
     class MetaResponse:
         status_code = 400
