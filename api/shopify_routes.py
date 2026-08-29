@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from auth.auth_utils import admin_required
 from auth.dependencies import CurrentUser
+from services.work_team_service import require_conversation_access
 from services.shopify_service import (
     commerce_summary,
     complete_oauth,
@@ -198,4 +199,5 @@ async def shopify_checkout_retry(payload: CheckoutRetryPayload, user: CurrentUse
 async def shopify_conversation_activity(conversation_id: str, user: CurrentUser):
     if len(conversation_id) > 240:
         raise HTTPException(status_code=422, detail="Invalid conversation ID")
+    await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
     return await conversation_activity(user.org_id, conversation_id)

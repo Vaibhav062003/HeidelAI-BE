@@ -378,5 +378,8 @@ async def run_chat_analysis(request: Request, conversation_id: str, user: Curren
                 
         return cached_analysis
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        logger.error(f"Chat analysis failed for {conversation_id}: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="AI analysis is temporarily unavailable.")

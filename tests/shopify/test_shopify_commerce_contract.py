@@ -28,7 +28,7 @@ class HTTPException(Exception):
 def pure_namespace():
     wanted = {
         "_parse_datetime", "normalize_shop", "normalize_phone", "_phone_and_consent",
-        "_record_phone_and_consent", "_phone_key", "_message_preference",
+        "_record_phone_and_consent", "_phone_key", "_phone_candidates", "_message_preference",
         "_provider_reports_block", "_eligibility_status",
         "_provider_time", "_provider_sort_key", "_reminder_due", "_sync_retry_at",
         "_recovery_activity_time", "_checkout_changed_for_send",
@@ -76,6 +76,7 @@ def main():
             pass
     assert ns["normalize_phone"]("+91 98765-43210") == "+919876543210"
     assert ns["normalize_phone"]("9876543210") == ""
+    assert ns["_phone_candidates"]("919876543210", "whatsapp_919876543210") == ["+919876543210", "919876543210"]
 
     phone, consent, changed = ns["_phone_and_consent"]({
         "customer_id": 7,
@@ -162,6 +163,8 @@ def main():
         "/api/conversations/{conversation_id}/shopify-activity",
     ):
         assert endpoint in ROUTES
+    assert "await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)" in ROUTES
+    assert '"phone": {"$in": phones}' in SERVICE
 
     for required in (
         'find_one_and_delete({', 'hmac.compare_digest', 'create_index("shop", unique=True',
