@@ -30,6 +30,7 @@ from services.websocket_service import broadcast_org_admin_ws, broadcast_org_ws
 API_VERSION = "2025-10"
 OAUTH_SCOPES = "read_orders,read_customers,read_fulfillments"
 DEFAULT_REMINDER_DELAY_MINUTES = 10
+DEFAULT_TEMPLATE_LANGUAGE = "en_US"
 ALLOWED_DELAYS = {5, 10, 15, 30, 60, 120, 240, 1440}
 SHOP_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -1481,33 +1482,15 @@ async def list_compatible_templates(
 
 
 async def create_default_template(
-    org_id: str, phone_id: str = "", language: str = "en", *, wa_id: str = "", event: str = "abandoned_cart",
+    org_id: str, phone_id: str = "", language: str = DEFAULT_TEMPLATE_LANGUAGE, *, wa_id: str = "", event: str = "abandoned_cart",
 ) -> dict:
     connection = await _whatsapp_connection_for_selector(
         org_id, phone_id=phone_id or None, wa_id=wa_id or None, projection={"wa_id": 1, "phone_id": 1, "access_token": 1},
     )
     if not connection:
         raise HTTPException(status_code=404, detail="Active WhatsApp connection not found")
-    definitions = {
-        "abandoned_cart": ("heidelai_abandoned_cart_v1", "MARKETING", "Hi {{1}}, you left {{2}} in your cart. Complete your order here: {{3}}"),
-        "received": ("heidelai_order_received_v1", "UTILITY", "Hi {{1}}, we received order {{2}} for {{3}}."),
-        "shipped": ("heidelai_order_shipped_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has shipped."),
-        "fulfilled": ("heidelai_order_fulfilled_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has been fulfilled."),
-        "cancelled": ("heidelai_order_cancelled_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has been cancelled."),
-    }
-    if event not in definitions:
-        raise HTTPException(status_code=422, detail="Unsupported Shopify template event")
-    name, category, text = definitions[event]
-    payload = {
-        "name": name,
-        "language": language,
-        "category": category,
-        "components": [{
-            "type": "BODY",
-            "text": text,
-            "example": {"body_text": [["Aarav", "#1001", "Laptop stand, keyboard"]] if event != "abandoned_cart" else [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
-        }],
-    }
+    payload = _default_template_payload(event, language)
+    language = payload["language"]
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
@@ -1516,12 +1499,13 @@ async def create_default_template(
                 json=payload,
             )
         if response.status_code not in {200, 201}:
-            try:
-                already_exists = "already exists" in str((response.json().get("error") or {}).get("message") or "").lower()
-            except (ValueError, AttributeError):
-                already_exists = False
-            if not already_exists:
-                raise HTTPException(status_code=409, detail="Meta could not create the Shopify template")
+            meta_error = _meta_template_error(response)
+            if not meta_error["already_exists"]:
+                logger.warning(
+                    "Shopify Meta template rejected | event={} status={} code={} subcode={}",
+                    event, response.status_code, meta_error["code"], meta_error["subcode"],
+                )
+                raise HTTPException(status_code=409, detail=meta_error["detail"])
     except HTTPException:
         raise
     except httpx.RequestError as exc:
@@ -1533,7 +1517,50 @@ async def create_default_template(
     else:
         fields[f"order_templates.{event}"] = selected
     await db.shopify_connections.update_one({"org_id": org_id, "status": "connected"}, {"$set": fields})
-    return {**selected, "category": category}
+    return {**selected, "category": payload["category"]}
+
+
+def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGUAGE) -> dict:
+    definitions = {
+        "abandoned_cart": ("heidelai_abandoned_cart_v1", "MARKETING", "Hi {{1}}, you left {{2}} in your cart. Complete your order here: {{3}}"),
+        "received": ("heidelai_order_received_v1", "UTILITY", "Hi {{1}}, we received order {{2}} for {{3}}."),
+        "shipped": ("heidelai_order_shipped_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has shipped."),
+        "fulfilled": ("heidelai_order_fulfilled_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has been fulfilled."),
+        "cancelled": ("heidelai_order_cancelled_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has been cancelled."),
+    }
+    if event not in definitions:
+        raise HTTPException(status_code=422, detail="Unsupported Shopify template event")
+    name, category, text = definitions[event]
+    normalized_language = str(language or DEFAULT_TEMPLATE_LANGUAGE).strip()
+    if normalized_language.lower() == "en":
+        normalized_language = DEFAULT_TEMPLATE_LANGUAGE
+    return {
+        "name": name,
+        "language": normalized_language,
+        "category": category,
+        "components": [{
+            "type": "BODY",
+            "text": text,
+            "example": {"body_text": [["Aarav", "#1001", "Laptop stand, keyboard"]] if event != "abandoned_cart" else [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
+        }],
+    }
+
+
+def _meta_template_error(response) -> dict:
+    try:
+        payload = response.json()
+        error = payload.get("error") if isinstance(payload, dict) else {}
+        error = error if isinstance(error, dict) else {}
+    except (ValueError, AttributeError):
+        error = {}
+    message = " ".join(str(error.get("error_user_msg") or error.get("message") or "").split())[:300]
+    status = int(getattr(response, "status_code", 0) or 0)
+    return {
+        "already_exists": "already exists" in message.lower(),
+        "code": error.get("code"),
+        "subcode": error.get("error_subcode"),
+        "detail": f"Meta rejected the Shopify template: {message or f'HTTP {status}'}",
+    }
 
 
 def _template_compatible(template: dict, purpose: str = "cart") -> bool:

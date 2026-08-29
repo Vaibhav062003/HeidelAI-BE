@@ -32,7 +32,8 @@ def pure_namespace():
         "_provider_reports_block", "_eligibility_status",
         "_provider_time", "_provider_sort_key", "_reminder_due", "_sync_retry_at",
         "_recovery_activity_time", "_checkout_changed_for_send",
-        "_product_summary", "_template_compatible", "_checkout_status_clause", "verify_callback_hmac", "_iso_utc",
+        "_product_summary", "_default_template_payload", "_meta_template_error",
+        "_template_compatible", "_checkout_status_clause", "verify_callback_hmac", "_iso_utc",
     }
     tree = ast.parse(SERVICE)
     nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted]
@@ -44,6 +45,7 @@ def pure_namespace():
         "OPT_OUT_COMMANDS": {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"},
         "OPT_IN_COMMANDS": {"start", "subscribe"},
         "OVERDUE_GRACE_SECONDS": 90,
+        "DEFAULT_TEMPLATE_LANGUAGE": "en_US",
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVICE_PATH), "exec"), namespace)
     return namespace
@@ -117,6 +119,27 @@ def main():
     assert SERVICE.count("shippingAddress { phone }") >= 2
     assert SERVICE.count("billingAddress { phone }") >= 2
     assert ns["_product_summary"]([{"name": "A"}, {"name": "B"}, {"name": "C"}, {"name": "D"}]) == "A, B, C +1 more"
+    for event in ("abandoned_cart", "received", "shipped", "fulfilled", "cancelled"):
+        payload = ns["_default_template_payload"](event, "en")
+        assert payload["language"] == "en_US"
+        assert sorted(re.findall(r"{{\s*(\d+)\s*}}", payload["components"][0]["text"])) == ["1", "2", "3"]
+        assert payload["category"] == ("MARKETING" if event == "abandoned_cart" else "UTILITY")
+
+    class MetaResponse:
+        status_code = 400
+
+        @staticmethod
+        def json():
+            return {"error": {"message": "Invalid parameter", "error_user_msg": "English (US) is required", "code": 100, "error_subcode": 2388003}}
+
+    meta_error = ns["_meta_template_error"](MetaResponse())
+    assert meta_error == {
+        "already_exists": False,
+        "code": 100,
+        "subcode": 2388003,
+        "detail": "Meta rejected the Shopify template: English (US) is required",
+    }
+    assert len(ns["_meta_template_error"](type("LongResponse", (), {"status_code": 400, "json": lambda _self: {"error": {"error_user_msg": "x" * 400}}})())["detail"]) < 340
     assert ns["_template_compatible"]({"status": "APPROVED", "category": "MARKETING", "components": [{"type": "BODY", "text": "Hi {{1}}: {{2}} {{3}}"}]})
     assert not ns["_template_compatible"]({"status": "APPROVED", "category": "UTILITY", "components": [{"type": "BODY", "text": "{{1}} {{2}} {{3}}"}]})
     assert not ns["_template_compatible"]({"status": "APPROVED", "category": "MARKETING", "components": [{"type": "HEADER", "text": "{{1}}"}, {"type": "BODY", "text": "{{1}} {{2}} {{3}}"}]})
