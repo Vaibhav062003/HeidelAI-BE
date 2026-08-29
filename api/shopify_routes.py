@@ -63,7 +63,7 @@ class ShopifySettingsPayload(BaseModel):
 class TemplateCreatePayload(BaseModel):
     whatsapp_id: str = Field(default="", max_length=200)
     whatsapp_phone_id: str = Field(default="", max_length=200)
-    language: str = Field(default="en", min_length=1, max_length=20)
+    language: str = Field(default="en_US", min_length=1, max_length=20)
     event: Literal["abandoned_cart", "received", "shipped", "fulfilled", "cancelled"] = "abandoned_cart"
 
 
