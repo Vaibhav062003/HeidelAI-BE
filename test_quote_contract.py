@@ -2,10 +2,12 @@ import ast
 from pathlib import Path
 
 from services.quote_math import quote_line_amounts
+from services.quote_service import build_quote_document
 
 
 def test_quote_routes_are_authenticated_and_store_private_pricing():
     tree = ast.parse(Path("api/quote_routes.py").read_text())
+    service_tree = ast.parse(Path("services/quote_service.py").read_text())
     route_functions = [
         node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -26,11 +28,17 @@ def test_quote_routes_are_authenticated_and_store_private_pricing():
     string_values = {
         node.value for node in ast.walk(tree)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    } | {
+        node.value for node in ast.walk(service_tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert "private_unit_price" in string_values
     assert "public_grand_total" in string_values
     field_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     assert {"gst_inclusive", "revision_number"} <= string_values
+    assert "build_quote_document" in {
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    }
     assert {"category", "component_categories", "design"} <= field_names
 
     settings_update = next(function for function in route_functions if function.name == "update_quote_settings")
@@ -68,7 +76,22 @@ def test_quote_math_handles_inclusive_and_extra_gst():
     assert quote_line_amounts(2, 100, 18, False) == (200, 36, 236)
 
 
+def test_shared_quote_document_keeps_inclusive_gst_total_exact():
+    document = build_quote_document({
+        "items": [{
+            "id": "one", "description": "Product", "quantity": 1,
+            "unit_price": 118, "gst_rate": 18, "gst_inclusive": True,
+        }],
+        "shipping": 0, "discount": 0,
+    }, org_id="org", actor_id="ai-sales", actor_name="AI Sales Agent")
+    assert document["private_subtotal"] == 100
+    assert document["private_gst_total"] == 18
+    assert document["public_grand_total"] == 118
+    assert document["items"][0]["private_unit_price"] == 118
+
+
 if __name__ == "__main__":
     test_quote_routes_are_authenticated_and_store_private_pricing()
     test_quote_math_handles_inclusive_and_extra_gst()
+    test_shared_quote_document_keeps_inclusive_gst_total_exact()
     print("Quote contract checks passed.")

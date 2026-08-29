@@ -182,9 +182,8 @@ async def _reconciliation_loop() -> None:
       - Google coalesces rapid edits into fewer notifications
     """
     logger.info("[Scheduler] Reconciliation loop started.")
-    # Wait a short time before the first reconciliation to let webhooks handle
-    # any immediate changes after startup
-    await asyncio.sleep(60)
+    # Let the web server pass health checks before the first full-sheet sync.
+    await asyncio.sleep(300)
 
     while True:
         try:

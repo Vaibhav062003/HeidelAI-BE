@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from bson.objectid import ObjectId
 from fastapi import HTTPException
 from pymongo import ReturnDocument, UpdateOne
+from pymongo.errors import DuplicateKeyError
 
 # Internal modules
 from core.managers import manager
@@ -37,6 +38,66 @@ db = get_mongo_db()
 mongo_client = get_mongo_client()
 
 
+def broadcast_phone_key(value) -> str:
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    return digits if 7 <= len(digits) <= 15 else ""
+
+
+def broadcast_message_preference(content) -> str | None:
+    command = "".join(character for character in str(content or "").casefold() if character.isalpha())
+    if command in {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"}:
+        return "opted_out"
+    if command in {"start", "subscribe"}:
+        return "subscribed"
+    return None
+
+
+def get_broadcast_suppressed_phone_keys(org_id: str, phones: list[str]) -> set[str]:
+    keys = {broadcast_phone_key(phone) for phone in phones}
+    keys.discard("")
+    if not keys:
+        return set()
+    suppressed = {
+        str(item.get("phone") or "")
+        for item in db.whatsapp_suppressions.find(
+            {"org_id": org_id, "phone": {"$in": list(keys)}},
+            {"_id": 0, "phone": 1},
+        )
+    }
+    unchecked = keys - suppressed
+    if unchecked:
+        conversation_ids = [f"whatsapp_{phone}" for phone in unchecked]
+        preference_messages = db[f"messages_{org_id}"].aggregate([
+            {"$match": {
+                "conversation_id": {"$in": conversation_ids},
+                "role": "customer",
+                "mode": {"$ne": "private"},
+                "content": {"$regex": r"^\s*(?:stop(?:\s*all)?|unsubscribe|cancel|end|quit|start|subscribe)\s*[.!]?\s*$", "$options": "i"},
+            }},
+            {"$sort": {"timestamp": -1}},
+            {"$group": {"_id": "$conversation_id", "content": {"$first": "$content"}}},
+        ])
+        now = datetime.now(timezone.utc)
+        operations = []
+        for item in preference_messages:
+            phone = broadcast_phone_key(str(item.get("_id") or "").removeprefix("whatsapp_"))
+            if phone and broadcast_message_preference(item.get("content")) == "opted_out":
+                suppressed.add(phone)
+                operations.append(UpdateOne(
+                    {"org_id": org_id, "phone": phone},
+                    {"$set": {"reason": "customer_opt_out", "source": "message_history", "updated_at": now}, "$setOnInsert": {"created_at": now}},
+                    upsert=True,
+                ))
+        if operations:
+            db.whatsapp_suppressions.bulk_write(operations, ordered=False)
+    return suppressed
+
+
+def is_broadcast_suppressed(org_id: str, phone: str) -> bool:
+    key = broadcast_phone_key(phone)
+    return bool(key and db.whatsapp_suppressions.find_one({"org_id": org_id, "phone": key}, {"_id": 1}))
+
+
 async def create_or_update_whatsapp_conversation(
     org_id: str, 
     recipient_id, 
@@ -49,6 +110,7 @@ async def create_or_update_whatsapp_conversation(
     is_auto_followup: bool = False,
     mode: Optional[str] = None,
     extra_updates: Optional[dict] = None,
+    idempotency_key: Optional[str] = None,
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -174,6 +236,8 @@ async def create_or_update_whatsapp_conversation(
         "$setOnInsert": update_set_on_insert,
         "$inc": update_inc
     }
+    if idempotency_key:
+        mongo_update["$addToSet"] = {"applied_outbound_message_ids": idempotency_key}
 
     # Safely apply $max ONLY if we have a valid expiry from the customer
     if last_sender == "customer" and reply_window_expiry:
@@ -181,20 +245,31 @@ async def create_or_update_whatsapp_conversation(
         update_set["is_ad_referral"] = is_ad_referral 
 
     # Execute atomic update
-    updated_conversation = conversations_collection.find_one_and_update(
-        {"conversation_id": conversation_id},
-        mongo_update,
-        upsert=True,
-        return_document=ReturnDocument.AFTER
-    )
+    update_filter = {"conversation_id": conversation_id}
+    if idempotency_key:
+        update_filter["applied_outbound_message_ids"] = {"$ne": idempotency_key}
+    try:
+        updated_conversation = conversations_collection.find_one_and_update(
+            update_filter,
+            mongo_update,
+            upsert=True,
+            return_document=ReturnDocument.AFTER
+        )
+    except DuplicateKeyError:
+        if idempotency_key and conversations_collection.find_one(
+            {"conversation_id": conversation_id, "applied_outbound_message_ids": idempotency_key},
+            {"_id": 1},
+        ):
+            return conversation_id
+        raise
 
-    logger.success(f"Whatsapp conversation updated: {updated_conversation}")
+    logger.success("Whatsapp conversation updated: org=...{} conversation=...{}", org_id[-6:], conversation_id[-6:])
 
     # Format the timestamp for JSON serialization
     broadcast_conversation = dict(updated_conversation)
     if "last_message_timestamp" in broadcast_conversation:
         broadcast_conversation["last_message_timestamp"] = broadcast_conversation["last_message_timestamp"].isoformat()
-    if broadcast_conversation["next_action_at"] is not None:
+    if broadcast_conversation.get("next_action_at") is not None:
         broadcast_conversation["next_action_at"] = broadcast_conversation["next_action_at"].isoformat()
     if "started_at" in broadcast_conversation:
         broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()
@@ -324,9 +399,6 @@ async def store_whatsapp_message(
     # )
 
     logger.success(f"Whatsapp conversation updated: {conversation_id}")
-    
-    if status == "sending":
-        return message_id
     
     # Format message for WebSocket broadcast
     broadcast_message = {
@@ -832,11 +904,24 @@ async def send_whatsapp_message(
                 payload={"conversation": final_conversation}
             )
 
-        result = {"message": "Messages sent", "message_ids": all_message_ids, "message_id": last_stored_id}
+        result = {
+            "message": "Messages sent",
+            "message_ids": all_message_ids,
+            "message_id": last_stored_id,
+            "delivery_state": "sent",
+            "local_sync_pending": False,
+        }
         if len(contents) == 1 and not complete_reply(db.whatsapp_outbound_sends, outbound_operation, result):
             existing_operation = db.whatsapp_outbound_sends.find_one({"_id": outbound_operation["_id"], "org_id": org_id}) if outbound_operation else None
             if existing_operation and existing_operation.get("status") == "completed" and isinstance(existing_operation.get("result"), dict):
                 return existing_operation["result"]
+            if mode == "reply" and last_stored_id:
+                return {
+                    **result,
+                    "message": "Message accepted; delivery status is still synchronizing",
+                    "delivery_state": "accepted_pending_sync",
+                    "local_sync_pending": True,
+                }
             raise HTTPException(status_code=409, detail="The reply was delivered and is still being synchronized. Refresh the conversation.")
         return result
 
@@ -2159,6 +2244,7 @@ def create_bulk_job(
         "total": total,
         "sent": 0,
         "failed": 0,
+        "skipped": 0,
         # RESULTS SHOULD BE STORED IN A SEPARATE COLLECTION TO AVOID 16MB LIMIT
         "created_at": now,
         "updated_at": now,
@@ -2365,14 +2451,33 @@ async def run_bulk_send_job(
                 
                 logger.info(f"Bulk WA | job={job_id} | processing batch {current_batch}/{total_batches} | size={len(chunk)}")
                 
-                tasks = [send_to_recipient(i + idx, r, client) for idx, r in enumerate(chunk)]
-                batch_results = await asyncio.gather(*tasks)
+                suppressed = await asyncio.to_thread(
+                    get_broadcast_suppressed_phone_keys,
+                    org_id,
+                    [recipient.phone_number for recipient in chunk],
+                )
+                tasks = []
+                batch_results = []
+                for idx, recipient in enumerate(chunk):
+                    if broadcast_phone_key(recipient.phone_number) in suppressed:
+                        batch_results.append(({
+                            "job_id": job_id,
+                            "phone_number": recipient.phone_number,
+                            "status": "skipped",
+                            "error": "Recipient opted out",
+                            "created_at": datetime.now(timezone.utc),
+                        }, {"$inc": {"skipped": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}))
+                    else:
+                        tasks.append(send_to_recipient(i + idx, recipient, client))
+                if tasks:
+                    batch_results.extend(await asyncio.gather(*tasks))
                 
                 # Batch DB operations
                 entries = [res[0] for res in batch_results]
                 
                 total_sent = sum(res[1]["$inc"].get("sent", 0) for res in batch_results)
                 total_failed = sum(res[1]["$inc"].get("failed", 0) for res in batch_results)
+                total_skipped = sum(res[1]["$inc"].get("skipped", 0) for res in batch_results)
                 
                 # Prepare message and conversation bulk operations for successful sends
                 message_docs = []
@@ -2444,6 +2549,7 @@ async def run_bulk_send_job(
                 }
                 if total_sent > 0: combined_update["$inc"]["sent"] = total_sent
                 if total_failed > 0: combined_update["$inc"]["failed"] = total_failed
+                if total_skipped > 0: combined_update["$inc"]["skipped"] = total_skipped
 
                 db_tasks = [
                     asyncio.to_thread(db.bulk_job_results.insert_many, entries),

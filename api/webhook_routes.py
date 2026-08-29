@@ -1,5 +1,5 @@
 # Built-in Modules
-import time, json, hmac, hashlib
+import asyncio, time, json, hmac, hashlib
 from fastapi import APIRouter, HTTPException, Response
 from datetime import datetime, timezone, timedelta
 from fastapi import Request, Header, BackgroundTasks
@@ -18,6 +18,7 @@ from services.contacts_service import store_contact_background
 from services.payment_service import build_idempotency_key, process_cashfree_event, verify_cashfree_signature
 from services.heidelai_bot import send_to_chatbot
 from services.agent_service import send_to_agent
+from services.sales_action_service import mark_sales_action_delivered
 from services.ai_policy_service import ai_access_state, is_effective_ai_enabled
 from services.ai_reply_guard import AIProviderUnavailable, log_ai_failure
 from services.pricing_service import is_price_signal, is_pricing_enabled, observe_customer_message, validate_ai_pricing_response
@@ -42,6 +43,7 @@ from services.whatsapp_call_history import (
     provider_lifecycle_filter,
 )
 from services.intent_queue_worker import enqueue_intent_check
+from services.shopify_service import record_whatsapp_preference, record_whatsapp_provider_block, update_shopify_reminder_delivery
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -628,6 +630,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         
                         if not message_id or not status_type:
                             continue
+
+                        if status_type == "failed":
+                            await asyncio.to_thread(
+                                record_whatsapp_provider_block,
+                                connection.get("org_id"),
+                                status.get("recipient_id"),
+                                status,
+                            )
                         
                         logger.info(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
                         
@@ -638,6 +648,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             status=status_type,
                             # status_timestamp=status.get("timestamp")
                         )
+
+                        try:
+                            await update_shopify_reminder_delivery(
+                                connection.get("org_id"), message_id, status_type,
+                            )
+                        except Exception as exc:
+                            logger.debug(f"Shopify reminder delivery propagation skipped for {message_id}: {exc}")
 
                         try:
                             from services.sales_offer_service import update_offer_delivery
@@ -787,6 +804,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 if "_id" in broadcast_message:
                                     broadcast_message["_id"] = str(broadcast_message["_id"])
 
+                                try:
+                                    from services.sales_learning_service import record_reaction
+                                    await record_reaction(
+                                        org_id, conversation_id,
+                                        str(message.get("id") or f"wa:{message_id}:{message.get('timestamp')}:{action}:{emoji}"),
+                                        str(message_id), str(emoji or ""), action, "whatsapp",
+                                    )
+                                except Exception as learning_error:
+                                    logger.warning(f"Could not record internal WhatsApp reaction learning: {type(learning_error).__name__}")
+
                                 await broadcast_main_ws(
                                     platform_id=whatsapp_business_id,
                                     platform_type="whatsapp",
@@ -927,6 +954,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract message content based on message type
                             if message_type == "text":
                                 content = message.get("text", {}).get("body", "")
+                                try:
+                                    await asyncio.to_thread(record_whatsapp_preference, org_id, customer_phone_no, content)
+                                except Exception:
+                                    services.processed_message_ids.pop(wa_message_id, None)
+                                    raise
 
                                 # Check if this is a registered dealer from the conversation doc first
                                 is_dealer = convo_doc.get("is_dealer", False) if convo_doc else False
@@ -1089,19 +1121,29 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             source="webhook",
                                             reply_context_message_id=replied_message_id,
                                             message_id=wa_message_id,
+                                            message_type=message_type,
                                         )
+                                        if chatbot_response.get("duplicate_event"):
+                                            return {"status": "duplicate_ignored"}
                                         if not await is_effective_ai_enabled(org_id, conversation_id):
                                             return {"status": "ok"}
 
                                         await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
-                                        await send_whatsapp_message({
+                                        sales_action = chatbot_response.get("sales_action")
+                                        agent_reply_to = chatbot_response.get("reply_to_message_id")
+                                        send_result = await send_whatsapp_message({
                                             "conversation_id": conversation_id,
                                             "content": chatbot_response["final_response"],
                                             "sender_id": whatsapp_business_id,
-                                            "pricing_source_message_id": wa_message_id,
+                                            "pricing_source_message_id": None if sales_action else wa_message_id,
                                             "ai_usage": chatbot_response.get("usage"),
-                                        }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
+                                        }, org_id, "ai", temp_id=f"ai:{wa_message_id}",
+                                            context_type="message_reply" if agent_reply_to else None,
+                                            context={"mid": agent_reply_to} if agent_reply_to else None,
+                                            bot_context={"sales_action_job_id": sales_action.get("job_id")} if sales_action else None,
+                                        )
+                                        await mark_sales_action_delivered(org_id, sales_action, send_result)
                                     except AIProviderUnavailable as exc:
                                         await _handle_ai_provider_failure(
                                             exc,
@@ -1251,16 +1293,26 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         source="webhook",
                                         reply_context_message_id=replied_message_id,
                                         message_id=wa_message_id,
+                                        message_type=message_type,
                                     )
+                                    if chatbot_response.get("duplicate_event"):
+                                        return {"status": "duplicate_ignored"}
                                     if not await is_effective_ai_enabled(org_id, conversation_id):
                                         return {"status": "ok"}
-                                    await send_whatsapp_message({
+                                    sales_action = chatbot_response.get("sales_action")
+                                    agent_reply_to = chatbot_response.get("reply_to_message_id")
+                                    send_result = await send_whatsapp_message({
                                         "conversation_id": conversation_id,
                                         "content": chatbot_response["final_response"],
                                         "sender_id": whatsapp_business_id,
-                                        "pricing_source_message_id": wa_message_id,
+                                        "pricing_source_message_id": None if sales_action else wa_message_id,
                                         "ai_usage": chatbot_response.get("usage"),
-                                    }, org_id, "ai", temp_id=f"ai:{wa_message_id}")
+                                    }, org_id, "ai", temp_id=f"ai:{wa_message_id}",
+                                        context_type="message_reply" if agent_reply_to else None,
+                                        context={"mid": agent_reply_to} if agent_reply_to else None,
+                                        bot_context={"sales_action_job_id": sales_action.get("job_id")} if sales_action else None,
+                                    )
+                                    await mark_sales_action_delivered(org_id, sales_action, send_result)
                                 except AIProviderUnavailable as exc:
                                     await _handle_ai_provider_failure(
                                         exc,
@@ -2102,6 +2154,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         if "_id" in broadcast_message:
                             broadcast_message["_id"] = str(broadcast_message["_id"])
 
+                        try:
+                            from services.sales_learning_service import record_reaction
+                            await record_reaction(
+                                org_id, f"instagram_{sender_id}",
+                                f"ig:{mid}:{sender_id}:{message_timestamp}:{action}:{emoji}",
+                                str(mid), str(emoji or ""), action, "instagram",
+                            )
+                        except Exception as learning_error:
+                            logger.warning(f"Could not record internal Instagram reaction learning: {type(learning_error).__name__}")
+
                         await broadcast_main_ws(
                             platform_id=recipient_id,
                             platform_type="instagram",
@@ -2346,9 +2408,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         org_id=org_id,
                                         source="webhook",
                                         message_id=ig_message_id,
+                                        message_type=attachment_type,
                                     )
+                                    if chatbot_response.get("duplicate_event"):
+                                        return {"status": "duplicate_ignored"}
                                     if await is_effective_ai_enabled(org_id, conversation_id):
-                                        if is_pricing_enabled(org_id):
+                                        sales_action = chatbot_response.get("sales_action")
+                                        if is_pricing_enabled(org_id) and not sales_action:
                                             try:
                                                 valid, reason = await validate_ai_pricing_response(
                                                     org_id=org_id,
@@ -2374,6 +2440,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         )
                                         if not ai_result.get("success"):
                                             raise AIProviderUnavailable("delivery_error")
+                                        await mark_sales_action_delivered(
+                                            org_id, sales_action, ai_result, platform="instagram",
+                                        )
                                 else:
                                     await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform="instagram", customer_number=sender_id, customer_name=name or username)
                                 ai_processing_complete = True
@@ -2525,6 +2594,7 @@ async def cashfree_webhook(request: Request):
     data = payload["data"]
 
     idempotency_key = await build_idempotency_key(event_type, data)
+    attempt_time = datetime.utcnow()
 
     try:
         db.cashfree_webhook_events.insert_one({
@@ -2532,14 +2602,34 @@ async def cashfree_webhook(request: Request):
             "gateway": "CASHFREE",
             "event_type": event_type,
             "reference_id": data.get("cf_payment_id")
-                or data.get("cf_subscription_id"),
+                or data.get("cf_subscription_id")
+                or data.get("link_id"),
             "processed": False,
+            "processing": True,
+            "attempts": 1,
             "payload": payload,
-            "created_at": datetime.utcnow()
+            "created_at": attempt_time,
+            "updated_at": attempt_time,
         })
     except DuplicateKeyError:
-        # webhook retry or duplicate
-        return {"status": "duplicate_ignored"}
+        claimed = db.cashfree_webhook_events.find_one_and_update(
+            {
+                "idempotency_key": idempotency_key,
+                "processed": False,
+                "$or": [
+                    {"processing": {"$ne": True}},
+                    {"updated_at": {"$lt": attempt_time - timedelta(minutes=5)}},
+                ],
+            },
+            {
+                "$set": {"processing": True, "updated_at": attempt_time, "payload": payload},
+                "$inc": {"attempts": 1},
+                "$unset": {"last_error": ""},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            return {"status": "duplicate_ignored"}
 
     try:
         logger.info(f"Processing Cashfree event: {event_type}")
@@ -2547,11 +2637,19 @@ async def cashfree_webhook(request: Request):
 
         db.cashfree_webhook_events.update_one(
             {"idempotency_key": idempotency_key},
-            {"$set": {"processed": True}}
+            {"$set": {"processed": True, "processing": False, "updated_at": datetime.utcnow()}}
         )
 
     except Exception as e:
-        # DO NOT fail the webhook
         logger.error(f"Webhook processing failed : {e}")
+        db.cashfree_webhook_events.update_one(
+            {"idempotency_key": idempotency_key},
+            {"$set": {
+                "processing": False,
+                "last_error": str(e)[:500],
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+        raise HTTPException(status_code=500, detail="Cashfree event processing failed") from e
 
     return {"status": "processed"}

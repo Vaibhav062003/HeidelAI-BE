@@ -346,7 +346,7 @@ def build_snapshot_requests(settings: dict) -> list[dict]:
         ])},
         {"key": "stock_items", "xml": _export_collection_xml(settings, "StockItem", [
             "Name", "Alias", "Parent", "GUID", "MasterID", "AlterID", "BaseUnits", "ClosingBalance",
-            "ClosingValue", "StandardPrice", "GSTApplicable", "GSTTaxability", "GSTHSNName", "GSTIGSTRate",
+            "ClosingValue", "StandardPrice", "Description", "BatchAllocations", "GSTApplicable", "GSTTaxability", "GSTHSNName", "GSTIGSTRate",
         ])},
         {"key": "units", "xml": _export_collection_xml(settings, "Unit", [
             "Name", "GUID", "MasterID", "AlterID", "OriginalName", "GSTRepUOM",
@@ -517,6 +517,16 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                 })
             elif key == "stock_items":
                 aliases = [value.strip() for value in _node_text(node, "ALIAS").split(",") if value.strip()]
+                allocations = []
+                for allocation in node.iter():
+                    if _tag(allocation) != "BATCHALLOCATIONS.LIST":
+                        continue
+                    quantity = float(_decimal_text(_node_text(allocation, "CLOSINGBALANCE", "ACTUALQTY", "BILLEDQTY")))
+                    allocations.append({
+                        "godown": _node_text(allocation, "GODOWNNAME") or "Main Location",
+                        "batch": _node_text(allocation, "BATCHNAME") or "Primary Batch",
+                        "quantity": abs(quantity),
+                    })
                 parsed[key].append({**common,
                     "aliases": aliases,
                     "model_number": aliases[0] if aliases else name,
@@ -525,6 +535,8 @@ def parse_snapshot_responses(responses: list[dict]) -> dict:
                     "closing_quantity": float(_decimal_text(_node_text(node, "CLOSINGBALANCE"))),
                     "closing_value": float(_decimal_text(_node_text(node, "CLOSINGVALUE"))),
                     "standard_rate": float(_decimal_text(_node_text(node, "STANDARDPRICE"))),
+                    "description": _node_text(node, "DESCRIPTION"),
+                    "allocations": allocations,
                     "hsn": _node_text(node, "GSTHSNNAME", "HSNCODE"),
                     "gst_rate": float(_decimal_text(_node_text(node, "GSTIGSTRATE"))),
                     "gst_applicable": _node_text(node, "GSTAPPLICABLE"),
@@ -1406,6 +1418,7 @@ def build_master_xml(
             f"<STOCKITEM NAME=\"{_xml(target)}\" ACTION=\"{action}\"><NAME>{_xml(name)}</NAME>"
             f"<PARENT>{_xml(value.get('parent') or 'Primary')}</PARENT>"
             f"<ALIAS>{_xml(value.get('model_number'))}</ALIAS><BASEUNITS>{_xml(value.get('unit'))}</BASEUNITS>"
+            f"<DESCRIPTION>{_xml(value.get('description'))}</DESCRIPTION>"
             f"<GSTAPPLICABLE>{_xml(value.get('gst_applicable') or 'Applicable')}</GSTAPPLICABLE>"
             f"<GSTHSNNAME>{_xml(value.get('hsn'))}</GSTHSNNAME>"
             f"<STANDARDPRICELIST.LIST><DATE>{date.today().strftime('%Y%m%d')}</DATE>"
@@ -1420,6 +1433,42 @@ def build_master_xml(
         "<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA>"
         f"<REQUESTDESC><REPORTNAME>All Masters</REPORTNAME>{static_variables}</REQUESTDESC><REQUESTDATA>"
         f"<TALLYMESSAGE xmlns:UDF=\"TallyUDF\">{body}</TALLYMESSAGE>"
+        "</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>"
+    )
+
+
+def build_physical_stock_xml(settings: dict, item: dict, quantity: float, allocations: list[dict]) -> str:
+    """Build a location/batch-aware Physical Stock voucher for actual quantity."""
+    unit = item.get("unit") or normalized_settings(settings)["stock_unit"]
+    allocations = allocations or [{"godown": "Main Location", "batch": "Primary Batch", "quantity": quantity}]
+    total = sum(float(row.get("quantity") or 0) for row in allocations)
+    if abs(total - float(quantity)) > 0.001:
+        raise HTTPException(status_code=422, detail="Location and batch quantities must equal the total stock quantity")
+    batch_xml = "".join(
+        "<BATCHALLOCATIONS.LIST>"
+        f"<GODOWNNAME>{_xml(row.get('godown') or 'Main Location')}</GODOWNNAME>"
+        f"<BATCHNAME>{_xml(row.get('batch') or 'Primary Batch')}</BATCHNAME>"
+        f"<ACTUALQTY>{_number(row.get('quantity'))} {_xml(unit)}</ACTUALQTY>"
+        f"<BILLEDQTY>{_number(row.get('quantity'))} {_xml(unit)}</BILLEDQTY>"
+        "</BATCHALLOCATIONS.LIST>"
+        for row in allocations
+    )
+    company = _xml(normalized_settings(settings)["company_name"])
+    body = (
+        '<VOUCHER VCHTYPE="Physical Stock" ACTION="Create" OBJVIEW="Inventory Voucher View">'
+        f"<DATE>{date.today().strftime('%Y%m%d')}</DATE><EFFECTIVEDATE>{date.today().strftime('%Y%m%d')}</EFFECTIVEDATE>"
+        "<VOUCHERTYPENAME>Physical Stock</VOUCHERTYPENAME><PERSISTEDVIEW>Inventory Voucher View</PERSISTEDVIEW>"
+        "<ALLINVENTORYENTRIES.LIST>"
+        f"<STOCKITEMNAME>{_xml(item.get('name'))}</STOCKITEMNAME>"
+        f"<ACTUALQTY>{_number(quantity)} {_xml(unit)}</ACTUALQTY>"
+        f"<BILLEDQTY>{_number(quantity)} {_xml(unit)}</BILLEDQTY>{batch_xml}"
+        "</ALLINVENTORYENTRIES.LIST></VOUCHER>"
+    )
+    return (
+        "<ENVELOPE><HEADER><TALLYREQUEST>Import Data</TALLYREQUEST></HEADER><BODY><IMPORTDATA>"
+        "<REQUESTDESC><REPORTNAME>Vouchers</REPORTNAME><STATICVARIABLES>"
+        f"<SVCURRENTCOMPANY>{company}</SVCURRENTCOMPANY></STATICVARIABLES></REQUESTDESC><REQUESTDATA>"
+        f'<TALLYMESSAGE xmlns:UDF="TallyUDF">{body}</TALLYMESSAGE>'
         "</REQUESTDATA></IMPORTDATA></BODY></ENVELOPE>"
     )
 
@@ -1593,6 +1642,18 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
         }}
     )
     await reconcile_default_payment_reminders(org_id)
+    try:
+        from services.sales_learning_service import record_verified_tally_outcome
+        for invoice in parsed["invoices"]:
+            previous = previous_invoices.get(invoice.get("master_id")) or {}
+            contact = invoice.get("billing_contact") or {}
+            if invoice.get("payment_status") == "paid" and previous.get("payment_status") != "paid" and contact.get("conversation_id"):
+                await record_verified_tally_outcome(
+                    org_id, str(contact["conversation_id"]),
+                    f"tally-paid:{invoice.get('invoice_id')}", "paid",
+                )
+    except Exception as error:
+        logger.warning(f"Could not record internal Tally payment learning: {type(error).__name__}")
     return {"counts": counts, "contact_counts": contact_counts, "last_sync_at": now}
 
 
@@ -2029,6 +2090,89 @@ async def _party_candidates(org_id: str, customer: dict, mapped_master_id: str =
     return serialize_mongo(rows)
 
 
+async def _draft_items_from_quote(org_id: str, quote: dict) -> list[dict]:
+    items = []
+    for item in quote.get("items") or []:
+        term = item.get("sku") or item.get("description") or ""
+        candidates = await _product_candidates(org_id, term)
+        selected_master_id = item.get("tally_master_id") or _exact_product_master_id(candidates, term)
+        if selected_master_id and not any(row.get("master_id") == selected_master_id for row in candidates):
+            selected = await db.tally_stock_items.find_one(
+                {"org_id": org_id, "master_id": selected_master_id}, {"_id": 0, "sync_id": 0}
+            )
+            if selected:
+                candidates.insert(0, serialize_mongo(selected))
+        items.append({
+            "requested": term, "quantity": str(Decimal(str(item.get("quantity") or 1)).normalize()),
+            "candidates": candidates, "selected_master_id": selected_master_id,
+            "rate": float(_money(item.get("private_unit_price"))),
+            "gst_rate": float(_money(item.get("gst_rate"))),
+            "gst_inclusive": item.get("gst_inclusive") is True,
+        })
+    return items
+
+
+async def _message_draft_source(org_id: str, conversation_id: str, requested_ids: list[str]) -> tuple[list[dict], dict | None, list[dict]]:
+    offers = db[f"sales_offers_{org_id}"]
+    query = {
+        "org_id": org_id,
+        "conversation_id": conversation_id,
+        "delivery_status": {"$ne": "failed"},
+        "status": {"$in": ["open", "accepted", "billed", "paid"]},
+    }
+    if requested_ids:
+        rows = await offers.find({**query, "source_message_id": {"$in": requested_ids}}).sort("created_at", -1).to_list(length=20)
+        matched = {str(row.get("source_message_id") or "") for row in rows}
+        if matched != set(requested_ids):
+            raise HTTPException(status_code=422, detail="Choose delivered quote or offer messages from this conversation")
+        rows.sort(key=lambda row: requested_ids.index(str(row["source_message_id"])))
+    else:
+        rows = await offers.find({**query, "$or": [
+            {"source_type": "formal_quote"}, {"line_items.0": {"$exists": True}},
+        ]}).sort("created_at", -1).limit(1).to_list(length=1)
+    if not rows:
+        raise HTTPException(status_code=422, detail="No delivered structured quote or offer is available for billing")
+
+    formal = [row for row in rows if row.get("source_type") == "formal_quote"]
+    if len(formal) > 1 or (formal and len(rows) > 1):
+        raise HTTPException(status_code=422, detail="Choose one current formal quotation for billing")
+    quote = None
+    items = []
+    if formal:
+        offer = formal[0]
+        quote = await db[f"quotes_{org_id}"].find_one({
+            "org_id": org_id, "conversation_id": conversation_id,
+            "quote_id": offer.get("quote_id"),
+        })
+        if not quote:
+            raise HTTPException(status_code=404, detail="The source quotation is no longer available")
+        items = await _draft_items_from_quote(org_id, quote)
+    else:
+        for offer in rows:
+            line_items = offer.get("line_items") or []
+            if not line_items:
+                raise HTTPException(status_code=422, detail="Choose a structured product offer for billing")
+            for item in line_items:
+                term = str(item.get("description") or "").strip()
+                candidates = await _product_candidates(org_id, term)
+                items.append({
+                    "requested": term,
+                    "quantity": str(Decimal(str(item.get("quantity") or 1)).normalize()),
+                    "rate": float(_money(item.get("unit_price"))),
+                    "gst_rate": float(_money(item.get("gst_rate"))),
+                    "gst_inclusive": item.get("gst_inclusive") is True,
+                    "candidates": candidates,
+                    "selected_master_id": _exact_product_master_id(candidates, term),
+                })
+    previews = [{
+        "message_id": str(row.get("source_message_id") or ""),
+        "source_type": str(row.get("source_type") or "chat_price"),
+        "preview": str(row.get("message_preview") or row.get("quote_number") or "Offer")[:240],
+        "created_at": row.get("created_at"),
+    } for row in rows]
+    return items, quote, previews
+
+
 async def create_tally_invoice_draft(
     org_id: str, user_id: str, role: str, conversation_id: str, payload: dict,
 ) -> dict:
@@ -2051,27 +2195,17 @@ async def create_tally_invoice_draft(
         })
         if not quote:
             raise HTTPException(status_code=404, detail="Quotation not found")
-        for item in quote.get("items") or []:
-            term = item.get("sku") or item.get("description") or ""
-            candidates = await _product_candidates(org_id, term)
-            selected_master_id = item.get("tally_master_id") or _exact_product_master_id(candidates, term)
-            if selected_master_id and not any(row.get("master_id") == selected_master_id for row in candidates):
-                selected = await db.tally_stock_items.find_one(
-                    {"org_id": org_id, "master_id": selected_master_id}, {"_id": 0, "sync_id": 0}
-                )
-                if selected:
-                    candidates.insert(0, serialize_mongo(selected))
-            items.append({
-                "requested": term, "quantity": str(Decimal(str(item.get("quantity") or 1)).normalize()),
-                "candidates": candidates,
-                "selected_master_id": selected_master_id,
-                "rate": float(_money(item.get("private_unit_price"))),
-                "gst_rate": float(_money(item.get("gst_rate"))),
-                "gst_inclusive": item.get("gst_inclusive") is True,
-            })
+        items = await _draft_items_from_quote(org_id, quote)
         reference = quote.get("quote_number") or quote["quote_id"]
+        source_messages = []
+    elif source == "messages":
+        source_ids = list(dict.fromkeys(str(value).strip() for value in payload.get("source_message_ids") or [] if str(value).strip()))[:20]
+        items, quote, source_messages = await _message_draft_source(org_id, conversation_id, source_ids)
+        reference = (quote or {}).get("quote_number") or f"HDL-{uuid.uuid4().hex[:8].upper()}"
     else:
-        raise HTTPException(status_code=422, detail="Invoice draft source must be command or quote")
+        raise HTTPException(status_code=422, detail="Invoice draft source must be command, quote, or messages")
+    if source != "messages":
+        source_messages = []
     customer = _customer_snapshot(quote or {}, conversation)
     mapping = await get_customer_mapping(org_id, conversation_id)
     party_candidates = await _party_candidates(org_id, customer, mapping.get("party_master_id") or "")
@@ -2097,13 +2231,16 @@ async def create_tally_invoice_draft(
     draft = {
         "draft_id": str(uuid.uuid4()), "org_id": org_id, "conversation_id": conversation_id,
         "source": source, "reference": reference, "quote_id": (quote or {}).get("quote_id"),
+        "source_message_ids": [item["message_id"] for item in source_messages],
+        "source_messages": source_messages,
         "quote_revision": int((quote or {}).get("revision_number") or 1), "customer": customer,
         "party_candidates": party_candidates, "party_master_id": party_master_id,
         "bill_to": bill_to, "ship_to": ship_to, "dispatch_from": {},
         "items": items, "status": "needs_review",
         "shipping": float(_money((quote or {}).get("shipping"))),
         "discount": float(_money((quote or {}).get("discount"))),
-        "created_by": user_id, "created_at": now, "updated_at": now,
+        "created_by": user_id, "created_by_type": "ai" if user_id == "ai-sales" else "user",
+        "created_at": now, "updated_at": now,
     }
     await db.tally_invoice_drafts.insert_one(draft)
     draft.pop("_id", None)
@@ -2831,6 +2968,21 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                     {"org_id": integration["org_id"], "job_id": job_id},
                     {"$set": {"sync": command["sync"], "updated_at": now}},
                 )
+                if command.get("triggered_by_job_id"):
+                    parent = await db.tally_command_jobs.find_one({
+                        "org_id": integration["org_id"], "job_id": command["triggered_by_job_id"], "job_type": "stock_change",
+                    })
+                    if parent:
+                        from services.stock_service import fail_tally_stock_readback, finish_tally_stock_change
+                        try:
+                            await finish_tally_stock_change(
+                                integration["org_id"], parent["job_id"], True, after_readback=True,
+                            )
+                        except Exception as stock_exc:
+                            logger.exception("Tally stock read-back processing failed for %s", parent["job_id"])
+                            await fail_tally_stock_readback(
+                                integration["org_id"], parent["job_id"], type(stock_exc).__name__,
+                            )
             except Exception as exc:
                 status = "failed"
                 error = str(exc.detail) if isinstance(exc, HTTPException) else f"HeidelAI could not store the Tally snapshot: {type(exc).__name__}"
@@ -2842,6 +2994,12 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                     {"org_id": integration["org_id"]}, {"$set": {"last_sync_error": error}}
                 )
                 command.update({"status": status, "error": error})
+        elif command["job_type"] == "stock_change":
+            from services.stock_service import finish_tally_stock_change
+            await finish_tally_stock_change(
+                integration["org_id"], command["job_id"], status == "completed", error,
+                delivery_unknown=status == "delivery_unknown",
+            )
         elif status == "completed" and command["job_type"] == "profit_loss_report":
             response = next((item for item in result.get("responses") or [] if item.get("key") == "profit_loss"), None)
             try:
@@ -2917,6 +3075,12 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
                 {"org_id": integration["org_id"], "job_id": job_id},
                 {"$set": {"readback_job_id": readback["job_id"], "updated_at": now}},
             )
+        elif existing_command.get("job_type") == "stock_change":
+            from services.stock_service import finish_tally_stock_change
+            await finish_tally_stock_change(
+                integration["org_id"], existing_command["job_id"], status == "completed", existing_command.get("error"),
+                delivery_unknown=status == "delivery_unknown",
+            )
         return await get_tally_command_job(integration["org_id"], job_id)
     invoice_job = await db.tally_bill_jobs.find_one({"org_id": integration["org_id"], "job_id": job_id})
     if invoice_job and status == "completed":
@@ -2953,6 +3117,14 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
             if status == "completed":
                 await _remember_customer_mapping(integration["org_id"], existing)
                 await queue_tally_sync(integration["org_id"], force=True)
+                try:
+                    from services.sales_learning_service import record_verified_tally_outcome
+                    await record_verified_tally_outcome(
+                        integration["org_id"], str(existing.get("conversation_id") or ""),
+                        f"tally-billed:{existing['job_id']}", "billed",
+                    )
+                except Exception as learning_error:
+                    logger.warning(f"Could not record internal Tally billed learning: {type(learning_error).__name__}")
             if existing.get("draft_id"):
                 await db.tally_invoice_drafts.update_one(
                     {"org_id": integration["org_id"], "draft_id": existing["draft_id"]},
@@ -2971,6 +3143,14 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
     if status == "completed":
         await _remember_customer_mapping(integration["org_id"], updated)
         await queue_tally_sync(integration["org_id"], force=True)
+        try:
+            from services.sales_learning_service import record_verified_tally_outcome
+            await record_verified_tally_outcome(
+                integration["org_id"], str(updated.get("conversation_id") or ""),
+                f"tally-billed:{updated['job_id']}", "billed",
+            )
+        except Exception as learning_error:
+            logger.warning(f"Could not record internal Tally billed learning: {type(learning_error).__name__}")
     if updated.get("draft_id"):
         await db.tally_invoice_drafts.update_one(
             {"org_id": integration["org_id"], "draft_id": updated["draft_id"]},
