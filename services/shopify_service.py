@@ -1523,10 +1523,10 @@ async def create_default_template(
 def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGUAGE) -> dict:
     definitions = {
         "abandoned_cart": ("heidelai_abandoned_cart_v1", "MARKETING", "Hi {{1}}, you left {{2}} in your cart. Complete your order here: {{3}}"),
-        "received": ("heidelai_order_received_v1", "UTILITY", "Hi {{1}}, we received order {{2}} for {{3}}."),
-        "shipped": ("heidelai_order_shipped_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has shipped."),
-        "fulfilled": ("heidelai_order_fulfilled_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has been fulfilled."),
-        "cancelled": ("heidelai_order_cancelled_v1", "UTILITY", "Hi {{1}}, order {{2}} for {{3}} has been cancelled."),
+        "received": ("heidelai_order_received_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. We have received order {{2}} containing {{3}}. Our team is reviewing the order details and will notify you when its status changes."),
+        "shipped": ("heidelai_order_shipped_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been shipped. We will notify you when another delivery status update becomes available."),
+        "fulfilled": ("heidelai_order_fulfilled_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been fulfilled. Please review the delivered items and contact our support team if you need help."),
+        "cancelled": ("heidelai_order_cancelled_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been cancelled. Please contact our support team if you did not request this cancellation or need help."),
     }
     if event not in definitions:
         raise HTTPException(status_code=422, detail="Unsupported Shopify template event")
