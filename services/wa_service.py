@@ -23,6 +23,7 @@ from services.conversation_utils import reopen_conversation
 from services.followup_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
 from services.utils import name_search_prefixes, normalize_phone, phone_search_parts
+from services.whatsapp_connection_service import whatsapp_conversation_id
 from services.push_notification_service import schedule_customer_message_push
 from services.ai_reply_guard import AIProviderUnavailable
 from services.whatsapp_reply_idempotency import ReplyOperationConflict, claim_reply, complete_reply, mark_unknown, record_acceptance, release_claim, start_provider
@@ -36,6 +37,61 @@ MSG_SPLIT = "|MSG_SPLIT|"
 
 db = get_mongo_db()
 mongo_client = get_mongo_client()
+
+
+def resolve_active_whatsapp_connection(
+    phone_number_id: Optional[str],
+    entry_wa_id: Optional[str],
+    org_id: Optional[str] = None,
+    *,
+    allow_single_fallback: bool = True,
+) -> Optional[dict]:
+    """Resolve one inbound Meta sender without guessing between multiple numbers."""
+    normalized_phone_id = str(phone_number_id or "").strip()
+    normalized_wa_id = str(entry_wa_id or "").strip()
+    if not normalized_wa_id:
+        return None
+
+    query = {"wa_id": normalized_wa_id, "is_active": {"$ne": False}}
+    if org_id:
+        query["org_id"] = org_id
+    if normalized_phone_id:
+        matches = list(db.whatsapp_connections.find({
+            **query,
+            "phone_id": normalized_phone_id,
+        }).limit(2))
+        return matches[0] if len(matches) == 1 else None
+    if not allow_single_fallback:
+        return None
+    matches = list(db.whatsapp_connections.find(query).limit(2))
+    return matches[0] if len(matches) == 1 else None
+
+
+def resolve_outbound_whatsapp_connection(
+    org_id: str,
+    wa_id: Optional[str] = None,
+    business_phone_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Resolve the bound sender, or the primary sender for new outbound work."""
+    query = {"org_id": org_id, "is_active": {"$ne": False}}
+    normalized_wa_id = str(wa_id or "").strip()
+    normalized_phone_id = str(business_phone_id or "").strip()
+    if normalized_wa_id:
+        query["wa_id"] = normalized_wa_id
+    if normalized_phone_id:
+        matches = list(db.whatsapp_connections.find({
+            **query,
+            "phone_id": normalized_phone_id,
+        }).limit(2))
+        return matches[0] if len(matches) == 1 else None
+
+    primary_matches = list(db.whatsapp_connections.find({**query, "slot": 1}).limit(2))
+    if len(primary_matches) == 1:
+        return primary_matches[0]
+    if primary_matches:
+        return None
+    legacy_matches = list(db.whatsapp_connections.find(query).limit(2))
+    return legacy_matches[0] if len(legacy_matches) == 1 else None
 
 
 def broadcast_phone_key(value) -> str:
@@ -66,10 +122,18 @@ def get_broadcast_suppressed_phone_keys(org_id: str, phones: list[str]) -> set[s
     }
     unchecked = keys - suppressed
     if unchecked:
-        conversation_ids = [f"whatsapp_{phone}" for phone in unchecked]
+        conversation_phone = {
+            str(item["conversation_id"]): broadcast_phone_key(item.get("customer_id"))
+            for item in db[f"conversations_{org_id}"].find(
+                {"platform": "whatsapp", "customer_id": {"$in": list(unchecked)}},
+                {"_id": 0, "conversation_id": 1, "customer_id": 1},
+            )
+            if item.get("conversation_id")
+        }
+        conversation_phone.update({f"whatsapp_{phone}": phone for phone in unchecked})
         preference_messages = db[f"messages_{org_id}"].aggregate([
             {"$match": {
-                "conversation_id": {"$in": conversation_ids},
+                "conversation_id": {"$in": list(conversation_phone)},
                 "role": "customer",
                 "mode": {"$ne": "private"},
                 "content": {"$regex": r"^\s*(?:stop(?:\s*all)?|unsubscribe|cancel|end|quit|start|subscribe)\s*[.!]?\s*$", "$options": "i"},
@@ -80,7 +144,7 @@ def get_broadcast_suppressed_phone_keys(org_id: str, phones: list[str]) -> set[s
         now = datetime.now(timezone.utc)
         operations = []
         for item in preference_messages:
-            phone = broadcast_phone_key(str(item.get("_id") or "").removeprefix("whatsapp_"))
+            phone = conversation_phone.get(str(item.get("_id") or ""), "")
             if phone and broadcast_message_preference(item.get("content")) == "opted_out":
                 suppressed.add(phone)
                 operations.append(UpdateOne(
@@ -111,6 +175,8 @@ async def create_or_update_whatsapp_conversation(
     mode: Optional[str] = None,
     extra_updates: Optional[dict] = None,
     idempotency_key: Optional[str] = None,
+    business_phone_id: Optional[str] = None,
+    business_phone: Optional[str] = None,
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -133,7 +199,6 @@ async def create_or_update_whatsapp_conversation(
     # Canonical normalization to prevent duplicate conversations
     customer_phone_no = normalize_phone(customer_phone_no)
     
-    conversation_id = f"whatsapp_{customer_phone_no}"
     phone_digits, phone_search_suffixes = phone_search_parts(customer_phone_no)
     now = datetime.now(timezone.utc)
     
@@ -142,7 +207,16 @@ async def create_or_update_whatsapp_conversation(
     conversations_collection = db[conversations_collection_name]
     
     # Check if conversation already exists
-    existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+    existing_conversation = conversations_collection.find_one({
+        "platform": "whatsapp",
+        "customer_id": customer_phone_no,
+        **({"business_phone_id": str(business_phone_id)} if business_phone_id else {}),
+    })
+    conversation_id = (
+        existing_conversation.get("conversation_id")
+        if existing_conversation
+        else whatsapp_conversation_id(customer_phone_no, business_phone_id)
+    )
     convo_key = (org_id, conversation_id)
     
     # Check if the viewers set exists and is not empty
@@ -193,6 +267,10 @@ async def create_or_update_whatsapp_conversation(
         "last_sender": last_sender,
         "status": existing_conversation.get("status", "open") if is_auto_followup and existing_conversation else "open",
     }
+    if business_phone_id:
+        update_set["business_phone_id"] = str(business_phone_id)
+    if business_phone:
+        update_set["business_phone"] = str(business_phone)
     
     if extra_updates:
         update_set.update(extra_updates)
@@ -565,22 +643,25 @@ async def send_whatsapp_message(
         logger.error("Missing 'sender_id' in outbound WhatsApp message payload")
         raise HTTPException(status_code=422, detail="Missing 'sender_id'")
         
-    # Query the database to validate the ID
-    wa_connection = db.whatsapp_connections.find_one(
-        {"wa_id": whatsapp_id, "org_id": org_id, "is_active": {"$ne": False}},
-        {"wa_id": 1, "_id": 0}
-    )
-    
-    if not wa_connection:
-        logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
-        raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
-        
-    # safe to use wa_id
-    whatsapp_business_id = wa_connection["wa_id"]
-        
-    
     try:
         conversation_id = message["conversation_id"]
+        conversation = db[f"conversations_{org_id}"].find_one({
+            "conversation_id": conversation_id,
+            "platform": "whatsapp",
+        })
+        if not conversation:
+            raise HTTPException(status_code=404, detail="WhatsApp conversation not found")
+        conversation_wa_id = str(conversation.get("whatsapp_id") or whatsapp_id)
+        if str(whatsapp_id) != conversation_wa_id:
+            raise HTTPException(status_code=409, detail="The selected sender does not own this conversation")
+        connection = resolve_outbound_whatsapp_connection(
+            org_id,
+            conversation_wa_id,
+            conversation.get("business_phone_id"),
+        )
+        if not connection:
+            raise HTTPException(status_code=409, detail="The WhatsApp number for this conversation is not connected")
+        whatsapp_business_id = connection["wa_id"]
         original_content = message["content"]
         pricing_source_message_id = message.get("pricing_source_message_id")
         pricing_audit_active = False
@@ -633,18 +714,7 @@ async def send_whatsapp_message(
                         raise AIProviderUnavailable("catalogue_unavailable") from exc
                     logger.error(f"Shadow AI pricing validation failed open for org={org_id}: {exc}")
         
-        # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({
-            "wa_id": whatsapp_business_id,
-            "org_id": org_id,
-            "is_active": {"$ne": False},
-        })
-        
-        if not connection:
-            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
-
-        # Extract the recipient phone number from conversation ID
-        recipient_id = message.get("recipient_override") or conversation_id.replace("whatsapp_", "").replace("dealer_", "")
+        recipient_id = message.get("recipient_override") or (conversation or {}).get("customer_id") or conversation_id.replace("whatsapp_", "").replace("dealer_", "")
 
         # Handle multi-part messages (e.g. lists returned by the agent or strings with MSG_SPLIT)
         if isinstance(original_content, list):
@@ -984,20 +1054,30 @@ async def send_whatsapp_message(
             detail=f"Failed to send message: {str(e)}"
         )
 
-async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent") -> dict:
+async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent", conversation_id: Optional[str] = None) -> dict:
     """
     Send a template message via WhatsApp Cloud API
     """
     try:
-        # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({
-            "wa_id": wa_id,
-            "org_id": org_id,
-            "is_active": {"$ne": False},
-        })
+        conversation = db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id}) if conversation_id else None
+        connection = resolve_outbound_whatsapp_connection(
+            org_id,
+            (conversation or {}).get("whatsapp_id") or wa_id,
+            (conversation or {}).get("business_phone_id"),
+        )
 
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+        if not conversation:
+            conversation = db[f"conversations_{org_id}"].find_one({
+                "platform": "whatsapp",
+                "customer_id": normalize_phone(recipient_id),
+                "business_phone_id": connection.get("phone_id"),
+            })
+        resolved_conversation_id = (conversation or {}).get("conversation_id") or whatsapp_conversation_id(
+            recipient_id,
+            connection.get("phone_id"),
+        )
 
         # Normalize template language format if it's a string
         if "language" in template and isinstance(template["language"], str):
@@ -1051,10 +1131,33 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
             "next_action_at": now + timedelta(hours=6),
             "last_message_is_private_note": mode == "private"
         }
+        if mode != "private":
+            wa_conversation["needs_reply"] = False
+        wa_conversation.update({
+            "platform": "whatsapp",
+            "conversation_id": resolved_conversation_id,
+            "whatsapp_id": connection.get("wa_id"),
+            "business_phone_id": connection.get("phone_id"),
+            "business_phone": connection.get("phone"),
+            "customer_id": normalize_phone(recipient_id),
+            "status": "open",
+        })
 
         conversation = db[f"conversations_{org_id}"].find_one_and_update(
-            {"conversation_id": f"whatsapp_{recipient_id}"},
-            {"$set": wa_conversation},
+            {"conversation_id": resolved_conversation_id},
+            {
+                "$set": wa_conversation,
+                "$setOnInsert": {
+                    "customer_name": normalize_phone(recipient_id),
+                    "is_ai_enabled": True,
+                    "started_at": now,
+                    "created_at": now,
+                    "unread_count": 0,
+                    "closed_at": None,
+                    "message_counter": 0,
+                },
+            },
+            upsert=True,
             return_document=ReturnDocument.AFTER  
         )
 
@@ -1072,7 +1175,7 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
         mid = await store_whatsapp_message(
             org_id=org_id,
             content=f"Shared a template {template_name}",
-            conversation_id=f"whatsapp_{recipient_id}",
+            conversation_id=resolved_conversation_id,
             customer_phone_no=recipient_id,
             type="template",
             payload=template,
@@ -1115,17 +1218,21 @@ async def send_wa_media_message(
         duration_ms: Optional[int] = None,
         mime_type: Optional[str] = None,
         file_name: Optional[str] = None,
+        conversation_id: Optional[str] = None,
     ) -> dict:
     """
     Send a media message via WhatsApp Cloud API
     """
     try:
-        # Find the WhatsApp connection to get the access token
-        connection = db.whatsapp_connections.find_one({
-            "wa_id": wa_id,
-            "org_id": org_id,
-            "is_active": {"$ne": False},
-        })
+        existing_conversation = (
+            db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+            if conversation_id else None
+        )
+        connection = resolve_outbound_whatsapp_connection(
+            org_id,
+            (existing_conversation or {}).get("whatsapp_id") or wa_id,
+            (existing_conversation or {}).get("business_phone_id"),
+        )
 
         api_media_type = media_type if media_type in {"image", "video", "audio", "document"} else "document"
         media_payload = {
@@ -1190,14 +1297,41 @@ async def send_wa_media_message(
             "next_action_at": now + timedelta(hours=6),
             "last_message_is_private_note": mode == "private"
         }
+        if mode != "private":
+            wa_conversation["needs_reply"] = False
 
+        stored_conversation_id = conversation_id or whatsapp_conversation_id(
+            recipient_id,
+            connection.get("phone_id"),
+        )
+        wa_conversation.update({
+            "platform": "whatsapp",
+            "conversation_id": stored_conversation_id,
+            "whatsapp_id": connection.get("wa_id"),
+            "business_phone_id": connection.get("phone_id"),
+            "business_phone": connection.get("phone"),
+            "customer_id": normalize_phone(recipient_id),
+            "status": "open",
+        })
         conversation = db[f"conversations_{org_id}"].find_one_and_update(
-            {"conversation_id": f"whatsapp_{recipient_id}"},
-            {"$set": wa_conversation},
+            {"conversation_id": stored_conversation_id},
+            {
+                "$set": wa_conversation,
+                "$setOnInsert": {
+                    "customer_name": normalize_phone(recipient_id),
+                    "is_ai_enabled": True,
+                    "started_at": now,
+                    "created_at": now,
+                    "unread_count": 0,
+                    "closed_at": None,
+                    "message_counter": 0,
+                },
+            },
+            upsert=True,
             return_document=ReturnDocument.AFTER  
         )
 
-        if "_id" in conversation:
+        if conversation and "_id" in conversation:
             conversation["_id"] = str(conversation["_id"])
 
         await broadcast_main_ws(
@@ -1210,7 +1344,7 @@ async def send_wa_media_message(
         mid = await store_whatsapp_message(
             org_id=org_id,
             content=content,
-            conversation_id=f"whatsapp_{recipient_id}",
+            conversation_id=stored_conversation_id,
             customer_phone_no=recipient_id,
             type="voice" if media_kind == "voice_note" else api_media_type,
             payload={
@@ -1244,7 +1378,7 @@ async def send_wa_media_message(
             detail=f"Failed to send media message: {str(e)}"
         )
 
-async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent", media_kind: Optional[str] = None, duration_ms: Optional[int] = None) -> dict:
+async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: str, org_id: str, content: Optional[str], temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent", media_kind: Optional[str] = None, duration_ms: Optional[int] = None, conversation_id: Optional[str] = None) -> dict:
     """
     Upload media to Cloudinary and send it as a media message
     """
@@ -1267,7 +1401,7 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
         response = await send_wa_media_message(
             recipient_id, media_url, media_type, wa_id, content, org_id, temp_id,
             mode, context_type, context, sender_name, media_kind, duration_ms,
-            result.get("mime_type"), result.get("file_name"),
+            result.get("mime_type"), result.get("file_name"), conversation_id,
         )
         
         return response
@@ -1296,118 +1430,127 @@ async def update_whatsapp_message_status(org_id: str, message_id: str, status: s
     except Exception as e:
         logger.error(f"Error updating WhatsApp message status: {e}")
 
-async def archive_whatsapp_data(org_id: str, wa_id: str, expire_days=30):
-    """
-    Archives Whatsapp converstions, messages and private notes for a specific connection of an org.
-    If a previous active archive exists for the same wa_id, reuse and extend it.
-    """
+async def archive_whatsapp_data(org_id: str, phone_id: str, expire_days=30):
+    """Archive only the conversations owned by one WhatsApp phone number."""
+    archive_id = None
     try:
+        connection = db.whatsapp_connections.find_one({
+            "org_id": org_id, "phone_id": phone_id, "is_active": {"$ne": False},
+        })
+        if not connection:
+            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+
         now = datetime.now(timezone.utc)
+        conversations_collection_name = f"conversations_{org_id}"
+        messages_collection_name = f"messages_{org_id}"
+        private_notes_collection_name = f"private_notes_{org_id}"
+        active_count = db.whatsapp_connections.count_documents({
+            "org_id": org_id, "wa_id": connection["wa_id"], "is_active": {"$ne": False},
+        })
+        phone_filter = {"platform": "whatsapp", "business_phone_id": phone_id}
+        if active_count == 1:
+            phone_filter = {
+                "platform": "whatsapp",
+                "$or": [
+                    {"business_phone_id": phone_id},
+                    {"business_phone_id": {"$exists": False}},
+                    {"business_phone_id": None},
+                ],
+            }
 
         with mongo_client.start_session() as session:
             with session.start_transaction():
-
-                archived_id = None
-
-                existing_archive = db["archived_tracker"].find_one({
-                        "org_id": org_id,
-                        "platform": "whatsapp",
-                        "whatsapp_id": wa_id,
-                        "status": "active",
-                    },
-                    session=session
+                existing_archive = db.archived_tracker.find_one({
+                    "org_id": org_id,
+                    "platform": "whatsapp",
+                    "whatsapp_id": phone_id,
+                    "status": "active",
+                }, session=session)
+                archive_id = existing_archive.get("archive_id") if existing_archive else uuid.uuid4().hex
+                tracker_fields = {
+                    "org_id": org_id,
+                    "platform": "whatsapp",
+                    "whatsapp_id": phone_id,
+                    "phone_id": phone_id,
+                    "waba_id": connection.get("wa_id"),
+                    "phone": connection.get("phone"),
+                    "label": connection.get("label"),
+                    "slot": connection.get("slot"),
+                    "wa_bot_flow_id": connection.get("wa_bot_flow_id"),
+                    "expires_at": now + timedelta(days=expire_days),
+                    "status": "active",
+                }
+                db.archived_tracker.update_one(
+                    {"archive_id": archive_id},
+                    {"$set": tracker_fields, "$setOnInsert": {"archive_id": archive_id, "created_at": now}},
+                    upsert=True,
+                    session=session,
                 )
 
-                if existing_archive:
-                    archived_id = existing_archive["archive_id"]
-                    logger.success(f"Found existing archive {archived_id} for whatsapp_id {wa_id}, extending expiration")
+                conversations_to_archive = list(db[conversations_collection_name].find(
+                    phone_filter, {"_id": 0}, session=session,
+                ))
+                conversation_ids = [item["conversation_id"] for item in conversations_to_archive]
+                message_filter = {"conversation_id": {"$in": conversation_ids}}
+                note_filter = {"conversation_id": {"$in": conversation_ids}}
+                messages_to_archive = []
+                for item in db[messages_collection_name].find(message_filter, session=session):
+                    archived = dict(item)
+                    archived["message_id"] = str(archived.get("message_id") or archived.get("id") or archived.get("_id"))
+                    archived.pop("_id", None)
+                    messages_to_archive.append(archived)
+                notes_to_archive = []
+                for item in db[private_notes_collection_name].find(note_filter, session=session):
+                    archived = dict(item)
+                    archived["note_id"] = str(archived.get("note_id") or archived.get("_id"))
+                    archived.pop("_id", None)
+                    notes_to_archive.append(archived)
 
-                    new_expiry = now + timedelta(days=expire_days)
-
-                    db.archived_tracker.update_one(
-                        {"archive_id": archived_id},
-                        {"$set": {"expires_at": new_expiry}},
-                        session=session
-                    )
-                else:
-                    archive_id = uuid.uuid4().hex
-                    logger.success(f"Creating new archive {archive_id} for whatsapp_id {wa_id}")
-
-                    db.archived_tracker.insert_one({
-                            "archive_id": archive_id,
-                            "org_id": org_id,
-                            "platform": "whatsapp",
-                            "whatsapp_id": wa_id,
-                            "created_at": now,
-                            "expires_at": now + timedelta(days=expire_days),
-                            "status": "active",
-                        }, 
-                        session=session
-                    )
-
-                messages_collection_name = f"messages_{org_id}"
-                conversations_collection_name = f"conversations_{org_id}"
-                private_notes_collection_name = f"private_notes_{org_id}"
-                
-                archived_messages = f"archived_messages_{org_id}_{archive_id}"
-                archived_conversations = f"archived_conversations_{org_id}_{archive_id}"
-                archived_private_notes = f"archived_private_notes_{org_id}_{archive_id}"
-
-                # Archiving messages collection
-                messages_to_archive = list(
-                    db[messages_collection_name].find(
-                            {"platform": "whatsapp"}, 
-                            {"_id": 0},
-                            session=session
-                        )
-                    )
-                
-                if messages_to_archive:
-                    db[archived_messages].insert_many(messages_to_archive, session=session)
-                    db[messages_collection_name].delete_many({"platform": "whatsapp"}, session=session)
-
-                # Archiving conversations collection
-                conversations_to_archive = list(
-                    db[conversations_collection_name].find(
-                            {"platform": "whatsapp", "whatsapp_id": wa_id}, 
-                            {"_id": 0},
-                            session=session
-                        )
-                    )
-                
+                archived_conversations = db[f"archived_conversations_{org_id}_{archive_id}"]
+                archived_messages = db[f"archived_messages_{org_id}_{archive_id}"]
+                archived_notes = db[f"archived_private_notes_{org_id}_{archive_id}"]
                 if conversations_to_archive:
-                    bulk_ops = []
-                    for convo in conversations_to_archive:
-                        bulk_ops.append(
-                            UpdateOne(
-                                {"conversation_id": convo["conversation_id"]},  
-                                {"$set": convo},
-                                upsert=True
-                            )
-                        )
+                    archived_conversations.bulk_write([
+                        UpdateOne({"conversation_id": item["conversation_id"]}, {"$set": item}, upsert=True)
+                        for item in conversations_to_archive
+                    ], session=session)
+                message_ops = [
+                    UpdateOne({"message_id": item["message_id"]}, {"$set": item}, upsert=True)
+                    for item in messages_to_archive
+                ]
+                if message_ops:
+                    archived_messages.bulk_write(message_ops, session=session)
+                note_ops = [
+                    UpdateOne({"note_id": item["note_id"]}, {"$set": item}, upsert=True)
+                    for item in notes_to_archive
+                ]
+                if note_ops:
+                    archived_notes.bulk_write(note_ops, session=session)
 
-                    if bulk_ops:
-                        db[archived_conversations].bulk_write(bulk_ops, session=session)
-                        
-                    db[conversations_collection_name].delete_many({"platform": "whatsapp", "whatsapp_id": wa_id}, session=session)
-                
-                # Archiving private notes collection
-                private_notes_to_archive = list(
-                    db[private_notes_collection_name].find(
-                        {"platform": "whatsapp", "user_id": wa_id},
-                        {"_id": 0},
-                        session=session
+                if conversation_ids:
+                    db[messages_collection_name].delete_many(message_filter, session=session)
+                    db[private_notes_collection_name].delete_many(note_filter, session=session)
+                    db[conversations_collection_name].delete_many(
+                        {"conversation_id": {"$in": conversation_ids}}, session=session,
                     )
-                )
+                    contacts = db[f"contacts_{org_id}"]
+                    for contact in contacts.find({"$or": [
+                        {"conversation_id": {"$in": conversation_ids}},
+                        {"conversation_ids": {"$in": conversation_ids}},
+                    ]}, session=session):
+                        remaining = [item for item in contact.get("conversation_ids", []) if item not in conversation_ids]
+                        update = {"conversation_ids": remaining}
+                        if contact.get("conversation_id") in conversation_ids:
+                            update["conversation_id"] = remaining[-1] if remaining else None
+                        contacts.update_one({"_id": contact["_id"]}, {"$set": update}, session=session)
 
-                if private_notes_to_archive:
-                    db[archived_private_notes].insert_many(private_notes_to_archive, session=session)
-                    db[private_notes_collection_name].delete_many({"platform": "whatsapp", "user_id": wa_id}, session=session)
-
-                logger.success(f"Archived WhatsApp data for org {org_id} with archive_id {archive_id}")
-
+        logger.success(f"Archived WhatsApp phone {phone_id} for org {org_id} with archive_id {archive_id}")
+        return {"archive_id": archive_id, "conversation_count": len(conversation_ids)}
+    except HTTPException:
+        raise
     except Exception as e:
-         logger.error(f"Error archiving WhatsApp data for org {org_id} with archive_id {archive_id}: {str(e)}")
+        logger.error(f"Error archiving WhatsApp phone {phone_id} for org {org_id}: {e}")
+        raise
 
 async def revoke_whatsapp_access(org_id: str, wa_id: str):
     """
@@ -1447,29 +1590,55 @@ async def revoke_whatsapp_access(org_id: str, wa_id: str):
         logger.error(f"Error disconnecting WhatsApp: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
     
-async def remove_whatsapp_connection(org_id: str, wa_id: str):
+async def remove_whatsapp_connection(org_id: str, phone_id: str):
     """
     Remove WhatsApp connection record from the organizations collection and whatsapp_connections collection
     """
     try:
-        delete_result = db.whatsapp_connections.delete_many(
-            {"wa_id": wa_id, "org_id": org_id}
-            )
+        connection = db.whatsapp_connections.find_one({"phone_id": phone_id, "org_id": org_id})
+        if not connection:
+            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+
+        delete_result = db.whatsapp_connections.delete_one({"phone_id": phone_id, "org_id": org_id})
         logger.success(f"Deleted {delete_result.deleted_count} whatsapp connections for org {org_id}")
+
+        remaining = db.whatsapp_connections.find_one(
+            {"org_id": org_id, "wa_id": connection.get("wa_id"), "is_active": {"$ne": False}},
+            sort=[("slot", 1)],
+        )
+        if remaining and connection.get("slot") == 1:
+            db.whatsapp_connections.update_one(
+                {"_id": remaining["_id"]},
+                {"$set": {"slot": 1, "updated_at": datetime.now(timezone.utc)}},
+            )
+
+        bound_flow_id = connection.get("wa_bot_flow_id")
+        if bound_flow_id and not db.whatsapp_connections.find_one({
+            "org_id": org_id, "wa_bot_flow_id": bound_flow_id, "is_active": {"$ne": False},
+        }):
+            db[f"wa_bot_flows_{org_id}"].update_one(
+                {"flow_id": bound_flow_id, "org_id": org_id},
+                {"$set": {
+                    "status": "draft",
+                    "published_at": None,
+                    "updated_at": datetime.now(timezone.utc),
+                }},
+            )
 
         org_update_result = db.organizations.update_one(
             {"org_id": org_id},
-            {"$set": {"wa_id": None}}
-        )
+            {"$set": {"wa_id": None}},
+        ) if not remaining else None
 
-        if org_update_result.modified_count:
+        if org_update_result and org_update_result.modified_count:
             logger.success(f"Cleared wa_id for organization {org_id}")
         else:
             logger.info(f"No organization updated for org_id {org_id}")
 
         return {
             "deleted_connections": delete_result.deleted_count,
-            "organization_updated": org_update_result.modified_count > 0
+            "organization_updated": bool(org_update_result and org_update_result.modified_count > 0),
+            "remaining_connections": 1 if remaining else 0,
         }
     
     except Exception as e:
@@ -1521,23 +1690,20 @@ async def send_whatsapp_reaction(org_id, message_id, emoji):
 
         # Find the message first
         message = messages_collection.find_one({"message_id": message_id})
-        recipient_id = message.get("sender_id")
-
         if not message:
             logger.error("Message not found")
             return {"status": "error", "message": "Message not found"}
         
-        org_document = db.organizations.find_one({"org_id": org_id})
-        whatsapp_id = org_document.get("wa_id")
-
-
-        if not whatsapp_id:
-            raise HTTPException(status_code=400, detail="WhatsApp ID not configured for this organization")
-
-        # Get the page access token for this WhatsApp account
-        connection = db.whatsapp_connections.find_one(
-            {"wa_id": whatsapp_id, "org_id": org_id},
-            {"access_token" : 1, "phone_id": 1, "name": 1, "phone": 1,"_id": 0}
+        conversation = db[f"conversations_{org_id}"].find_one({
+            "conversation_id": message.get("conversation_id")
+        })
+        if not conversation:
+            raise HTTPException(status_code=404, detail="WhatsApp conversation not found")
+        recipient_id = conversation.get("customer_id") or message.get("sender_id")
+        connection = resolve_outbound_whatsapp_connection(
+            org_id,
+            conversation.get("whatsapp_id"),
+            conversation.get("business_phone_id"),
         )
 
 
@@ -1946,8 +2112,16 @@ async def send_interactive_whatsapp_message(
         logger.error("Webhook payload is missing 'sender_id'")
         raise HTTPException(status_code=404, detail="Error: Webhook payload is missing 'sender_id'")
         
-    # Query the database to validate the ID
-    wa_connection = db.whatsapp_connections.find_one({"wa_id": whatsapp_id})
+    conversation_doc = db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+    if not conversation_doc:
+        raise HTTPException(status_code=404, detail="WhatsApp conversation not found")
+    if str(conversation_doc.get("whatsapp_id") or whatsapp_id) != str(whatsapp_id):
+        raise HTTPException(status_code=409, detail="The selected sender does not own this conversation")
+    wa_connection = resolve_outbound_whatsapp_connection(
+        org_id,
+        conversation_doc.get("whatsapp_id") or whatsapp_id,
+        conversation_doc.get("business_phone_id"),
+    )
     if not wa_connection:
         logger.warning(f"Received webhook for unregistered WhatsApp ID: {whatsapp_id}")
         raise HTTPException(status_code=403, detail="Received webhook for unregistered WhatsApp ID")
@@ -1955,7 +2129,7 @@ async def send_interactive_whatsapp_message(
     whatsapp_business_id = wa_connection.get("wa_id")
     access_token = wa_connection.get("access_token")
     phone_id = wa_connection.get("phone_id")
-    recipient_id = conversation_id.replace("whatsapp_", "")
+    recipient_id = conversation_doc.get("customer_id")
 
     if not access_token or not phone_id or not whatsapp_business_id:
         raise HTTPException(status_code=404, detail="WhatsApp connection not properly configured")
@@ -2106,9 +2280,14 @@ async def read_message_and_typing_indicator(whatsapp_id: str, mode: Optional[str
             logger.error(f"No message_id available when trying to send typing indicator for WhatsApp ID: {whatsapp_id}")
             return
         
-        # Query the database to validate the ID
-        connection = db.whatsapp_connections.find_one(
-            {"wa_id": whatsapp_id}
+        conversation = (
+            db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id})
+            if conversation_id else None
+        )
+        connection = resolve_outbound_whatsapp_connection(
+            org_id,
+            (conversation or {}).get("whatsapp_id") or whatsapp_id,
+            (conversation or {}).get("business_phone_id"),
         )
         
         if not connection:
@@ -2368,6 +2547,25 @@ async def run_bulk_send_job(
     if job_record is None:
         logger.error(f"Bulk WA | job={job_id} | org={org_id} | missing job record in MongoDB")
         return
+    sender_connection = await asyncio.to_thread(
+        db.whatsapp_connections.find_one,
+        {
+            "org_id": org_id,
+            "wa_id": wa_id,
+            "phone_id": phone_id,
+            "is_active": {"$ne": False},
+        },
+        {"phone": 1, "_id": 0},
+    )
+    if not sender_connection:
+        logger.error(f"Bulk WA | job={job_id} | sender connection is no longer active")
+        await asyncio.to_thread(
+            db.bulk_jobs.update_one,
+            {"job_id": job_id, "org_id": org_id},
+            {"$set": {"status": "failed", "error": "sender_disconnected", "updated_at": datetime.now(timezone.utc)}},
+        )
+        return
+    business_phone = sender_connection.get("phone")
     await asyncio.to_thread(
         db.bulk_jobs.update_one,
         {"job_id": job_id, "org_id": org_id},
@@ -2506,7 +2704,7 @@ async def run_bulk_send_job(
                     if entry["status"] == "sent":
                         phone_number = entry["phone_number"]
                         msg_id = entry["message_id"]
-                        convo_id = f"whatsapp_{phone_number}"
+                        convo_id = whatsapp_conversation_id(phone_number, phone_id)
                         
                         # Prepare individual message doc
                         message_doc = {
@@ -2539,6 +2737,8 @@ async def run_bulk_send_job(
                                 "$set": {
                                     "platform": "whatsapp",
                                     "whatsapp_id": wa_id,
+                                    "business_phone_id": phone_id,
+                                    "business_phone": business_phone,
                                     "customer_id": phone_number,
                                     "last_message": f"AI: Shared a template {template_name}",
                                     "last_message_timestamp": now,

@@ -119,6 +119,7 @@ async def get_conversations(
     assigned_agent_id: Optional[str] = None,
     team_id: Optional[str] = None,
     include_meta: bool = Query(False),
+    business_phone_id: Optional[str] = Query(None, max_length=128),
 ):
     """
     Get conversations for the current user's organization
@@ -147,6 +148,7 @@ async def get_conversations(
             include_meta=include_meta,
             current_user_role=user.role,
             team_id=team_id,
+            business_phone_id=business_phone_id,
         )
 
     except HTTPException:
@@ -158,13 +160,17 @@ async def get_conversations(
 
 @router.get("/api/conversations/focus-counts")
 @limiter.limit("60/minute")
-async def get_focus_counts(request: Request, user: CurrentUser):
+async def get_focus_counts(
+    request: Request,
+    user: CurrentUser,
+    business_phone_id: Optional[str] = Query(None, max_length=128),
+):
     if not user.org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
 
     return {
         "status": "success",
-        "data": await fetch_focus_counts(user.org_id, user.user_id, user.role),
+        "data": await fetch_focus_counts(user.org_id, user.user_id, user.role, business_phone_id),
     }
 
 
@@ -187,6 +193,7 @@ async def search_conversation_queue(
     status_filter: Optional[str] = Query(None, alias="status"),
     assigned_agent_id: Optional[str] = None,
     team_id: Optional[str] = None,
+    business_phone_id: Optional[str] = Query(None, max_length=128),
 ):
     if not user.org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
@@ -208,6 +215,7 @@ async def search_conversation_queue(
         assigned_agent_id=assigned_agent_id,
         current_user_role=user.role,
         team_id=team_id,
+        business_phone_id=business_phone_id,
     )
 
 @router.get("/api/conversations/{conversation_id}")
@@ -799,10 +807,13 @@ async def get_labels(request: Request, user: CurrentUser):
     return {"labels": result}
 
 @router.get("/api/org/metadata/labels-unread")
-async def get_labels_unread(user: CurrentUser):
+async def get_labels_unread(
+    user: CurrentUser,
+    business_phone_id: Optional[str] = Query(None, max_length=128),
+):
     """Get labels for the organization with unread counts."""
 
-    result = await get_unread_counts_by_labels(user.org_id)
+    result = await get_unread_counts_by_labels(user.org_id, business_phone_id)
 
     return {"labels": result}
 

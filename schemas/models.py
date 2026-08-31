@@ -41,6 +41,31 @@ class PlatformDisconnectRequest(BaseModel):
     user_id: str
 
 
+class WhatsappDisconnectRequest(BaseModel):
+    connection_id: Optional[str] = Field(default=None, max_length=128)
+    phone_id: Optional[str] = Field(default=None, max_length=128)
+    phone_number_id: Optional[str] = Field(default=None, max_length=128)
+    user_id: Optional[str] = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def require_connection_selector(self):
+        if not any((self.connection_id, self.phone_id, self.phone_number_id, self.user_id)):
+            raise ValueError("connection_id, phone_id, phone_number_id, or user_id is required")
+        return self
+
+
+class WhatsappConnectionLabelRequest(BaseModel):
+    label: str = Field(..., min_length=1, max_length=24)
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise ValueError("Label must contain printable characters")
+        return value
+
+
 class WhatsappAuthRequest(BaseModel):
     code: str
     redirect_uri: Optional[str] = None
@@ -51,6 +76,7 @@ class WhatsappAuthRequest(BaseModel):
     catalog_ids: Optional[List[str]] = None
     dataset_ids: Optional[List[str]] = None
     instagram_account_ids: Optional[List[str]] = None
+    label: Optional[str] = Field(default=None, max_length=24)
 
 class ChatbotPromptUpdate(BaseModel):
     chatbot_prompt: str = Field(..., min_length=10, max_length=5000)
@@ -328,4 +354,5 @@ class BulkMessageRequest(BaseModel):
     )
     recipients: List[BulkRecipient] = Field(..., min_length=1)  # At least one recipient required
     components: Optional[List[Dict[str, Any]]] = None  # Same for all recipients (header, body, etc.)
+    phone_number_id: Optional[str] = Field(default=None, max_length=128)
     delay_seconds: float = Field(default=8.0, ge=8.0)  # Seconds to wait between each batch of sends (applied per batch, not per recipient)

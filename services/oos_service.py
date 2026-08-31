@@ -262,10 +262,17 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         }}
     )
 
-    # Resolve WhatsApp Business Account ID
+    # Reuse the sender bound to the source customer conversation.
     db = get_mongo_db()
-    wa_connection = await asyncio.to_thread(
-        db.whatsapp_connections.find_one, {"org_id": org_id}
+    source_conversation = await asyncio.to_thread(
+        db[f"conversations_{org_id}"].find_one,
+        {"conversation_id": oos_doc.get("conversation_id")},
+    )
+    from services.wa_service import create_or_update_whatsapp_conversation, resolve_outbound_whatsapp_connection
+    wa_connection = resolve_outbound_whatsapp_connection(
+        org_id,
+        (source_conversation or {}).get("whatsapp_id"),
+        (source_conversation or {}).get("business_phone_id"),
     )
     wa_id = (wa_connection or {}).get("wa_id")
     if not wa_id:
@@ -289,8 +296,19 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         async with sem:
             try:
                 logger.info(f"[OOS] Sending WhatsApp message to dealer '{dealer_name}' at +{dealer_phone}...")
+                dealer_conversation_id = await create_or_update_whatsapp_conversation(
+                    org_id=org_id,
+                    recipient_id=wa_id,
+                    customer_phone_no=dealer_phone,
+                    customer_name=dealer_name or dealer_phone,
+                    last_message=dealer_message,
+                    last_sender="ai",
+                    mode="ai",
+                    business_phone_id=wa_connection.get("phone_id"),
+                    business_phone=wa_connection.get("phone"),
+                )
                 res = await send_whatsapp_message({
-                    "conversation_id": f"whatsapp_{dealer_phone}",
+                    "conversation_id": dealer_conversation_id,
                     "content": dealer_message,
                     "sender_id": wa_id,
                     "recipient_override": dealer_phone,

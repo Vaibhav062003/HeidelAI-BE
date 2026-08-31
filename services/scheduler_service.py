@@ -33,6 +33,7 @@ async def purge_archived_data(doc: dict):
         archive_id = doc.get("archive_id")
         archived_msgs_col = f"archived_messages_{org_id}_{archive_id}"
         archived_convs_col = f"archived_conversations_{org_id}_{archive_id}"
+        archived_notes_col = f"archived_private_notes_{org_id}_{archive_id}"
         deleted_counts = {}
 
         message_result = db[archived_msgs_col].delete_many({})
@@ -42,6 +43,10 @@ async def purge_archived_data(doc: dict):
         conv_result = db[archived_convs_col].delete_many({})
         deleted_counts["conversations"] = conv_result.deleted_count
         db.drop_collection(archived_convs_col)
+
+        notes_result = db[archived_notes_col].delete_many({})
+        deleted_counts["private_notes"] = notes_result.deleted_count
+        db.drop_collection(archived_notes_col)
 
         db.archived_tracker.update_one(
             {"archive_id": archive_id},
