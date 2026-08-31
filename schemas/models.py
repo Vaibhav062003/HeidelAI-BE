@@ -100,7 +100,19 @@ class SendReactionRequest(BaseModel):
 class Product(BaseModel):
     product_name: str
     description: Optional[str] = None
-    price: float = None
+    # ``price`` is retained for legacy display. Safety decisions use only the
+    # provenance-bearing canonical fields below.
+    price: Optional[float] = None
+    cost_price: Optional[float] = Field(default=None, gt=0)
+    approved_floor_price: Optional[float] = Field(default=None, gt=0)
+    target_selling_price: Optional[float] = Field(default=None, gt=0)
+    mrp: Optional[float] = Field(default=None, gt=0)
+    currency: Literal["INR"] = "INR"
+    selling_gst_inclusive: Optional[bool] = None
+    cost_gst_inclusive: Optional[bool] = None
+    price_source_sheet_id: Optional[str] = None
+    price_verified_at: Optional[datetime] = None
+    price_version: Optional[str] = None
     stock: Optional[int] = None
     gst_inclusive: bool = False
     gst_rate: float = Field(default=18, ge=0, le=100)
@@ -110,6 +122,7 @@ class Product(BaseModel):
     search_text: Optional[str] = None
     source: Optional[str] = None  # "manual" | "csv_upload" | "google_sheet"
     source_sheet_id: Optional[str] = None
+    source_sheet_ids: List[str] = Field(default_factory=list)
     updated_at: Optional[datetime] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -135,6 +148,9 @@ class ProductSheetConnection(BaseModel):
     column_mapping: Dict[str, str]  # {product_field: sheet_column_name}
     product_type: str = "laptop"  # "laptop" | "component"
     last_synced_at: Optional[datetime] = None
+    next_reconcile_at: Optional[datetime] = None
+    reconcile_lease_id: Optional[str] = None
+    reconcile_lease_until: Optional[datetime] = None
     last_sync_count: int = 0
     sync_errors: List[str] = Field(default_factory=list)
     status: str = "active"  # "active" | "syncing" | "error"

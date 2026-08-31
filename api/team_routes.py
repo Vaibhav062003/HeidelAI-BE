@@ -17,14 +17,14 @@ from services.team_service import (
     fetch_team_messages,
     fetch_team_conversations,
     fetch_ai_escalations,
+    fetch_ai_escalations_v2,
     update_escalation_status,
     create_ai_escalation
 )
-from fastapi import APIRouter, HTTPException, Body, Header, Depends
+from fastapi import APIRouter, HTTPException, Header, Query
 from auth.dependencies import CurrentUser
 from config import settings
-from typing import List, Dict, Literal
-from fastapi import APIRouter, HTTPException, Body
+from typing import Literal, Optional
 from pydantic import BaseModel
 from loguru import logger
 
@@ -101,6 +101,31 @@ async def get_team_escalations(user: CurrentUser):
         raise HTTPException(status_code=500, detail="Failed to fetch escalations")
 
 
+@router.get("/escalations/v2")
+async def get_team_escalations_v2(
+    user: CurrentUser,
+    status: Literal["all", "pending", "pending_human_review", "reviewed"] = Query("pending"),
+    cursor: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+):
+    """Cursor-paginated pending or reviewed escalations for the current org."""
+    org_id = user.org_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    try:
+        return await fetch_ai_escalations_v2(
+            org_id,
+            status=status,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"get_team_escalations_v2 error for org={org_id}: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to fetch escalations") from exc
+
+
 class StatusUpdate(BaseModel):
     status: Literal["pending_human_review", "reviewed"]
 
@@ -123,7 +148,8 @@ async def update_escalation_status_route(
         success = await update_escalation_status(
             org_id=org_id,
             escalation_id=id,
-            status=update.status
+            status=update.status,
+            reviewer_id=user.user_id,
         )
         if not success:
             raise HTTPException(status_code=404, detail="Escalation not found")
@@ -164,4 +190,3 @@ async def internal_create_escalation(
     except Exception as e:
         logger.error(f"Error in internal_create_escalation: {e}")
         raise HTTPException(status_code=500, detail="Failed to create escalation")
-

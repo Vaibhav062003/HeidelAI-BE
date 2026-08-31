@@ -1,33 +1,59 @@
 import asyncio
+import hashlib
 import httpx
-import math
 import urllib.parse
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import re
 
-from pymongo import UpdateOne
+from pymongo import ReturnDocument, UpdateOne
 from pymongo.errors import BulkWriteError
 from loguru import logger
 
 from database import get_mongo_db
 from api.google_sheets_routes import refresh_google_token, _force_token_refresh, _detect_header_row
 from services.stock_gst import DEFAULT_GST_RATE, normalize_gst_inclusive, normalize_gst_rate
+from services.pricing_policy import (
+    normalize_currency,
+    normalize_gst_inclusive as normalize_explicit_gst_inclusive,
+    normalize_gst_rate as normalize_explicit_gst_rate,
+    normalize_inr,
+)
 
 # ─── Field Aliases ─────────────────────────────────────────────────────────────
 # Maps canonical MongoDB field names to possible sheet column name variations.
-# Used by auto_suggest_mapping() for the preview endpoint. The transform_row()
-# function does direct 1:1 snake_case mapping, so columns that already match
-# the MongoDB field name (e.g. "brand" → "brand") don't need aliases here —
-# aliases are only needed when the sheet column name differs from the DB field.
+# Used by auto_suggest_mapping() for the preview endpoint and as the fallback
+# normalization for columns not covered by a saved mapping.
 
 FIELD_ALIASES = {
     # --- Shared / Laptop fields ---
     "product_name": ["product name", "product_name", "name", "title", "product title", "item name", "item"],
     "model_no":     ["model_no", "model no", "model number", "model", "sku", "item code", "product code", "part number", "part no", "article no"],
     "description":  ["description", "desc", "product description", "details", "short description"],
-    "price":        ["price", "mrp", "cost", "rate", "unit price", "selling price", "amount"],
-    "gst_inclusive": ["gst inclusive", "gst_inclusive", "tax inclusive", "price includes gst", "gst treatment"],
+    # Keep price concepts separate. ``price`` remains a legacy display field;
+    # it is never treated as an approved floor by the V1 pricing policy.
+    "price":        ["price", "rate", "unit price", "amount"],
+    "cost_price":   ["cost price", "purchase price", "landed cost", "landing cost", "dealer cost", "cost"],
+    "approved_floor_price": [
+        "approved floor price", "floor price", "minimum selling price",
+        "min selling price", "approved minimum price",
+    ],
+    "target_selling_price": [
+        "target selling price", "selling price", "target price", "offer price",
+    ],
+    "mrp": ["mrp", "maximum retail price", "maximum retail price mrp", "list price"],
+    "currency": ["currency", "currency code"],
+    "selling_gst_inclusive": [
+        "gst inclusive", "selling gst inclusive", "selling_gst_inclusive",
+        "tax inclusive", "price includes gst", "gst treatment",
+    ],
+    "cost_gst_inclusive": [
+        "cost gst inclusive", "cost_gst_inclusive", "cost includes gst",
+        "purchase price includes gst",
+    ],
+    # Retain exact legacy mapping keys saved before selling_gst_inclusive existed.
+    "gst_inclusive": ["gst_inclusive"],
     "gst_rate":      ["gst rate", "gst_rate", "gst percent", "gst percentage", "gst %", "tax rate"],
     "stock":        ["stock", "quantity", "qty", "available", "inventory", "units", "available qty"],
     "image_url":    ["image", "image url", "image_url", "image link", "photo", "picture", "product image"],
@@ -163,6 +189,206 @@ def auto_suggest_mapping(columns: list[str]) -> dict[str, str]:
     return mapping
 
 
+def _field_name(value: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return FIELD_NAME_NORMALIZE.get(key, key)
+
+
+def apply_saved_column_mapping(row_data: dict, column_mapping: dict) -> dict:
+    """Apply the persisted ``{canonical_field: sheet_header}`` mapping.
+
+    Unmapped columns are retained under their normalized names so catalogue
+    search continues to receive arbitrary specification columns. A reverse
+    mapping is accepted for compatibility with early preview clients.
+    """
+    headers_by_normalized = {_field_name(header): header for header in row_data}
+    destinations: dict[str, str] = {}
+    for raw_field, raw_header in (column_mapping or {}).items():
+        field = _field_name(raw_field)
+        header_key = _field_name(raw_header)
+        if raw_header in row_data:
+            destinations[str(raw_header)] = field
+        elif header_key in headers_by_normalized:
+            destinations[headers_by_normalized[header_key]] = field
+        elif raw_field in row_data and header_key in CANONICAL_FIELDS:
+            destinations[str(raw_field)] = header_key
+
+    mapped = {}
+    # First retain all unmapped fields for search/specification data.
+    for header, value in row_data.items():
+        if header not in destinations:
+            mapped[_field_name(header)] = value
+    # Apply explicit mappings last so an auto-normalized alias can never
+    # override the merchant's saved choice for the same canonical field.
+    for header, field in destinations.items():
+        if header in row_data:
+            mapped[field] = row_data[header]
+    return mapped
+
+
+_PRICE_FIELDS = (
+    "cost_price", "approved_floor_price", "target_selling_price", "mrp",
+)
+_PRICE_PROVENANCE_FIELDS = (
+    *_PRICE_FIELDS, "price", "currency", "selling_gst_inclusive",
+    "cost_gst_inclusive", "gst_inclusive", "gst_rate",
+    "price_source_sheet_id", "price_verified_at", "price_version",
+)
+
+
+def _price_version(sheet_id: str, doc: dict) -> str:
+    values = "|".join(str(doc.get(field) if doc.get(field) is not None else "") for field in (
+        *_PRICE_FIELDS, "currency", "selling_gst_inclusive", "cost_gst_inclusive", "gst_rate",
+    ))
+    identity = str(doc.get("unique_identifier") or doc.get("model_no") or "")
+    return hashlib.sha256(f"{sheet_id}|{identity}|{values}".encode("utf-8")).hexdigest()
+
+
+def _source_value_snapshot(doc: dict) -> dict:
+    fields = (
+        "product_name", "model_no", "sku", "description", "stock", "category",
+        *_PRICE_PROVENANCE_FIELDS,
+    )
+    return {key: doc.get(key) for key in fields if key in doc}
+
+
+def source_unlink_update(doc: dict, removed_sheet_id: str) -> dict:
+    """Build an unlink update that cannot retain a removed price authority.
+
+    Removing a non-authoritative source preserves the current price authority.
+    Removing the authoritative source clears canonical approval and provenance;
+    remaining source values may still provide a deterministic legacy display
+    ``price``, but never become an approved authority implicitly.
+    """
+    remaining_ids = sorted(
+        str(value) for value in (doc.get("source_sheet_ids") or [])
+        if str(value) != str(removed_sheet_id)
+    )
+    source_values = doc.get("source_values") or {}
+    current_source = str(doc.get("price_source_sheet_id") or "")
+    preferred = current_source if current_source in remaining_ids else ""
+    unset_fields = {
+        f"source_rows.{removed_sheet_id}": "",
+        f"source_values.{removed_sheet_id}": "",
+    }
+    if str(doc.get("source_sheet_id") or "") == str(removed_sheet_id):
+        unset_fields["source_sheet_id"] = ""
+    update = {
+        "$pull": {"source_sheet_ids": removed_sheet_id},
+        "$unset": unset_fields,
+    }
+
+    # Some legacy multi-source products predate source_values snapshots. If
+    # the current authority is not the source being removed, preserve the
+    # top-level verified fields instead of erasing evidence we cannot rebuild.
+    preferred_snapshot = source_values.get(preferred) if preferred else None
+    if preferred and not (
+        isinstance(preferred_snapshot, dict)
+        and any(key in preferred_snapshot for key in _PRICE_PROVENANCE_FIELDS)
+    ):
+        return update
+
+    replacement_id = preferred or next(
+        (sheet_id for sheet_id in remaining_ids if isinstance(source_values.get(sheet_id), dict)),
+        "",
+    )
+    replacement = dict(source_values.get(replacement_id) or {})
+
+    set_fields = {}
+    if preferred:
+        set_fields = {
+            key: replacement[key]
+            for key in _PRICE_PROVENANCE_FIELDS
+            if key in replacement and replacement[key] is not None
+        }
+    for key in _PRICE_PROVENANCE_FIELDS:
+        if key not in set_fields:
+            unset_fields[key] = ""
+
+    # A legacy source may supply display price, but it remains unverified.
+    if replacement and "price" in replacement and replacement.get("price") is not None:
+        set_fields["price"] = replacement["price"]
+        unset_fields.pop("price", None)
+    if (
+        not preferred
+        or not replacement.get("price_verified_at")
+        or not replacement.get("price_version")
+    ):
+        for key in (*_PRICE_FIELDS, "price_source_sheet_id", "price_verified_at", "price_version"):
+            set_fields.pop(key, None)
+            unset_fields[key] = ""
+
+    if set_fields:
+        update["$set"] = set_fields
+    return update
+
+
+async def unlink_product_sheet_source(org_id: str, sheet_id: str) -> int:
+    """Remove one Sheet source without leaving its price as authoritative."""
+    database = get_mongo_db()
+    products = database[f"products_{org_id}"]
+    documents = await asyncio.to_thread(
+        lambda: list(products.find(
+            {"source_sheet_ids": sheet_id},
+            {
+                "_id": 1, "source": 1, "source_sheet_ids": 1, "source_values": 1,
+                "source_sheet_id": 1, "price_source_sheet_id": 1,
+            },
+        ))
+    )
+    delete_ids = []
+    updates = []
+    for doc in documents:
+        if (
+            len(doc.get("source_sheet_ids") or []) <= 1
+            and doc.get("source") not in {"manual", "csv_upload"}
+        ):
+            delete_ids.append(doc["_id"])
+        else:
+            updates.append(UpdateOne({"_id": doc["_id"]}, source_unlink_update(doc, sheet_id)))
+    removed = 0
+    if updates:
+        await asyncio.to_thread(lambda: products.bulk_write(updates, ordered=False))
+    if delete_ids:
+        result = await asyncio.to_thread(
+            lambda: products.delete_many({"_id": {"$in": delete_ids}})
+        )
+        removed += result.deleted_count
+    legacy_documents = await asyncio.to_thread(
+        lambda: list(products.find(
+            {
+                "source_sheet_id": sheet_id,
+                "$or": [
+                    {"source_sheet_ids": {"$exists": False}},
+                    {"source_sheet_ids": {"$size": 0}},
+                ],
+            },
+            {"_id": 1, "source": 1, "price_source_sheet_id": 1},
+        ))
+    )
+    legacy_delete_ids = [
+        doc["_id"] for doc in legacy_documents
+        if doc.get("source") not in {"manual", "csv_upload"}
+    ]
+    legacy_updates = []
+    for doc in legacy_documents:
+        if doc["_id"] in legacy_delete_ids:
+            continue
+        unset = {"source_sheet_id": ""}
+        if str(doc.get("price_source_sheet_id") or "") == str(sheet_id):
+            for field in (*_PRICE_FIELDS, "price_source_sheet_id", "price_verified_at", "price_version"):
+                unset[field] = ""
+        legacy_updates.append(UpdateOne({"_id": doc["_id"]}, {"$unset": unset}))
+    if legacy_updates:
+        await asyncio.to_thread(lambda: products.bulk_write(legacy_updates, ordered=False))
+    if legacy_delete_ids:
+        result = await asyncio.to_thread(
+            lambda: products.delete_many({"_id": {"$in": legacy_delete_ids}})
+        )
+        removed += result.deleted_count
+    return removed
+
+
 def generate_search_text(product_data: dict) -> str:
     """Generate search_text from ALL fields for LLM retrieval.
     Includes product name, description, brand, model, specs — everything
@@ -210,27 +436,22 @@ def transform_row(
     org_id: str,
     product_type: str = "laptop",
 ) -> tuple[dict | None, str | None]:
-    """Transform a sheet row dict into a product document matching the sheet columns 1:1 in snake_case.
+    """Transform a sheet row using the saved canonical-to-header mapping.
     
     Args:
         row_data: Raw row from the sheet {column_name: value}
-        column_mapping: Unused (kept for API compat) — mapping is 1:1 by column name
+        column_mapping: Persisted ``{canonical_field: sheet_header}`` mapping.
         sheet_id: Source sheet ID for provenance tracking
         org_id: Organization ID
         product_type: "laptop" or "component" — sets the `type` field on the doc
     
     Returns (product_doc, error_reason)."""
     doc = {}
-    
-    for col_name, value in row_data.items():
-        clean_key = col_name.strip().lower()
-        clean_key = re.sub(r'[^a-z0-9]+', '_', clean_key).strip('_')
+
+    for clean_key, value in apply_saved_column_mapping(row_data, column_mapping).items():
         if not clean_key:
             continue
-        
-        # Normalize variant field names to canonical DB field name
-        clean_key = FIELD_NAME_NORMALIZE.get(clean_key, clean_key)
-        
+
         # Handle empty/cleared cells explicitly by setting to None
         if value is None or str(value).strip() == "":
             doc[clean_key] = None
@@ -243,15 +464,22 @@ def transform_row(
             val = False
         else:
             try:
-                numeric = re.sub(r"(?i)\b(?:inr|rs\.?)\b|₹|,|\s", "", val_str) if clean_key == "price" else val_str
+                numeric = (
+                    re.sub(r"(?i)\b(?:inr|rs\.?)\b|₹|,|\s", "", val_str)
+                    if clean_key in {"price", *_PRICE_FIELDS}
+                    else val_str
+                )
                 if numeric.isdigit() or (numeric.startswith('-') and numeric[1:].isdigit()):
                     val = int(numeric)
                 else:
                     val = float(numeric)
             except ValueError:
                 val = str(value).strip()
-        if clean_key == "price" and isinstance(val, (int, float)) and not isinstance(val, bool) and not math.isfinite(val):
-            return None, "price must be finite"
+        if clean_key in {"price", *_PRICE_FIELDS}:
+            try:
+                val = float(normalize_inr(value, field=clean_key))
+            except ValueError as exc:
+                return None, str(exc)
                 
         doc[clean_key] = val
 
@@ -286,12 +514,38 @@ def transform_row(
     elif "type" not in doc or not doc.get("type"):
         doc["type"] = product_type
 
-    doc["gst_inclusive"] = normalize_gst_inclusive(doc.get("gst_inclusive"))
-    doc["gst_rate"] = normalize_gst_rate(doc.get("gst_rate"), DEFAULT_GST_RATE)
+    try:
+        selling_gst = normalize_explicit_gst_inclusive(
+            doc.get("selling_gst_inclusive", doc.get("gst_inclusive")),
+            field="selling_gst_inclusive",
+        )
+        cost_gst = normalize_explicit_gst_inclusive(
+            doc.get("cost_gst_inclusive"), field="cost_gst_inclusive",
+        )
+        doc["currency"] = normalize_currency(doc.get("currency") or "INR")
+        explicit_rate = doc.get("gst_rate")
+        doc["gst_rate"] = float(normalize_explicit_gst_rate(
+            DEFAULT_GST_RATE if explicit_rate is None else explicit_rate
+        ))
+    except ValueError as exc:
+        return None, str(exc)
+    doc["selling_gst_inclusive"] = selling_gst
+    doc["cost_gst_inclusive"] = cost_gst
+    # Legacy consumers still render ``price``/``gst_inclusive``. Cost and MRP
+    # never flow into price; target then floor are the only canonical fallbacks.
+    if doc.get("target_selling_price") is not None:
+        doc["price"] = doc["target_selling_price"]
+    elif doc.get("approved_floor_price") is not None:
+        doc["price"] = doc["approved_floor_price"]
+    doc["gst_inclusive"] = bool(selling_gst) if selling_gst is not None else False
 
     now = datetime.now(timezone.utc)
     doc["org_id"] = org_id
     doc["updated_at"] = now
+    if any(doc.get(field) is not None for field in _PRICE_FIELDS):
+        doc["price_source_sheet_id"] = sheet_id
+        doc["price_verified_at"] = now
+        doc["price_version"] = _price_version(sheet_id, doc)
     
     doc["search_text"] = generate_search_text(doc)
 
@@ -300,8 +554,144 @@ def transform_row(
 
 # ─── Full Reconciliation Sync ──────────────────────────────────────────────────
 
+PRODUCT_SHEET_SYNC_LEASE = timedelta(minutes=30)
+PRODUCT_SHEET_RECONCILE_INTERVAL = timedelta(minutes=15)
+PRODUCT_SHEET_RECONCILE_LEASE = timedelta(minutes=30)
 
-async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
+
+async def _renew_product_sheet_sync_claim(db, org_id: str, sheet_id: str, claim_id: str) -> None:
+    renewed = await asyncio.to_thread(
+        db.product_sheet_connections.update_one,
+        {
+            "org_id": org_id,
+            "sheet_id": sheet_id,
+            "status": "syncing",
+            "sync_claim_id": claim_id,
+            "disconnect_requested_at": {"$exists": False},
+        },
+        {"$set": {
+            "sync_claim_until": datetime.now(timezone.utc) + PRODUCT_SHEET_SYNC_LEASE,
+            "updated_at": datetime.now(timezone.utc),
+        }},
+    )
+    if not renewed.matched_count:
+        raise Exception(f"Product sheet {sheet_id} disconnected during sync")
+
+
+async def _release_product_sheet_sync_claim(db, org_id: str, sheet_id: str, claim_id: str) -> None:
+    now = datetime.now(timezone.utc)
+    disconnected = await asyncio.to_thread(
+        db.product_sheet_connections.update_one,
+        {
+            "org_id": org_id,
+            "sheet_id": sheet_id,
+            "status": "syncing",
+            "sync_claim_id": claim_id,
+            "disconnect_requested_at": {"$exists": True},
+        },
+        {
+            "$set": {"status": "disconnecting", "updated_at": now},
+            "$unset": {"sync_claim_id": "", "sync_claim_until": ""},
+        },
+    )
+    if not disconnected.matched_count:
+        await asyncio.to_thread(
+            db.product_sheet_connections.update_one,
+            {
+                "org_id": org_id,
+                "sheet_id": sheet_id,
+                "status": "syncing",
+                "sync_claim_id": claim_id,
+                "disconnect_requested_at": {"$exists": False},
+            },
+            {
+                "$set": {"status": "error", "updated_at": now},
+                "$unset": {"sync_claim_id": "", "sync_claim_until": ""},
+            },
+        )
+
+
+async def begin_product_sheet_disconnect(
+    org_id: str, sheet_id: str, *, wait_seconds: float = 30,
+) -> None:
+    """Fence an active sync before callers unlink any Sheet-owned products."""
+    connections = get_mongo_db().product_sheet_connections
+    now = datetime.now(timezone.utc)
+    marked = await asyncio.to_thread(
+        connections.update_one,
+        {
+            "org_id": org_id,
+            "sheet_id": sheet_id,
+            "status": {"$nin": ["syncing", "disconnecting"]},
+        },
+        {"$set": {"status": "disconnecting", "disconnect_requested_at": now}},
+    )
+    if marked.matched_count:
+        return
+
+    connection = await asyncio.to_thread(
+        connections.find_one,
+        {"org_id": org_id, "sheet_id": sheet_id},
+        {"_id": 1, "status": 1, "sync_claim_id": 1, "sync_claim_until": 1},
+    )
+    if not connection:
+        raise ValueError("Product sheet connection not found")
+    if connection.get("status") == "disconnecting":
+        return
+    requested = await asyncio.to_thread(
+        connections.update_one,
+        {"_id": connection["_id"], "status": "syncing"},
+        {"$set": {"disconnect_requested_at": now}},
+    )
+    if not requested.matched_count:
+        return await begin_product_sheet_disconnect(org_id, sheet_id, wait_seconds=wait_seconds)
+
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    while True:
+        current = await asyncio.to_thread(
+            connections.find_one,
+            {"_id": connection["_id"]},
+            {"status": 1, "sync_claim_id": 1, "sync_claim_until": 1},
+        )
+        if not current:
+            raise ValueError("Product sheet connection not found")
+        if current.get("status") == "disconnecting":
+            return
+        lease_until = current.get("sync_claim_until")
+        if isinstance(lease_until, datetime) and lease_until.tzinfo is None:
+            lease_until = lease_until.replace(tzinfo=timezone.utc)
+        if current.get("status") == "syncing" and isinstance(lease_until, datetime) and lease_until <= datetime.now(timezone.utc):
+            expired = await asyncio.to_thread(
+                connections.update_one,
+                {
+                    "_id": connection["_id"],
+                    "status": "syncing",
+                    "sync_claim_id": current.get("sync_claim_id"),
+                    "disconnect_requested_at": {"$exists": True},
+                },
+                {
+                    "$set": {"status": "disconnecting", "updated_at": datetime.now(timezone.utc)},
+                    "$unset": {"sync_claim_id": "", "sync_claim_until": ""},
+                },
+            )
+            if expired.matched_count:
+                return
+        if current.get("status") != "syncing":
+            transitioned = await asyncio.to_thread(
+                connections.update_one,
+                {"_id": connection["_id"], "status": current.get("status")},
+                {"$set": {"status": "disconnecting", "disconnect_requested_at": now}},
+            )
+            if transitioned.matched_count:
+                return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError("Product sheet sync is still finishing; retry disconnect shortly")
+        await asyncio.sleep(0.05)
+
+
+async def sync_product_sheet(
+    org_id: str, sheet_id: str, *, reconcile_claim_id: str | None = None,
+) -> dict:
     """
     Full reconciliation sync: fetches ALL rows from Google Sheet, transforms
     using saved column mapping, upserts into products_{org_id}, and deletes
@@ -314,7 +704,12 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
     # 1. Load connection config
     connection = await asyncio.to_thread(
         db.product_sheet_connections.find_one,
-        {"org_id": org_id, "sheet_id": sheet_id}
+        {
+            "org_id": org_id,
+            "sheet_id": sheet_id,
+            "status": {"$ne": "disconnecting"},
+            "disconnect_requested_at": {"$exists": False},
+        }
     )
     if not connection:
         raise Exception(f"Product sheet connection not found for sheet {sheet_id}")
@@ -322,13 +717,34 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
     column_mapping = connection["column_mapping"]
     tab_name = connection["tab_name"]
     product_type = connection.get("product_type", "laptop")
+    # Legacy single-sheet connections predate is_primary and are authoritative.
+    is_primary_source = connection.get("is_primary") is not False
 
-    # Mark as syncing
-    await asyncio.to_thread(
+    # Claim the write phase. Scheduled recovery may replace only its own stale lease.
+    sync_claim_id = uuid.uuid4().hex
+    claim_filter = {
+        "org_id": org_id,
+        "sheet_id": sheet_id,
+        "status": {"$in": ["active", "error"]},
+        "disconnect_requested_at": {"$exists": False},
+    }
+    if reconcile_claim_id:
+        claim_filter.update({
+            "status": {"$in": ["active", "error", "syncing"]},
+            "reconcile_lease_id": reconcile_claim_id,
+        })
+    marked = await asyncio.to_thread(
         db.product_sheet_connections.update_one,
-        {"org_id": org_id, "sheet_id": sheet_id},
-        {"$set": {"status": "syncing", "updated_at": datetime.now(timezone.utc)}}
+        claim_filter,
+        {"$set": {
+            "status": "syncing",
+            "sync_claim_id": sync_claim_id,
+            "sync_claim_until": datetime.now(timezone.utc) + PRODUCT_SHEET_SYNC_LEASE,
+            "updated_at": datetime.now(timezone.utc),
+        }},
     )
+    if not marked.matched_count:
+        raise Exception(f"Product sheet {sheet_id} is already syncing or disconnecting")
 
     try:
         products_col = db[f"products_{org_id}"]
@@ -379,6 +795,7 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                                 UpdateOne({"_id": doc["_id"]}, {"$set": update_fields})
                             )
                     if backfill_ops:
+                        await _renew_product_sheet_sync_claim(db, org_id, sheet_id, sync_claim_id)
                         await asyncio.to_thread(
                             lambda ops=backfill_ops: products_col.bulk_write(ops, ordered=False)
                         )
@@ -459,6 +876,7 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
 
         async with httpx.AsyncClient() as client:
             while True:
+                await _renew_product_sheet_sync_claim(db, org_id, sheet_id, sync_claim_id)
                 page_end = page_start + PAGE_SIZE - 1
                 range_str = f"{encoded_tab}!A{page_start}:ZZ{page_end}"
                 url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{range_str}"
@@ -517,6 +935,19 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
             products_to_upsert.append(product_doc)
 
         # ── Reconcile with MongoDB ───────────────────────────────────────────
+        still_connected = await asyncio.to_thread(
+            db.product_sheet_connections.find_one,
+            {
+                "org_id": org_id,
+                "sheet_id": sheet_id,
+                "status": "syncing",
+                "sync_claim_id": sync_claim_id,
+                "disconnect_requested_at": {"$exists": False},
+            },
+            {"_id": 1},
+        )
+        if not still_connected:
+            raise Exception(f"Product sheet {sheet_id} disconnected during sync")
         now = datetime.now(timezone.utc)
         added = 0
         updated = 0
@@ -530,11 +961,11 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                 # MongoDB "Updating the path 'X' would create a conflict" errors
                 set_doc = {k: v for k, v in doc.items()
                            if k not in ("source", "source_sheet_id", "source_sheet_ids", "created_at")}
+                if not is_primary_source:
+                    for field in _PRICE_PROVENANCE_FIELDS:
+                        set_doc.pop(field, None)
                 set_doc[f"source_rows.{sheet_id}"] = sheet_row
-                set_doc[f"source_values.{sheet_id}"] = {
-                    key: doc.get(key) for key in ("product_name", "model_no", "sku", "description", "price", "stock", "category", "gst_inclusive", "gst_rate")
-                    if key in doc
-                }
+                set_doc[f"source_values.{sheet_id}"] = _source_value_snapshot(doc)
                 operations.append(
                     UpdateOne(
                         {"unique_identifier": doc["unique_identifier"], "type": doc["type"]},
@@ -556,6 +987,7 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
             for i in range(0, len(operations), 500):
                 batch = operations[i:i+500]
                 try:
+                    await _renew_product_sheet_sync_claim(db, org_id, sheet_id, sync_claim_id)
                     result = await asyncio.to_thread(
                         lambda b=batch: products_col.bulk_write(b, ordered=False)
                     )
@@ -596,11 +1028,16 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
             }
 
         # Find candidates for deletion
+        await _renew_product_sheet_sync_claim(db, org_id, sheet_id, sync_claim_id)
         stale_docs = await asyncio.to_thread(
-            lambda: list(products_col.find(
-                delete_filter,
-                {"_id": 1, "source_sheet_ids": 1, "source": 1}
-            ))
+                lambda: list(products_col.find(
+                    delete_filter,
+                    {
+                        "_id": 1, "source_sheet_ids": 1, "source": 1,
+                        "source_values": 1, "source_sheet_id": 1,
+                        "price_source_sheet_id": 1,
+                    }
+                ))
         )
 
         if stale_docs:
@@ -619,13 +1056,7 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
                     unlink_ops.append(
                         UpdateOne(
                             {"_id": doc["_id"]},
-                            {
-                                "$pull": {"source_sheet_ids": sheet_id},
-                                "$unset": {
-                                    f"source_rows.{sheet_id}": "",
-                                    f"source_values.{sheet_id}": "",
-                                },
-                            }
+                            source_unlink_update(doc, sheet_id),
                         )
                     )
 
@@ -646,17 +1077,43 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
             lambda: products_col.count_documents({"source_sheet_ids": sheet_id})
         )
 
-        await asyncio.to_thread(
+        await _renew_product_sheet_sync_claim(db, org_id, sheet_id, sync_claim_id)
+        completed = await asyncio.to_thread(
             db.product_sheet_connections.update_one,
-            {"org_id": org_id, "sheet_id": sheet_id},
-            {"$set": {
-                "status": "active",
-                "last_synced_at": now,
-                "last_sync_count": total_products,
-                "sync_errors": errors[:20],
-                "updated_at": now,
-            }}
+            {
+                "org_id": org_id,
+                "sheet_id": sheet_id,
+                "status": "syncing",
+                "sync_claim_id": sync_claim_id,
+                "disconnect_requested_at": {"$exists": False},
+            },
+            {
+                "$set": {
+                    "status": "active",
+                    "last_synced_at": now,
+                    "last_sync_count": total_products,
+                    "sync_errors": errors[:20],
+                    "updated_at": now,
+                },
+                "$unset": {"sync_claim_id": "", "sync_claim_until": ""},
+            },
         )
+        if not completed.matched_count:
+            await asyncio.to_thread(
+                db.product_sheet_connections.update_one,
+                {
+                    "org_id": org_id,
+                    "sheet_id": sheet_id,
+                    "status": "syncing",
+                    "sync_claim_id": sync_claim_id,
+                    "disconnect_requested_at": {"$exists": True},
+                },
+                {
+                    "$set": {"status": "disconnecting", "updated_at": now},
+                    "$unset": {"sync_claim_id": "", "sync_claim_until": ""},
+                },
+            )
+            raise Exception(f"Product sheet {sheet_id} disconnected during sync")
 
         # ── Update org metadata ──────────────────────────────────────────────
         total_all_products = await asyncio.to_thread(
@@ -686,15 +1143,107 @@ async def sync_product_sheet(org_id: str, sheet_id: str) -> dict:
             "errors": errors[:20],
         }
 
+    except asyncio.CancelledError:
+        await asyncio.shield(_release_product_sheet_sync_claim(db, org_id, sheet_id, sync_claim_id))
+        raise
     except Exception as e:
-        # Mark connection as error
-        await asyncio.to_thread(
-            db.product_sheet_connections.update_one,
-            {"org_id": org_id, "sheet_id": sheet_id},
-            {"$set": {"status": "error", "updated_at": datetime.now(timezone.utc)}}
-        )
+        await _release_product_sheet_sync_claim(db, org_id, sheet_id, sync_claim_id)
         logger.error(f"Product sheet sync failed for org {org_id} sheet {sheet_id}: {e}")
         raise
+
+
+async def reconcile_active_product_sheets(*, limit: int = 25) -> dict:
+    """Lease and reconcile due product Sheets across all application replicas."""
+    database = get_mongo_db()
+    connections = database.product_sheet_connections
+    try:
+        await asyncio.to_thread(
+            lambda: connections.create_index(
+                [("status", 1), ("next_reconcile_at", 1), ("reconcile_lease_until", 1)],
+                name="product_sheet_reconcile_due",
+            )
+        )
+    except Exception as exc:
+        logger.warning(f"[ProductSync] Reconciliation index unavailable: {exc}")
+
+    claimed = succeeded = failed = 0
+    errors: list[dict] = []
+    for _ in range(max(0, min(int(limit), 100))):
+        claim_now = datetime.now(timezone.utc)
+        lease_id = uuid.uuid4().hex
+        due_filter = {
+            "$and": [
+                {
+                    "$or": [
+                        {"next_reconcile_at": {"$lte": claim_now}},
+                        {"next_reconcile_at": {"$exists": False}},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"status": {"$in": ["active", "error"]}},
+                        {
+                            "status": "syncing",
+                            "sync_claim_until": {"$lt": claim_now},
+                        },
+                    ]
+                },
+                {
+                    "$or": [
+                        {"reconcile_lease_until": {"$lte": claim_now}},
+                        {"reconcile_lease_until": {"$exists": False}},
+                    ]
+                },
+            ]
+        }
+        connection = await asyncio.to_thread(
+            lambda query=due_filter, claim=lease_id: connections.find_one_and_update(
+                query,
+                {
+                    "$set": {
+                        "reconcile_lease_id": claim,
+                        "reconcile_lease_until": claim_now + PRODUCT_SHEET_RECONCILE_LEASE,
+                        "next_reconcile_at": claim_now + PRODUCT_SHEET_RECONCILE_INTERVAL,
+                    }
+                },
+                sort=[("next_reconcile_at", 1), ("updated_at", 1)],
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        if not connection:
+            break
+        claimed += 1
+        org_id = str(connection.get("org_id") or "")
+        sheet_id = str(connection.get("sheet_id") or "")
+        try:
+            if not org_id or not sheet_id:
+                raise ValueError("Product Sheet connection is missing org_id or sheet_id")
+            await sync_product_sheet(org_id, sheet_id, reconcile_claim_id=lease_id)
+        except Exception as exc:
+            failed += 1
+            errors.append({"org_id": org_id, "sheet_id": sheet_id, "error": str(exc)[:300]})
+            logger.error(f"[ProductSync] Scheduled reconciliation failed for org={org_id} sheet={sheet_id}: {exc}")
+        else:
+            succeeded += 1
+        finally:
+            completed_at = datetime.now(timezone.utc)
+            await asyncio.to_thread(
+                connections.update_one,
+                {"_id": connection["_id"], "reconcile_lease_id": lease_id},
+                {
+                    "$unset": {"reconcile_lease_id": "", "reconcile_lease_until": ""},
+                    "$set": {
+                        "next_reconcile_at": completed_at + PRODUCT_SHEET_RECONCILE_INTERVAL,
+                    },
+                },
+            )
+
+    return {
+        "claimed": claimed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "errors": errors,
+    }
 
 
 async def primary_product_sheet(org_id: str) -> dict:
