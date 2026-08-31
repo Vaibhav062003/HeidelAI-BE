@@ -26,17 +26,16 @@ class WhatsAppService(BasePlatformService):
             is_auto_followup=bool(kwargs.get("is_auto_followup")),
         )
 
-    async def disconnect(self, org_id: str, connection_id: str) -> dict:
+    async def disconnect(self, org_id: str, phone_id: str) -> dict:
         connection = db.whatsapp_connections.find_one({
             "org_id": org_id,
-            "$or": [{"phone_id": connection_id}, {"user_id": connection_id}],
+            "phone_id": phone_id,
             "is_active": {"$ne": False},
         })
         if not connection:
             from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
 
-        phone_id = connection["phone_id"]
         await archive_whatsapp_data(org_id, phone_id)
         siblings = db.whatsapp_connections.count_documents({
             "org_id": org_id,
