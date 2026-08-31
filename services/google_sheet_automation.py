@@ -60,7 +60,12 @@ async def process_google_sheet_trigger(
         return {"sent": 0, "skipped": 0, "errors": 1}
 
     # 1. Get WhatsApp connection early
-    wa_connection = await asyncio.to_thread(_get_wa_connection, org_id)
+    requested_phone_id = (
+        message_config.get("phone_number_id")
+        or message_config.get("business_phone_id")
+        or trigger_config.get("phone_number_id")
+    )
+    wa_connection = await asyncio.to_thread(_get_wa_connection, org_id, requested_phone_id)
     if not wa_connection:
         logger.error(f"[GoogleSheetAuto] No WhatsApp connection found for org {org_id}")
         return {"sent": 0, "skipped": 0, "errors": 1}
@@ -230,7 +235,7 @@ async def process_google_sheet_trigger(
             # use find_one_and_update WITHOUT upsert, so new contacts from sheets would crash.
             # create_or_update_whatsapp_conversation uses upsert=True and handles name resolution.
             try:
-                await create_or_update_whatsapp_conversation(
+                conversation_id = await create_or_update_whatsapp_conversation(
                     org_id=org_id,
                     recipient_id=wa_id,
                     customer_phone_no=phone,
@@ -238,9 +243,13 @@ async def process_google_sheet_trigger(
                     last_message=resolved_text,
                     last_sender="agent",
                     mode="reply",
+                    business_phone_id=phone_id,
+                    business_phone=wa_connection.get("phone"),
                 )
             except Exception as e:
                 logger.warning(f"[GoogleSheetAuto] Conversation pre-create for {phone}: {e}")
+                await asyncio.to_thread(_mark_failed, org_id, flow_id, phone, sheet_id)
+                return {"sent": 0, "errors": 1}
 
             msg_id = ""
             send_ok = False
@@ -263,13 +272,14 @@ async def process_google_sheet_trigger(
                         mode="reply",
                         context_type=None,
                         context=None,
+                        conversation_id=conversation_id,
                     )
                     msg_id = result.get("message_id", "")
                     send_ok = True
                 else:
                     # Build message dict matching what send_whatsapp_message expects
                     message_dict = {
-                        "conversation_id": f"whatsapp_{phone}",
+                        "conversation_id": conversation_id,
                         "content": resolved_text,
                         "sender_id": wa_id,
                     }
@@ -781,13 +791,14 @@ async def _fetch_rows(
     return raw_rows
 
 
-def _get_wa_connection(org_id: str) -> Optional[dict]:
-    """Get active WhatsApp connection for an org."""
+def _get_wa_connection(org_id: str, phone_number_id: Optional[str] = None) -> Optional[dict]:
+    """Resolve an exact sender or the organization's primary sender."""
     org = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1})
     if not org or not org.get("wa_id"):
         return None
-    wa_id = org["wa_id"]
-    return db.whatsapp_connections.find_one({"wa_id": wa_id, "org_id": org_id})
+    from services.wa_service import resolve_outbound_whatsapp_connection
+
+    return resolve_outbound_whatsapp_connection(org_id, org["wa_id"], phone_number_id)
 
 
 async def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:

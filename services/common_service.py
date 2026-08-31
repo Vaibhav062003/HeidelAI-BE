@@ -105,14 +105,24 @@ def build_focus_group_condition(
     return {"$and": [*conditions, {"status": "open"}]}
 
 
-async def fetch_focus_counts(org_id: str, user_id: str, role: str) -> Dict[str, int]:
+async def fetch_focus_counts(
+    org_id: str,
+    user_id: str,
+    role: str,
+    business_phone_id: Optional[str] = None,
+) -> Dict[str, int]:
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{org_id}"]
     now = datetime.now(timezone.utc)
     access = await conversation_access_condition(org_id, user_id, role)
+    phone_scope = {"platform": "whatsapp", "business_phone_id": business_phone_id} if business_phone_id else None
     facets = {
         group: [
-            {"$match": {"$and": [build_focus_group_condition(group, now), access]} if access else build_focus_group_condition(group, now)},
+            {"$match": {"$and": [
+                build_focus_group_condition(group, now),
+                *([access] if access else []),
+                *([phone_scope] if phone_scope else []),
+            ]}},
             {"$count": "count"},
         ]
         for group in FOCUS_GROUPS
@@ -337,6 +347,7 @@ async def search_conversations(
     assigned_agent_id: Optional[str] = None,
     current_user_role: str = "org:member",
     team_id: Optional[str] = None,
+    business_phone_id: Optional[str] = None,
 ) -> Dict:
     clean_query = query.strip()
     if len(clean_query) < 2:
@@ -352,6 +363,8 @@ async def search_conversations(
         conditions.append(access)
     if active_tab == "team" and team_id:
         await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
+    if business_phone_id:
+        conditions.append({"platform": "whatsapp", "business_phone_id": business_phone_id})
 
     conditions.extend(_queue_filter_conditions(
         active_tab, current_user_id, attention, handling, status_filter, assigned_agent_id, team_id
@@ -370,9 +383,16 @@ async def search_conversations(
         requested_labels = [item.strip() for item in labels.split(",") if item.strip()]
         if requested_labels:
             label_regexes = [re.compile(f"^{re.escape(item)}$", re.IGNORECASE) for item in requested_labels]
-            matching_ids = await async_db[f"contacts_{org_id}"].distinct(
-                "conversation_id", {"labels": {"$in": label_regexes}}
-            )
+            contact_rows = await async_db[f"contacts_{org_id}"].find(
+                {"labels": {"$in": label_regexes}},
+                {"_id": 0, "conversation_id": 1, "conversation_ids": 1},
+            ).to_list(length=None)
+            matching_ids = list(dict.fromkeys(
+                conversation_id
+                for contact in contact_rows
+                for conversation_id in [contact.get("conversation_id"), *(contact.get("conversation_ids") or [])]
+                if conversation_id
+            ))
             if not matching_ids:
                 return {"conversations": [], "has_more": False}
             conditions.append({"conversation_id": {"$in": matching_ids}})
@@ -392,6 +412,7 @@ async def search_conversations(
         {
             "_id": 0,
             "conversation_id": 1,
+            "conversation_ids": 1,
             "full_name": 1,
             "username": 1,
             "company": 1,
@@ -399,9 +420,10 @@ async def search_conversations(
         },
     ).limit(max(50, candidate_limit * 3)).to_list(length=max(50, candidate_limit * 3))
     contacts_by_conversation = {
-        str(contact["conversation_id"]): contact
+        str(conversation_id): contact
         for contact in contact_rows
-        if contact.get("conversation_id")
+        for conversation_id in [contact.get("conversation_id"), *(contact.get("conversation_ids") or [])]
+        if conversation_id
     }
     contact_conversation_ids = list(contacts_by_conversation)
     results: Dict[str, tuple[Dict, Dict]] = {}
@@ -566,6 +588,7 @@ async def fetch_conversations_new(
     include_meta: bool = False,
     current_user_role: str = "org:member",
     team_id: Optional[str] = None,
+    business_phone_id: Optional[str] = None,
 ) -> object:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -590,6 +613,8 @@ async def fetch_conversations_new(
     access = await conversation_access_condition(org_id, current_user_id or "", current_user_role)
     if access:
         base_conditions.append(access)
+    if business_phone_id:
+        base_conditions.append({"platform": "whatsapp", "business_phone_id": business_phone_id})
     if active_tab == "team" and team_id:
         await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
     base_conditions.extend(_queue_filter_conditions(
@@ -614,8 +639,16 @@ async def fetch_conversations_new(
             # Optimization: Use regex for case-insensitive exact matching
             regex_labels = [re.compile(f"^{re.escape(l)}$", re.IGNORECASE) for l in labels_list]
             
-            # Fetch unique conversation_ids from contacts who have any of these labels
-            matching_ids = await contact_col.distinct("conversation_id", {"labels": {"$in": regex_labels}})
+            contact_rows = await contact_col.find(
+                {"labels": {"$in": regex_labels}},
+                {"_id": 0, "conversation_id": 1, "conversation_ids": 1},
+            ).to_list(length=None)
+            matching_ids = list(dict.fromkeys(
+                conversation_id
+                for contact in contact_rows
+                for conversation_id in [contact.get("conversation_id"), *(contact.get("conversation_ids") or [])]
+                if conversation_id
+            ))
             
             if not matching_ids:
                 return {"conversations": [], "has_more": False, "total": 0, "counts": {"all": 0, "mine": 0, "transferred": 0, "team": 0, "unassigned": 0, "escalated": 0}} if include_meta else []
@@ -717,7 +750,9 @@ async def fetch_conversations_new(
             "categories": doc.get("categories", []),
             "labels": doc.get("labels", []),
             "participants": doc.get("participants", []),
-            "unread": doc.get("unread", {})
+            "unread": doc.get("unread", {}),
+            "business_phone_id": doc.get("business_phone_id"),
+            "business_phone": doc.get("business_phone"),
         }
             
         result.append(conv_obj)
@@ -732,6 +767,8 @@ async def fetch_conversations_new(
     count_scope_parts = [{"type": {"$ne": "team"}}]
     if access:
         count_scope_parts.append(access)
+    if business_phone_id:
+        count_scope_parts.append({"platform": "whatsapp", "business_phone_id": business_phone_id})
     count_scope = {"$and": count_scope_parts} if len(count_scope_parts) > 1 else count_scope_parts[0]
     team_conditions = _queue_filter_conditions("team", current_user_id, None, None, None, None, team_id)
     facets = {
@@ -1301,7 +1338,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             raise HTTPException(status_code=409, detail="The WhatsApp number for this conversation is not connected")
 
         if file:
-            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name, media_kind, duration_ms)
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name, media_kind, duration_ms, conversation_id)
 
             if res.get("error"):
                 raise HTTPException(
@@ -1324,7 +1361,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                         mode=mode,
                         context_type=context_type,
                         context=context,
-                        sender_name=sender_name
+                        sender_name=sender_name,
+                        conversation_id=conversation_id,
                     )
                 else:
                     raise ValueError("Not a template")

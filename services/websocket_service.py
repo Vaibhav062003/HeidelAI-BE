@@ -165,6 +165,7 @@ async def handle_typing_event(client_id: str, data: dict):
             asyncio.create_task(read_message_and_typing_indicator(
                 whatsapp_id=wa_id,
                 message_id=message_id,
+                conversation_id=conversation_id,
             ))
 
 async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: str, payload: dict, exclude_client_id: str = None):

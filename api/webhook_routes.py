@@ -525,14 +525,25 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         logger.warning("Missing WhatsApp business ID in webhook payload")
                         continue
                     
-                    # Find the connection to get user details
-                    connection = db.whatsapp_connections.find_one(
-                        {"wa_id": whatsapp_business_id}
+                    metadata_phone_id = str(
+                        (value.get("metadata") or {}).get("phone_number_id") or ""
+                    ).strip()
+                    connection = resolve_active_whatsapp_connection(
+                        metadata_phone_id,
+                        whatsapp_business_id,
                     )
                     
                     if not connection:
-                        logger.error(f"No connection found for WhatsApp business ID: {whatsapp_business_id}")
-                        return {"status": "ok"}
+                        logger.error(
+                            "No unambiguous active WhatsApp connection for "
+                            f"WABA={whatsapp_business_id}, phone_number_id={metadata_phone_id or 'missing'}"
+                        )
+                        continue
+
+                    business_phone_id = str(
+                        connection.get("phone_id") or metadata_phone_id or ""
+                    ).strip() or None
+                    business_phone = connection.get("phone")
 
                     # Calling uses the same webhook URL, but its statuses are not message receipts.
                     if change.get("field") == "calls":
@@ -556,6 +567,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             phone = contact_phone or (call.get("from") if direction == "USER_INITIATED" else call.get("to")) or existing.get("phone")
                             digits = "".join(character for character in str(phone or "") if character.isdigit())
                             conversation = db[f"conversations_{org_id}"].find_one({
+                                "business_phone_id": business_phone_id,
                                 "$or": [
                                     {"customer_id": {"$in": [phone, digits]}},
                                     {"conversation_id": {"$in": [f"whatsapp_{phone}", f"whatsapp_{digits}"]}},
@@ -566,6 +578,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             provider_time = meta_datetime(call.get("timestamp"), now)
                             metadata_fields = {
                                 "wa_id": whatsapp_business_id,
+                                "business_phone_id": business_phone_id,
+                                "business_phone": business_phone,
                                 "direction": direction,
                                 "conversation_id": conversation_id,
                                 "contact_name": (conversation or {}).get("customer_name") or contact_name,
@@ -824,7 +838,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 conversations_collection = db[conversations_collection_name]
                                 
                                 # Create conversation ID
-                                conversation_id = f"whatsapp_{customer_phone_no}"
+                                conversation_id = whatsapp_conversation_id(customer_phone_no, business_phone_id)
 
                                 logger.info(f"Reaction Event: {customer_name} {action} to message ID {message_id} {f'with emoji: {emoji}' if action == 'react' else ''} ")
 
@@ -932,7 +946,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             conversations_collection = db[conversations_collection_name]
                             
                             # Create conversation ID
-                            conversation_id = f"whatsapp_{customer_phone_no}"
+                            conversation_id = whatsapp_conversation_id(customer_phone_no, business_phone_id)
 
                             context_type = None
                             context = None
@@ -1019,7 +1033,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info(f"is_test: {is_test}")
                             logger.info(f"ai_enabled: {ai_enabled}") 
 
-                            whatsapp_flow = flow_collection.find_one({"trigger_from": "webhook", "trigger_event": "message_received", "status": "active"})
+                            bound_flow_id = connection.get("wa_bot_flow_id")
+                            whatsapp_flow = flow_collection.find_one({
+                                "flow_id": bound_flow_id,
+                                "trigger_from": "webhook",
+                                "trigger_event": "message_received",
+                                "status": "active",
+                            }) if bound_flow_id else None
                             logger.info(
                                 f"[{org_id}] WhatsApp automation flow: "
                                 f"{'found' if whatsapp_flow else 'no active flow found'}"
@@ -1069,7 +1089,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         reply_window_expiry=reply_window_expiry_time_utc,
                                         is_ad_referral=is_ad_referral,
                                         mode="reply",
-                                        extra_updates={"persona": "dealer", "is_dealer": True} if is_dealer_newly_detected else None
+                                        extra_updates={"persona": "dealer", "is_dealer": True} if is_dealer_newly_detected else None,
+                                        business_phone_id=business_phone_id,
+                                        business_phone=business_phone,
                                     )
                                     
                                 # Store in WhatsApp-specific collections
@@ -1157,7 +1179,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     "phone_number": customer_phone_no,
                                     "country": None,
                                     "profile_url": None,
-                                    "conversation_id": f"whatsapp_{customer_phone_no}",
+                                    "conversation_id": conversation_id,
                                     "email": None,
                                     "categories": []
                                 }
@@ -1186,7 +1208,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     # If the flow handled the message successfully, exit early.
                                     if automation_response:
                                         logger.info(f"[AI_ROUTING] [{conversation_id}] Message handled by WhatsApp automation flow. Skipping AI.")
-                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
+                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id, conversation_id=conversation_id)
                                         return {"status": "ok"}
                                 # Fallback to AI Agent (only if AI is enabled for this org+conversation)
                                 if ai_enabled and await is_effective_ai_enabled(org_id, conversation_id):
@@ -1212,7 +1234,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         if not await is_effective_ai_enabled(org_id, conversation_id):
                                             return {"status": "ok"}
 
-                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
+                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id, conversation_id=conversation_id)
 
                                         sales_action = chatbot_response.get("sales_action")
                                         agent_reply_to = chatbot_response.get("reply_to_message_id")
@@ -1430,6 +1452,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         reply_window_expiry=reply_window_expiry_time_utc,
                                         is_ad_referral=is_ad_referral,
                                         mode="reply",
+                                        business_phone_id=business_phone_id,
+                                        business_phone=business_phone,
                                     )
                                     await store_whatsapp_message(
                                         org_id=org_id,
@@ -1525,7 +1549,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 "phone_number": customer_phone_no,
                                 "country": None,
                                 "profile_url": None,
-                                "conversation_id": f"whatsapp_{customer_phone_no}",
+                                "conversation_id": conversation_id,
                                 "email": None,
                                 "categories": []
                                 }
@@ -1577,7 +1601,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         last_sender="customer",
                                         reply_window_expiry=reply_window_expiry_time_utc,
                                         is_ad_referral=is_ad_referral,
-                                        mode="reply"
+                                        mode="reply",
+                                        business_phone_id=business_phone_id,
+                                        business_phone=business_phone,
                                     )
                                     
                                 # Store in WhatsApp-specific collections
@@ -1920,6 +1946,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 reply_window_expiry=reply_window_expiry_time_utc,
                                 is_ad_referral=is_ad_referral,
                                 mode="reply",
+                                business_phone_id=business_phone_id,
+                                business_phone=business_phone,
                             )
                             
                             # Store in WhatsApp-specific collections
@@ -1974,7 +2002,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 "phone_number": customer_phone_no,
                                 "country": None,
                                 "profile_url": None,
-                                "conversation_id": f"whatsapp_{customer_phone_no}",
+                                "conversation_id": conversation_id,
                                 "email": None,
                                 "categories": []
                                 }

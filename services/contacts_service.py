@@ -84,6 +84,8 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
     elif platform == "whatsapp":
         update_doc["$set"]["phone_number"] = contact_data.get("phone_number")
         update_doc["$set"]["whatsapp_id"] = contact_data.get("whatsapp_id")
+        if contact_data.get("conversation_id"):
+            update_doc["$addToSet"] = {"conversation_ids": contact_data["conversation_id"]}
 
     # Clean up $set to avoid overwriting with None if fields are missing in contact_data
     for key in list(update_doc["$set"].keys()):
@@ -376,7 +378,7 @@ async def get_labels_from_org_metadata(org_id: str):
     else:
         return []
 
-async def get_unread_counts_by_labels(org_id: str):
+async def get_unread_counts_by_labels(org_id: str, business_phone_id: str | None = None):
     """
     Get labels from org metadata and calculate unread conversation count for each label.
     Returns a dictionary: { "label_name": unread_count, ... }
@@ -395,15 +397,21 @@ async def get_unread_counts_by_labels(org_id: str):
         
         conv_col = async_db[f"conversations_{org_id}"]
         
+        conversation_match = {"unread_count": {"$gt": 0}}
+        if business_phone_id:
+            conversation_match.update({"platform": "whatsapp", "business_phone_id": business_phone_id})
         pipeline = [
             # Only conversations with unread messages
-            {"$match": {"unread_count": {"$gt": 0}}},
+            {"$match": conversation_match},
             # Join with contacts to get labels
             {
                 "$lookup": {
                     "from": f"contacts_{org_id}",
-                    "localField": "conversation_id",
-                    "foreignField": "conversation_id",
+                    "let": {"conversation_id": "$conversation_id"},
+                    "pipeline": [{"$match": {"$expr": {"$or": [
+                        {"$eq": ["$conversation_id", "$$conversation_id"]},
+                        {"$in": ["$$conversation_id", {"$ifNull": ["$conversation_ids", []]}]},
+                    ]}}}],
                     "as": "contact"
                 }
             },

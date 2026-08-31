@@ -25,5 +25,9 @@ jobs:
           python test_sales_offer_contract.py
           python test_ai_fail_closed_contract.py
           python test_whatsapp_reply_idempotency.py
+          python test_multi_whatsapp_contract.py
+          python test_multi_whatsapp_migration.py
+          python test_whatsapp_number_binding.py
+          python test_whatsapp_outbound_binding.py
           python test_entitlement_contract.py
           python -m py_compile api/*.py services/*.py schemas/*.py
