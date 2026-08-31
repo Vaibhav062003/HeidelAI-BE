@@ -62,9 +62,19 @@ def test_plan_keeps_generated_labels_unique_when_defaults_are_already_used():
     assert len(labels) == len(set(labels)) == 2
 
 
+def test_plan_accepts_fifty_numbers_and_rejects_fifty_one():
+    fifty = [_connection(str(index), "org-1", f"phone-{index}") for index in range(50)]
+    assert build_plan(fifty)["errors"] == []
+    assert len(build_plan(fifty)["organizations"]["org-1"]["updates"]) == 50
+    assert "51 distinct WhatsApp numbers" in "\n".join(
+        build_plan([*fifty, _connection("50", "org-1", "phone-50")])["errors"]
+    )
+
+
 if __name__ == "__main__":
     test_plan_deduplicates_reconnects_and_assigns_two_slots()
     test_plan_refuses_cross_org_ownership_and_mixed_wabas()
     test_plan_prefers_active_reconnect_and_does_not_resurrect_inactive_rows()
     test_plan_keeps_generated_labels_unique_when_defaults_are_already_used()
+    test_plan_accepts_fifty_numbers_and_rejects_fifty_one()
     print("Multi-number WhatsApp migration tests passed.")

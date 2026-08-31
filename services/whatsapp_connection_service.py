@@ -7,11 +7,12 @@ from typing import Iterable, Optional
 
 
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+MAX_WHATSAPP_CONNECTIONS = 50
 
 
 def whatsapp_connection_limit(_org_id: str) -> int:
-    """Every organization can connect the supported two WhatsApp numbers."""
-    return 2
+    """Every organization can connect up to 50 WhatsApp numbers."""
+    return MAX_WHATSAPP_CONNECTIONS
 
 
 def normalize_connection_label(label: Optional[str], slot: int) -> str:
@@ -55,17 +56,20 @@ def choose_connection_slot(
     )
     if any(str(row.get("wa_id") or "") != waba_id for row in connections):
         raise ValueError("All WhatsApp numbers in an organization must belong to the same WABA")
-    if existing:
-        slot = existing.get("slot")
-        if isinstance(slot, int) and 1 <= slot <= limit:
-            return slot, existing
-    elif len(connections) >= limit:
+    if not existing and len(connections) >= limit:
         raise ValueError(f"This organization can connect at most {limit} WhatsApp number{'s' if limit != 1 else ''}")
 
-    used_slots = {
-        row.get("slot") for row in connections
-        if isinstance(row.get("slot"), int) and 1 <= row["slot"] <= limit and row is not existing
-    }
+    used_slots = set()
+    existing_slot = None
+    for row in connections:
+        slot = row.get("slot")
+        if not isinstance(slot, int) or not 1 <= slot <= limit or slot in used_slots:
+            slot = next(candidate for candidate in range(1, limit + 1) if candidate not in used_slots)
+        used_slots.add(slot)
+        if row is existing:
+            existing_slot = slot
+    if existing:
+        return existing_slot, existing
     for slot in range(1, limit + 1):
         if slot not in used_slots:
             return slot, existing
@@ -112,3 +116,18 @@ def public_connection(connection: dict) -> dict:
         "connected_at": connection.get("connected_at"),
         "is_active": connection.get("is_active") is not False,
     }
+
+
+def public_connections(connections: Iterable[dict]) -> list[dict]:
+    """Repair duplicate legacy slots in the API response without exposing secrets."""
+    used_slots: set[int] = set()
+    result = []
+    for connection in connections:
+        slot = connection.get("slot")
+        if not isinstance(slot, int) or slot < 1 or slot in used_slots:
+            slot = 1
+            while slot in used_slots:
+                slot += 1
+        used_slots.add(slot)
+        result.append(public_connection({**connection, "slot": slot}))
+    return result

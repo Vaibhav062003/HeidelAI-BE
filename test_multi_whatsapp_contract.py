@@ -1,4 +1,4 @@
-"""Dependency-free contract checks for the two-number WhatsApp boundary."""
+"""Dependency-free contract checks for the multi-number WhatsApp boundary."""
 
 import ast
 from pathlib import Path
@@ -20,13 +20,14 @@ def test_connection_and_webhook_contracts():
 
     assert '@router.get("/connections")' in routes
     assert '@router.patch("/connections/{connection_id}")' in routes
+    assert '"connections": public_connections(connections)' in routes
     assert 'phone_number_id=req.phone_id or req.phone_number_id' in routes
     assert 'requested_phone_id = str(req.phone_number_id or "").strip()' in routes
     assert '(value.get("metadata") or {}).get("phone_number_id")' in webhook
     assert 'connection.get("wa_bot_flow_id")' in webhook
     assert 'business_phone_id=business_phone_id' in webhook
     assert 'len(value) > 24' in connection_service
-    assert 'return 2' in connection_service
+    assert 'MAX_WHATSAPP_CONNECTIONS = 50' in connection_service
 
 
 def test_scoped_archive_and_cleanup_contracts():
@@ -64,7 +65,11 @@ def test_number_scoped_query_and_flow_binding_contracts():
 
 
 def test_primary_phone_scope_keeps_legacy_conversations_visible():
-    from services.whatsapp_connection_service import whatsapp_conversation_scope
+    from services.whatsapp_connection_service import (
+        choose_connection_slot,
+        public_connections,
+        whatsapp_conversation_scope,
+    )
 
     assert whatsapp_conversation_scope("primary", include_legacy=True) == {
         "platform": "whatsapp",
@@ -78,6 +83,19 @@ def test_primary_phone_scope_keeps_legacy_conversations_visible():
         "platform": "whatsapp",
         "business_phone_id": "secondary",
     }
+    legacy = [
+        {"phone_id": "one", "wa_id": "waba", "slot": 1},
+        {"phone_id": "two", "wa_id": "waba", "slot": 1},
+        {"phone_id": "three", "wa_id": "waba", "slot": 1},
+    ]
+    assert [item["slot"] for item in public_connections(legacy)] == [1, 2, 3]
+    assert [item["is_primary"] for item in public_connections(legacy)] == [True, False, False]
+    assert choose_connection_slot(
+        legacy,
+        phone_number_id="four",
+        waba_id="waba",
+        limit=50,
+    )[0] == 4
 
 
 if __name__ == "__main__":
