@@ -86,10 +86,8 @@ def resolve_outbound_whatsapp_connection(
         return matches[0] if len(matches) == 1 else None
 
     primary_matches = list(db.whatsapp_connections.find({**query, "slot": 1}).limit(2))
-    if len(primary_matches) == 1:
-        return primary_matches[0]
     if primary_matches:
-        return None
+        return primary_matches[0]
     legacy_matches = list(db.whatsapp_connections.find(query).limit(2))
     return legacy_matches[0] if len(legacy_matches) == 1 else None
 

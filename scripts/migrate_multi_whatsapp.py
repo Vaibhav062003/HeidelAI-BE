@@ -1,4 +1,4 @@
-"""Validate and backfill the two-number WhatsApp model.
+"""Validate and backfill the multi-number WhatsApp model.
 
 Dry-run is the default. Apply only after the report has no errors:
 
@@ -10,6 +10,8 @@ import argparse
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
+
+from services.whatsapp_connection_service import MAX_WHATSAPP_CONNECTIONS
 
 def _connected_at(connection: dict) -> str:
     value = connection.get("connected_at")
@@ -76,7 +78,7 @@ def build_plan(connections: list[dict]) -> dict:
             duplicate_ids.extend(item["_id"] for item in same_phone if item.get("is_active") is False)
 
         waba_ids = {str(item["wa_id"]) for item in distinct}
-        if len(distinct) > 2:
+        if len(distinct) > MAX_WHATSAPP_CONNECTIONS:
             errors.append(f"Organization {org_id} has {len(distinct)} distinct WhatsApp numbers")
         if len(waba_ids) > 1:
             errors.append(f"Organization {org_id} has mixed WABAs: {sorted(waba_ids)}")

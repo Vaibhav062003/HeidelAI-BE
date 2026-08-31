@@ -63,6 +63,7 @@ from services.whatsapp_connection_service import (
     connection_label_key,
     normalize_connection_label,
     public_connection,
+    public_connections,
     select_exact_phone_number,
     whatsapp_connection_limit,
 )
@@ -780,7 +781,7 @@ async def list_whatsapp_connections(request: Request, user: CurrentUser):
         "is_active": {"$ne": False},
     }, {"_id": 0, "access_token": 0}).sort([("slot", 1), ("connected_at", 1)]))
     return {
-        "connections": [public_connection(connection) for connection in connections],
+        "connections": public_connections(connections),
         "multi_number_enabled": limit > 1,
         "max_connections": limit,
         "max_numbers": limit,
