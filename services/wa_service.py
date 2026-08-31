@@ -1557,7 +1557,11 @@ async def revoke_whatsapp_access(org_id: str, wa_id: str):
     Revoke whatsapp access token through Meta App for an organization
     """
     try:
-        connection = db.whatsapp_connections.find_one({"wa_id": wa_id, "is_active": True, "org_id": org_id})
+        connection = db.whatsapp_connections.find_one({
+            "wa_id": wa_id,
+            "is_active": {"$ne": False},
+            "org_id": org_id,
+        })
 
         if not connection:
             logger.error(f"No active WhatsApp connection found for org {org_id} and wa_id {wa_id}")

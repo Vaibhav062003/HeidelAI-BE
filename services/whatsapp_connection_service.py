@@ -5,15 +5,13 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional
 
-from config.settings import MULTI_WHATSAPP_ORG_IDS
-
 
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 
-def whatsapp_connection_limit(org_id: str) -> int:
-    """Return the staged rollout limit for one organization."""
-    return 2 if org_id in MULTI_WHATSAPP_ORG_IDS else 1
+def whatsapp_connection_limit(_org_id: str) -> int:
+    """Every organization can connect the supported two WhatsApp numbers."""
+    return 2
 
 
 def normalize_connection_label(label: Optional[str], slot: int) -> str:
@@ -79,6 +77,17 @@ def whatsapp_conversation_id(customer_phone: str, business_phone_id: Optional[st
     customer = str(customer_phone or "").strip()
     phone_id = str(business_phone_id or "").strip()
     return f"whatsapp_{phone_id}_{customer}" if phone_id else f"whatsapp_{customer}"
+
+
+def whatsapp_conversation_scope(phone_id: str, include_legacy: bool = False) -> dict:
+    """Scope conversations to one line, including pre-migration rows for the primary line."""
+    exact = {"business_phone_id": str(phone_id)}
+    if not include_legacy:
+        return {"platform": "whatsapp", **exact}
+    return {
+        "platform": "whatsapp",
+        "$or": [exact, {"business_phone_id": {"$exists": False}}, {"business_phone_id": None}],
+    }
 
 
 def public_connection(connection: dict) -> dict:
