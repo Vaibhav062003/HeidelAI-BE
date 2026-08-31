@@ -51,10 +51,10 @@ def choose_connection_slot(
     """Validate same-WABA/capacity rules and return a stable connection slot."""
     connections = [row for row in existing_connections if row.get("is_active") is not False]
     existing = next(
-        (row for row in connections if str(row.get("phone_id") or "") == phone_number_id),
+        (row for row in connections if str(row.get("phone_id") or row.get("phone_number_id") or "") == phone_number_id),
         None,
     )
-    if any(str(row.get("wa_id") or "") != waba_id for row in connections):
+    if any(str(row.get("wa_id") or row.get("waba_id") or "") != waba_id for row in connections):
         raise ValueError("All WhatsApp numbers in an organization must belong to the same WABA")
     if not existing and len(connections) >= limit:
         raise ValueError(f"This organization can connect at most {limit} WhatsApp number{'s' if limit != 1 else ''}")
@@ -96,9 +96,11 @@ def whatsapp_conversation_scope(phone_id: str, include_legacy: bool = False) -> 
 
 def public_connection(connection: dict) -> dict:
     """Return the non-secret connection contract used by settings clients."""
-    phone_id = str(connection.get("phone_id") or "")
-    wa_id = str(connection.get("wa_id") or "")
+    phone_id = str(connection.get("phone_id") or connection.get("phone_number_id") or "")
+    wa_id = str(connection.get("wa_id") or connection.get("waba_id") or "")
     user_id = str(connection.get("user_id") or phone_id)
+    is_active = connection.get("is_active") is not False
+    slot = connection.get("slot") or connection.get("last_slot") or 1
     return {
         "connection_id": user_id,
         "user_id": user_id,
@@ -106,15 +108,17 @@ def public_connection(connection: dict) -> dict:
         "wa_id": wa_id,
         "phone_number_id": phone_id,
         "phone_id": phone_id,
-        "phone": connection.get("phone"),
+        "phone": connection.get("phone") or connection.get("display_phone_number"),
         "name": connection.get("name"),
         "label": connection.get("label"),
-        "slot": connection.get("slot", 1),
-        "is_primary": connection.get("slot", 1) == 1,
+        "slot": slot,
+        "is_primary": is_active and slot == 1,
         "wa_bot_flow_id": connection.get("wa_bot_flow_id"),
         "business_info": connection.get("business_info") or {},
         "connected_at": connection.get("connected_at"),
-        "is_active": connection.get("is_active") is not False,
+        "is_active": is_active,
+        "disconnected_at": connection.get("disconnected_at"),
+        "provider_revoke_status": connection.get("provider_revoke_status"),
     }
 
 
@@ -130,4 +134,17 @@ def public_connections(connections: Iterable[dict]) -> list[dict]:
                 slot += 1
         used_slots.add(slot)
         result.append(public_connection({**connection, "slot": slot}))
+    return result
+
+
+def public_historical_connections(connections: Iterable[dict]) -> list[dict]:
+    """Return one non-secret historical row per disconnected phone number."""
+    result = []
+    seen: set[str] = set()
+    for connection in connections:
+        phone_id = str(connection.get("phone_id") or connection.get("phone_number_id") or "")
+        if not phone_id or phone_id in seen:
+            continue
+        seen.add(phone_id)
+        result.append(public_connection(connection))
     return result

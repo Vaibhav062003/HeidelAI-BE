@@ -28,7 +28,7 @@ from core.limiter import limiter
 from core.services import services
 from services.utils import serialize_mongo
 from schemas.models import WhatsappAuthRequest, WhatsappConnectionLabelRequest, WhatsappDisconnectRequest, MessageRole, Template, BulkMessageRequest
-from services.wa_service import broadcast_whatsapp_message, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, get_broadcast_suppressed_phone_keys, run_bulk_send_job, resolve_outbound_whatsapp_connection
+from services.wa_service import broadcast_whatsapp_message, finalize_whatsapp_revocation, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, get_broadcast_suppressed_phone_keys, run_bulk_send_job, resolve_outbound_whatsapp_connection
 from services.platforms.whatsapp_service import WhatsAppService
 from services.cloudinary_service import check_cloudinary_storage_limit
 from database import get_async_mongo_db, get_mongo_db
@@ -64,6 +64,7 @@ from services.whatsapp_connection_service import (
     normalize_connection_label,
     public_connection,
     public_connections,
+    public_historical_connections,
     select_exact_phone_number,
     whatsapp_connection_limit,
 )
@@ -87,14 +88,18 @@ def _find_owned_whatsapp_connection(
     *,
     connection_id: str | None = None,
     phone_number_id: str | None = None,
+    include_inactive: bool = False,
 ) -> dict | None:
-    query: dict = {"org_id": org_id, "is_active": {"$ne": False}}
+    query: dict = {"org_id": org_id}
+    if not include_inactive:
+        query["is_active"] = {"$ne": False}
     if phone_number_id:
-        query["phone_id"] = str(phone_number_id).strip()
+        value = str(phone_number_id).strip()
+        query["$or"] = [{"phone_id": value}, {"phone_number_id": value}]
         return db.whatsapp_connections.find_one(query)
     if connection_id:
         value = str(connection_id).strip()
-        query["$or"] = [{"user_id": value}, {"phone_id": value}]
+        query["$or"] = [{"user_id": value}, {"phone_id": value}, {"phone_number_id": value}]
         return db.whatsapp_connections.find_one(query)
     return db.whatsapp_connections.find_one({**query, "slot": 1}) or db.whatsapp_connections.find_one(query)
 
@@ -505,7 +510,10 @@ async def update_whatsapp_call(request: Request, body: dict, user: CurrentUser):
 @limiter.limit("10/minute")
 async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, user: CurrentUser):
     reservation_id = None
+    meta_client = None
     try:
+        await admin_required(user)
+        meta_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         # Extract authorization code from request
         code = req.code
         # redirect_uri = request.redirect_uri
@@ -529,7 +537,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         }
         
         # Make request to Facebook Graph API
-        token_response = requests.post(token_url, json=token_data)
+        token_response = await meta_client.post(token_url, json=token_data)
         
         if token_response.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to exchange the WhatsApp authorization code")
@@ -566,7 +574,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "access_token": access_token # User's access token
         }
         phone_url = f"https://graph.facebook.com/v22.0/{whatsapp_business_id}/phone_numbers"
-        phone_response = requests.get(phone_url, params=params)
+        phone_response = await meta_client.get(phone_url, params=params)
         if phone_response.status_code != 200:
             raise HTTPException(
                 status_code=400, 
@@ -588,13 +596,13 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         phone_id = str(phones_data.get("id") or "").strip()
 
         if db.whatsapp_connections.find_one({
-            "phone_id": phone_id,
+            "$or": [{"phone_id": phone_id}, {"phone_number_id": phone_id}],
             "org_id": {"$ne": org_id},
             "is_active": {"$ne": False},
         }, {"_id": 1}):
             raise HTTPException(status_code=409, detail="This WhatsApp number is already connected to another organization")
         if db.whatsapp_connections.find_one({
-            "wa_id": whatsapp_business_id,
+            "$or": [{"wa_id": whatsapp_business_id}, {"waba_id": whatsapp_business_id}],
             "org_id": {"$ne": org_id},
             "is_active": {"$ne": False},
         }, {"_id": 1}):
@@ -604,6 +612,11 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "org_id": org_id,
             "is_active": {"$ne": False},
         }))
+        historical_connection = db.whatsapp_connections.find_one({
+            "org_id": org_id,
+            "$or": [{"phone_id": phone_id}, {"phone_number_id": phone_id}],
+            "is_active": False,
+        })
         limit = whatsapp_connection_limit(org_id)
         try:
             slot, existing_connection = choose_connection_slot(
@@ -612,6 +625,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
                 waba_id=whatsapp_business_id,
                 limit=limit,
             )
+            existing_connection = existing_connection or historical_connection
             requested_label = req.label if req.label is not None else (existing_connection or {}).get("label")
             if not requested_label:
                 verified_name = " ".join(str(phones_data.get("verified_name") or "").split())[:24]
@@ -633,7 +647,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "access_token": access_token
         }
         webhook_url = f"https://graph.facebook.com/v22.0/{whatsapp_business_id}/subscribed_apps"
-        webhook_response = requests.post(webhook_url, json=webhook_params)
+        webhook_response = await meta_client.post(webhook_url, json=webhook_params)
 
         if webhook_response.status_code != 200:
             raise HTTPException(
@@ -659,7 +673,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         phone_register_url = f"https://graph.facebook.com/v22.0/{phone_id}/register"
 
         try:
-            phone_register_response = requests.post(phone_register_url, json=phone_register_params)
+            phone_register_response = await meta_client.post(phone_register_url, json=phone_register_params, timeout=5.0)
             if phone_register_response.status_code != 200:
                 logger.warning("WhatsApp phone registration returned status {}", phone_register_response.status_code)
             
@@ -708,8 +722,23 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         # Store in your existing MongoDB database
         try:
             db.whatsapp_connections.update_one(
-                {"org_id": org_id, "phone_id": phone_id},
-                {"$set": whatsapp_connection, "$setOnInsert": {"connected_at": now}},
+                {
+                    "org_id": org_id,
+                    "$or": [{"phone_id": phone_id}, {"phone_number_id": phone_id}],
+                },
+                {
+                    "$set": whatsapp_connection,
+                    "$setOnInsert": {"connected_at": now},
+                    "$unset": {
+                        "disconnected_at": "",
+                        "last_slot": "",
+                        "provider_revoke_status": "",
+                        "provider_revoke_error": "",
+                        "provider_revoke_attempts": "",
+                        "provider_revoke_updated_at": "",
+                        "superseded_by": "",
+                    },
+                },
                 upsert=True,
             )
         except DuplicateKeyError as exc:
@@ -718,10 +747,17 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
                 detail="This WhatsApp number, slot, or label was claimed by another connection. Refresh and try again.",
             ) from exc
         db.whatsapp_connections.update_many(
-            {"org_id": org_id, "wa_id": whatsapp_business_id},
+            {
+                "org_id": org_id,
+                "$or": [{"wa_id": whatsapp_business_id}, {"waba_id": whatsapp_business_id}],
+                "is_active": {"$ne": False},
+            },
             {"$set": {"access_token": access_token, "updated_at": now}},
         )
-        saved_connection = db.whatsapp_connections.find_one({"org_id": org_id, "phone_id": phone_id}) or whatsapp_connection
+        saved_connection = db.whatsapp_connections.find_one({
+            "org_id": org_id,
+            "$or": [{"phone_id": phone_id}, {"phone_number_id": phone_id}],
+        }) or whatsapp_connection
         
         return {
             "status": "success",
@@ -745,31 +781,45 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         logger.error("WhatsApp authentication failed for org {} ({})", user.org_id, type(e).__name__)
         raise HTTPException(status_code=502, detail="WhatsApp authentication failed") from e
     finally:
+        if meta_client:
+            await meta_client.aclose()
         release_capacity(reservation_id)
     
 @router.post("/disconnect")
 @limiter.limit("10/minute")
-async def whatsapp_disconnect(request: Request, req: WhatsappDisconnectRequest, user: CurrentUser):
+async def whatsapp_disconnect(
+    request: Request,
+    req: WhatsappDisconnectRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser,
+):
     """Disconnect a WhatsApp Account from the system"""
     try:
+        await admin_required(user)
         org_id = user.org_id
         connection = _find_owned_whatsapp_connection(
             org_id,
             connection_id=req.connection_id or req.user_id,
             phone_number_id=req.phone_id or req.phone_number_id,
+            include_inactive=True,
         )
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
-        connection_id = connection.get("phone_id") or connection.get("wa_id")
+        connection_id = connection.get("phone_id") or connection.get("phone_number_id") or connection.get("wa_id")
         removal_result = await whatsapp_service.disconnect(org_id, connection_id)
-        suffix = "The other WhatsApp number remains connected." if removal_result.get("remaining_connections") else "The organization WhatsApp reference was cleared."
-        return {"message": f"WhatsApp number disconnected and archived. {suffix}"}
+        if removal_result.get("provider_cleanup") in {"pending", "failed"}:
+            background_tasks.add_task(finalize_whatsapp_revocation, org_id, connection_id)
+        return {
+            "status": "disconnected",
+            "phone_id": connection_id,
+            **removal_result,
+        }
        
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error disconnecting WhatsApp: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to disconnect WhatsApp: {str(e)}")
+        logger.error("Error disconnecting WhatsApp for org {} ({})", user.org_id, type(e).__name__)
+        raise HTTPException(status_code=500, detail="Failed to disconnect WhatsApp") from e
 
 
 @router.get("/connections")
@@ -780,8 +830,13 @@ async def list_whatsapp_connections(request: Request, user: CurrentUser):
         "org_id": user.org_id,
         "is_active": {"$ne": False},
     }, {"_id": 0, "access_token": 0}).sort([("slot", 1), ("connected_at", 1)]))
+    historical = list(db.whatsapp_connections.find({
+        "org_id": user.org_id,
+        "is_active": False,
+    }, {"_id": 0, "access_token": 0}).sort("disconnected_at", -1))
     return {
         "connections": public_connections(connections),
+        "historical_connections": public_historical_connections(historical),
         "multi_number_enabled": limit > 1,
         "max_connections": limit,
         "max_numbers": limit,
@@ -798,6 +853,7 @@ async def update_whatsapp_connection_label(
     body: WhatsappConnectionLabelRequest,
     user: CurrentUser,
 ):
+    await admin_required(user)
     try:
         label = normalize_connection_label(body.label, 1)
     except ValueError as exc:
@@ -832,6 +888,48 @@ async def update_whatsapp_connection_label(
     if not connection:
         raise HTTPException(status_code=404, detail="WhatsApp connection not found")
     return {"connection": public_connection(connection)}
+
+
+@router.post("/connections/{phone_id}/primary")
+@limiter.limit("20/minute")
+async def make_whatsapp_connection_primary(request: Request, phone_id: str, user: CurrentUser):
+    await admin_required(user)
+    target = db.whatsapp_connections.find_one({
+        "org_id": user.org_id,
+        "$or": [{"phone_id": phone_id.strip()}, {"phone_number_id": phone_id.strip()}],
+        "is_active": {"$ne": False},
+    })
+    if not target:
+        raise HTTPException(status_code=404, detail="WhatsApp connection not found")
+    active = list(db.whatsapp_connections.find({
+        "org_id": user.org_id,
+        "is_active": {"$ne": False},
+    }).sort([("slot", 1), ("connected_at", 1)]))
+    current = next((row for row in active if row.get("slot") == 1), active[0] if active else None)
+    if current and current.get("_id") == target.get("_id"):
+        return {"connection": public_connection(target)}
+
+    used = {row.get("slot") for row in active if isinstance(row.get("slot"), int) and row.get("slot") > 1}
+    replacement_slot = target.get("slot")
+    if not isinstance(replacement_slot, int) or replacement_slot <= 1:
+        replacement_slot = next(slot for slot in range(2, whatsapp_connection_limit(user.org_id) + 1) if slot not in used)
+    now = datetime.now(timezone.utc)
+    with db.client.start_session() as session:
+        with session.start_transaction():
+            db.whatsapp_connections.update_one({"_id": target["_id"]}, {"$set": {"slot": 0}}, session=session)
+            if current:
+                db.whatsapp_connections.update_one(
+                    {"_id": current["_id"]},
+                    {"$set": {"slot": replacement_slot, "updated_at": now}},
+                    session=session,
+                )
+            target = db.whatsapp_connections.find_one_and_update(
+                {"_id": target["_id"]},
+                {"$set": {"slot": 1, "updated_at": now}},
+                return_document=ReturnDocument.AFTER,
+                session=session,
+            )
+    return {"connection": public_connection(target)}
 
 @router.get("/{whatsapp_id}/details")
 @limiter.limit("20/minute")

@@ -5,6 +5,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from datetime import datetime, timezone
 from typing import Optional
 
 for key in (
@@ -66,6 +67,11 @@ class SyncCursor:
         self.documents = self.documents[:length]
         return self
 
+    def sort(self, fields):
+        for field, direction in reversed(fields):
+            self.documents.sort(key=lambda item: item.get(field) or 0, reverse=direction < 0)
+        return self
+
     def __iter__(self):
         return iter(self.documents)
 
@@ -88,12 +94,14 @@ class SyncDB:
 
 def _load_connection_resolver():
     tree = ast.parse((ROOT / "services/wa_service.py").read_text(encoding="utf-8"))
-    node = next(
+    nodes = [
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "resolve_active_whatsapp_connection"
-    )
-    namespace = {"Optional": Optional}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "resolver", "exec"), namespace)
+        if isinstance(node, ast.FunctionDef) and node.name in {
+            "_identifier_values", "active_whatsapp_connection_candidates", "resolve_active_whatsapp_connection",
+        }
+    ]
+    namespace = {"Optional": Optional, "MAX_WHATSAPP_CONNECTIONS": 50}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "resolver", "exec"), namespace)
     return namespace["resolve_active_whatsapp_connection"], namespace
 
 
@@ -120,6 +128,9 @@ def test_inbound_connection_resolution_is_exact_and_ambiguity_safe():
     assert resolver(None, "waba")["phone_id"] == "phone-1"
     assert resolver(None, "waba", allow_single_fallback=False) is None
 
+    namespace["db"] = SyncDB([{"org_id": "org", "wa_id": 123, "phone_id": 456, "is_active": True}])
+    assert resolver("456", "123")["phone_id"] == 456
+
 
 def _load_disconnect_service():
     tree = ast.parse((ROOT / "services/platforms/whatsapp_service.py").read_text(encoding="utf-8"))
@@ -137,47 +148,103 @@ def _load_disconnect_service():
     return namespace["WhatsAppService"], namespace
 
 
-class DisconnectConnections:
-    def __init__(self, documents):
-        self.documents = documents
-
-    def find_one(self, query):
-        return next((document for document in self.documents if _matches(document, query)), None)
-
-    def count_documents(self, query):
-        return sum(_matches(document, query) for document in self.documents)
-
-
 def test_disconnect_uses_canonical_phone_id_and_keeps_sibling():
     service_class, namespace = _load_disconnect_service()
-    documents = [
-        {"org_id": "org", "wa_id": "waba", "phone_id": "phone-1", "user_id": "phone-2", "is_active": True},
-        {"org_id": "org", "wa_id": "waba", "phone_id": "phone-2", "user_id": "user-2", "is_active": True},
-    ]
-    namespace["db"] = SimpleNamespace(whatsapp_connections=DisconnectConnections(documents))
     calls = []
 
-    async def archive(org_id, phone_id):
-        calls.append(("archive", org_id, phone_id))
+    async def deactivate(org_id, phone_id):
+        calls.append(("deactivate", org_id, phone_id))
+        return {"remaining_connections": 1, "provider_cleanup": "not_needed"}
 
-    async def revoke(org_id, wa_id):
-        calls.append(("revoke", org_id, wa_id))
-
-    async def remove(org_id, phone_id):
-        calls.append(("remove", org_id, phone_id))
-        documents[:] = [document for document in documents if document["phone_id"] != phone_id]
-        return {"deleted_connections": 1, "remaining_connections": len(documents)}
-
-    namespace.update({
-        "archive_whatsapp_data": archive,
-        "revoke_whatsapp_access": revoke,
-        "remove_whatsapp_connection": remove,
-    })
+    namespace["deactivate_whatsapp_connection"] = deactivate
     result = asyncio.run(service_class().disconnect("org", "phone-2"))
 
     assert result["remaining_connections"] == 1
-    assert calls == [("archive", "org", "phone-2"), ("remove", "org", "phone-2")]
-    assert [document["phone_id"] for document in documents] == ["phone-1"]
+    assert calls == [("deactivate", "org", "phone-2")]
+
+
+def _load_deactivate_connection():
+    tree = ast.parse((ROOT / "services/wa_service.py").read_text(encoding="utf-8"))
+    node = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "deactivate_whatsapp_connection"
+    )
+    namespace = {"datetime": datetime, "timezone": timezone, "HTTPException": RuntimeError}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "deactivate", "exec"), namespace)
+    return namespace["deactivate_whatsapp_connection"], namespace
+
+
+class MutableCollection(SyncConnections):
+    def find_one(self, query):
+        document = next((document for document in self.documents if _matches(document, query)), None)
+        return deepcopy(document) if document else None
+
+    def find(self, query, *_args, **_kwargs):
+        return SyncCursor([document for document in self.documents if _matches(document, query)])
+
+    def update_one(self, query, update, **_kwargs):
+        document = next((document for document in self.documents if _matches(document, query)), None)
+        if document is None:
+            return SimpleNamespace(modified_count=0)
+        document.update(deepcopy(update.get("$set", {})))
+        for field, amount in update.get("$inc", {}).items():
+            document[field] = document.get(field, 0) + amount
+        for field in update.get("$unset", {}):
+            document.pop(field, None)
+        return SimpleNamespace(modified_count=1)
+
+
+class Session:
+    def __enter__(self): return self
+    def __exit__(self, *_args): return False
+    def start_transaction(self): return self
+
+
+def test_disconnect_is_fast_soft_delete_and_keeps_history_owner():
+    deactivate, namespace = _load_deactivate_connection()
+    connections = MutableCollection([
+        {"_id": "one", "org_id": "org", "wa_id": "waba", "phone_id": "phone-1", "slot": 1, "is_active": True},
+        {"_id": "two", "org_id": "org", "wa_id": "waba", "phone_id": "phone-2", "slot": 2, "is_active": True},
+    ])
+    organizations = MutableCollection([{"_id": "org", "org_id": "org", "wa_id": "waba"}])
+    namespace["db"] = SimpleNamespace(
+        whatsapp_connections=connections,
+        organizations=organizations,
+        __getitem__=lambda _self, _name: MutableCollection([]),
+    )
+    namespace["mongo_client"] = SimpleNamespace(start_session=lambda: Session())
+
+    result = asyncio.run(deactivate("org", "phone-1"))
+    assert result == {"already_disconnected": False, "remaining_connections": 1, "provider_cleanup": "not_needed"}
+    assert connections.documents[0]["is_active"] is False and "slot" not in connections.documents[0]
+    assert connections.documents[1]["slot"] == 1
+    assert asyncio.run(deactivate("org", "phone-1"))["already_disconnected"] is True
+
+
+def test_provider_cleanup_is_claimed_and_idempotent():
+    tree = ast.parse((ROOT / "services/wa_service.py").read_text(encoding="utf-8"))
+    node = next(
+        item for item in tree.body
+        if isinstance(item, ast.AsyncFunctionDef) and item.name == "finalize_whatsapp_revocation"
+    )
+    namespace = {"datetime": datetime, "timezone": timezone}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "finalize", "exec"), namespace)
+    connections = MutableCollection([{
+        "_id": "one", "org_id": "org", "wa_id": "waba", "phone_id": "phone-1",
+        "is_active": False, "access_token": "secret", "provider_revoke_status": "pending",
+    }])
+    namespace["db"] = SimpleNamespace(whatsapp_connections=connections)
+
+    async def revoke(*_args):
+        return True, ""
+
+    namespace["_revoke_whatsapp_token"] = revoke
+    finalize = namespace["finalize_whatsapp_revocation"]
+    assert asyncio.run(finalize("org", "phone-1")) == {"provider_cleanup": "complete"}
+    assert connections.documents[0]["provider_revoke_status"] == "complete"
+    assert connections.documents[0]["provider_revoke_attempts"] == 1
+    assert "access_token" not in connections.documents[0]
+    assert asyncio.run(finalize("org", "phone-1")) == {"provider_cleanup": "not_pending"}
 
 
 class AsyncCursor:
@@ -363,6 +430,8 @@ if __name__ == "__main__":
     monkeypatch = SimpleNamespace(setattr=setattr)
     test_inbound_connection_resolution_is_exact_and_ambiguity_safe()
     test_disconnect_uses_canonical_phone_id_and_keeps_sibling()
+    test_disconnect_is_fast_soft_delete_and_keeps_history_owner()
+    test_provider_cleanup_is_claimed_and_idempotent()
     test_publish_binds_connections_without_adding_phone_ids_to_flow(monkeypatch)
     test_publish_rejects_unknown_phone_and_delete_or_duplicate_stays_unbound(monkeypatch)
     test_webhook_uses_bound_flow_and_number_aware_conversations()

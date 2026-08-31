@@ -538,6 +538,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             "No unambiguous active WhatsApp connection for "
                             f"WABA={whatsapp_business_id}, phone_number_id={metadata_phone_id or 'missing'}"
                         )
+                        if active_whatsapp_connection_candidates(whatsapp_business_id):
+                            raise HTTPException(
+                                status_code=503,
+                                detail="WhatsApp connection metadata is temporarily inconsistent",
+                            )
                         continue
 
                     business_phone_id = str(

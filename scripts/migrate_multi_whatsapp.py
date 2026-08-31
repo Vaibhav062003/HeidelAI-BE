@@ -42,12 +42,12 @@ def build_plan(connections: list[dict]) -> dict:
 
     for connection in connections:
         org_id = str(connection.get("org_id") or "")
-        phone_id = str(connection.get("phone_id") or "")
-        wa_id = str(connection.get("wa_id") or "")
+        phone_id = str(connection.get("phone_id") or connection.get("phone_number_id") or "")
+        wa_id = str(connection.get("wa_id") or connection.get("waba_id") or "")
         if not org_id or not phone_id or not wa_id:
             errors.append(f"Connection {connection.get('_id')} is missing org_id, phone_id, or wa_id")
             continue
-        grouped[org_id].append(connection)
+        grouped[org_id].append({**connection, "phone_id": phone_id, "wa_id": wa_id})
         if connection.get("is_active") is not False:
             phone_owners[phone_id].add(org_id)
             waba_owners[wa_id].add(org_id)
@@ -89,8 +89,10 @@ def build_plan(connections: list[dict]) -> dict:
             updates.append({
                 "_id": connection["_id"],
                 "phone_id": str(connection["phone_id"]),
+                "phone_number_id": str(connection["phone_id"]),
                 "phone": connection.get("phone"),
                 "wa_id": str(connection["wa_id"]),
+                "waba_id": str(connection["wa_id"]),
                 "slot": slot,
                 "label": label,
                 "label_key": label_key,
@@ -120,7 +122,24 @@ def migrate(apply: bool = False) -> dict:
     now = datetime.now(timezone.utc)
     for org_id, actions in plan["organizations"].items():
         if actions["delete_ids"]:
-            db.whatsapp_connections.delete_many({"_id": {"$in": actions["delete_ids"]}})
+            for duplicate_id in actions["delete_ids"]:
+                duplicate = db.whatsapp_connections.find_one({"_id": duplicate_id}) or {}
+                db.whatsapp_connections.update_one(
+                    {"_id": duplicate_id},
+                    {
+                        "$set": {
+                            "phone_number_id": str(duplicate.get("phone_number_id") or duplicate.get("phone_id") or ""),
+                            "waba_id": str(duplicate.get("waba_id") or duplicate.get("wa_id") or ""),
+                            "is_active": False,
+                            "migration_status": "superseded",
+                            "updated_at": now,
+                        },
+                        "$unset": {
+                            "access_token": "", "phone_id": "", "wa_id": "", "slot": "",
+                            "label_key": "", "wa_bot_flow_id": "",
+                        },
+                    },
+                )
 
         primary = None
         for update in actions["updates"]:
@@ -133,7 +152,10 @@ def migrate(apply: bool = False) -> dict:
 
         if not primary:
             continue
-        db.organizations.update_one({"org_id": org_id}, {"$set": {"wa_id": primary["wa_id"]}})
+        db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"wa_id": primary["wa_id"], "whatsapp_connection_schema_version": 2}},
+        )
         conversations = db[f"conversations_{org_id}"]
         conversations.update_many(
             {"platform": "whatsapp", "$or": [
@@ -166,18 +188,23 @@ def migrate(apply: bool = False) -> dict:
             name="whatsapp_phone_customer_unique",
         )
 
+    index_names = db.whatsapp_connections.index_information()
+    for name in ("whatsapp_phone_unique", "whatsapp_org_slot_unique", "whatsapp_org_label_unique"):
+        if name in index_names:
+            db.whatsapp_connections.drop_index(name)
     db.whatsapp_connections.create_index(
-        "phone_id", unique=True, partialFilterExpression={"phone_id": {"$type": "string"}},
+        "phone_id", unique=True,
+        partialFilterExpression={"phone_id": {"$type": "string"}, "is_active": True},
         name="whatsapp_phone_unique",
     )
     db.whatsapp_connections.create_index(
         [("org_id", 1), ("slot", 1)], unique=True,
-        partialFilterExpression={"org_id": {"$type": "string"}, "slot": {"$type": "number"}},
+        partialFilterExpression={"org_id": {"$type": "string"}, "slot": {"$type": "number"}, "is_active": True},
         name="whatsapp_org_slot_unique",
     )
     db.whatsapp_connections.create_index(
         [("org_id", 1), ("label_key", 1)], unique=True,
-        partialFilterExpression={"org_id": {"$type": "string"}, "label_key": {"$type": "string"}},
+        partialFilterExpression={"org_id": {"$type": "string"}, "label_key": {"$type": "string"}, "is_active": True},
         name="whatsapp_org_label_unique",
     )
     db.organizations.create_index(
