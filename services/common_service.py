@@ -22,6 +22,7 @@ from services.work_team_service import (
     require_conversation_access,
     team_queue_condition,
 )
+from services.whatsapp_connection_service import whatsapp_conversation_scope
 
 from database import get_mongo_db, get_async_mongo_db
 
@@ -30,6 +31,18 @@ from dateutil import parser
 
 
 db = get_mongo_db()
+
+
+def _business_phone_scope(org_id: str, phone_id: str) -> Dict:
+    active = {"org_id": org_id, "is_active": {"$ne": False}}
+    primary = (
+        db.whatsapp_connections.find_one({**active, "slot": 1}, {"phone_id": 1})
+        or db.whatsapp_connections.find_one(active, {"phone_id": 1}, sort=[("connected_at", 1)])
+    )
+    return whatsapp_conversation_scope(
+        phone_id,
+        include_legacy=bool(primary and str(primary.get("phone_id") or "") == str(phone_id)),
+    )
 
 
 def validate_outbound_attachment(file) -> None:
@@ -115,7 +128,7 @@ async def fetch_focus_counts(
     collection = async_db[f"conversations_{org_id}"]
     now = datetime.now(timezone.utc)
     access = await conversation_access_condition(org_id, user_id, role)
-    phone_scope = {"platform": "whatsapp", "business_phone_id": business_phone_id} if business_phone_id else None
+    phone_scope = _business_phone_scope(org_id, business_phone_id) if business_phone_id else None
     facets = {
         group: [
             {"$match": {"$and": [
@@ -364,7 +377,7 @@ async def search_conversations(
     if active_tab == "team" and team_id:
         await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
     if business_phone_id:
-        conditions.append({"platform": "whatsapp", "business_phone_id": business_phone_id})
+        conditions.append(_business_phone_scope(org_id, business_phone_id))
 
     conditions.extend(_queue_filter_conditions(
         active_tab, current_user_id, attention, handling, status_filter, assigned_agent_id, team_id
@@ -614,7 +627,7 @@ async def fetch_conversations_new(
     if access:
         base_conditions.append(access)
     if business_phone_id:
-        base_conditions.append({"platform": "whatsapp", "business_phone_id": business_phone_id})
+        base_conditions.append(_business_phone_scope(org_id, business_phone_id))
     if active_tab == "team" and team_id:
         await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
     base_conditions.extend(_queue_filter_conditions(
@@ -768,7 +781,7 @@ async def fetch_conversations_new(
     if access:
         count_scope_parts.append(access)
     if business_phone_id:
-        count_scope_parts.append({"platform": "whatsapp", "business_phone_id": business_phone_id})
+        count_scope_parts.append(_business_phone_scope(org_id, business_phone_id))
     count_scope = {"$and": count_scope_parts} if len(count_scope_parts) > 1 else count_scope_parts[0]
     team_conditions = _queue_filter_conditions("team", current_user_id, None, None, None, None, team_id)
     facets = {

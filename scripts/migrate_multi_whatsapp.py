@@ -31,7 +31,7 @@ def _label(connection: dict, slot: int, used: set[str]) -> tuple[str, str]:
     return candidate, key
 
 
-def build_plan(connections: list[dict], allowed_org_ids: set[str]) -> dict:
+def build_plan(connections: list[dict]) -> dict:
     """Return deterministic actions and errors without touching MongoDB."""
     grouped: dict[str, list[dict]] = defaultdict(list)
     phone_owners: dict[str, set[str]] = defaultdict(set)
@@ -80,9 +80,6 @@ def build_plan(connections: list[dict], allowed_org_ids: set[str]) -> dict:
             errors.append(f"Organization {org_id} has {len(distinct)} distinct WhatsApp numbers")
         if len(waba_ids) > 1:
             errors.append(f"Organization {org_id} has mixed WABAs: {sorted(waba_ids)}")
-        if len(distinct) == 2 and org_id not in allowed_org_ids:
-            errors.append(f"Organization {org_id} has two numbers but is not allowlisted")
-
         used_labels: set[str] = set()
         updates = []
         for slot, connection in enumerate(sorted(distinct, key=_connected_at), start=1):
@@ -102,12 +99,11 @@ def build_plan(connections: list[dict], allowed_org_ids: set[str]) -> dict:
 
 
 def migrate(apply: bool = False) -> dict:
-    from config.settings import MULTI_WHATSAPP_ORG_IDS
     from database import get_mongo_db
 
     db = get_mongo_db()
     raw_connections = list(db.whatsapp_connections.find({}))
-    plan = build_plan(raw_connections, set(MULTI_WHATSAPP_ORG_IDS))
+    plan = build_plan(raw_connections)
 
     for org_id, actions in plan["organizations"].items():
         active_flows = list(db[f"wa_bot_flows_{org_id}"].find({"status": "active"}, {"flow_id": 1}))

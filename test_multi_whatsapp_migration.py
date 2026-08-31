@@ -18,7 +18,7 @@ def test_plan_deduplicates_reconnects_and_assigns_two_slots():
         _connection("old", "org-1", "phone-1", connected_at="2026-01-01"),
         _connection("new", "org-1", "phone-1", connected_at="2026-02-01"),
         _connection("support", "org-1", "phone-2", connected_at="2026-03-01"),
-    ], {"org-1"})
+    ])
 
     assert plan["errors"] == []
     org = plan["organizations"]["org-1"]
@@ -27,17 +27,16 @@ def test_plan_deduplicates_reconnects_and_assigns_two_slots():
     assert len({item["label_key"] for item in org["updates"]}) == 2
 
 
-def test_plan_refuses_cross_org_ownership_mixed_wabas_and_unentitled_second_line():
+def test_plan_refuses_cross_org_ownership_and_mixed_wabas():
     plan = build_plan([
         _connection("one", "org-1", "phone-1", "waba-1"),
         _connection("two", "org-1", "phone-2", "waba-2"),
         _connection("stolen", "org-2", "phone-1", "waba-1"),
-    ], set())
+    ])
 
     errors = "\n".join(plan["errors"])
     assert "multiple organizations" in errors
     assert "mixed WABAs" in errors
-    assert "not allowlisted" in errors
 
 
 def test_plan_prefers_active_reconnect_and_does_not_resurrect_inactive_rows():
@@ -45,7 +44,7 @@ def test_plan_prefers_active_reconnect_and_does_not_resurrect_inactive_rows():
         _connection("active", "org-1", "phone-1", connected_at="2026-01-01"),
         _connection("inactive-newer", "org-1", "phone-1", connected_at="2026-03-01", is_active=False),
         _connection("inactive-only", "org-2", "phone-2", is_active=False),
-    ], set())
+    ])
 
     assert [item["_id"] for item in plan["organizations"]["org-1"]["updates"]] == ["active"]
     assert plan["organizations"]["org-1"]["delete_ids"] == ["inactive-newer"]
@@ -57,7 +56,7 @@ def test_plan_keeps_generated_labels_unique_when_defaults_are_already_used():
     plan = build_plan([
         _connection("one", "org-1", "phone-1", name="WhatsApp 2"),
         _connection("two", "org-1", "phone-2", name="WhatsApp 2"),
-    ], {"org-1"})
+    ])
 
     labels = [item["label_key"] for item in plan["organizations"]["org-1"]["updates"]]
     assert len(labels) == len(set(labels)) == 2
@@ -65,7 +64,7 @@ def test_plan_keeps_generated_labels_unique_when_defaults_are_already_used():
 
 if __name__ == "__main__":
     test_plan_deduplicates_reconnects_and_assigns_two_slots()
-    test_plan_refuses_cross_org_ownership_mixed_wabas_and_unentitled_second_line()
+    test_plan_refuses_cross_org_ownership_and_mixed_wabas()
     test_plan_prefers_active_reconnect_and_does_not_resurrect_inactive_rows()
     test_plan_keeps_generated_labels_unique_when_defaults_are_already_used()
     print("Multi-number WhatsApp migration tests passed.")

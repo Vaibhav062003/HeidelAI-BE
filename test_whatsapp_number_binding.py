@@ -43,6 +43,10 @@ ROOT = Path(__file__).parent
 
 def _matches(document: dict, query: dict) -> bool:
     for field, expected in query.items():
+        if field == "$or":
+            if not any(_matches(document, option) for option in expected):
+                return False
+            continue
         actual = document.get(field)
         if isinstance(expected, dict):
             if "$in" in expected and actual not in expected["$in"]:
@@ -115,6 +119,65 @@ def test_inbound_connection_resolution_is_exact_and_ambiguity_safe():
     namespace["db"] = SyncDB([documents[0]])
     assert resolver(None, "waba")["phone_id"] == "phone-1"
     assert resolver(None, "waba", allow_single_fallback=False) is None
+
+
+def _load_disconnect_service():
+    tree = ast.parse((ROOT / "services/platforms/whatsapp_service.py").read_text(encoding="utf-8"))
+    service = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "WhatsAppService"
+    )
+    disconnect = next(
+        node for node in service.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "disconnect"
+    )
+    service.body = [disconnect]
+    namespace = {"BasePlatformService": object}
+    exec(compile(ast.Module(body=[service], type_ignores=[]), "disconnect", "exec"), namespace)
+    return namespace["WhatsAppService"], namespace
+
+
+class DisconnectConnections:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def find_one(self, query):
+        return next((document for document in self.documents if _matches(document, query)), None)
+
+    def count_documents(self, query):
+        return sum(_matches(document, query) for document in self.documents)
+
+
+def test_disconnect_uses_canonical_phone_id_and_keeps_sibling():
+    service_class, namespace = _load_disconnect_service()
+    documents = [
+        {"org_id": "org", "wa_id": "waba", "phone_id": "phone-1", "user_id": "phone-2", "is_active": True},
+        {"org_id": "org", "wa_id": "waba", "phone_id": "phone-2", "user_id": "user-2", "is_active": True},
+    ]
+    namespace["db"] = SimpleNamespace(whatsapp_connections=DisconnectConnections(documents))
+    calls = []
+
+    async def archive(org_id, phone_id):
+        calls.append(("archive", org_id, phone_id))
+
+    async def revoke(org_id, wa_id):
+        calls.append(("revoke", org_id, wa_id))
+
+    async def remove(org_id, phone_id):
+        calls.append(("remove", org_id, phone_id))
+        documents[:] = [document for document in documents if document["phone_id"] != phone_id]
+        return {"deleted_connections": 1, "remaining_connections": len(documents)}
+
+    namespace.update({
+        "archive_whatsapp_data": archive,
+        "revoke_whatsapp_access": revoke,
+        "remove_whatsapp_connection": remove,
+    })
+    result = asyncio.run(service_class().disconnect("org", "phone-2"))
+
+    assert result["remaining_connections"] == 1
+    assert calls == [("archive", "org", "phone-2"), ("remove", "org", "phone-2")]
+    assert [document["phone_id"] for document in documents] == ["phone-1"]
 
 
 class AsyncCursor:
@@ -299,6 +362,7 @@ def test_all_outbound_paths_use_bound_sender_and_customer_fields():
 if __name__ == "__main__":
     monkeypatch = SimpleNamespace(setattr=setattr)
     test_inbound_connection_resolution_is_exact_and_ambiguity_safe()
+    test_disconnect_uses_canonical_phone_id_and_keeps_sibling()
     test_publish_binds_connections_without_adding_phone_ids_to_flow(monkeypatch)
     test_publish_rejects_unknown_phone_and_delete_or_duplicate_stays_unbound(monkeypatch)
     test_webhook_uses_bound_flow_and_number_aware_conversations()

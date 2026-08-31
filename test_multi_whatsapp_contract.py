@@ -26,6 +26,7 @@ def test_connection_and_webhook_contracts():
     assert 'connection.get("wa_bot_flow_id")' in webhook
     assert 'business_phone_id=business_phone_id' in webhook
     assert 'len(value) > 24' in connection_service
+    assert 'return 2' in connection_service
 
 
 def test_scoped_archive_and_cleanup_contracts():
@@ -39,6 +40,8 @@ def test_scoped_archive_and_cleanup_contracts():
     assert 'delete_one({"phone_id": phone_id, "org_id": org_id})' in service
     assert 'archived_private_notes_' in scheduler
     assert 'drop_collection(archived_notes_col)' in scheduler
+    revoke = service[service.index("async def revoke_whatsapp_access"):service.index("async def remove_whatsapp_connection")]
+    assert '"is_active": {"$ne": False}' in revoke
 
 
 def test_number_scoped_query_and_flow_binding_contracts():
@@ -49,10 +52,10 @@ def test_number_scoped_query_and_flow_binding_contracts():
     wa_service = source("services/wa_service.py")
 
     assert common_routes.count("business_phone_id: Optional[str]") >= 4
-    assert 'conditions.append({"platform": "whatsapp", "business_phone_id": business_phone_id})' in common_service
-    assert 'base_conditions.append({"platform": "whatsapp", "business_phone_id": business_phone_id})' in common_service
+    assert 'conditions.append(_business_phone_scope(org_id, business_phone_id))' in common_service
+    assert 'base_conditions.append(_business_phone_scope(org_id, business_phone_id))' in common_service
     assert '"business_phone_id": doc.get("business_phone_id")' in common_service
-    assert '{"platform": "whatsapp", "business_phone_id": business_phone_id}' in common_service
+    assert common_service.count("_business_phone_scope(org_id, business_phone_id)") == 4
     assert '"wa_bot_flow_id": flow_id' in flow_service
     assert '"phone_ids", "wa_bot_flow_id"' in flow_service
     assert '"conversation_ids": contact_data["conversation_id"]' in contacts_service
@@ -60,8 +63,26 @@ def test_number_scoped_query_and_flow_binding_contracts():
     assert 'conversation_phone.get(str(item.get("_id") or ""), "")' in wa_service
 
 
+def test_primary_phone_scope_keeps_legacy_conversations_visible():
+    from services.whatsapp_connection_service import whatsapp_conversation_scope
+
+    assert whatsapp_conversation_scope("primary", include_legacy=True) == {
+        "platform": "whatsapp",
+        "$or": [
+            {"business_phone_id": "primary"},
+            {"business_phone_id": {"$exists": False}},
+            {"business_phone_id": None},
+        ],
+    }
+    assert whatsapp_conversation_scope("secondary") == {
+        "platform": "whatsapp",
+        "business_phone_id": "secondary",
+    }
+
+
 if __name__ == "__main__":
     test_connection_and_webhook_contracts()
     test_scoped_archive_and_cleanup_contracts()
     test_number_scoped_query_and_flow_binding_contracts()
+    test_primary_phone_scope_keeps_legacy_conversations_visible()
     print("Multi-number WhatsApp backend contracts passed.")
