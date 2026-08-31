@@ -1,4 +1,4 @@
-from scripts.migrate_multi_whatsapp import build_plan
+from scripts.migrate_multi_whatsapp import build_plan, conversation_key_errors, organization_waba_errors
 
 
 def _connection(row_id, org_id, phone_id, wa_id="waba-1", connected_at="2026-01-01", **extra):
@@ -24,7 +24,23 @@ def test_plan_deduplicates_reconnects_and_assigns_two_slots():
     org = plan["organizations"]["org-1"]
     assert org["delete_ids"] == ["old"]
     assert [(item["_id"], item["slot"]) for item in org["updates"]] == [("new", 1), ("support", 2)]
+    assert all(item["phone_number_id"] == item["phone_id"] for item in org["updates"])
+    assert all(item["waba_id"] == item["wa_id"] for item in org["updates"])
     assert len({item["label_key"] for item in org["updates"]}) == 2
+
+
+def test_plan_backfills_legacy_identifier_aliases():
+    plan = build_plan([{
+        "_id": "legacy",
+        "org_id": "org-1",
+        "phone_number_id": "phone-1",
+        "waba_id": "waba-1",
+        "connected_at": "2026-01-01",
+    }])
+    assert plan["errors"] == []
+    update = plan["organizations"]["org-1"]["updates"][0]
+    assert update["phone_id"] == "phone-1"
+    assert update["wa_id"] == "waba-1"
 
 
 def test_plan_refuses_cross_org_ownership_and_mixed_wabas():
@@ -71,10 +87,24 @@ def test_plan_accepts_fifty_numbers_and_rejects_fifty_one():
     )
 
 
+def test_preflight_rejects_duplicate_conversation_keys_and_waba_owners():
+    errors = conversation_key_errors("org-1", [
+        {"_id": "legacy", "customer_id": "customer"},
+        {"_id": "bound", "customer_id": "customer", "business_phone_id": "primary"},
+    ], "primary")
+    assert len(errors) == 1 and "share sender/customer" in errors[0]
+    assert organization_waba_errors([
+        {"org_id": "org-1", "wa_id": "waba"},
+        {"org_id": "org-2", "wa_id": "waba"},
+    ]) == ["WABA waba is assigned to multiple organizations: ['org-1', 'org-2']"]
+
+
 if __name__ == "__main__":
     test_plan_deduplicates_reconnects_and_assigns_two_slots()
+    test_plan_backfills_legacy_identifier_aliases()
     test_plan_refuses_cross_org_ownership_and_mixed_wabas()
     test_plan_prefers_active_reconnect_and_does_not_resurrect_inactive_rows()
     test_plan_keeps_generated_labels_unique_when_defaults_are_already_used()
     test_plan_accepts_fifty_numbers_and_rejects_fifty_one()
+    test_preflight_rejects_duplicate_conversation_keys_and_waba_owners()
     print("Multi-number WhatsApp migration tests passed.")

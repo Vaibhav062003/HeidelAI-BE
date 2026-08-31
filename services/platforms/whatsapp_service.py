@@ -1,9 +1,6 @@
-from datetime import datetime
-import asyncio
 from database import get_mongo_db
 from .base_platform_service import BasePlatformService
-from services.wa_service import send_whatsapp_message, revoke_whatsapp_access, archive_whatsapp_data, remove_whatsapp_connection
-from config.settings import ORG_ID
+from services.wa_service import deactivate_whatsapp_connection, send_whatsapp_message
 
 db = get_mongo_db()   
 
@@ -27,25 +24,7 @@ class WhatsAppService(BasePlatformService):
         )
 
     async def disconnect(self, org_id: str, phone_id: str) -> dict:
-        connection = db.whatsapp_connections.find_one({
-            "org_id": org_id,
-            "phone_id": phone_id,
-            "is_active": {"$ne": False},
-        })
-        if not connection:
-            from fastapi import HTTPException
-            raise HTTPException(status_code=404, detail="WhatsApp connection not found")
-
-        await archive_whatsapp_data(org_id, phone_id)
-        siblings = db.whatsapp_connections.count_documents({
-            "org_id": org_id,
-            "wa_id": connection["wa_id"],
-            "phone_id": {"$ne": phone_id},
-            "is_active": {"$ne": False},
-        })
-        if siblings == 0:
-            await revoke_whatsapp_access(org_id, connection["wa_id"])
-        return await remove_whatsapp_connection(org_id, phone_id)
+        return await deactivate_whatsapp_connection(org_id, phone_id)
 
 # if __name__ == "__main__":
 #     service = WhatsAppService()

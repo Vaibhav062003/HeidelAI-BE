@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 import asyncio
 from core.scheduler import start_scheduler, stop_scheduler
 from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cache
-from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, recover_stale_bulk_jobs
+from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, run_whatsapp_revocation_reconciler, recover_stale_bulk_jobs
 from services.automation_scheduler import startup_scheduler, shutdown_scheduler
 from services.google_sheets_scheduler import startup_google_scheduler, shutdown_google_scheduler
 from services.intent_queue_worker import startup_intent_worker, shutdown_intent_worker
@@ -32,6 +32,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_whatsapp_call_indexes)
     await asyncio.to_thread(ensure_whatsapp_outbound_indexes)
     await asyncio.to_thread(recover_stale_bulk_jobs)
+    revocation_task = asyncio.create_task(run_whatsapp_revocation_reconciler())
     await asyncio.to_thread(ensure_push_notification_indexes)
     await asyncio.to_thread(ensure_transfer_notification_indexes)
     load_agents()
@@ -56,4 +57,7 @@ async def lifespan(app: FastAPI):
     await shutdown_intent_worker()
     await shutdown_scheduler()
     await shutdown_google_scheduler()
+    if not revocation_task.done():
+        revocation_task.cancel()
+        await asyncio.gather(revocation_task, return_exceptions=True)
     clear_agents()
