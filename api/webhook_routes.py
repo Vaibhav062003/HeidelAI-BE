@@ -21,7 +21,8 @@ from services.agent_service import send_to_agent
 from services.sales_action_service import mark_sales_action_delivered
 from services.ai_policy_service import ai_access_state, is_effective_ai_enabled
 from services.ai_reply_guard import AIProviderUnavailable, log_ai_failure
-from services.pricing_service import is_price_signal, is_pricing_enabled, observe_customer_message, validate_ai_pricing_response
+from services.pricing_decision_service import get_pricing_settings
+from services.pricing_service import is_price_signal, is_pricing_enabled, observe_customer_message, pricing_failure_intercept
 from services.wa_service import *
 from services.ig_service import *
 from services.utils import normalize_phone
@@ -47,6 +48,78 @@ from services.shopify_service import record_whatsapp_preference, record_whatsapp
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
+
+
+async def pricing_runtime_mode(org_id: str) -> str:
+    """Read rollout mode; retain the legacy allowlist as an outage fallback."""
+    try:
+        mode = str((await get_pricing_settings(org_id)).get("mode") or "off")
+        return mode if mode in {"off", "shadow", "review"} else "off"
+    except Exception as exc:
+        fallback = "review" if is_pricing_enabled(org_id) else "off"
+        logger.error(
+            f"Pricing settings lookup failed for org={org_id}; using {fallback} fallback: {exc}"
+        )
+        return fallback
+
+
+def normalize_whatsapp_message_content(message: dict) -> str:
+    """Return content for the current message without relying on loop state."""
+    message_type = str(message.get("type") or "")
+    if message_type == "text":
+        return str((message.get("text") or {}).get("body") or "")
+    if message_type in {"image", "video", "document", "audio"}:
+        media = message.get(message_type) or {}
+        caption = str(media.get("caption") or "").strip()
+        if caption:
+            return caption
+        article = "an" if message_type in {"image", "audio"} else "a"
+        return f"Shared {article} {message_type}"
+    if message_type == "location":
+        return "Shared a location"
+    if message_type == "button":
+        return f"[Button: {(message.get('button') or {}).get('payload', 'Unknown')}]"
+    if message_type == "order":
+        return "Shared an order"
+    if message_type == "interactive":
+        interactive = message.get("interactive") or {}
+        reply = interactive.get(interactive.get("type")) or {}
+        return str(reply.get("title") or reply.get("id") or "Interactive reply")
+    if message_type == "unsupported":
+        return "[Unsupported message type]"
+    return f"[Unsupported message type: {message_type or 'unknown'}]"
+
+
+async def send_pricing_intercept_reply(
+    pricing_result: dict,
+    *,
+    org_id: str,
+    conversation_id: str,
+    whatsapp_business_id: str,
+    customer_phone_no: str,
+    customer_name: str,
+    source_message_id: str,
+) -> bool:
+    """Consume one buyer holding reply; supplier intercepts intentionally stay silent."""
+    if not pricing_result.get("intercept"):
+        return False
+    reply = str(pricing_result.get("reply") or "").strip()
+    if not reply:
+        return True
+    await send_whatsapp_message(
+        {
+            "conversation_id": conversation_id,
+            "content": reply,
+            "sender_id": whatsapp_business_id,
+            "customer_name": customer_name,
+            "recipient_override": customer_phone_no,
+        },
+        org_id,
+        "reply",
+        temp_id=f"pricing-hold:{source_message_id}",
+        sender_name="Pricing Intelligence",
+    )
+    return True
 
 
 def _apply_call_lifecycle(collection, org_id: str, call_id: str, existing: dict, **kwargs) -> dict:
@@ -847,6 +920,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Extract essential data
                             customer_phone_no = normalize_phone(message.get("from"), is_canonical=True)
                             message_type = message.get("type")
+                            content = normalize_whatsapp_message_content(message)
                             message_context = message.get("context")
 
                             # Get user-specific collections
@@ -953,7 +1027,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                             # Extract message content based on message type
                             if message_type == "text":
-                                content = message.get("text", {}).get("body", "")
                                 try:
                                     await asyncio.to_thread(record_whatsapp_preference, org_id, customer_phone_no, content)
                                 except Exception:
@@ -1052,7 +1125,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     )
                                 except Exception as exc:
                                     logger.error(f"Pricing guard failed for org={org_id}: {exc}")
-                                    pricing_result = {"intercept": is_pricing_enabled(org_id) and is_price_signal(content)}
+                                    review_mode = await pricing_runtime_mode(org_id) == "review"
+                                    pricing_result = pricing_failure_intercept(
+                                        review_mode and is_price_signal(content)
+                                    )
                                     if pricing_result["intercept"]:
                                         await _handle_ai_provider_failure(
                                             AIProviderUnavailable("catalogue_unavailable"),
@@ -1064,7 +1140,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             source_message_id=wa_message_id,
                                         )
 
-                                if pricing_result.get("intercept"):
+                                if await send_pricing_intercept_reply(
+                                    pricing_result,
+                                    org_id=org_id,
+                                    conversation_id=conversation_id,
+                                    whatsapp_business_id=whatsapp_business_id,
+                                    customer_phone_no=customer_phone_no,
+                                    customer_name=sender_name2,
+                                    source_message_id=wa_message_id,
+                                ):
                                     return {"status": "ok"}
 
                                 contact_data = {
@@ -1333,15 +1417,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 mime_type = media_data["mime_type"]
                                 media_name = media_data.get("filename", f"{message_type}_{media_id}")
 
-                                if message_type == "image":
-                                    content = media_data.get("caption", "Shared an image")
-                                elif message_type == "video":
-                                    content = media_data.get("caption", "Shared a video")
-                                elif message_type == "document":
-                                    content = media_data.get("caption", "Shared a document")
-                                elif message_type == "audio":
-                                    content = "Shared an audio"
-
                                 # Make the new conversation and notification durable before the
                                 # external media upload; Cloudinary may be slow or unavailable.
                                 try:
@@ -1411,11 +1486,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             reply_to_message_id=replied_message_id,
                                             customer_name=sender_name2,
                                         )
-                                        if pricing_result.get("intercept"):
+                                        if await send_pricing_intercept_reply(
+                                            pricing_result,
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            whatsapp_business_id=whatsapp_business_id,
+                                            customer_phone_no=customer_phone_no,
+                                            customer_name=sender_name2,
+                                            source_message_id=wa_message_id,
+                                        ):
                                             return {"status": "ok"}
                                     except Exception as exc:
                                         logger.error(f"Media-caption pricing observation failed: {exc}")
-                                        if is_pricing_enabled(org_id):
+                                        if await pricing_runtime_mode(org_id) == "review":
                                             await _handle_ai_provider_failure(
                                                 AIProviderUnavailable("catalogue_unavailable"),
                                                 org_id=org_id,
@@ -1425,6 +1508,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                 customer_number=customer_phone_no,
                                                 source_message_id=wa_message_id,
                                             )
+                                            await send_pricing_intercept_reply(
+                                                pricing_failure_intercept(True),
+                                                org_id=org_id,
+                                                conversation_id=conversation_id,
+                                                whatsapp_business_id=whatsapp_business_id,
+                                                customer_phone_no=customer_phone_no,
+                                                customer_name=sender_name2,
+                                                source_message_id=wa_message_id,
+                                            )
+                                            return {"status": "ok"}
 
                                 contact_data = {
                                 "whatsapp_id": whatsapp_business_id,
@@ -2414,18 +2507,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         return {"status": "duplicate_ignored"}
                                     if await is_effective_ai_enabled(org_id, conversation_id):
                                         sales_action = chatbot_response.get("sales_action")
-                                        if is_pricing_enabled(org_id) and not sales_action:
-                                            try:
-                                                valid, reason = await validate_ai_pricing_response(
-                                                    org_id=org_id,
-                                                    conversation_id=conversation_id,
-                                                    source_message_id=ig_message_id,
-                                                    content=chatbot_response["final_response"],
-                                                )
-                                            except Exception as exc:
-                                                raise AIProviderUnavailable("catalogue_unavailable") from exc
-                                            if not valid:
-                                                raise AIProviderUnavailable(reason, escalation_required=False)
                                         ai_result = await send_ig_message(
                                             id=sender_id,
                                             message_text=chatbot_response["final_response"],

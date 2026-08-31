@@ -583,22 +583,33 @@ async def send_whatsapp_message(
         conversation_id = message["conversation_id"]
         original_content = message["content"]
         pricing_source_message_id = message.get("pricing_source_message_id")
+        pricing_audit_active = False
         pricing_guard_active = False
 
         if mode == "ai":
+            from services.pricing_decision_service import get_pricing_settings
             from services.pricing_service import (
                 is_pricing_enabled,
                 validate_ai_pricing_response,
             )
 
-            pricing_guard_active = is_pricing_enabled(org_id)
+            try:
+                pricing_mode = str((await get_pricing_settings(org_id)).get("mode") or "off")
+            except Exception as exc:
+                pricing_mode = "review" if is_pricing_enabled(org_id) else "off"
+                logger.error(
+                    f"Pricing settings lookup failed for org={org_id}; "
+                    f"using {pricing_mode} fallback: {exc}"
+                )
+            pricing_audit_active = pricing_mode in {"shadow", "review"}
+            pricing_guard_active = pricing_mode == "review"
 
             validation_text = (
                 "\n".join(str(part) for part in original_content)
                 if isinstance(original_content, list)
                 else str(original_content)
             )
-            if pricing_guard_active:
+            if pricing_audit_active:
                 try:
                     valid, reason = await validate_ai_pricing_response(
                         org_id=org_id,
@@ -606,17 +617,21 @@ async def send_whatsapp_message(
                         source_message_id=pricing_source_message_id,
                         content=validation_text,
                     )
-                    if not valid:
+                    if pricing_guard_active and not valid:
                         logger.warning(
                             f"Blocked unsafe AI price for org={org_id}, "
                             f"conversation=...{conversation_id[-6:]}, reason={reason}"
                         )
                         raise AIProviderUnavailable(reason, escalation_required=False)
-                except AIProviderUnavailable:
-                    raise
+                except AIProviderUnavailable as exc:
+                    if pricing_guard_active:
+                        raise
+                    logger.error(f"Shadow AI pricing validation could not complete for org={org_id}: {exc}")
                 except Exception as exc:
-                    logger.error(f"AI pricing validation failed closed for org={org_id}: {exc}")
-                    raise AIProviderUnavailable("catalogue_unavailable") from exc
+                    if pricing_guard_active:
+                        logger.error(f"AI pricing validation failed closed for org={org_id}: {exc}")
+                        raise AIProviderUnavailable("catalogue_unavailable") from exc
+                    logger.error(f"Shadow AI pricing validation failed open for org={org_id}: {exc}")
         
         # Find the WhatsApp connection to get the access token
         connection = db.whatsapp_connections.find_one({
@@ -691,7 +706,7 @@ async def send_whatsapp_message(
                 part_operation = claim_reply(db.whatsapp_outbound_sends, org_id, part_temp_id, conversation_id, mode, [content_item])
             active_operation = part_operation
             part_cached = part_operation and part_operation.get("action") == "replay"
-            if pricing_guard_active:
+            if pricing_audit_active:
                 try:
                     valid, reason = await validate_ai_pricing_response(
                         org_id=org_id,
@@ -700,9 +715,12 @@ async def send_whatsapp_message(
                         content=content_item,
                     )
                 except Exception as exc:
-                    logger.error(f"Final AI pricing revalidation failed closed for org={org_id}: {exc}")
-                    raise AIProviderUnavailable("catalogue_unavailable") from exc
-                if not valid:
+                    if pricing_guard_active:
+                        logger.error(f"Final AI pricing revalidation failed closed for org={org_id}: {exc}")
+                        raise AIProviderUnavailable("catalogue_unavailable") from exc
+                    logger.error(f"Final shadow AI pricing revalidation failed open for org={org_id}: {exc}")
+                    valid, reason = True, "shadow_validation_error"
+                if pricing_guard_active and not valid:
                     raise AIProviderUnavailable(reason, escalation_required=False)
 
             data = {
@@ -868,7 +886,7 @@ async def send_whatsapp_message(
                 if not existing_part or existing_part.get("status") != "completed":
                     raise HTTPException(status_code=409, detail="A message bubble was delivered and is still being synchronized. Refresh the conversation.")
 
-            if pricing_guard_active:
+            if pricing_audit_active:
                 try:
                     from services.pricing_service import record_accepted_ai_response
 

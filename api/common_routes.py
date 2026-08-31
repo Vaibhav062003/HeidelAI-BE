@@ -1,4 +1,5 @@
 import json
+import re
 import requests
 import httpx
 from typing import Optional
@@ -87,6 +88,11 @@ async def health_check_head(request: Request, response: Response):
     response.headers["X-App-Status"] = "Online"
     
     return None
+
+@router.get("/health")
+@limiter.limit("60/minute")
+async def health_check_get(request: Request):
+    return {"status": "ok"}
 
 @router.get("/favicon.ico", include_in_schema=False)
 @limiter.limit("60/minute")
@@ -297,6 +303,7 @@ async def send_message_endpoint(
     file: Optional[UploadFile] = File(None),
     media_kind: Optional[str] = Form(None),
     duration_ms: Optional[int] = Form(None),
+    pricing_decision_id: Optional[str] = Form(None),
 ):    
     """
     Send a message to a specific conversation.
@@ -308,8 +315,10 @@ async def send_message_endpoint(
         raise HTTPException(status_code=400, detail="Invalid organization ID")
     if platform in {"whatsapp", "instagram"}:
         await require_conversation_access(org_id, conversation_id, user.user_id, user.role)
-    if platform == "instagram" and mode == "reply" and not temp_id:
-        raise HTTPException(status_code=400, detail="temp_id is required for Instagram replies")
+    if platform in {"whatsapp", "instagram"} and mode == "reply" and not temp_id:
+        raise HTTPException(status_code=400, detail="temp_id is required for channel replies")
+    if temp_id and len(temp_id) > 160:
+        raise HTTPException(status_code=400, detail="Invalid temp_id")
 
     if file:
         validate_outbound_attachment(file)
@@ -330,27 +339,87 @@ async def send_message_endpoint(
             raise HTTPException(status_code=400, detail="Invalid JSON format in context field")
     if isinstance(context_dict, dict) and "offer" in context_dict:
         try:
-            from services.sales_offer_policy import structured_offer_snapshot
+            from services.sales_offer_policy import render_structured_offer_message, structured_offer_snapshot
 
-            structured_offer_snapshot(context_dict)
+            offer = structured_offer_snapshot(context_dict)
+            if offer:
+                content = render_structured_offer_message(offer)
+                if len(content) > (900 if platform == "instagram" else 3500):
+                    raise ValueError("The rendered chat offer exceeds the channel message limit")
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    res = await send_message(
-        org_id, 
-        platform, 
-        conversation_id, 
-        content if content else None, 
-        mode,
-        sender_name,
-        file if file else None, 
-        temp_id if temp_id else None,
-        context_type if context_type else None,
-        context_dict,
-        timestamp=timestamp,
-        media_kind=media_kind,
-        duration_ms=duration_ms,
-    )
+    pricing_decision = None
+    if pricing_decision_id and len(pricing_decision_id) > 120:
+        raise HTTPException(status_code=400, detail="Invalid pricing decision ID")
+    if platform == "whatsapp" and mode == "reply":
+        from services.pricing_decision_service import require_human_pricing_acknowledgement
+
+        pricing_decision = await require_human_pricing_acknowledgement(
+            org_id=org_id,
+            user_id=user.user_id,
+            conversation_id=conversation_id,
+            content=content or "",
+            context=context_dict,
+            temp_id=temp_id,
+            pricing_decision_id=pricing_decision_id,
+        )
+        if pricing_decision and pricing_decision.get("requires_acknowledgement") and not pricing_decision.get("acknowledged"):
+            raise HTTPException(status_code=409, detail={
+                "code": "pricing_acknowledgement_required",
+                "decision_id": pricing_decision["_id"],
+                "message": "This price needs your acknowledgement before it can be sent.",
+                "warnings": pricing_decision.get("warnings") or [],
+                "items": pricing_decision.get("items") or [],
+            })
+
+    try:
+        res = await send_message(
+            org_id,
+            platform,
+            conversation_id,
+            content if content else None,
+            mode,
+            sender_name,
+            file if file else None,
+            temp_id if temp_id else None,
+            context_type if context_type else None,
+            context_dict,
+            timestamp=timestamp,
+            media_kind=media_kind,
+            duration_ms=duration_ms,
+        )
+    except Exception as send_error:
+        if pricing_decision and pricing_decision.get("acknowledged"):
+            from services.pricing_decision_service import release_pricing_decision_claim
+
+            operation = db.whatsapp_outbound_sends.find_one(
+                {"_id": f"{org_id}:{temp_id}"}, {"status": 1},
+            ) if temp_id and not file else None
+            provider_state = str((operation or {}).get("status") or "")
+            status_code = getattr(send_error, "status_code", None)
+            delivery_uncertain = bool(file) or provider_state in {
+                "provider_pending", "delivery_unknown", "provider_accepted",
+                "reconciling", "completed",
+            } or isinstance(status_code, int) and status_code >= 500
+            if not delivery_uncertain:
+                try:
+                    await release_pricing_decision_claim(org_id, str(pricing_decision.get("_id") or ""))
+                except Exception as exc:
+                    logger.error(f"Failed to release pricing decision after message failure: {exc}")
+        raise
+
+    if pricing_decision:
+        from services.pricing_decision_service import mark_pricing_decision_sent
+
+        try:
+            await mark_pricing_decision_sent(
+                org_id,
+                str(pricing_decision.get("_id") or ""),
+                (res or {}).get("message_id"),
+            )
+        except Exception as exc:
+            logger.error(f"Failed to finalize pricing decision after message send: {exc}")
 
     offer_tracking = "not_detected"
     if mode == "reply" and platform in {"whatsapp", "instagram"}:
@@ -574,18 +643,27 @@ def list_products(
     page_size: Optional[int] = Query(None, ge=1, le=100),
 ):
     org_id = user.org_id
+    organization = db.organizations.find_one(
+        {"org_id": org_id}, {"sales_catalogue_org_id": 1},
+    ) or {}
+    configured_catalogue = str(organization.get("sales_catalogue_org_id") or "")
+    catalogue_org_id = (
+        configured_catalogue
+        if re.fullmatch(r"[A-Za-z0-9_-]+", configured_catalogue)
+        else org_id
+    )
     legacy = page is None and page_size is None and not q.strip()
     resolved_page = page or 1
     resolved_page_size = page_size or (100 if legacy else 50)
     products = get_products_for_org(
-        org_id,
+        catalogue_org_id,
         limit=resolved_page_size,
         skip=(resolved_page - 1) * resolved_page_size,
         query=q,
     )
     if legacy:
         return {"products": products}
-    total = count_products_for_org(org_id, q)
+    total = count_products_for_org(catalogue_org_id, q)
     return {
         "products": products,
         "total": total,

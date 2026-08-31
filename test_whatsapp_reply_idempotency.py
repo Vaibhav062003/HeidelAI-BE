@@ -107,10 +107,15 @@ expect_conflict(lambda: claim_reply(ai_collection, *ai_args, now=now))
 
 lifespan = Path("core/lifespan.py").read_text()
 service = Path("services/wa_service.py").read_text()
+common_routes = Path("api/common_routes.py").read_text()
+decision_service = Path("services/pricing_decision_service.py").read_text()
 assert "ensure_whatsapp_outbound_indexes" in lifespan
 assert 'create_index("expires_at", expireAfterSeconds=0)' in service
 assert '"delivery_state": "accepted_pending_sync"' in service
 assert '"local_sync_pending": True' in service
 assert 'if status == "sending":\n        return message_id' not in service
+assert 'platform in {"whatsapp", "instagram"} and mode == "reply" and not temp_id' in common_routes
+assert 'provider_state in {' in common_routes
+assert '"temp_id": temp_id' in decision_service
 
 print("WhatsApp reply idempotency behavior passed.")

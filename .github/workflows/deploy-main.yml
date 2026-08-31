@@ -7,7 +7,11 @@ on:
       - main
 
 jobs:
+  checks:
+    uses: ./.github/workflows/backend-checks.yml
+
   deploy-main:
+    needs: checks
     runs-on: ubuntu-latest
 
     steps:
@@ -42,3 +46,6 @@ jobs:
 
       - name: Redeploy Koyeb Instance
         run: koyeb service redeploy backend/backend
+
+      - name: Verify API health
+        run: curl --fail --retry 30 --retry-delay 10 --retry-all-errors https://api.heidelai.com/health
