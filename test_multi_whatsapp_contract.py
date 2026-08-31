@@ -31,6 +31,15 @@ def test_connection_and_webhook_contracts():
     assert "token_response = requests" not in auth_source
     assert "phone_response = requests" not in auth_source
     assert "webhook_response = requests" not in auth_source
+    assert auth_source.index("pending_reconnect") < auth_source.index("token_url")
+    details_source = routes[routes.index("async def get_whatsapp_details"):routes.index('@router.get("/{whatsapp_id}/analytics/conversations")')]
+    assert "user: CurrentUser" in details_source
+    assert "_find_owned_whatsapp_connection(user.org_id" in details_source
+    assert "httpx.AsyncClient" in details_source
+    assert "requests.get" not in details_source
+    assert 'headers = {"Authorization": f"Bearer {connection[\'access_token\']}"}' in details_source
+    assert 'status_code=409, detail="Meta access expired. Reconnect this WhatsApp number."' in routes
+    assert 'error.get("code") == 190' in routes
     assert 'requested_phone_id = str(req.phone_number_id or "").strip()' in routes
     assert '(value.get("metadata") or {}).get("phone_number_id")' in webhook
     assert "active_whatsapp_connection_candidates(whatsapp_business_id)" in webhook
@@ -47,6 +56,8 @@ def test_scoped_archive_and_cleanup_contracts():
     scheduler = source("services/scheduler_service.py")
 
     assert 'phone_filter = {"platform": "whatsapp", "business_phone_id": phone_id}' in service
+    assert 'primary_phone_id == str(business_phone_id) and (primary or {}).get("slot") == 1' in service
+    assert '"business_phone_id": str(connection.get("phone_id")' in service
     assert 'db[conversations_collection_name].delete_many(' in service
     assert '{"conversation_id": {"$in": conversation_ids}}, session=session' in service
     assert 'archived["note_id"] = str(archived.get("note_id") or archived.get("_id"))' in service
@@ -57,7 +68,18 @@ def test_scoped_archive_and_cleanup_contracts():
     assert 'drop_collection(archived_notes_col)' in scheduler
     assert "async def finalize_whatsapp_revocation" in service
     assert '"provider_revoke_status": {"$in": ["pending", "failed"]}' in service
-    assert "asyncio.create_task(reconcile_pending_whatsapp_revocations())" in source("core/lifespan.py")
+    assert "async def run_whatsapp_revocation_reconciler" in service
+    assert "asyncio.create_task(run_whatsapp_revocation_reconciler())" in source("core/lifespan.py")
+
+
+def test_deployment_runs_the_verified_migration_before_serving():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    migration = source("scripts/migrate_multi_whatsapp.py")
+
+    assert "python -m scripts.migrate_multi_whatsapp --apply && exec uvicorn" in dockerfile
+    assert migration.index('plan["verified_indexes"] = True') < migration.index(
+        '{"_id": MIGRATION_ID},\n        {"$set": {"status": "complete"'
+    )
 
 
 def test_number_scoped_query_and_flow_binding_contracts():
@@ -75,6 +97,7 @@ def test_number_scoped_query_and_flow_binding_contracts():
     assert '"wa_bot_flow_id": flow_id' in flow_service
     assert '"phone_ids", "wa_bot_flow_id"' in flow_service
     assert '"conversation_ids": contact_data["conversation_id"]' in contacts_service
+    assert "conversation_match.update(whatsapp_conversation_scope(" in contacts_service
     assert '*(contact.get("conversation_ids") or [])' in common_service
     assert 'conversation_phone.get(str(item.get("_id") or ""), "")' in wa_service
 
@@ -122,6 +145,7 @@ def test_primary_phone_scope_keeps_legacy_conversations_visible():
 if __name__ == "__main__":
     test_connection_and_webhook_contracts()
     test_scoped_archive_and_cleanup_contracts()
+    test_deployment_runs_the_verified_migration_before_serving()
     test_number_scoped_query_and_flow_binding_contracts()
     test_primary_phone_scope_keeps_legacy_conversations_visible()
     print("Multi-number WhatsApp backend contracts passed.")

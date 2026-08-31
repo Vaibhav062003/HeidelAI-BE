@@ -232,6 +232,20 @@ async def create_or_update_whatsapp_conversation(
         "customer_id": customer_phone_no,
         **({"business_phone_id": str(business_phone_id)} if business_phone_id else {}),
     })
+    if not existing_conversation and business_phone_id:
+        primary = resolve_active_whatsapp_connection(
+            business_phone_id, str(recipient_id or ""), org_id, allow_single_fallback=False,
+        )
+        primary_phone_id = str((primary or {}).get("phone_id") or (primary or {}).get("phone_number_id") or "")
+        if primary_phone_id == str(business_phone_id) and (primary or {}).get("slot") == 1:
+            existing_conversation = conversations_collection.find_one({
+                "platform": "whatsapp",
+                "customer_id": customer_phone_no,
+                "$or": [
+                    {"business_phone_id": {"$exists": False}},
+                    {"business_phone_id": None},
+                ],
+            })
     conversation_id = (
         existing_conversation.get("conversation_id")
         if existing_conversation
@@ -1589,11 +1603,17 @@ async def _revoke_whatsapp_token(access_token: str, org_id: str, wa_id: str) -> 
 
 async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
     """Finish provider cleanup after the local line is already disconnected."""
+    stale_before = datetime.now(timezone.utc) - timedelta(minutes=5)
+    claimable = {"$or": [
+        {"provider_revoke_status": {"$in": ["pending", "failed"]}},
+        {"provider_revoke_status": "processing", "provider_revoke_updated_at": {"$lt": stale_before}},
+        {"provider_revoke_status": "processing", "provider_revoke_updated_at": {"$exists": False}},
+    ]}
     connection = db.whatsapp_connections.find_one({
         "org_id": org_id,
         "phone_id": phone_id,
         "is_active": False,
-        "provider_revoke_status": {"$in": ["pending", "failed"]},
+        **claimable,
     })
     if not connection:
         return {"provider_cleanup": "not_pending"}
@@ -1609,9 +1629,12 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
         {
             "_id": connection["_id"],
             "is_active": False,
-            "provider_revoke_status": {"$in": ["pending", "failed"]},
+            **claimable,
         },
-        {"$set": {"provider_revoke_status": "processing"}, "$inc": {"provider_revoke_attempts": 1}},
+        {"$set": {
+            "provider_revoke_status": "processing",
+            "provider_revoke_updated_at": datetime.now(timezone.utc),
+        }, "$inc": {"provider_revoke_attempts": 1}},
     )
     if not claim.modified_count:
         return {"provider_cleanup": "processing"}
@@ -1637,7 +1660,14 @@ async def reconcile_pending_whatsapp_revocations(limit: int = 10) -> int:
     try:
         pending = list(db.whatsapp_connections.find({
             "is_active": False,
-            "provider_revoke_status": {"$in": ["pending", "failed"]},
+            "$or": [
+                {"provider_revoke_status": {"$in": ["pending", "failed"]}},
+                {
+                    "provider_revoke_status": "processing",
+                    "provider_revoke_updated_at": {"$lt": datetime.now(timezone.utc) - timedelta(minutes=5)},
+                },
+                {"provider_revoke_status": "processing", "provider_revoke_updated_at": {"$exists": False}},
+            ],
         }, {"org_id": 1, "phone_id": 1}).limit(limit))
         if pending:
             await asyncio.gather(*(
@@ -1648,6 +1678,13 @@ async def reconcile_pending_whatsapp_revocations(limit: int = 10) -> int:
     except Exception as exc:
         logger.error("Pending WhatsApp revocation reconciliation failed ({})", type(exc).__name__)
         return 0
+
+
+async def run_whatsapp_revocation_reconciler() -> None:
+    # ponytail: one small periodic worker; move to a queue if cleanup volume becomes sustained.
+    while True:
+        await reconcile_pending_whatsapp_revocations()
+        await asyncio.sleep(60)
 
 
 async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
@@ -1669,8 +1706,28 @@ async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
 
     now = datetime.now(timezone.utc)
     provider_cleanup = "not_needed" if remaining_rows else "pending"
+    current_primary = db.whatsapp_connections.find_one({
+        "org_id": org_id, "slot": 1, "is_active": {"$ne": False},
+    }) or next(iter(db.whatsapp_connections.find(
+        {"org_id": org_id, "is_active": {"$ne": False}},
+    ).sort([("connected_at", 1)])), connection)
     with mongo_client.start_session() as session:
         with session.start_transaction():
+            if current_primary.get("_id") == connection.get("_id"):
+                db[f"conversations_{org_id}"].update_many(
+                    {
+                        "platform": "whatsapp",
+                        "$or": [
+                            {"business_phone_id": {"$exists": False}},
+                            {"business_phone_id": None},
+                        ],
+                    },
+                    {"$set": {
+                        "business_phone_id": str(connection.get("phone_id") or connection.get("phone_number_id") or phone_id),
+                        "business_phone": connection.get("phone"),
+                    }},
+                    session=session,
+                )
             update: dict = {
                 "$set": {
                     "phone_id": str(connection.get("phone_id") or connection.get("phone_number_id") or phone_id),
@@ -1690,10 +1747,16 @@ async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
                 update["$unset"]["access_token"] = ""
             db.whatsapp_connections.update_one({"_id": connection["_id"]}, update, session=session)
 
-            if connection.get("slot") == 1 and remaining_rows:
+            for index, remaining in enumerate(remaining_rows, start=1):
                 db.whatsapp_connections.update_one(
-                    {"_id": remaining_rows[0]["_id"]},
-                    {"$set": {"slot": 1, "updated_at": now}},
+                    {"_id": remaining["_id"]},
+                    {"$set": {"slot": -index, "updated_at": now}},
+                    session=session,
+                )
+            for slot, remaining in enumerate(remaining_rows, start=1):
+                db.whatsapp_connections.update_one(
+                    {"_id": remaining["_id"]},
+                    {"$set": {"slot": slot, "updated_at": now}},
                     session=session,
                 )
             if not remaining_rows:

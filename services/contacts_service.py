@@ -16,6 +16,7 @@ from database import get_mongo_db
 from loguru import logger
 from services.websocket_service import broadcast_on_stats_update
 from services.utils import name_search_prefixes, normalize_phone
+from services.whatsapp_connection_service import whatsapp_conversation_scope
 
 db = get_mongo_db()
 
@@ -399,7 +400,16 @@ async def get_unread_counts_by_labels(org_id: str, business_phone_id: str | None
         
         conversation_match = {"unread_count": {"$gt": 0}}
         if business_phone_id:
-            conversation_match.update({"platform": "whatsapp", "business_phone_id": business_phone_id})
+            active = {"org_id": org_id, "is_active": {"$ne": False}}
+            primary = await async_db.whatsapp_connections.find_one(
+                {**active, "slot": 1}, {"phone_id": 1}
+            ) or await async_db.whatsapp_connections.find_one(
+                active, {"phone_id": 1}, sort=[("connected_at", 1)]
+            )
+            conversation_match.update(whatsapp_conversation_scope(
+                business_phone_id,
+                include_legacy=bool(primary and str(primary.get("phone_id") or "") == str(business_phone_id)),
+            ))
         pipeline = [
             # Only conversations with unread messages
             {"$match": conversation_match},

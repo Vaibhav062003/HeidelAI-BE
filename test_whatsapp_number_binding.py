@@ -5,7 +5,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 for key in (
@@ -50,6 +50,10 @@ def _matches(document: dict, query: dict) -> bool:
             continue
         actual = document.get(field)
         if isinstance(expected, dict):
+            if "$exists" in expected and (field in document) != bool(expected["$exists"]):
+                return False
+            if "$lt" in expected and (actual is None or actual >= expected["$lt"]):
+                return False
             if "$in" in expected and actual not in expected["$in"]:
                 return False
             if "$ne" in expected and actual == expected["$ne"]:
@@ -90,6 +94,85 @@ class SyncConnections:
 class SyncDB:
     def __init__(self, documents):
         self.whatsapp_connections = SyncConnections(documents)
+
+
+class FakeHTTPException(Exception):
+    def __init__(self, status_code, detail):
+        self.status_code = status_code
+        self.detail = detail
+
+
+class FakeRequestError(Exception):
+    pass
+
+
+class FakeTimeoutError(FakeRequestError):
+    pass
+
+
+def _load_route_helpers():
+    tree = ast.parse((ROOT / "api/wa_routes.py").read_text(encoding="utf-8"))
+    nodes = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {
+            "_find_owned_whatsapp_connection", "_fetch_meta_details_resource", "_whatsapp_reconnect_identity",
+        }
+    ]
+    namespace = {
+        "HTTPException": FakeHTTPException,
+        "httpx": SimpleNamespace(RequestError=FakeRequestError, TimeoutException=FakeTimeoutError),
+        "logger": SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "route_helpers", "exec"), namespace)
+    return namespace
+
+
+def test_details_helpers_are_tenant_scoped_and_map_meta_failures():
+    namespace = _load_route_helpers()
+    reconnect_identity = namespace["_whatsapp_reconnect_identity"]("new-phone", "same-waba")
+    assert reconnect_identity == {"$or": [
+        {"wa_id": "same-waba"}, {"waba_id": "same-waba"},
+        {"phone_id": "new-phone"}, {"phone_number_id": "new-phone"},
+    ]}
+    namespace["db"] = SyncDB([
+        {"org_id": "org-1", "phone_id": "phone", "is_active": True},
+        {"org_id": "org-2", "phone_id": "other", "is_active": True},
+        {"org_id": "org-1", "phone_id": "inactive", "is_active": False},
+    ])
+    find_owned = namespace["_find_owned_whatsapp_connection"]
+    assert find_owned("org-1", connection_id="phone")["phone_id"] == "phone"
+    assert find_owned("org-1", connection_id="other") is None
+    assert find_owned("org-1", connection_id="inactive") is None
+
+    fetch = namespace["_fetch_meta_details_resource"]
+
+    class Response:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self.is_success = 200 <= status_code < 300
+            self.payload = payload or {}
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, result): self.result = result
+        async def get(self, *_args, **_kwargs):
+            if isinstance(self.result, Exception): raise self.result
+            return self.result
+
+    async def call(result, *, required):
+        warnings = []
+        data = await fetch(Client(result), "url", {}, {}, "account", "org-1", warnings, required=required)
+        return data, warnings
+
+    try:
+        asyncio.run(call(Response(400, {"error": {"code": 190}}), required=True))
+        raise AssertionError("expired credentials must fail")
+    except FakeHTTPException as exc:
+        assert exc.status_code == 409
+    assert asyncio.run(call(FakeTimeoutError(), required=True)) == ({}, ["account unavailable"])
+    assert asyncio.run(call(Response(503), required=False)) == ({}, ["account unavailable"])
+    assert asyncio.run(call(Response(200, {"id": "waba"}), required=True)) == ({"id": "waba"}, [])
 
 
 def _load_connection_resolver():
@@ -193,6 +276,23 @@ class MutableCollection(SyncConnections):
             document.pop(field, None)
         return SimpleNamespace(modified_count=1)
 
+    def update_many(self, query, update, **_kwargs):
+        modified = 0
+        for document in self.documents:
+            if _matches(document, query):
+                document.update(deepcopy(update.get("$set", {})))
+                modified += 1
+        return SimpleNamespace(modified_count=modified)
+
+
+class MutableDB(SimpleNamespace):
+    def __init__(self, collections, **kwargs):
+        super().__init__(**kwargs)
+        self.collections = collections
+
+    def __getitem__(self, name):
+        return self.collections.setdefault(name, MutableCollection([]))
+
 
 class Session:
     def __enter__(self): return self
@@ -207,10 +307,13 @@ def test_disconnect_is_fast_soft_delete_and_keeps_history_owner():
         {"_id": "two", "org_id": "org", "wa_id": "waba", "phone_id": "phone-2", "slot": 2, "is_active": True},
     ])
     organizations = MutableCollection([{"_id": "org", "org_id": "org", "wa_id": "waba"}])
-    namespace["db"] = SimpleNamespace(
+    conversations = MutableCollection([{
+        "conversation_id": "whatsapp_customer", "platform": "whatsapp", "customer_id": "customer",
+    }])
+    namespace["db"] = MutableDB(
+        {"conversations_org": conversations},
         whatsapp_connections=connections,
         organizations=organizations,
-        __getitem__=lambda _self, _name: MutableCollection([]),
     )
     namespace["mongo_client"] = SimpleNamespace(start_session=lambda: Session())
 
@@ -218,6 +321,7 @@ def test_disconnect_is_fast_soft_delete_and_keeps_history_owner():
     assert result == {"already_disconnected": False, "remaining_connections": 1, "provider_cleanup": "not_needed"}
     assert connections.documents[0]["is_active"] is False and "slot" not in connections.documents[0]
     assert connections.documents[1]["slot"] == 1
+    assert conversations.documents[0]["business_phone_id"] == "phone-1"
     assert asyncio.run(deactivate("org", "phone-1"))["already_disconnected"] is True
 
 
@@ -227,7 +331,7 @@ def test_provider_cleanup_is_claimed_and_idempotent():
         item for item in tree.body
         if isinstance(item, ast.AsyncFunctionDef) and item.name == "finalize_whatsapp_revocation"
     )
-    namespace = {"datetime": datetime, "timezone": timezone}
+    namespace = {"datetime": datetime, "timezone": timezone, "timedelta": timedelta}
     exec(compile(ast.Module(body=[node], type_ignores=[]), "finalize", "exec"), namespace)
     connections = MutableCollection([{
         "_id": "one", "org_id": "org", "wa_id": "waba", "phone_id": "phone-1",
@@ -245,6 +349,21 @@ def test_provider_cleanup_is_claimed_and_idempotent():
     assert connections.documents[0]["provider_revoke_attempts"] == 1
     assert "access_token" not in connections.documents[0]
     assert asyncio.run(finalize("org", "phone-1")) == {"provider_cleanup": "not_pending"}
+
+    connections.documents.extend([
+        {
+            "_id": "fresh", "org_id": "org", "wa_id": "waba", "phone_id": "phone-2",
+            "is_active": False, "access_token": "fresh", "provider_revoke_status": "processing",
+            "provider_revoke_updated_at": datetime.now(timezone.utc),
+        },
+        {
+            "_id": "stale", "org_id": "org", "wa_id": "waba", "phone_id": "phone-3",
+            "is_active": False, "access_token": "stale", "provider_revoke_status": "processing",
+            "provider_revoke_updated_at": datetime.now(timezone.utc) - timedelta(minutes=10),
+        },
+    ])
+    assert asyncio.run(finalize("org", "phone-2")) == {"provider_cleanup": "not_pending"}
+    assert asyncio.run(finalize("org", "phone-3")) == {"provider_cleanup": "complete"}
 
 
 class AsyncCursor:
@@ -428,6 +547,7 @@ def test_all_outbound_paths_use_bound_sender_and_customer_fields():
 
 if __name__ == "__main__":
     monkeypatch = SimpleNamespace(setattr=setattr)
+    test_details_helpers_are_tenant_scoped_and_map_meta_failures()
     test_inbound_connection_resolution_is_exact_and_ambiguity_safe()
     test_disconnect_uses_canonical_phone_id_and_keeps_sibling()
     test_disconnect_is_fast_soft_delete_and_keeps_history_owner()

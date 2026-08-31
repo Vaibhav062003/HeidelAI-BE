@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 
 from services.whatsapp_connection_service import MAX_WHATSAPP_CONNECTIONS
 
+MIGRATION_ID = "multi_whatsapp_v2"
+
+
 def _connected_at(connection: dict) -> str:
     value = connection.get("connected_at")
     return value.isoformat() if isinstance(value, datetime) else str(value or "")
@@ -31,6 +34,35 @@ def _label(connection: dict, slot: int, used: set[str]) -> tuple[str, str]:
         key = candidate.casefold()
     used.add(key)
     return candidate, key
+
+
+def conversation_key_errors(org_id: str, conversations: list[dict], primary_phone_id: str) -> list[str]:
+    seen = {}
+    errors = []
+    for conversation in conversations:
+        customer_id = str(conversation.get("customer_id") or "").strip()
+        phone_id = str(conversation.get("business_phone_id") or primary_phone_id or "").strip()
+        if not customer_id or not phone_id:
+            errors.append(f"WhatsApp conversation {conversation.get('_id')} in {org_id} has no customer or sender id")
+            continue
+        key = (phone_id, customer_id)
+        if key in seen:
+            errors.append(f"WhatsApp conversations {seen[key]} and {conversation.get('_id')} in {org_id} share sender/customer {key}")
+        else:
+            seen[key] = conversation.get("_id")
+    return errors
+
+
+def organization_waba_errors(organizations: list[dict]) -> list[str]:
+    owners = defaultdict(list)
+    for organization in organizations:
+        wa_id = str(organization.get("wa_id") or "").strip()
+        if wa_id:
+            owners[wa_id].append(str(organization.get("org_id") or organization.get("_id")))
+    return [
+        f"WABA {wa_id} is assigned to multiple organizations: {sorted(org_ids)}"
+        for wa_id, org_ids in owners.items() if len(org_ids) > 1
+    ]
 
 
 def build_plan(connections: list[dict]) -> dict:
@@ -106,6 +138,9 @@ def migrate(apply: bool = False) -> dict:
     from database import get_mongo_db
 
     db = get_mongo_db()
+    if apply and db.system_migrations.find_one({"_id": MIGRATION_ID, "status": "complete"}):
+        return {"errors": [], "organizations": {}, "verified_indexes": True, "applied": False}
+
     raw_connections = list(db.whatsapp_connections.find({}))
     plan = build_plan(raw_connections)
 
@@ -114,6 +149,15 @@ def migrate(apply: bool = False) -> dict:
         if len(active_flows) > 1:
             plan["errors"].append(f"Organization {org_id} has multiple active WaBot flows")
         actions["active_flow_id"] = active_flows[0].get("flow_id") if len(active_flows) == 1 else None
+        primary = next((item for item in actions["updates"] if item["slot"] == 1), None)
+        conversations = list(db[f"conversations_{org_id}"].find({"platform": "whatsapp"}, {
+            "_id": 1, "customer_id": 1, "business_phone_id": 1,
+        }))
+        plan["errors"].extend(conversation_key_errors(org_id, conversations, (primary or {}).get("phone_id", "")))
+
+    plan["errors"].extend(organization_waba_errors(list(db.organizations.find(
+        {"wa_id": {"$type": "string"}}, {"_id": 1, "org_id": 1, "wa_id": 1},
+    ))))
 
     plan["errors"] = sorted(set(plan["errors"]))
     if not apply or plan["errors"]:
@@ -154,7 +198,7 @@ def migrate(apply: bool = False) -> dict:
             continue
         db.organizations.update_one(
             {"org_id": org_id},
-            {"$set": {"wa_id": primary["wa_id"], "whatsapp_connection_schema_version": 2}},
+            {"$set": {"wa_id": primary["wa_id"]}},
         )
         conversations = db[f"conversations_{org_id}"]
         conversations.update_many(
@@ -188,10 +232,6 @@ def migrate(apply: bool = False) -> dict:
             name="whatsapp_phone_customer_unique",
         )
 
-    index_names = db.whatsapp_connections.index_information()
-    for name in ("whatsapp_phone_unique", "whatsapp_org_slot_unique", "whatsapp_org_label_unique"):
-        if name in index_names:
-            db.whatsapp_connections.drop_index(name)
     db.whatsapp_connections.create_index(
         "phone_id", unique=True,
         partialFilterExpression={"phone_id": {"$type": "string"}, "is_active": True},
@@ -211,7 +251,29 @@ def migrate(apply: bool = False) -> dict:
         "wa_id", unique=True, partialFilterExpression={"wa_id": {"$type": "string"}},
         name="organization_waba_unique",
     )
+    required_connection_indexes = {
+        "whatsapp_phone_unique", "whatsapp_org_slot_unique", "whatsapp_org_label_unique",
+    }
+    if not required_connection_indexes.issubset(db.whatsapp_connections.index_information()):
+        raise RuntimeError("Multi-number WhatsApp connection indexes could not be verified")
+    if "organization_waba_unique" not in db.organizations.index_information():
+        raise RuntimeError("WhatsApp organization ownership index could not be verified")
+    for org_id, actions in plan["organizations"].items():
+        if not actions["updates"]:
+            continue
+        if "whatsapp_phone_customer_unique" not in db[f"conversations_{org_id}"].index_information():
+            raise RuntimeError(f"WhatsApp conversation index could not be verified for {org_id}")
+        db.organizations.update_one(
+            {"org_id": org_id},
+            {"$set": {"whatsapp_connection_schema_version": 2}},
+        )
+    plan["verified_indexes"] = True
     plan["applied"] = True
+    db.system_migrations.update_one(
+        {"_id": MIGRATION_ID},
+        {"$set": {"status": "complete", "completed_at": now}},
+        upsert=True,
+    )
     return plan
 
 
