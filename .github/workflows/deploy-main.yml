@@ -44,7 +44,7 @@ jobs:
       - name: Deploy exact image to Koyeb
         env:
           IMAGE: ${{ secrets.DOCKER_USERNAME_PROD }}/backend:sha-${{ github.sha }}
-        run: koyeb service update backend/backend --docker "$IMAGE" --scale 1 --wait --wait-timeout 15m
+        run: koyeb service update backend/backend --docker "$IMAGE" --wait --wait-timeout 15m
 
       - name: Verify API health
         env:
