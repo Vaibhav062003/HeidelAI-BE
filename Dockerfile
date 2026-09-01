@@ -39,5 +39,8 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy application code
 COPY . .
 
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 EXPOSE 8000
-CMD ["sh", "-c", "python -m scripts.migrate_multi_whatsapp --apply && exec uvicorn main:app --host 0.0.0.0 --port 8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
