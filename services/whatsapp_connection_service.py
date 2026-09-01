@@ -128,6 +128,9 @@ def public_connection(connection: dict) -> dict:
         "is_active": is_active,
         "disconnected_at": connection.get("disconnected_at"),
         "provider_revoke_status": connection.get("provider_revoke_status"),
+        "webhook_status": connection.get("webhook_status"),
+        "last_webhook_at": connection.get("last_webhook_at"),
+        "webhook_error": connection.get("webhook_error"),
     }
 
 

@@ -428,6 +428,7 @@ async def store_whatsapp_message(
     context: Optional[dict] = None,
     bot_context: Optional[dict] = None,
     notify_push: bool = False,
+    business_phone_id: Optional[str] = None,
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -481,6 +482,27 @@ async def store_whatsapp_message(
     messages_collection.insert_one(message)
 
     logger.success(f"Whatsapp message stored: {message_id}")
+
+    if business_phone_id and role == MessageRole.CUSTOMER:
+        received_at = datetime.now(timezone.utc)
+        db.whatsapp_connections.update_one(
+            {
+                "org_id": org_id,
+                "$or": [
+                    {"phone_id": str(business_phone_id)},
+                    {"phone_number_id": str(business_phone_id)},
+                ],
+                "is_active": {"$ne": False},
+            },
+            {
+                "$set": {
+                    "webhook_status": "healthy",
+                    "last_webhook_at": received_at,
+                    "updated_at": received_at,
+                },
+                "$unset": {"webhook_error": ""},
+            },
+        )
 
     if notify_push and role == MessageRole.CUSTOMER and mode != "private":
         await schedule_customer_message_push(
