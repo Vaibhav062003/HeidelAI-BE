@@ -16,7 +16,12 @@ if "services.team_service" not in sys.modules:
     mock_team.create_ai_escalation = AsyncMock()
     sys.modules["services.team_service"] = mock_team
 
-from services.oos_service import canonical_brand, send_oos_to_dealers
+from services.oos_service import (
+    canonical_brand,
+    format_dealer_sourcing_message,
+    generate_dealer_message,
+    send_oos_to_dealers,
+)
 
 
 # ==========================================
@@ -90,6 +95,43 @@ def test_dealer_directory_hyphenated_in_db():
     assert canonical_brand("lianli") in dealer_brands
     assert canonical_brand("LIAN-LI") in dealer_brands
     assert canonical_brand("Lian Li") in dealer_brands
+
+
+def test_format_dealer_sourcing_message_lian_li():
+    """Verify O11 Vision request produces exact concise sourcing message without budget/labels."""
+    attrs = {
+        "brand": "lian li",
+        "model_name": "O11 Vision",
+        "category": "cabinet",
+        "specs": {"colour": "black", "budget": 14000},
+    }
+    oos_doc = {
+        "extracted_attributes": attrs,
+        "raw_query_text": "I need Lian Li O11 Vision Cabinet in Black, budget around 14000",
+    }
+    msg = generate_dealer_message(oos_doc)
+    assert msg == "Lian Li O11 Vision Cabinet in Black\nPrice and availability?"
+
+
+def test_format_dealer_sourcing_message_neutral_brands():
+    """Verify neutral brands (Lenovo, NZXT) produce clean, generic sourcing messages."""
+    lenovo_attrs = {
+        "brand": "lenovo",
+        "model_name": "Legion 5",
+        "category": "laptop",
+        "specs": {"colour": "grey", "budget": 95000},
+    }
+    lenovo_msg = format_dealer_sourcing_message(lenovo_attrs)
+    assert lenovo_msg == "Lenovo Legion 5 Laptop in Grey\nPrice and availability?"
+
+    nzxt_attrs = {
+        "brand": "nzxt",
+        "model_name": "Kraken 360",
+        "category": "cooler",
+        "specs": {"colour": "white"},
+    }
+    nzxt_msg = format_dealer_sourcing_message(nzxt_attrs)
+    assert nzxt_msg == "NZXT Kraken 360 Cooler in White\nPrice and availability?"
 
 
 # ==========================================
@@ -319,15 +361,64 @@ def test_send_oos_to_dealers_raw_query_fallback_with_spaces_and_hyphens():
     asyncio.run(_async_test_send_oos_to_dealers_raw_query_fallback_with_spaces_and_hyphens())
 
 
+async def _async_test_send_oos_to_dealers_exact_payload_o11_vision():
+    """Verify send_oos_to_dealers formats and dispatches the exact 2-line WhatsApp payload for O11 Vision."""
+    org_id = "org_test_1"
+    dealer_docs = [
+        {
+            "org_id": org_id,
+            "name": "Lian Li / NZXT Dealer",
+            "phone": "910000000001",
+            "brands": "Lian Li,NZXT",
+            "active": True,
+        },
+    ]
+
+    async_db, oos_col = _build_mock_async_db(dealer_docs)
+    oos_doc = {
+        "query_id": "q_o11_exact",
+        "conversation_id": "conv_o11",
+        "raw_query_text": "I need Lian Li O11 Vision Cabinet in Black, budget around 14000",
+        "extracted_attributes": {
+            "brand": "lian li",
+            "model_name": "O11 Vision",
+            "category": "cabinet",
+            "specs": {"colour": "black", "budget": 14000},
+        },
+    }
+
+    with patch("services.oos_service.get_async_mongo_db", return_value=async_db), \
+         patch("services.oos_service.get_mongo_db") as mock_get_mongo, \
+         patch("services.wa_service.resolve_outbound_whatsapp_connection", return_value={"wa_id": "wa_system", "phone_id": "p_1"}), \
+         patch("services.wa_service.create_or_update_whatsapp_conversation", new=AsyncMock(return_value="dealer_conv_o11")), \
+         patch("services.wa_service.send_whatsapp_message", new=AsyncMock(return_value={"message_ids": ["msg_o11"]})) as mock_send_wa:
+
+        mock_get_mongo.return_value[f"conversations_{org_id}"].find_one.return_value = {"whatsapp_id": "wa_system"}
+
+        await send_oos_to_dealers(oos_doc, org_id)
+
+        assert mock_send_wa.call_count == 1
+        payload = mock_send_wa.call_args[0][0]
+        assert payload["content"] == "Lian Li O11 Vision Cabinet in Black\nPrice and availability?"
+        assert payload["recipient_override"] == "910000000001"
+
+
+def test_send_oos_to_dealers_exact_payload_o11_vision():
+    asyncio.run(_async_test_send_oos_to_dealers_exact_payload_o11_vision())
+
+
 def run_all_tests():
     test_canonical_brand_normalization()
     test_dealer_matching_with_alias_variations()
     test_dealer_directory_hyphenated_in_db()
+    test_format_dealer_sourcing_message_lian_li()
+    test_format_dealer_sourcing_message_neutral_brands()
     test_send_oos_to_dealers_lian_li_aliases()
     test_send_oos_to_dealers_nzxt()
     test_send_oos_to_dealers_tenant_and_inactive_isolation()
     test_send_oos_to_dealers_raw_query_fallback_with_spaces_and_hyphens()
-    print("All 7 canonical brand and routing integration tests passed successfully!")
+    test_send_oos_to_dealers_exact_payload_o11_vision()
+    print("All 10 canonical brand, formatting, and routing integration tests passed successfully!")
 
 
 if __name__ == "__main__":

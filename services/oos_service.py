@@ -80,42 +80,47 @@ async def fetch_dealer_directory(org_id: str, sheet_id: Optional[str] = None, ta
         return []
 
 
+UPPERCASE_BRANDS = {"nzxt", "msi", "hp"}
+
+
+def _format_brand(brand: str) -> str:
+    if not brand:
+        return ""
+    b = brand.strip()
+    if b.lower() in UPPERCASE_BRANDS:
+        return b.upper()
+    return b.title()
+
+
+def format_dealer_sourcing_message(extracted_attrs: dict) -> str:
+    """
+    Format a concise, generic sourcing message for dealers across any brand/org.
+    Excludes budget, raw customer query, and internal labels.
+    Produces:
+        <Brand> <Model> <Category> in <Colour>
+        Price and availability?
+    If no usable extracted attributes exist, produces:
+        Product Inquiry
+        Price and availability?
+    """
+    brand = _format_brand(extracted_attrs.get("brand") or "")
+    model = (extracted_attrs.get("model_name") or "").strip()
+    category = (extracted_attrs.get("category") or "").strip().title()
+    specs = extracted_attrs.get("specs") or {}
+
+    colour = specs.get("colour") or specs.get("color")
+
+    parts = [p for p in (brand, model, category) if p]
+    title = " ".join(parts) if parts else "Product Inquiry"
+    if parts and colour:
+        title += f" in {str(colour).strip().capitalize()}"
+    return f"{title}\nPrice and availability?"
+
+
 def generate_dealer_message(oos_doc: dict) -> str:
-    """Generate the formatted inquiry message to send to dealers."""
+    """Generate the concise sourcing message to send to dealers."""
     attrs = oos_doc.get("extracted_attributes", {})
-    parts = []
-    if attrs.get("category"):
-        parts.append(f"Category: {attrs['category'].strip().title()}")
-    if attrs.get("brand"):
-        parts.append(f"Brand: {attrs['brand'].strip().upper()}")
-    if attrs.get("model_name"):
-        parts.append(f"Model: {attrs['model_name'].strip()}")
-
-    specs = attrs.get("specs", {})
-    if specs:
-        for k, v in specs.items():
-            if v is None:
-                continue
-            label = k.replace("_", " ").title()
-            if label.lower() == "ram gb":
-                label, v = "RAM", f"{v}GB"
-            elif label.lower() == "storage gb":
-                label, v = "Storage", f"{v}GB"
-            elif label.lower() == "budget max":
-                label = "Max Budget"
-                try:
-                    v = f"Rs. {float(v):,.0f}"
-                except (ValueError, TypeError):
-                    v = f"Rs. {v}"
-            parts.append(f"{label}: {v}")
-
-    spec_summary = "\n".join(f"  - {p}" for p in parts)
-    raw_query = oos_doc.get("raw_query_text", "")
-
-    message = f"Query: \"{raw_query}\""
-    if parts:
-        message += f"\nSpecifications:\n{spec_summary}"
-    return message
+    return format_dealer_sourcing_message(attrs)
 
 
 async def send_oos_to_dealers(oos_doc: dict, org_id: str):
