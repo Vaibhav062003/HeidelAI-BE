@@ -86,6 +86,7 @@ def test_deployment_starts_the_api_without_running_migrations():
     assert "group: deploy-main" in deploy_main
     assert "koyeb service update" in deploy_dev
     assert "koyeb service update" in deploy_main
+    assert "--scale 1" not in deploy_dev
     assert "--wait --wait-timeout 15m" in deploy_dev
     assert "--wait --wait-timeout 15m" in deploy_main
     assert migration.index('plan["verified_indexes"] = True') < migration.index(
