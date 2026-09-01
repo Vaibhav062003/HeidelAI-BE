@@ -6,6 +6,7 @@ from scripts.migrate_multi_whatsapp import (
     build_plan,
     checkpoint_org,
     claim_org_lease,
+    conversation_mapping_plan,
     merge_conversation_documents,
     organization_waba_errors,
     renew_org_lease,
@@ -96,6 +97,63 @@ def test_plan_accepts_fifty_numbers_and_rejects_fifty_one():
     assert "51 distinct WhatsApp numbers" in "\n".join(
         build_plan([*fifty, _connection("50", "org-1", "phone-50")])["errors"]
     )
+
+
+def test_plan_preserves_the_legacy_organization_primary_waba():
+    plan = build_plan([
+        _connection("older-test", "org-1", "phone-test", "waba-test", connected_at="2025-01-01"),
+        _connection("legacy", "org-1", "phone-legacy", "waba-legacy", connected_at="2026-01-01"),
+    ], {"org-1": "waba-legacy"})
+
+    updates = plan["organizations"]["org-1"]["updates"]
+    assert [(item["phone_id"], item["slot"]) for item in updates] == [
+        ("phone-legacy", 1),
+        ("phone-test", 2),
+    ]
+
+
+def test_conversations_are_mapped_from_waba_and_unknown_rows_use_explicit_primary():
+    connections = [
+        {"phone_id": "phone-test", "wa_id": "waba-test", "phone": "1555"},
+        {"phone_id": "phone-legacy", "wa_id": "waba-legacy", "phone": "+91"},
+    ]
+    plan = conversation_mapping_plan([
+        {
+            "_id": "legacy", "customer_id": "one", "whatsapp_id": "waba-legacy",
+            "business_phone_id": "phone-test", "business_phone": "1555",
+        },
+        {
+            "_id": "test", "customer_id": "two", "whatsapp_id": "waba-test",
+            "business_phone_id": "phone-test", "business_phone": "1555",
+        },
+        {
+            "_id": "unknown", "customer_id": "three",
+            "business_phone_id": "phone-test", "business_phone": "1555",
+        },
+    ], connections, "phone-legacy", remap_unidentified_to_primary=True)
+
+    assert plan["assignments"] == {"phone-legacy": ["legacy", "unknown"]}
+    assert plan["reassignment_count"] == 2
+    assert plan["collision_count"] == 0
+    assert plan["unresolved_count"] == 0
+
+
+def test_conversation_mapping_reports_target_collisions_before_writing():
+    plan = conversation_mapping_plan([
+        {
+            "_id": "one", "customer_id": "customer", "whatsapp_id": "waba-legacy",
+            "business_phone_id": "phone-test", "business_phone": "1555",
+        },
+        {
+            "_id": "two", "customer_id": "customer", "whatsapp_id": "waba-legacy",
+            "business_phone_id": "phone-legacy", "business_phone": "+91",
+        },
+    ], [
+        {"phone_id": "phone-test", "wa_id": "waba-test", "phone": "1555"},
+        {"phone_id": "phone-legacy", "wa_id": "waba-legacy", "phone": "+91"},
+    ], "phone-legacy")
+
+    assert plan["collision_count"] == 1
 
 
 def test_duplicate_conversations_keep_newest_state_and_oldest_start():
@@ -190,6 +248,9 @@ if __name__ == "__main__":
     test_plan_prefers_active_reconnect_and_does_not_resurrect_inactive_rows()
     test_plan_keeps_generated_labels_unique_when_defaults_are_already_used()
     test_plan_accepts_fifty_numbers_and_rejects_fifty_one()
+    test_plan_preserves_the_legacy_organization_primary_waba()
+    test_conversations_are_mapped_from_waba_and_unknown_rows_use_explicit_primary()
+    test_conversation_mapping_reports_target_collisions_before_writing()
     test_duplicate_conversations_keep_newest_state_and_oldest_start()
     test_preflight_rejects_waba_owners()
     test_org_lease_fences_overlap_and_can_be_renewed_and_checkpointed()
