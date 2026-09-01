@@ -740,10 +740,21 @@ def test_delays_and_product_summary(service):
         "orders/create": "received", "fulfillments/create": "shipped",
         "orders/fulfilled": "fulfilled", "orders/cancelled": "cancelled",
     }
-    assert service._template_compatible({
+    compliant_template = {
         "status": "APPROVED", "category": "UTILITY",
-        "components": [{"type": "BODY", "text": "Hi {{1}}, order {{2}} for {{3}}"}],
-    }, "order")
+        "components": [
+            {"type": "BODY", "text": "Hi {{1}}, order {{2}} for {{3}}"},
+            {"type": "FOOTER", "text": service.SHOPIFY_TEMPLATE_FOOTER},
+        ],
+    }
+    assert service._template_compatible(compliant_template, "order")
+    assert not service._template_compatible({**compliant_template, "components": compliant_template["components"][:1]}, "order")
+    for event in ("abandoned_cart", "received", "shipped", "fulfilled", "cancelled"):
+        payload = service._default_template_payload(event)
+        assert payload["name"].endswith("_v2")
+        assert payload["category"] == ("MARKETING" if event == "abandoned_cart" else "UTILITY")
+        assert [component["type"] for component in payload["components"]] == ["BODY", "FOOTER"]
+        assert payload["components"][1]["text"] == service.SHOPIFY_TEMPLATE_FOOTER
     summary = service._product_summary([
         {"name": "Board", "quantity": 6},
         {"name": "Wax", "quantity": 1},
