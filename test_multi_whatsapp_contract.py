@@ -36,6 +36,13 @@ def test_connection_and_webhook_contracts():
     assert "token_response = requests" not in auth_source
     assert "phone_response = requests" not in auth_source
     assert "webhook_response = requests" not in auth_source
+    registration = auth_source[
+        auth_source.index("phone_register_url"):
+        auth_source.index("# Generate a unique user_id")
+    ]
+    assert 'except httpx.RequestError as exc:' in registration
+    assert 'if phone_verified != "VERIFIED":' in registration
+    assert "Meta has not verified this WhatsApp number" in registration
     legacy_indexes = auth_source[
         auth_source.index("# Keep the legacy indexes"):
         auth_source.index("# Store connection in database")

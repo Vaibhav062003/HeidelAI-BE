@@ -797,11 +797,21 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
 
         try:
             phone_register_response = await meta_client.post(phone_register_url, json=phone_register_params, timeout=5.0)
+        except httpx.RequestError as exc:
+            logger.warning("WhatsApp phone registration request failed ({})", type(exc).__name__)
+            if phone_verified != "VERIFIED":
+                raise HTTPException(
+                    status_code=502,
+                    detail="Meta could not register this WhatsApp number. Start Add another number again.",
+                ) from exc
+        else:
             if phone_register_response.status_code != 200:
                 logger.warning("WhatsApp phone registration returned status {}", phone_register_response.status_code)
-            
-        except Exception as e:
-            logger.warning("WhatsApp phone registration request failed ({})", type(e).__name__)
+                if phone_verified != "VERIFIED":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Meta has not verified this WhatsApp number. Verify it in WhatsApp Manager, then start Add another number again.",
+                    )
         
         # Generate a unique user_id for this WhatsApp connection
         user_id = (existing_connection or {}).get("user_id") or str(uuid.uuid4())
