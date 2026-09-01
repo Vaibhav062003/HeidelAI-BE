@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import asyncio
+from loguru import logger
 from core.scheduler import start_scheduler, stop_scheduler
 from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cache
 from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, run_whatsapp_revocation_reconciler, recover_stale_bulk_jobs
@@ -15,12 +16,25 @@ from services.tally_service import ensure_tally_indexes
 from services.stock_service import ensure_stock_indexes
 from services.entitlement_service import ensure_entitlement_indexes
 from services.transfer_notification_service import ensure_transfer_notification_indexes
-from services.shopify_service import ensure_shopify_runtime_ready
+from services.shopify_service import ensure_shopify_indexes, repair_legacy_shopify_connections
 from services.push_notification_service import (
     ensure_push_notification_indexes,
     start_push_notification_workers,
     stop_push_notification_workers,
 )
+
+
+async def _run_noncritical_startup() -> None:
+    jobs = (
+        ("bulk job recovery", asyncio.to_thread(recover_stale_bulk_jobs)),
+        ("prompt cache loading", asyncio.to_thread(load_prompts_into_cache)),
+        ("Shopify legacy repair", repair_legacy_shopify_connections()),
+    )
+    results = await asyncio.gather(*(job for _, job in jobs), return_exceptions=True)
+    for (name, _), result in zip(jobs, results):
+        if isinstance(result, Exception):
+            logger.error(f"Non-critical startup job failed ({name}): {type(result).__name__}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,14 +45,13 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_bulk_job_indexes)
     await asyncio.to_thread(ensure_whatsapp_call_indexes)
     await asyncio.to_thread(ensure_whatsapp_outbound_indexes)
-    await asyncio.to_thread(recover_stale_bulk_jobs)
     revocation_task = asyncio.create_task(run_whatsapp_revocation_reconciler())
     await asyncio.to_thread(ensure_push_notification_indexes)
     await asyncio.to_thread(ensure_transfer_notification_indexes)
     load_agents()
-    load_prompts_into_cache()
     await ensure_followup_indexes()
-    await ensure_shopify_runtime_ready()
+    await ensure_shopify_indexes()
+    bootstrap_task = asyncio.create_task(_run_noncritical_startup())
     start_scheduler()
     await startup_scheduler()
     await startup_google_scheduler()
@@ -57,6 +70,9 @@ async def lifespan(app: FastAPI):
     await shutdown_intent_worker()
     await shutdown_scheduler()
     await shutdown_google_scheduler()
+    if not bootstrap_task.done():
+        bootstrap_task.cancel()
+    await asyncio.gather(bootstrap_task, return_exceptions=True)
     if not revocation_task.done():
         revocation_task.cancel()
         await asyncio.gather(revocation_task, return_exceptions=True)

@@ -1,15 +1,13 @@
 # === Built-in Modules ===
-import os, traceback, sys
+import os, sys
 
 # === Third-party Modules ===
-from fastapi.exception_handlers import http_exception_handler
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from loguru import logger
 from fastapi.responses import JSONResponse
-from core.limiter import limiter, get_remote_address        
+from core.limiter import limiter
 from slowapi.errors import RateLimitExceeded                       
 from slowapi.middleware import SlowAPIMiddleware                    
 
@@ -26,7 +24,7 @@ logger.add(sys.stdout, format=format_in_ist, colorize=True)
 if not INSTAGRAM_APP_ID or not INSTAGRAM_APP_SECRET:
     logger.error("Instagram credentials not properly configured!")
 else:
-    logger.success(f"Using Instagram App ID: {INSTAGRAM_APP_ID[:5]}... (truncated)")
+    logger.success("Instagram credentials configured")
 
 ENV = os.getenv("ENV", "prod")
 logger.success(f"Running in {ENV} environment.")
@@ -71,7 +69,7 @@ app.add_middleware(SlowAPIMiddleware)
 
 @app.exception_handler(RateLimitExceeded)                        
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    logger.warning(f"Rate limit exceeded: {request.method} {request.url} from {get_remote_address(request)}")
+    logger.warning(f"Rate limit exceeded: {request.method} {request.url.path}")
     return JSONResponse(                                        
         status_code=429,
         content={
@@ -79,20 +77,6 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
             "detail": "Too many requests, please slow down.",
         }
     )            
-
-@app.exception_handler(StarletteHTTPException)
-async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    # We only care about hunting down the 403 right now
-    if exc.status_code == 403:
-        tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        
-        logger.error("🚨 403 FORBIDDEN INTERCEPTED!")
-        logger.error(f"Endpoint: {request.method} {request.url}")
-        logger.error(f"Detail: {exc.detail}")
-        logger.error(f"Traceback:\n{tb_str}")
-        
-    # Delegate back to FastAPI's default handler to safely preserve all headers and exact behavior
-    return await http_exception_handler(request, exc)
 
 app.include_router(router)
 
