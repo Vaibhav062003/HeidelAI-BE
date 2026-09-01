@@ -797,22 +797,39 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
 
         try:
             phone_register_response = await meta_client.post(phone_register_url, json=phone_register_params, timeout=5.0)
+        except httpx.RequestError as exc:
+            logger.warning("WhatsApp phone registration request failed ({})", type(exc).__name__)
+            if phone_verified != "VERIFIED":
+                raise HTTPException(
+                    status_code=502,
+                    detail="Meta could not register this WhatsApp number. Start Add another number again.",
+                ) from exc
+        else:
             if phone_register_response.status_code != 200:
                 logger.warning("WhatsApp phone registration returned status {}", phone_register_response.status_code)
-            
-        except Exception as e:
-            logger.warning("WhatsApp phone registration request failed ({})", type(e).__name__)
+                if phone_verified != "VERIFIED":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Meta has not verified this WhatsApp number. Verify it in WhatsApp Manager, then start Add another number again.",
+                    )
         
         # Generate a unique user_id for this WhatsApp connection
         user_id = (existing_connection or {}).get("user_id") or str(uuid.uuid4())
 
-        # Create collections for messages and conversations
-        messages_collection = db[f"messages_{org_id}"]
-        conversations_collection = db[f"conversations_{org_id}"]
-
-        # Ensure indexes for efficient querying
-        messages_collection.create_index("message_id", unique=True)
-        conversations_collection.create_index("conversation_id", unique=True)
+        # Keep the legacy indexes, but let existing duplicate data be repaired by
+        # the migration instead of failing a one-time OAuth exchange.
+        for collection, index_field in (
+            (db[f"messages_{org_id}"], "message_id"),
+            (db[f"conversations_{org_id}"], "conversation_id"),
+        ):
+            try:
+                collection.create_index(index_field, unique=True)
+            except DuplicateKeyError:
+                logger.warning(
+                    "Skipped legacy WhatsApp {} unique index for org {} because duplicate records exist",
+                    index_field,
+                    org_id,
+                )
 
         # Store connection in database
         now = datetime.now(timezone.utc)
