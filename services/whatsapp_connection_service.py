@@ -50,6 +50,7 @@ def choose_connection_slot(
 ) -> tuple[int, Optional[dict]]:
     """Validate capacity rules and return a stable connection slot."""
     connections = [row for row in existing_connections if row.get("is_active") is not False]
+    validate_active_connection_slots(connections, limit=limit)
     existing = next(
         (row for row in connections if str(row.get("phone_id") or row.get("phone_number_id") or "") == phone_number_id),
         None,
@@ -57,21 +58,31 @@ def choose_connection_slot(
     if not existing and len(connections) >= limit:
         raise ValueError(f"This organization can connect at most {limit} WhatsApp number{'s' if limit != 1 else ''}")
 
-    used_slots = set()
-    existing_slot = None
-    for row in connections:
-        slot = row.get("slot")
-        if not isinstance(slot, int) or not 1 <= slot <= limit or slot in used_slots:
-            slot = next(candidate for candidate in range(1, limit + 1) if candidate not in used_slots)
-        used_slots.add(slot)
-        if row is existing:
-            existing_slot = slot
+    used_slots = {row["slot"] for row in connections}
     if existing:
-        return existing_slot, existing
+        return existing["slot"], existing
     for slot in range(1, limit + 1):
         if slot not in used_slots:
             return slot, existing
     raise ValueError("No WhatsApp connection slot is available")
+
+
+def validate_active_connection_slots(
+    connections: Iterable[dict],
+    *,
+    limit: int = MAX_WHATSAPP_CONNECTIONS,
+) -> list[dict]:
+    """Return active connections in slot order or reject corrupt persisted state."""
+    rows = [row for row in connections if row.get("is_active") is not False]
+    if len(rows) > limit:
+        raise ValueError(f"An organization can have at most {limit} active WhatsApp numbers")
+    phone_ids = [str(row.get("phone_id") or row.get("phone_number_id") or "").strip() for row in rows]
+    if any(not value for value in phone_ids) or len(phone_ids) != len(set(phone_ids)):
+        raise ValueError("Active WhatsApp phone identifiers must be present and unique")
+    slots = [row.get("slot") for row in rows]
+    if not all(isinstance(slot, int) for slot in slots) or sorted(slots) != list(range(1, len(rows) + 1)):
+        raise ValueError("Active WhatsApp slots must be complete, unique, and contiguous")
+    return sorted(rows, key=lambda row: row["slot"])
 
 
 def whatsapp_conversation_id(customer_phone: str, business_phone_id: Optional[str] = None) -> str:
@@ -98,7 +109,7 @@ def public_connection(connection: dict) -> dict:
     wa_id = str(connection.get("wa_id") or connection.get("waba_id") or "")
     user_id = str(connection.get("user_id") or phone_id)
     is_active = connection.get("is_active") is not False
-    slot = connection.get("slot") or connection.get("last_slot") or 1
+    slot = connection.get("slot") if is_active else connection.get("last_slot")
     return {
         "connection_id": user_id,
         "user_id": user_id,
@@ -121,18 +132,8 @@ def public_connection(connection: dict) -> dict:
 
 
 def public_connections(connections: Iterable[dict]) -> list[dict]:
-    """Repair duplicate legacy slots in the API response without exposing secrets."""
-    used_slots: set[int] = set()
-    result = []
-    for connection in connections:
-        slot = connection.get("slot")
-        if not isinstance(slot, int) or slot < 1 or slot in used_slots:
-            slot = 1
-            while slot in used_slots:
-                slot += 1
-        used_slots.add(slot)
-        result.append(public_connection({**connection, "slot": slot}))
-    return result
+    """Return active connections without masking persisted slot corruption."""
+    return [public_connection(connection) for connection in validate_active_connection_slots(connections)]
 
 
 def public_historical_connections(connections: Iterable[dict]) -> list[dict]:

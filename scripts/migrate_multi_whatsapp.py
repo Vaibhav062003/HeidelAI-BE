@@ -8,17 +8,36 @@ Dry-run is the default. Apply only after the report has no errors:
 
 import argparse
 import json
+import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+try:
+    from pymongo import ReturnDocument
+    from pymongo.errors import DuplicateKeyError
+except ModuleNotFoundError:  # Keeps dependency-free planning/tests usable.
+    class ReturnDocument:
+        AFTER = True
+
+    class DuplicateKeyError(Exception):
+        pass
 
 from services.whatsapp_connection_service import MAX_WHATSAPP_CONNECTIONS
 
 MIGRATION_ID = "multi_whatsapp_v2"
+LEASE_SECONDS = 3600
+DEFAULT_ORG_BATCH_SIZE = 25
+DEFAULT_MAX_ROWS_PER_ORG = 1000
+DEFAULT_REPORT_ITEMS = 100
 
 
 def _connected_at(connection: dict) -> str:
     value = connection.get("connected_at")
     return value.isoformat() if isinstance(value, datetime) else str(value or "")
+
+
+def _connection_order(connection: dict) -> tuple[str, str]:
+    return _connected_at(connection), str(connection.get("_id") or "")
 
 
 def _label(connection: dict, slot: int, used: set[str]) -> tuple[str, str]:
@@ -106,12 +125,15 @@ def _merge_duplicate_conversations(db, org_id: str, primary_phone_id: str, now: 
                     upsert=True,
                 )
         if old_ids:
-            for collection_name in (f"messages_{org_id}", f"private_notes_{org_id}"):
+            for collection_name in (f"messages_{org_id}", f"private_notes_{org_id}", f"escalations_{org_id}"):
                 db[collection_name].update_many(
                     {"conversation_id": {"$in": old_ids}},
                     {"$set": {"conversation_id": canonical_id}},
                 )
-            for collection_name in ("scheduled_messages", "automation_scheduled_followups"):
+            for collection_name in (
+                "scheduled_messages", "automation_scheduled_followups",
+                "whatsapp_calls", "whatsapp_outbound_sends",
+            ):
                 db[collection_name].update_many(
                     {"org_id": org_id, "conversation_id": {"$in": old_ids}},
                     {"$set": {"conversation_id": canonical_id}},
@@ -158,6 +180,8 @@ def build_plan(connections: list[dict]) -> dict:
         phone_id = str(connection.get("phone_id") or connection.get("phone_number_id") or "")
         wa_id = str(connection.get("wa_id") or connection.get("waba_id") or "")
         if not org_id or not phone_id or not wa_id:
+            if connection.get("is_active") is False:
+                continue
             errors.append(f"Connection {connection.get('_id')} is missing org_id, phone_id, or wa_id")
             continue
         grouped[org_id].append({**connection, "phone_id": phone_id, "wa_id": wa_id})
@@ -185,7 +209,7 @@ def build_plan(connections: list[dict]) -> dict:
             if not active:
                 duplicate_ids.extend(item["_id"] for item in same_phone)
                 continue
-            ordered = sorted(active, key=_connected_at, reverse=True)
+            ordered = sorted(active, key=_connection_order, reverse=True)
             distinct.append(ordered[0])
             duplicate_ids.extend(item["_id"] for item in ordered[1:])
             duplicate_ids.extend(item["_id"] for item in same_phone if item.get("is_active") is False)
@@ -194,7 +218,7 @@ def build_plan(connections: list[dict]) -> dict:
             errors.append(f"Organization {org_id} has {len(distinct)} distinct WhatsApp numbers")
         used_labels: set[str] = set()
         updates = []
-        for slot, connection in enumerate(sorted(distinct, key=_connected_at), start=1):
+        for slot, connection in enumerate(sorted(distinct, key=_connection_order), start=1):
             label, label_key = _label(connection, slot, used_labels)
             updates.append({
                 "_id": connection["_id"],
@@ -212,103 +236,144 @@ def build_plan(connections: list[dict]) -> dict:
     return {"errors": sorted(set(errors)), "organizations": organizations}
 
 
-def migrate(apply: bool = False) -> dict:
-    from database import get_mongo_db
+def _org_checkpoint_id(org_id: str) -> str:
+    return f"{MIGRATION_ID}:{org_id}"
 
-    db = get_mongo_db()
-    if apply and db.system_migrations.find_one({"_id": MIGRATION_ID, "status": "complete"}):
-        return {"errors": [], "organizations": {}, "verified_indexes": True, "applied": False}
 
-    raw_connections = list(db.whatsapp_connections.find({}))
-    plan = build_plan(raw_connections)
+def claim_org_lease(db, org_id: str, owner: str, now: datetime, lease_seconds: int = LEASE_SECONDS) -> bool:
+    """Atomically claim one organization, without stealing a live or completed lease."""
+    try:
+        claimed = db.system_migrations.find_one_and_update(
+            {
+                "_id": _org_checkpoint_id(org_id),
+                "status": {"$nin": ["data_complete", "complete"]},
+                "$or": [
+                    {"lease_until": {"$lt": now}},
+                    {"lease_until": {"$exists": False}},
+                    {"lease_owner": owner},
+                ],
+            },
+            {"$set": {
+                "migration_id": MIGRATION_ID,
+                "org_id": org_id,
+                "status": "running",
+                "lease_owner": owner,
+                "lease_until": now + timedelta(seconds=lease_seconds),
+                "updated_at": now,
+            }, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return False
+    return bool(claimed and claimed.get("lease_owner") == owner)
 
-    for org_id, actions in plan["organizations"].items():
-        active_flows = list(db[f"wa_bot_flows_{org_id}"].find({"status": "active"}, {"flow_id": 1}))
-        if len(active_flows) > 1:
-            plan["errors"].append(f"Organization {org_id} has multiple active WaBot flows")
-        actions["active_flow_id"] = active_flows[0].get("flow_id") if len(active_flows) == 1 else None
-        primary = next((item for item in actions["updates"] if item["slot"] == 1), None)
-        if not apply:
-            actions["conversation_merge_count"] = sum(
-                max(0, group["count"] - 1)
-                for group in _duplicate_conversation_groups(
-                    db[f"conversations_{org_id}"], (primary or {}).get("phone_id", "")
-                )
+
+def checkpoint_org(db, org_id: str, owner: str, status: str, now: datetime, **fields) -> bool:
+    update = {"status": status, "updated_at": now, **fields}
+    result = db.system_migrations.update_one(
+        {"_id": _org_checkpoint_id(org_id), "lease_owner": owner},
+        {"$set": update, "$unset": {"lease_owner": "", "lease_until": ""}},
+    )
+    return bool(result.modified_count)
+
+
+def renew_org_lease(db, org_id: str, owner: str, now: datetime, lease_seconds: int = LEASE_SECONDS) -> bool:
+    result = db.system_migrations.update_one(
+        {"_id": _org_checkpoint_id(org_id), "status": "running", "lease_owner": owner},
+        {"$set": {
+            "lease_until": now + timedelta(seconds=lease_seconds),
+            "updated_at": now,
+        }},
+    )
+    return bool(result.modified_count)
+
+
+def bounded_report(report: dict, max_items: int = DEFAULT_REPORT_ITEMS) -> dict:
+    """Limit CLI output while keeping counts and resumability visible."""
+    maximum = max(1, int(max_items))
+    output = {key: value for key, value in report.items() if key != "organizations"}
+    errors = list(output.get("errors") or [])
+    output["error_count"] = len(errors)
+    output["errors"] = errors[:maximum]
+    organizations = {}
+    for org_id, actions in list((report.get("organizations") or {}).items())[:maximum]:
+        organizations[org_id] = {
+            **actions,
+            "updates": list(actions.get("updates") or [])[:maximum],
+            "delete_ids": list(actions.get("delete_ids") or [])[:maximum],
+        }
+    output["organizations"] = organizations
+    output["output_truncated"] = (
+        len(errors) > maximum
+        or len(report.get("organizations") or {}) > maximum
+        or any(
+            len(actions.get("updates") or []) > maximum or len(actions.get("delete_ids") or []) > maximum
+            for actions in (report.get("organizations") or {}).values()
+        )
+    )
+    return output
+
+
+def _cross_org_ownership_errors(db, max_items: int) -> list[str]:
+    errors = []
+    for label, canonical in (
+        ("Phone", {"$ifNull": ["$phone_id", "$phone_number_id"]}),
+        ("WABA", {"$ifNull": ["$wa_id", "$waba_id"]}),
+    ):
+        groups = db.whatsapp_connections.aggregate([
+            {"$match": {"is_active": {"$ne": False}, "org_id": {"$type": "string"}}},
+            {"$project": {"owner": "$org_id", "identifier": canonical}},
+            {"$match": {"identifier": {"$type": "string"}}},
+            {"$group": {"_id": "$identifier", "owners": {"$addToSet": "$owner"}}},
+            {"$match": {"owners.1": {"$exists": True}}},
+            {"$limit": max_items + 1},
+        ], allowDiskUse=True)
+        errors.extend(
+            f"{label} {group['_id']} belongs to multiple organizations: {sorted(group['owners'])}"
+            for group in groups
+        )
+    return errors
+
+
+def _apply_org(db, org_id: str, actions: dict, now: datetime, renew_lease=lambda: None) -> None:
+    if renew_lease() is False:
+        raise RuntimeError(f"Organization {org_id} lost its migration lease")
+    for wa_id in sorted({str(item["wa_id"]) for item in actions["updates"]}):
+        try:
+            db.whatsapp_waba_owners.update_one(
+                {"_id": wa_id, "$or": [{"org_id": org_id}, {"org_id": {"$exists": False}}]},
+                {"$set": {"org_id": org_id, "updated_at": now}, "$setOnInsert": {"created_at": now}},
+                upsert=True,
             )
-
-    plan["errors"].extend(organization_waba_errors(list(db.organizations.find(
-        {"wa_id": {"$type": "string"}}, {"_id": 1, "org_id": 1, "wa_id": 1},
-    ))))
-
-    plan["errors"] = sorted(set(plan["errors"]))
-    if not apply or plan["errors"]:
-        return plan
-
-    now = datetime.now(timezone.utc)
-    for org_id, actions in plan["organizations"].items():
-        if actions["delete_ids"]:
-            for duplicate_id in actions["delete_ids"]:
-                duplicate = db.whatsapp_connections.find_one({"_id": duplicate_id}) or {}
-                db.whatsapp_connections.update_one(
-                    {"_id": duplicate_id},
-                    {
-                        "$set": {
-                            "phone_number_id": str(duplicate.get("phone_number_id") or duplicate.get("phone_id") or ""),
-                            "waba_id": str(duplicate.get("waba_id") or duplicate.get("wa_id") or ""),
-                            "is_active": False,
-                            "migration_status": "superseded",
-                            "updated_at": now,
-                        },
-                        "$unset": {
-                            "access_token": "", "phone_id": "", "wa_id": "", "slot": "",
-                            "label_key": "", "wa_bot_flow_id": "",
-                        },
-                    },
-                )
-
-        primary = None
-        for update in actions["updates"]:
-            if update["slot"] == 1:
-                primary = update
-            fields = {key: value for key, value in update.items() if key != "_id"}
-            fields["is_active"] = True
-            fields["updated_at"] = now
-            db.whatsapp_connections.update_one({"_id": update["_id"]}, {"$set": fields})
-
-        if not primary:
-            continue
-        db.organizations.update_one(
-            {"org_id": org_id},
-            {"$set": {"wa_id": primary["wa_id"]}},
-        )
-        conversations = db[f"conversations_{org_id}"]
-        conversations.update_many(
-            {"platform": "whatsapp", "$or": [
-                {"business_phone_id": {"$exists": False}}, {"business_phone_id": None},
-            ]},
-            {"$set": {"business_phone_id": primary["phone_id"], "business_phone": primary.get("phone")}},
-        )
-        actions["merged_conversations"] = _merge_duplicate_conversations(
-            db, org_id, primary["phone_id"], now,
+        except DuplicateKeyError as exc:
+            raise RuntimeError(f"WABA {wa_id} is already owned by another organization") from exc
+    for duplicate_id in actions["delete_ids"]:
+        duplicate = db.whatsapp_connections.find_one({"_id": duplicate_id}) or {}
+        db.whatsapp_connections.update_one(
+            {"_id": duplicate_id},
+            {"$set": {
+                "phone_number_id": str(duplicate.get("phone_number_id") or duplicate.get("phone_id") or ""),
+                "waba_id": str(duplicate.get("waba_id") or duplicate.get("wa_id") or ""),
+                "is_active": False,
+                "migration_status": "superseded",
+                "updated_at": now,
+            }, "$unset": {
+                "access_token": "", "phone_id": "", "wa_id": "", "slot": "",
+                "label_key": "", "wa_bot_flow_id": "",
+            }},
         )
 
-        contacts = db[f"contacts_{org_id}"]
-        for contact in contacts.find({"platform": "whatsapp", "phone_number": {"$type": "string"}}, {"phone_number": 1}):
-            conversation_ids = [item["conversation_id"] for item in conversations.find(
-                {"platform": "whatsapp", "customer_id": contact["phone_number"]}, {"conversation_id": 1}
-            ) if item.get("conversation_id")]
-            if conversation_ids:
-                contacts.update_one(
-                    {"_id": contact["_id"]},
-                    {"$addToSet": {"conversation_ids": {"$each": conversation_ids}}},
-                )
-
-        if actions.get("active_flow_id"):
-            db.whatsapp_connections.update_one(
-                {"org_id": org_id, "slot": 1},
-                {"$set": {"wa_bot_flow_id": actions["active_flow_id"]}},
-            )
-
+    primary = None
+    for update in actions["updates"]:
+        primary = update if update["slot"] == 1 else primary
+        fields = {key: value for key, value in update.items() if key != "_id"}
+        db.whatsapp_connections.update_one(
+            {"_id": update["_id"]},
+            {"$set": {**fields, "is_active": True, "updated_at": now}},
+        )
+    conversations = db[f"conversations_{org_id}"]
+    if not primary:
         conversations.create_index(
             [("platform", 1), ("business_phone_id", 1), ("customer_id", 1)],
             unique=True,
@@ -319,7 +384,37 @@ def migrate(apply: bool = False) -> dict:
             },
             name="whatsapp_phone_customer_unique",
         )
+        return
 
+    db.organizations.update_one({"org_id": org_id}, {"$set": {"wa_id": primary["wa_id"]}})
+    conversations.update_many(
+        {"platform": "whatsapp", "$or": [
+            {"business_phone_id": {"$exists": False}}, {"business_phone_id": None},
+        ]},
+        {"$set": {"business_phone_id": primary["phone_id"], "business_phone": primary.get("phone")}},
+    )
+    if renew_lease() is False:
+        raise RuntimeError(f"Organization {org_id} lost its migration lease")
+    actions["merged_conversations"] = _merge_duplicate_conversations(db, org_id, primary["phone_id"], now)
+    if renew_lease() is False:
+        raise RuntimeError(f"Organization {org_id} lost its migration lease")
+    if actions.get("active_flow_id"):
+        db.whatsapp_connections.update_one(
+            {"org_id": org_id, "slot": 1}, {"$set": {"wa_bot_flow_id": actions["active_flow_id"]}},
+        )
+    conversations.create_index(
+        [("platform", 1), ("business_phone_id", 1), ("customer_id", 1)],
+        unique=True,
+        partialFilterExpression={
+            "platform": "whatsapp",
+            "business_phone_id": {"$type": "string"},
+            "customer_id": {"$type": "string"},
+        },
+        name="whatsapp_phone_customer_unique",
+    )
+
+
+def _create_and_verify_indexes(db, org_ids: list[str]) -> None:
     db.whatsapp_connections.create_index(
         "phone_id", unique=True,
         partialFilterExpression={"phone_id": {"$type": "string"}, "is_active": True},
@@ -335,41 +430,144 @@ def migrate(apply: bool = False) -> dict:
         partialFilterExpression={"org_id": {"$type": "string"}, "label_key": {"$type": "string"}, "is_active": True},
         name="whatsapp_org_label_unique",
     )
-    db.organizations.create_index(
-        "wa_id", unique=True, partialFilterExpression={"wa_id": {"$type": "string"}},
-        name="organization_waba_unique",
-    )
-    required_connection_indexes = {
-        "whatsapp_phone_unique", "whatsapp_org_slot_unique", "whatsapp_org_label_unique",
-    }
-    if not required_connection_indexes.issubset(db.whatsapp_connections.index_information()):
+    required = {"whatsapp_phone_unique", "whatsapp_org_slot_unique", "whatsapp_org_label_unique"}
+    if not required.issubset(db.whatsapp_connections.index_information()):
         raise RuntimeError("Multi-number WhatsApp connection indexes could not be verified")
-    if "organization_waba_unique" not in db.organizations.index_information():
-        raise RuntimeError("WhatsApp organization ownership index could not be verified")
-    for org_id, actions in plan["organizations"].items():
-        if not actions["updates"]:
-            continue
+    for org_id in org_ids:
         if "whatsapp_phone_customer_unique" not in db[f"conversations_{org_id}"].index_information():
             raise RuntimeError(f"WhatsApp conversation index could not be verified for {org_id}")
-        db.organizations.update_one(
-            {"org_id": org_id},
-            {"$set": {"whatsapp_connection_schema_version": 2}},
-        )
-    plan["verified_indexes"] = True
-    plan["applied"] = True
-    db.system_migrations.update_one(
-        {"_id": MIGRATION_ID},
-        {"$set": {"status": "complete", "completed_at": now}},
-        upsert=True,
+
+
+def migrate(
+    apply: bool = False,
+    org_id: str | None = None,
+    org_batch_size: int = DEFAULT_ORG_BATCH_SIZE,
+    max_rows_per_org: int = DEFAULT_MAX_ROWS_PER_ORG,
+    report_items: int = DEFAULT_REPORT_ITEMS,
+) -> dict:
+    from database import get_mongo_db
+
+    db = get_mongo_db()
+    all_org_ids = sorted(str(value) for value in db.whatsapp_connections.distinct("org_id") if value)
+    if org_id:
+        requested = str(org_id).strip()
+        all_selected_ids = [requested] if requested in all_org_ids else []
+    else:
+        all_selected_ids = all_org_ids
+    completed = {
+        str(row.get("org_id") or "")
+        for row in db.system_migrations.find({
+            "migration_id": MIGRATION_ID,
+            "status": {"$in": ["data_complete", "complete"]},
+        }, {"org_id": 1})
+    } if apply else set()
+    pending_ids = [value for value in all_selected_ids if value not in completed]
+    selected_ids = pending_ids[:max(1, int(org_batch_size))]
+    report = {
+        "errors": _cross_org_ownership_errors(db, max(1, report_items)),
+        "organizations": {},
+        "dry_run": not apply,
+        "applied": False,
+        "selected_org_count": len(selected_ids),
+        "remaining_org_count": max(0, len(pending_ids) - len(selected_ids)),
+    }
+    if org_id and not all_selected_ids:
+        report["errors"].append(f"Organization {org_id} has no WhatsApp connections")
+
+    for selected_org_id in selected_ids:
+        rows = list(db.whatsapp_connections.find({"org_id": selected_org_id}).limit(max_rows_per_org + 1))
+        if len(rows) > max_rows_per_org:
+            report["errors"].append(
+                f"Organization {selected_org_id} exceeds the bounded {max_rows_per_org}-row migration limit"
+            )
+            continue
+        org_plan = build_plan(rows)
+        report["errors"].extend(org_plan["errors"])
+        actions = org_plan["organizations"].get(selected_org_id, {"updates": [], "delete_ids": []})
+        active_flows = list(db[f"wa_bot_flows_{selected_org_id}"].find(
+            {"status": "active"}, {"flow_id": 1},
+        ).limit(2))
+        if len(active_flows) > 1:
+            report["errors"].append(f"Organization {selected_org_id} has multiple active WaBot flows")
+        actions["active_flow_id"] = active_flows[0].get("flow_id") if len(active_flows) == 1 else None
+        primary = next((item for item in actions["updates"] if item["slot"] == 1), None)
+        if not apply:
+            actions["conversation_merge_count"] = sum(
+                max(0, group["count"] - 1)
+                for group in _duplicate_conversation_groups(
+                    db[f"conversations_{selected_org_id}"], (primary or {}).get("phone_id", "")
+                )
+            )
+        report["organizations"][selected_org_id] = actions
+
+    report["errors"] = sorted(set(report["errors"]))
+    if not apply or report["errors"]:
+        return report
+
+    owner = uuid.uuid4().hex
+    for selected_org_id, actions in report["organizations"].items():
+        now = datetime.now(timezone.utc)
+        if not claim_org_lease(db, selected_org_id, owner, now):
+            report["errors"].append(f"Organization {selected_org_id} migration is already running or complete")
+            continue
+        try:
+            _apply_org(
+                db,
+                selected_org_id,
+                actions,
+                now,
+                renew_lease=lambda: renew_org_lease(
+                    db, selected_org_id, owner, datetime.now(timezone.utc),
+                ),
+            )
+            if not checkpoint_org(db, selected_org_id, owner, "data_complete", now):
+                raise RuntimeError(f"Organization {selected_org_id} lost its migration lease")
+        except Exception as exc:
+            checkpoint_org(db, selected_org_id, owner, "failed", datetime.now(timezone.utc), error=type(exc).__name__)
+            raise
+
+    all_data_complete = all(
+        db.system_migrations.find_one({
+            "_id": _org_checkpoint_id(value), "status": {"$in": ["data_complete", "complete"]},
+        })
+        for value in all_org_ids
     )
-    return plan
+    if all_data_complete:
+        _create_and_verify_indexes(db, all_org_ids)
+        now = datetime.now(timezone.utc)
+        for value in all_org_ids:
+            db.organizations.update_one(
+                {"org_id": value}, {"$set": {"whatsapp_connection_schema_version": 2}},
+            )
+            db.system_migrations.update_one(
+                {"_id": _org_checkpoint_id(value)},
+                {"$set": {"status": "complete", "completed_at": now}},
+            )
+        db.system_migrations.update_one(
+            {"_id": MIGRATION_ID}, {"$set": {"status": "complete", "completed_at": now}}, upsert=True,
+        )
+        report["verified_indexes"] = True
+    else:
+        report["has_more"] = True
+    report["applied"] = bool(report["organizations"])
+    return report
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", help="Apply a clean migration plan")
+    parser.add_argument("--org-id", help="Migrate only one organization")
+    parser.add_argument("--org-batch-size", type=int, default=DEFAULT_ORG_BATCH_SIZE)
+    parser.add_argument("--max-rows-per-org", type=int, default=DEFAULT_MAX_ROWS_PER_ORG)
+    parser.add_argument("--max-report-items", type=int, default=DEFAULT_REPORT_ITEMS)
     args = parser.parse_args()
-    report = migrate(apply=args.apply)
-    print(json.dumps(report, default=str, indent=2))
+    report = migrate(
+        apply=args.apply,
+        org_id=args.org_id,
+        org_batch_size=args.org_batch_size,
+        max_rows_per_org=args.max_rows_per_org,
+        report_items=args.max_report_items,
+    )
+    print(json.dumps(bounded_report(report, args.max_report_items), default=str, indent=2))
     if report["errors"]:
         raise SystemExit(1)
