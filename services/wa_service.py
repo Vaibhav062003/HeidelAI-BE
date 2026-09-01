@@ -32,6 +32,7 @@ from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
 
 MSG_SPLIT = "|MSG_SPLIT|"
+WHATSAPP_PROVIDER_CLEANUP_MAX_ATTEMPTS = 5
 
 
 
@@ -427,6 +428,7 @@ async def store_whatsapp_message(
     context: Optional[dict] = None,
     bot_context: Optional[dict] = None,
     notify_push: bool = False,
+    business_phone_id: Optional[str] = None,
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -480,6 +482,27 @@ async def store_whatsapp_message(
     messages_collection.insert_one(message)
 
     logger.success(f"Whatsapp message stored: {message_id}")
+
+    if business_phone_id and role == MessageRole.CUSTOMER:
+        received_at = datetime.now(timezone.utc)
+        db.whatsapp_connections.update_one(
+            {
+                "org_id": org_id,
+                "$or": [
+                    {"phone_id": str(business_phone_id)},
+                    {"phone_number_id": str(business_phone_id)},
+                ],
+                "is_active": {"$ne": False},
+            },
+            {
+                "$set": {
+                    "webhook_status": "healthy",
+                    "last_webhook_at": received_at,
+                    "updated_at": received_at,
+                },
+                "$unset": {"webhook_error": ""},
+            },
+        )
 
     if notify_push and role == MessageRole.CUSTOMER and mode != "private":
         await schedule_customer_message_push(
@@ -1586,18 +1609,29 @@ async def archive_whatsapp_data(org_id: str, phone_id: str, expire_days=30):
         logger.error(f"Error archiving WhatsApp phone {phone_id} for org {org_id}: {e}")
         raise
 
-async def _revoke_whatsapp_token(access_token: str, org_id: str, wa_id: str) -> tuple[bool, str]:
+async def _unsubscribe_whatsapp_waba(access_token: str, org_id: str, wa_id: str) -> tuple[bool, str]:
+    """Remove this app's WABA subscription without revoking the shared user token."""
+    if not wa_id:
+        return False, "missing_waba_id"
     try:
+        version = WA_VERSION or VERSION or "v24.0"
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             response = await client.delete(
-                "https://graph.facebook.com/v17.0/me/permissions",
-                params={"access_token": access_token},
+                f"https://graph.facebook.com/{version}/{wa_id}/subscribed_apps",
+                headers={"Authorization": f"Bearer {access_token}"},
             )
         if response.is_success:
             return True, ""
+        try:
+            error = (response.json() or {}).get("error") or {}
+        except ValueError:
+            error = {}
+        message = str(error.get("message") or "").casefold()
+        if response.status_code == 404 or "not subscribed" in message or "does not exist" in message:
+            return True, ""
         return False, f"Meta returned status {response.status_code}"
     except Exception as exc:
-        logger.error("WhatsApp token revocation failed for org {} and WABA {} ({})", org_id, wa_id, type(exc).__name__)
+        logger.error("WhatsApp WABA unsubscribe failed for org {} and WABA {} ({})", org_id, wa_id, type(exc).__name__)
         return False, type(exc).__name__
 
 
@@ -1617,12 +1651,40 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
     })
     if not connection:
         return {"provider_cleanup": "not_pending"}
+    wa_id = str(connection.get("wa_id") or connection.get("waba_id") or "")
+    active_sibling = db.whatsapp_connections.find_one({
+        "_id": {"$ne": connection["_id"]},
+        "$or": [{"wa_id": wa_id}, {"waba_id": wa_id}],
+        "is_active": {"$ne": False},
+    })
+    if active_sibling:
+        db.whatsapp_connections.update_one(
+            {"_id": connection["_id"], "is_active": False},
+            {"$set": {
+                "provider_revoke_status": "not_needed",
+                "provider_revoke_error": None,
+                "provider_revoke_updated_at": datetime.now(timezone.utc),
+            }, "$unset": {"access_token": ""}},
+        )
+        return {"provider_cleanup": "not_needed"}
+    attempts = int(connection.get("provider_revoke_attempts") or 0)
+    if attempts >= WHATSAPP_PROVIDER_CLEANUP_MAX_ATTEMPTS:
+        db.whatsapp_connections.update_one(
+            {"_id": connection["_id"], "is_active": False},
+            {"$set": {
+                "provider_revoke_status": "abandoned",
+                "provider_revoke_error": "retry_limit_reached",
+                "provider_revoke_updated_at": datetime.now(timezone.utc),
+            }, "$unset": {"access_token": ""}},
+        )
+        return {"provider_cleanup": "abandoned"}
     access_token = str(connection.get("access_token") or "")
     if not access_token:
         db.whatsapp_connections.update_one(
             {"_id": connection["_id"], "is_active": False},
             {"$set": {"provider_revoke_status": "complete", "provider_revoke_error": None}},
         )
+        db.whatsapp_waba_owners.delete_one({"_id": wa_id, "org_id": org_id})
         return {"provider_cleanup": "complete"}
 
     claim = db.whatsapp_connections.update_one(
@@ -1638,7 +1700,7 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
     )
     if not claim.modified_count:
         return {"provider_cleanup": "processing"}
-    success, error = await _revoke_whatsapp_token(access_token, org_id, str(connection.get("wa_id") or ""))
+    success, error = await _unsubscribe_whatsapp_waba(access_token, org_id, wa_id)
     update = {
         "$set": {
             "provider_revoke_status": "complete" if success else "failed",
@@ -1652,6 +1714,8 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
         {"_id": connection["_id"], "is_active": False, "provider_revoke_status": "processing"},
         update,
     )
+    if success:
+        db.whatsapp_waba_owners.delete_one({"_id": wa_id, "org_id": org_id})
     return {"provider_cleanup": "complete" if success else "failed"}
 
 
@@ -1687,7 +1751,7 @@ async def run_whatsapp_revocation_reconciler() -> None:
         await asyncio.sleep(60)
 
 
-async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
+def _deactivate_whatsapp_connection_sync(org_id: str, phone_id: str) -> dict:
     """Disconnect one sender immediately while retaining its conversation history."""
     connection = db.whatsapp_connections.find_one({
         "org_id": org_id,
@@ -1705,7 +1769,7 @@ async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
         }
 
     now = datetime.now(timezone.utc)
-    provider_cleanup = "not_needed" if remaining_rows else "pending"
+    provider_cleanup = "pending" if connection.get("access_token") else "complete"
     current_primary = db.whatsapp_connections.find_one({
         "org_id": org_id, "slot": 1, "is_active": {"$ne": False},
     }) or next(iter(db.whatsapp_connections.find(
@@ -1743,7 +1807,7 @@ async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
                 },
                 "$unset": {"slot": "", "label_key": "", "wa_bot_flow_id": ""},
             }
-            if remaining_rows:
+            if provider_cleanup != "pending":
                 update["$unset"]["access_token"] = ""
             db.whatsapp_connections.update_one({"_id": connection["_id"]}, update, session=session)
 
@@ -1759,12 +1823,12 @@ async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
                     {"$set": {"slot": slot, "updated_at": now}},
                     session=session,
                 )
-            if not remaining_rows:
-                db.organizations.update_one(
-                    {"org_id": org_id},
-                    {"$set": {"wa_id": None}},
-                    session=session,
-                )
+            primary = remaining_rows[0] if remaining_rows else None
+            db.organizations.update_one(
+                {"org_id": org_id},
+                {"$set": {"wa_id": str(primary.get("wa_id") or primary.get("waba_id") or "") if primary else None}},
+                session=session,
+            )
 
             bound_flow_id = connection.get("wa_bot_flow_id")
             if bound_flow_id and not any(row.get("wa_bot_flow_id") == bound_flow_id for row in remaining_rows):
@@ -1779,6 +1843,11 @@ async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
         "remaining_connections": len(remaining_rows),
         "provider_cleanup": provider_cleanup,
     }
+
+
+async def deactivate_whatsapp_connection(org_id: str, phone_id: str) -> dict:
+    """Run the local transactional disconnect outside the async event loop."""
+    return await asyncio.to_thread(_deactivate_whatsapp_connection_sync, org_id, phone_id)
 
 async def upload_whatsapp_media_to_cloudinary(media_url: str, org_id: str, media_id: str, access_token: str) -> Optional[str]:
     headers = {
