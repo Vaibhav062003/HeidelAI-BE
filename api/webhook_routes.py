@@ -51,9 +51,10 @@ db = get_mongo_db()
 
 DEV_WHATSAPP_WABA_IDS = {
     value
-    for value in (SAHIL_WA_ID, EGENIE_WA_ID, "1248072875064563")
+    for value in (SAHIL_WA_ID, EGENIE_WA_ID)
     if value
 }
+DEV_WHATSAPP_PHONE_IDS = {"1248072875064563"}
 
 
 async def pricing_runtime_mode(org_id: str) -> str:
@@ -498,9 +499,22 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
             account_id = payload["entry"][0]["id"]
         except (KeyError, IndexError):
             logger.warning("Could not extract entry[0].id from webhook payload")
-    
-        if object_type == "whatsapp_business_account" and account_id in DEV_WHATSAPP_WABA_IDS:
-            logger.info(f"WhatsApp webhook matched development WABA {account_id}. Forwarding.")
+
+        phone_number_ids = {
+            str(((change.get("value") or {}).get("metadata") or {}).get("phone_number_id") or "").strip()
+            for entry in payload.get("entry", [])
+            for change in entry.get("changes", [])
+        }
+        phone_number_ids.discard("")
+
+        if object_type == "whatsapp_business_account" and (
+            account_id in DEV_WHATSAPP_WABA_IDS
+            or bool(phone_number_ids & DEV_WHATSAPP_PHONE_IDS)
+        ):
+            logger.info(
+                f"WhatsApp webhook matched development routing: WABA={account_id}, "
+                f"phone_number_ids={sorted(phone_number_ids)}. Forwarding."
+            )
             forward_headers = {
                 key: value
                 for key, value in request.headers.items()

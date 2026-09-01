@@ -1136,7 +1136,11 @@ async def _get_whatsapp_details(org_id: str, selector: str):
     business_info = connection.get("business_info") or {}
     analytics = analytics_data.get("analytics")
     if not isinstance(analytics, dict):
-        analytics = {"phone_numbers": [phone_id], "granularity": "DAY", "data_points": []}
+        analytics = {}
+    analytics.setdefault("phone_numbers", [phone_id])
+    analytics.setdefault("granularity", "DAY")
+    if not isinstance(analytics.get("data_points"), list):
+        analytics["data_points"] = []
     account_info = {
         "id": whatsapp_business_id,
         "name": connection.get("name") or business_info.get("verified_name") or "WhatsApp Business",
