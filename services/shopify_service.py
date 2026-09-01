@@ -1528,11 +1528,11 @@ async def create_default_template(
 
 def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGUAGE) -> dict:
     definitions = {
-        "abandoned_cart": ("heidelai_abandoned_cart_v2", "MARKETING", "Hi {{1}}, you left {{2}} in your cart. Complete your purchase here: {{3}}"),
-        "received": ("heidelai_order_received_v2", "UTILITY", "Hi {{1}}, your order {{2}} for {{3}} has been received. We will notify you when its status changes."),
-        "shipped": ("heidelai_order_shipped_v2", "UTILITY", "Hi {{1}}, your order {{2}} for {{3}} has shipped. We will share further delivery updates when available."),
-        "fulfilled": ("heidelai_order_fulfilled_v2", "UTILITY", "Hi {{1}}, your order {{2}} for {{3}} has been fulfilled. Contact our support team if you need help."),
-        "cancelled": ("heidelai_order_cancelled_v2", "UTILITY", "Hi {{1}}, your order {{2}} for {{3}} has been cancelled. Contact our support team if you did not request this cancellation."),
+        "abandoned_cart": ("heidelai_abandoned_cart_v3", "MARKETING", "Hello {{1}}! It looks like these items are still waiting in your cart: {{2}}. You can complete your purchase using this secure checkout link: {{3}}. We are here if you need any help."),
+        "received": ("heidelai_order_received_v3", "UTILITY", "Hello {{1}}! We have received your order {{2}}, which includes {{3}}. Our team is reviewing it, and we will keep you updated as the status changes."),
+        "shipped": ("heidelai_order_shipped_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been shipped. We will share another update when delivery information is available."),
+        "fulfilled": ("heidelai_order_fulfilled_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been fulfilled. We hope everything arrived as expected. Please contact our support team if you need any help."),
+        "cancelled": ("heidelai_order_cancelled_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been cancelled. If you did not request this or need assistance, please contact our support team."),
     }
     if event not in definitions:
         raise HTTPException(status_code=422, detail="Unsupported Shopify template event")
@@ -1586,7 +1586,10 @@ def _template_compatible(template: dict, purpose: str = "cart") -> bool:
         or any(re.search(r"{{\s*\d+\s*}}", json.dumps(part)) for part in components if part is not bodies[0])
     ):
         return False
-    placeholders = re.findall(r"{{\s*(\d+)\s*}}", str(bodies[0].get("text") or ""))
+    body_text = str(bodies[0].get("text") or "")
+    if re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", body_text):
+        return False
+    placeholders = re.findall(r"{{\s*(\d+)\s*}}", body_text)
     return sorted(placeholders) == ["1", "2", "3"]
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib.util
+import re
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -743,18 +744,29 @@ def test_delays_and_product_summary(service):
     compliant_template = {
         "status": "APPROVED", "category": "UTILITY",
         "components": [
-            {"type": "BODY", "text": "Hi {{1}}, order {{2}} for {{3}}"},
+            {"type": "BODY", "text": "Hi {{1}}, order {{2}} for {{3}} is ready."},
             {"type": "FOOTER", "text": service.SHOPIFY_TEMPLATE_FOOTER},
         ],
     }
     assert service._template_compatible(compliant_template, "order")
     assert not service._template_compatible({**compliant_template, "components": compliant_template["components"][:1]}, "order")
+    assert not service._template_compatible({
+        **compliant_template,
+        "components": [
+            {"type": "BODY", "text": "{{1}} order {{2}} for {{3}}"},
+            compliant_template["components"][1],
+        ],
+    }, "order")
     for event in ("abandoned_cart", "received", "shipped", "fulfilled", "cancelled"):
         payload = service._default_template_payload(event)
-        assert payload["name"].endswith("_v2")
+        assert payload["name"].endswith("_v3")
         assert payload["category"] == ("MARKETING" if event == "abandoned_cart" else "UTILITY")
         assert [component["type"] for component in payload["components"]] == ["BODY", "FOOTER"]
         assert payload["components"][1]["text"] == service.SHOPIFY_TEMPLATE_FOOTER
+        assert not re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", payload["components"][0]["text"])
+        examples = payload["components"][0]["example"]["body_text"][0]
+        assert len(examples) == 3 and all(examples)
+        assert examples[2].startswith("https://") if event == "abandoned_cart" else examples[1].startswith("#")
     summary = service._product_summary([
         {"name": "Board", "quantity": 6},
         {"name": "Wax", "quantity": 1},
