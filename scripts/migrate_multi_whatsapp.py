@@ -4,6 +4,12 @@ Dry-run is the default. Apply only after the report has no errors:
 
     python -m scripts.migrate_multi_whatsapp
     python -m scripts.migrate_multi_whatsapp --apply
+
+Repair a completed migration whose legacy conversations were assigned to the
+wrong primary line:
+
+    python -m scripts.migrate_multi_whatsapp --org-id ORG --repair-primary-phone-id PHONE
+    python -m scripts.migrate_multi_whatsapp --org-id ORG --repair-primary-phone-id PHONE --apply
 """
 
 import argparse
@@ -29,6 +35,7 @@ LEASE_SECONDS = 3600
 DEFAULT_ORG_BATCH_SIZE = 25
 DEFAULT_MAX_ROWS_PER_ORG = 1000
 DEFAULT_REPORT_ITEMS = 100
+DEFAULT_MAX_CONVERSATIONS = 100_000
 
 
 def _connected_at(connection: dict) -> str:
@@ -168,7 +175,7 @@ def organization_waba_errors(organizations: list[dict]) -> list[str]:
     ]
 
 
-def build_plan(connections: list[dict]) -> dict:
+def build_plan(connections: list[dict], primary_wa_ids: dict[str, str] | None = None) -> dict:
     """Return deterministic actions and errors without touching MongoDB."""
     grouped: dict[str, list[dict]] = defaultdict(list)
     phone_owners: dict[str, set[str]] = defaultdict(set)
@@ -216,9 +223,26 @@ def build_plan(connections: list[dict]) -> dict:
 
         if len(distinct) > MAX_WHATSAPP_CONNECTIONS:
             errors.append(f"Organization {org_id} has {len(distinct)} distinct WhatsApp numbers")
+        preferred_phone_id = ""
+        legacy_wa_id = str((primary_wa_ids or {}).get(org_id) or "")
+        legacy_matches = [item for item in distinct if str(item["wa_id"]) == legacy_wa_id]
+        explicit_primary = [item for item in distinct if item.get("slot") == 1]
+        if len(legacy_matches) == 1:
+            preferred_phone_id = str(legacy_matches[0]["phone_id"])
+        elif len(legacy_matches) > 1 and len(explicit_primary) == 1 and explicit_primary[0] in legacy_matches:
+            preferred_phone_id = str(explicit_primary[0]["phone_id"])
+        elif len(legacy_matches) > 1:
+            errors.append(f"Organization {org_id} primary WABA maps to multiple phone numbers")
+        elif len(explicit_primary) == 1:
+            preferred_phone_id = str(explicit_primary[0]["phone_id"])
+
         used_labels: set[str] = set()
         updates = []
-        for slot, connection in enumerate(sorted(distinct, key=_connection_order), start=1):
+        ordered = sorted(
+            distinct,
+            key=lambda item: (str(item["phone_id"]) != preferred_phone_id, _connection_order(item)),
+        )
+        for slot, connection in enumerate(ordered, start=1):
             label, label_key = _label(connection, slot, used_labels)
             updates.append({
                 "_id": connection["_id"],
@@ -234,6 +258,103 @@ def build_plan(connections: list[dict]) -> dict:
         organizations[org_id] = {"updates": updates, "delete_ids": duplicate_ids}
 
     return {"errors": sorted(set(errors)), "organizations": organizations}
+
+
+def conversation_mapping_plan(
+    documents: list[dict],
+    connections: list[dict],
+    primary_phone_id: str,
+    *,
+    remap_unidentified_to_primary: bool = False,
+) -> dict:
+    """Resolve legacy conversations from their stored WABA without guessing."""
+    by_phone = {
+        str(item.get("phone_id") or item.get("phone_number_id") or ""): item
+        for item in connections if item.get("is_active") is not False
+    }
+    identifier_owners: dict[str, set[str]] = defaultdict(set)
+    for phone_id, connection in by_phone.items():
+        for value in (
+            phone_id,
+            connection.get("wa_id"),
+            connection.get("waba_id"),
+        ):
+            normalized = str(value or "").strip()
+            if normalized:
+                identifier_owners[normalized].add(phone_id)
+
+    assignments: dict[str, list] = defaultdict(list)
+    final_keys: dict[tuple[str, str], object] = {}
+    collisions = 0
+    unresolved = 0
+    for document in documents:
+        current = str(document.get("business_phone_id") or "").strip()
+        source = str(document.get("whatsapp_id") or "").strip()
+        owners = identifier_owners.get(source, set()) if source else set()
+        target = next(iter(owners)) if len(owners) == 1 else ""
+        if source and len(owners) > 1 and current in owners:
+            target = current
+        if not target and not source and (remap_unidentified_to_primary or current not in by_phone):
+            target = primary_phone_id
+        if not target and not source and current in by_phone:
+            target = current
+        if not target:
+            unresolved += 1
+            continue
+
+        customer_id = document.get("customer_id")
+        if isinstance(customer_id, str) and customer_id:
+            key = (target, customer_id)
+            if key in final_keys and final_keys[key] != document.get("_id"):
+                collisions += 1
+            else:
+                final_keys[key] = document.get("_id")
+        expected_phone = by_phone[target].get("phone")
+        if current != target or document.get("business_phone") != expected_phone:
+            assignments[target].append(document.get("_id"))
+
+    return {
+        "assignments": dict(assignments),
+        "reassignments_by_phone_id": {
+            phone_id: len(document_ids) for phone_id, document_ids in assignments.items()
+        },
+        "reassignment_count": sum(len(values) for values in assignments.values()),
+        "collision_count": collisions,
+        "unresolved_count": unresolved,
+    }
+
+
+def _conversation_documents(db, org_id: str, maximum: int) -> list[dict]:
+    if maximum < 1:
+        raise ValueError("The conversation limit must be positive")
+    documents = list(db[f"conversations_{org_id}"].find(
+        {"platform": "whatsapp"},
+        {
+            "_id": 1,
+            "customer_id": 1,
+            "whatsapp_id": 1,
+            "business_phone_id": 1,
+            "business_phone": 1,
+        },
+    ).limit(maximum + 1))
+    if len(documents) > maximum:
+        raise ValueError(f"Organization {org_id} exceeds the bounded {maximum}-conversation repair limit")
+    return documents
+
+
+def _apply_conversation_mapping(db, org_id: str, plan: dict, connections: list[dict]) -> None:
+    conversations = db[f"conversations_{org_id}"]
+    by_phone = {
+        str(item.get("phone_id") or item.get("phone_number_id") or ""): item
+        for item in connections
+    }
+    for phone_id, document_ids in plan["assignments"].items():
+        connection = by_phone[phone_id]
+        for offset in range(0, len(document_ids), 1000):
+            conversations.update_many(
+                {"_id": {"$in": document_ids[offset:offset + 1000]}},
+                {"$set": {"business_phone_id": phone_id, "business_phone": connection.get("phone")}},
+            )
 
 
 def _org_checkpoint_id(org_id: str) -> str:
@@ -336,9 +457,27 @@ def _cross_org_ownership_errors(db, max_items: int) -> list[str]:
     return errors
 
 
-def _apply_org(db, org_id: str, actions: dict, now: datetime, renew_lease=lambda: None) -> None:
+def _apply_org(
+    db,
+    org_id: str,
+    actions: dict,
+    now: datetime,
+    renew_lease=lambda: None,
+    max_conversations: int = DEFAULT_MAX_CONVERSATIONS,
+) -> None:
     if renew_lease() is False:
         raise RuntimeError(f"Organization {org_id} lost its migration lease")
+    primary = next((item for item in actions["updates"] if item["slot"] == 1), None)
+    mapping = conversation_mapping_plan(
+        _conversation_documents(db, org_id, max_conversations),
+        actions["updates"],
+        primary["phone_id"],
+    ) if primary else {"reassignment_count": 0, "unresolved_count": 0, "assignments": {}}
+    if mapping["unresolved_count"]:
+        raise RuntimeError(
+            f"Organization {org_id} has {mapping['unresolved_count']} conversations "
+            "that cannot be mapped to a WhatsApp number"
+        )
     for wa_id in sorted({str(item["wa_id"]) for item in actions["updates"]}):
         try:
             db.whatsapp_waba_owners.update_one(
@@ -364,9 +503,7 @@ def _apply_org(db, org_id: str, actions: dict, now: datetime, renew_lease=lambda
             }},
         )
 
-    primary = None
     for update in actions["updates"]:
-        primary = update if update["slot"] == 1 else primary
         fields = {key: value for key, value in update.items() if key != "_id"}
         db.whatsapp_connections.update_one(
             {"_id": update["_id"]},
@@ -387,12 +524,8 @@ def _apply_org(db, org_id: str, actions: dict, now: datetime, renew_lease=lambda
         return
 
     db.organizations.update_one({"org_id": org_id}, {"$set": {"wa_id": primary["wa_id"]}})
-    conversations.update_many(
-        {"platform": "whatsapp", "$or": [
-            {"business_phone_id": {"$exists": False}}, {"business_phone_id": None},
-        ]},
-        {"$set": {"business_phone_id": primary["phone_id"], "business_phone": primary.get("phone")}},
-    )
+    _apply_conversation_mapping(db, org_id, mapping, actions["updates"])
+    actions["conversation_reassignment_count"] = mapping["reassignment_count"]
     if renew_lease() is False:
         raise RuntimeError(f"Organization {org_id} lost its migration lease")
     actions["merged_conversations"] = _merge_duplicate_conversations(db, org_id, primary["phone_id"], now)
@@ -438,12 +571,134 @@ def _create_and_verify_indexes(db, org_ids: list[str]) -> None:
             raise RuntimeError(f"WhatsApp conversation index could not be verified for {org_id}")
 
 
+def repair_mapping(
+    *,
+    apply: bool = False,
+    org_id: str,
+    primary_phone_id: str,
+    max_conversations: int = DEFAULT_MAX_CONVERSATIONS,
+) -> dict:
+    """Repair one migrated organization from preserved conversation WABA IDs."""
+    from database import get_mongo_db
+
+    db = get_mongo_db()
+    org_id = str(org_id or "").strip()
+    primary_phone_id = str(primary_phone_id or "").strip()
+    report = {
+        "errors": [],
+        "dry_run": not apply,
+        "applied": False,
+        "org_id": org_id,
+        "primary_phone_id": primary_phone_id,
+    }
+    connections = list(db.whatsapp_connections.find({
+        "org_id": org_id,
+        "is_active": {"$ne": False},
+    }).sort([("slot", 1), ("connected_at", 1)]))
+    matches = [
+        item for item in connections
+        if str(item.get("phone_id") or item.get("phone_number_id") or "") == primary_phone_id
+    ]
+    if len(matches) != 1:
+        report["errors"].append(
+            f"Organization {org_id} does not have exactly one active WhatsApp connection {primary_phone_id}"
+        )
+        return report
+    target = matches[0]
+    current = next((item for item in connections if item.get("slot") == 1), None)
+    current_flow_id = str((current or {}).get("wa_bot_flow_id") or "")
+    target_flow_id = str(target.get("wa_bot_flow_id") or "")
+    if current and current.get("_id") != target.get("_id") and current_flow_id and target_flow_id != current_flow_id:
+        if target_flow_id:
+            report["errors"].append(
+                "The requested primary and current primary have different WaBot flows; repair them explicitly first"
+            )
+
+    try:
+        mapping = conversation_mapping_plan(
+            _conversation_documents(db, org_id, max_conversations),
+            connections,
+            primary_phone_id,
+            remap_unidentified_to_primary=True,
+        )
+    except ValueError as exc:
+        report["errors"].append(str(exc))
+        return report
+    report.update({
+        "conversation_reassignment_count": mapping["reassignment_count"],
+        "conversation_reassignments_by_phone_id": mapping["reassignments_by_phone_id"],
+        "conversation_collision_count": mapping["collision_count"],
+        "unresolved_conversation_count": mapping["unresolved_count"],
+        "primary_phone": target.get("phone"),
+    })
+    if mapping["collision_count"]:
+        report["errors"].append(
+            f"Repair would create {mapping['collision_count']} duplicate sender/customer conversations"
+        )
+    if mapping["unresolved_count"]:
+        report["errors"].append(
+            f"Repair cannot identify the WhatsApp number for {mapping['unresolved_count']} conversations"
+        )
+    if report["errors"] or not apply:
+        return report
+
+    _apply_conversation_mapping(db, org_id, mapping, connections)
+    now = datetime.now(timezone.utc)
+    reordered = [target, *(item for item in connections if item.get("_id") != target.get("_id"))]
+    with db.client.start_session() as session:
+        with session.start_transaction():
+            for index, connection in enumerate(reordered, start=1):
+                db.whatsapp_connections.update_one(
+                    {"_id": connection["_id"]},
+                    {"$set": {"slot": -index, "updated_at": now}},
+                    session=session,
+                )
+            for slot, connection in enumerate(reordered, start=1):
+                db.whatsapp_connections.update_one(
+                    {"_id": connection["_id"]},
+                    {"$set": {"slot": slot, "updated_at": now}},
+                    session=session,
+                )
+            db.organizations.update_one(
+                {"org_id": org_id},
+                {"$set": {"wa_id": str(target.get("wa_id") or target.get("waba_id") or "")}},
+                session=session,
+            )
+            if current and current.get("_id") != target.get("_id") and current_flow_id:
+                db.whatsapp_connections.update_one(
+                    {"_id": current["_id"], "wa_bot_flow_id": current_flow_id},
+                    {"$unset": {"wa_bot_flow_id": ""}},
+                    session=session,
+                )
+                db.whatsapp_connections.update_one(
+                    {"_id": target["_id"]},
+                    {"$set": {"wa_bot_flow_id": current_flow_id}},
+                    session=session,
+                )
+            db.system_migrations.update_one(
+                {"_id": f"{MIGRATION_ID}:line_mapping:{org_id}"},
+                {"$set": {
+                    "migration_id": MIGRATION_ID,
+                    "org_id": org_id,
+                    "status": "complete",
+                    "primary_phone_id": primary_phone_id,
+                    "conversation_reassignment_count": mapping["reassignment_count"],
+                    "completed_at": now,
+                }},
+                upsert=True,
+                session=session,
+            )
+    report["applied"] = True
+    return report
+
+
 def migrate(
     apply: bool = False,
     org_id: str | None = None,
     org_batch_size: int = DEFAULT_ORG_BATCH_SIZE,
     max_rows_per_org: int = DEFAULT_MAX_ROWS_PER_ORG,
     report_items: int = DEFAULT_REPORT_ITEMS,
+    max_conversations: int = DEFAULT_MAX_CONVERSATIONS,
 ) -> dict:
     from database import get_mongo_db
 
@@ -481,7 +736,8 @@ def migrate(
                 f"Organization {selected_org_id} exceeds the bounded {max_rows_per_org}-row migration limit"
             )
             continue
-        org_plan = build_plan(rows)
+        organization = db.organizations.find_one({"org_id": selected_org_id}, {"wa_id": 1}) or {}
+        org_plan = build_plan(rows, {selected_org_id: str(organization.get("wa_id") or "")})
         report["errors"].extend(org_plan["errors"])
         actions = org_plan["organizations"].get(selected_org_id, {"updates": [], "delete_ids": []})
         active_flows = list(db[f"wa_bot_flows_{selected_org_id}"].find(
@@ -491,13 +747,24 @@ def migrate(
             report["errors"].append(f"Organization {selected_org_id} has multiple active WaBot flows")
         actions["active_flow_id"] = active_flows[0].get("flow_id") if len(active_flows) == 1 else None
         primary = next((item for item in actions["updates"] if item["slot"] == 1), None)
-        if not apply:
-            actions["conversation_merge_count"] = sum(
-                max(0, group["count"] - 1)
-                for group in _duplicate_conversation_groups(
-                    db[f"conversations_{selected_org_id}"], (primary or {}).get("phone_id", "")
+        if primary:
+            try:
+                mapping = conversation_mapping_plan(
+                    _conversation_documents(db, selected_org_id, max_conversations),
+                    actions["updates"],
+                    primary["phone_id"],
                 )
-            )
+                actions["conversation_reassignment_count"] = mapping["reassignment_count"]
+                actions["conversation_reassignments_by_phone_id"] = mapping["reassignments_by_phone_id"]
+                actions["conversation_merge_count"] = mapping["collision_count"]
+                actions["unresolved_conversation_count"] = mapping["unresolved_count"]
+                if mapping["unresolved_count"]:
+                    report["errors"].append(
+                        f"Organization {selected_org_id} has {mapping['unresolved_count']} conversations "
+                        "that cannot be mapped to a WhatsApp number"
+                    )
+            except ValueError as exc:
+                report["errors"].append(str(exc))
         report["organizations"][selected_org_id] = actions
 
     report["errors"] = sorted(set(report["errors"]))
@@ -519,6 +786,7 @@ def migrate(
                 renew_lease=lambda: renew_org_lease(
                     db, selected_org_id, owner, datetime.now(timezone.utc),
                 ),
+                max_conversations=max_conversations,
             )
             if not checkpoint_org(db, selected_org_id, owner, "data_complete", now):
                 raise RuntimeError(f"Organization {selected_org_id} lost its migration lease")
@@ -559,15 +827,31 @@ if __name__ == "__main__":
     parser.add_argument("--org-id", help="Migrate only one organization")
     parser.add_argument("--org-batch-size", type=int, default=DEFAULT_ORG_BATCH_SIZE)
     parser.add_argument("--max-rows-per-org", type=int, default=DEFAULT_MAX_ROWS_PER_ORG)
+    parser.add_argument("--max-conversations", type=int, default=DEFAULT_MAX_CONVERSATIONS)
     parser.add_argument("--max-report-items", type=int, default=DEFAULT_REPORT_ITEMS)
-    args = parser.parse_args()
-    report = migrate(
-        apply=args.apply,
-        org_id=args.org_id,
-        org_batch_size=args.org_batch_size,
-        max_rows_per_org=args.max_rows_per_org,
-        report_items=args.max_report_items,
+    parser.add_argument(
+        "--repair-primary-phone-id",
+        help="Repair one migrated organization and make this phone ID primary",
     )
+    args = parser.parse_args()
+    if args.repair_primary_phone_id and not args.org_id:
+        parser.error("--repair-primary-phone-id requires --org-id")
+    if args.repair_primary_phone_id:
+        report = repair_mapping(
+            apply=args.apply,
+            org_id=args.org_id,
+            primary_phone_id=args.repair_primary_phone_id,
+            max_conversations=args.max_conversations,
+        )
+    else:
+        report = migrate(
+            apply=args.apply,
+            org_id=args.org_id,
+            org_batch_size=args.org_batch_size,
+            max_rows_per_org=args.max_rows_per_org,
+            report_items=args.max_report_items,
+            max_conversations=args.max_conversations,
+        )
     print(json.dumps(bounded_report(report, args.max_report_items), default=str, indent=2))
     if report["errors"]:
         raise SystemExit(1)
