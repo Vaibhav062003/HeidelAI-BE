@@ -66,10 +66,14 @@ def test_connection_and_webhook_contracts():
         webhook.index("payload_str = body.decode('utf-8')")
     ]
     assert "account_id in DEV_WHATSAPP_WABA_IDS" in routing_source
+    assert "phone_number_ids & DEV_WHATSAPP_PHONE_IDS" in routing_source
+    assert 'DEV_WHATSAPP_PHONE_IDS = {"1248072875064563"}' in webhook
     assert "if not await forward_webhook_to_dev" in routing_source
     assert "return Response(status_code=503)" in routing_source
     assert 'object_type == "instagram"' in routing_source
     assert "background_tasks.add_task(forward_webhook_to_dev" in routing_source
+    assert 'if not isinstance(analytics.get("data_points"), list):' in details_source
+    assert 'analytics["data_points"] = []' in details_source
     assert '"webhook_status": "pending"' in auth_source
     assert '"webhook_status": connection.get("webhook_status")' in connection_service
     wa_service = source("services/wa_service.py")
