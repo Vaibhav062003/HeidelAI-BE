@@ -1,4 +1,15 @@
-from scripts.migrate_multi_whatsapp import build_plan, merge_conversation_documents, organization_waba_errors
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+from scripts.migrate_multi_whatsapp import (
+    bounded_report,
+    build_plan,
+    checkpoint_org,
+    claim_org_lease,
+    merge_conversation_documents,
+    organization_waba_errors,
+    renew_org_lease,
+)
 
 
 def _connection(row_id, org_id, phone_id, wa_id="waba-1", connected_at="2026-01-01", **extra):
@@ -117,6 +128,61 @@ def test_preflight_rejects_waba_owners():
     ]) == ["WABA waba is assigned to multiple organizations: ['org-1', 'org-2']"]
 
 
+class LeaseCollection:
+    def __init__(self):
+        self.document = None
+
+    def find_one_and_update(self, query, update, **_kwargs):
+        if self.document:
+            status_allowed = self.document.get("status") not in query["status"]["$nin"]
+            now = query["$or"][0]["lease_until"]["$lt"]
+            lease_allowed = (
+                self.document.get("lease_until") is None
+                or self.document.get("lease_until") < now
+                or self.document.get("lease_owner") == query["$or"][2]["lease_owner"]
+            )
+            if not status_allowed or not lease_allowed:
+                return None
+        self.document = {**(self.document or {"_id": query["_id"]}), **update.get("$setOnInsert", {}), **update["$set"]}
+        return dict(self.document)
+
+    def update_one(self, query, update):
+        if not self.document or any(self.document.get(key) != value for key, value in query.items()):
+            return SimpleNamespace(modified_count=0)
+        self.document.update(update.get("$set", {}))
+        for key in update.get("$unset", {}):
+            self.document.pop(key, None)
+        return SimpleNamespace(modified_count=1)
+
+
+def test_org_lease_fences_overlap_and_can_be_renewed_and_checkpointed():
+    leases = LeaseCollection()
+    db = SimpleNamespace(system_migrations=leases)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert claim_org_lease(db, "org", "worker-a", start, lease_seconds=60)
+    assert not claim_org_lease(db, "org", "worker-b", start + timedelta(seconds=30), lease_seconds=60)
+    assert renew_org_lease(db, "org", "worker-a", start + timedelta(seconds=50), lease_seconds=60)
+    assert not claim_org_lease(db, "org", "worker-b", start + timedelta(seconds=90), lease_seconds=60)
+    assert checkpoint_org(db, "org", "worker-a", "data_complete", start + timedelta(seconds=91))
+    assert not claim_org_lease(db, "org", "worker-b", start + timedelta(hours=2), lease_seconds=60)
+
+
+def test_cli_report_is_bounded_without_losing_counts():
+    report = {
+        "errors": ["one", "two", "three"],
+        "organizations": {
+            "org-1": {"updates": [{"_id": 1}, {"_id": 2}], "delete_ids": [1, 2]},
+            "org-2": {"updates": [], "delete_ids": []},
+        },
+    }
+    output = bounded_report(report, 1)
+    assert output["error_count"] == 3
+    assert output["errors"] == ["one"]
+    assert list(output["organizations"]) == ["org-1"]
+    assert output["organizations"]["org-1"]["updates"] == [{"_id": 1}]
+    assert output["output_truncated"] is True
+
+
 if __name__ == "__main__":
     test_plan_deduplicates_reconnects_and_assigns_two_slots()
     test_plan_backfills_legacy_identifier_aliases()
@@ -126,4 +192,6 @@ if __name__ == "__main__":
     test_plan_accepts_fifty_numbers_and_rejects_fifty_one()
     test_duplicate_conversations_keep_newest_state_and_oldest_start()
     test_preflight_rejects_waba_owners()
+    test_org_lease_fences_overlap_and_can_be_renewed_and_checkpointed()
+    test_cli_report_is_bounded_without_losing_counts()
     print("Multi-number WhatsApp migration tests passed.")

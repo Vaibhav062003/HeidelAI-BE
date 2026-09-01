@@ -31,10 +31,11 @@ def test_connection_and_webhook_contracts():
     assert "token_response = requests" not in auth_source
     assert "phone_response = requests" not in auth_source
     assert "webhook_response = requests" not in auth_source
-    assert auth_source.index("pending_reconnect") < auth_source.index("token_url")
-    details_source = routes[routes.index("async def get_whatsapp_details"):routes.index('@router.get("/{whatsapp_id}/analytics/conversations")')]
-    assert "user: CurrentUser" in details_source
-    assert "_find_owned_whatsapp_connection(user.org_id" in details_source
+    assert auth_source.count("await _fence_whatsapp_reconnect_cleanup") == 2
+    assert auth_source.index("await _fence_whatsapp_reconnect_cleanup") < auth_source.index("token_url")
+    assert '@router.get("/connections/{phone_id}/details")' in routes
+    details_source = routes[routes.index("async def _get_whatsapp_details"):routes.index('@router.get("/{whatsapp_id}/analytics/conversations")')]
+    assert "_find_owned_whatsapp_connection(org_id" in details_source
     assert "httpx.AsyncClient" in details_source
     assert "requests.get" not in details_source
     assert 'headers = {"Authorization": f"Bearer {connection[\'access_token\']}"}' in details_source
@@ -62,6 +63,7 @@ def test_scoped_archive_and_cleanup_contracts():
     assert '{"conversation_id": {"$in": conversation_ids}}, session=session' in service
     assert 'archived["note_id"] = str(archived.get("note_id") or archived.get("_id"))' in service
     assert "async def deactivate_whatsapp_connection" in service
+    assert "await asyncio.to_thread(_deactivate_whatsapp_connection_sync" in service
     assert '"is_active": False' in service
     assert "archive_whatsapp_data" not in platform
     assert 'archived_private_notes_' in scheduler
@@ -70,11 +72,12 @@ def test_scoped_archive_and_cleanup_contracts():
     assert '"provider_revoke_status": {"$in": ["pending", "failed"]}' in service
     assert "async def run_whatsapp_revocation_reconciler" in service
     assert "asyncio.create_task(run_whatsapp_revocation_reconciler())" in source("core/lifespan.py")
+    assert "/subscribed_apps" in service
+    assert "/me/permissions" not in service
 
 
 def test_deployment_starts_the_api_without_running_migrations():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    migration = source("scripts/migrate_multi_whatsapp.py")
     deploy_dev = (ROOT / ".github/workflows/deploy-dev.yml").read_text(encoding="utf-8")
     deploy_main = (ROOT / ".github/workflows/deploy-main.yml").read_text(encoding="utf-8")
 
@@ -88,9 +91,16 @@ def test_deployment_starts_the_api_without_running_migrations():
     assert "koyeb service update" in deploy_main
     assert "--wait --wait-timeout 15m" in deploy_dev
     assert "--wait --wait-timeout 15m" in deploy_main
-    assert migration.index('plan["verified_indexes"] = True') < migration.index(
-        '{"_id": MIGRATION_ID},\n        {"$set": {"status": "complete"'
-    )
+
+
+def test_migration_is_dry_run_bounded_and_cli_only():
+    migration = source("scripts/migrate_multi_whatsapp.py")
+    assert "def migrate(\n    apply: bool = False" in migration
+    assert 'parser.add_argument("--org-id"' in migration
+    assert 'parser.add_argument("--org-batch-size"' in migration
+    assert "claim_org_lease" in migration and "checkpoint_org" in migration
+    assert "organization_waba_unique" not in migration
+    assert "migrate_multi_whatsapp" not in source("core/lifespan.py")
 
 
 def test_number_scoped_query_and_flow_binding_contracts():
@@ -133,20 +143,29 @@ def test_primary_phone_scope_keeps_legacy_conversations_visible():
         "platform": "whatsapp",
         "business_phone_id": "secondary",
     }
-    legacy = [
+    corrupt = [
         {"phone_id": "one", "wa_id": "waba", "slot": 1},
         {"phone_id": "two", "wa_id": "waba", "slot": 1},
         {"phone_id": "three", "wa_id": "waba", "slot": 1},
     ]
-    assert [item["slot"] for item in public_connections(legacy)] == [1, 2, 3]
-    assert [item["is_primary"] for item in public_connections(legacy)] == [True, False, False]
+    try:
+        public_connections(corrupt)
+        raise AssertionError("response serialization must not mask corrupt slots")
+    except ValueError:
+        pass
+    valid = [
+        {"phone_id": "one", "wa_id": "waba", "slot": 1},
+        {"phone_id": "two", "wa_id": "waba", "slot": 2},
+        {"phone_id": "three", "wa_id": "waba", "slot": 3},
+    ]
+    assert [item["slot"] for item in public_connections(valid)] == [1, 2, 3]
     historical = public_historical_connections([
         {"phone_id": "one", "is_active": False, "last_slot": 1},
         {"phone_id": "one", "is_active": False, "last_slot": 2},
     ])
     assert len(historical) == 1 and historical[0]["is_active"] is False
     assert choose_connection_slot(
-        legacy,
+        valid,
         phone_number_id="four",
         waba_id="waba",
         limit=50,
@@ -157,13 +176,39 @@ def test_primary_phone_scope_keeps_legacy_conversations_visible():
         waba_id="waba-two",
         limit=50,
     )[0] == 2
-    assert "Fetched WhatsApp connection: {connection}" not in source("api/wa_routes.py")
+    routes = source("api/wa_routes.py")
+    assert "Fetched WhatsApp connection: {connection}" not in routes
+    assert 'logger.success(f"Fetched WhatsApp connection: {connection}")' not in routes
+
+
+def test_whatsapp_credentials_cannot_be_interpolated_into_logs():
+    tree = ast.parse(source("api/wa_routes.py"))
+    for call in ast.walk(tree):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "logger"
+        ):
+            continue
+        logged_names = {
+            node.id for argument in call.args for node in ast.walk(argument)
+            if isinstance(node, ast.Name)
+        }
+        logged_fields = {
+            node.value for argument in call.args for node in ast.walk(argument)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        assert "connection" not in logged_names
+        assert "access_token" not in logged_fields
 
 
 if __name__ == "__main__":
     test_connection_and_webhook_contracts()
     test_scoped_archive_and_cleanup_contracts()
     test_deployment_starts_the_api_without_running_migrations()
+    test_migration_is_dry_run_bounded_and_cli_only()
     test_number_scoped_query_and_flow_binding_contracts()
     test_primary_phone_scope_keeps_legacy_conversations_visible()
+    test_whatsapp_credentials_cannot_be_interpolated_into_logs()
     print("Multi-number WhatsApp backend contracts passed.")
