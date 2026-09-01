@@ -75,8 +75,12 @@ def test_scoped_archive_and_cleanup_contracts():
 def test_deployment_runs_the_verified_migration_before_serving():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     migration = source("scripts/migrate_multi_whatsapp.py")
+    deploy_dev = (ROOT / ".github/workflows/deploy-dev.yml").read_text(encoding="utf-8")
+    deploy_main = (ROOT / ".github/workflows/deploy-main.yml").read_text(encoding="utf-8")
 
     assert "python -m scripts.migrate_multi_whatsapp --apply && exec uvicorn" in dockerfile
+    assert "--wait --wait-timeout 15m" in deploy_dev
+    assert "--wait --wait-timeout 15m" in deploy_main
     assert migration.index('plan["verified_indexes"] = True') < migration.index(
         '{"_id": MIGRATION_ID},\n        {"$set": {"status": "complete"'
     )
@@ -140,6 +144,13 @@ def test_primary_phone_scope_keeps_legacy_conversations_visible():
         waba_id="waba",
         limit=50,
     )[0] == 4
+    assert choose_connection_slot(
+        [{"phone_id": "one", "wa_id": "waba-one", "slot": 1}],
+        phone_number_id="two",
+        waba_id="waba-two",
+        limit=50,
+    )[0] == 2
+    assert "Fetched WhatsApp connection: {connection}" not in source("api/wa_routes.py")
 
 
 if __name__ == "__main__":

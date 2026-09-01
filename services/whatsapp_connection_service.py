@@ -48,14 +48,12 @@ def choose_connection_slot(
     waba_id: str,
     limit: int,
 ) -> tuple[int, Optional[dict]]:
-    """Validate same-WABA/capacity rules and return a stable connection slot."""
+    """Validate capacity rules and return a stable connection slot."""
     connections = [row for row in existing_connections if row.get("is_active") is not False]
     existing = next(
         (row for row in connections if str(row.get("phone_id") or row.get("phone_number_id") or "") == phone_number_id),
         None,
     )
-    if any(str(row.get("wa_id") or row.get("waba_id") or "") != waba_id for row in connections):
-        raise ValueError("All WhatsApp numbers in an organization must belong to the same WABA")
     if not existing and len(connections) >= limit:
         raise ValueError(f"This organization can connect at most {limit} WhatsApp number{'s' if limit != 1 else ''}")
 

@@ -36,21 +36,102 @@ def _label(connection: dict, slot: int, used: set[str]) -> tuple[str, str]:
     return candidate, key
 
 
-def conversation_key_errors(org_id: str, conversations: list[dict], primary_phone_id: str) -> list[str]:
-    seen = {}
-    errors = []
-    for conversation in conversations:
-        customer_id = str(conversation.get("customer_id") or "").strip()
-        phone_id = str(conversation.get("business_phone_id") or primary_phone_id or "").strip()
-        if not customer_id or not phone_id:
-            errors.append(f"WhatsApp conversation {conversation.get('_id')} in {org_id} has no customer or sender id")
+def merge_conversation_documents(documents: list[dict], business_phone_id: str) -> dict:
+    """Keep the newest conversation state while preserving older non-null fields."""
+    ordered = sorted(
+        documents,
+        key=lambda row: (
+            str(row.get("last_message_timestamp") or row.get("updated_at") or row.get("created_at") or ""),
+            str(row.get("_id") or ""),
+        ),
+    )
+    if len(ordered) < 2:
+        raise ValueError("At least two conversation documents are required")
+    survivor = ordered[-1]
+    merged = {}
+    for document in ordered:
+        merged.update({key: value for key, value in document.items() if value is not None})
+    merged["business_phone_id"] = str(business_phone_id)
+    merged["customer_id"] = str(survivor.get("customer_id") or "")
+    for field in ("created_at", "started_at"):
+        values = [document[field] for document in ordered if document.get(field) is not None]
+        if values:
+            merged[field] = min(values, key=str)
+    for field in ("message_counter", "unread_count"):
+        values = [document.get(field) for document in ordered if isinstance(document.get(field), int)]
+        if values:
+            merged[field] = max(values)
+    return {
+        "survivor_id": survivor["_id"],
+        "duplicate_ids": [document["_id"] for document in ordered[:-1]],
+        "conversation_ids": sorted({
+            str(document.get("conversation_id")) for document in ordered if document.get("conversation_id")
+        }),
+        "document": {key: value for key, value in merged.items() if key != "_id"},
+    }
+
+
+def _duplicate_conversation_groups(conversations, primary_phone_id: str):
+    return conversations.aggregate([
+        {"$match": {"platform": "whatsapp", "customer_id": {"$type": "string"}}},
+        {"$group": {
+            "_id": {
+                "business_phone_id": {"$ifNull": ["$business_phone_id", primary_phone_id]},
+                "customer_id": "$customer_id",
+            },
+            "document_ids": {"$push": "$_id"},
+            "count": {"$sum": 1},
+        }},
+        {"$match": {"count": {"$gt": 1}}},
+    ], allowDiskUse=True)
+
+
+def _merge_duplicate_conversations(db, org_id: str, primary_phone_id: str, now: datetime) -> int:
+    conversations = db[f"conversations_{org_id}"]
+    contacts = db[f"contacts_{org_id}"]
+    archive = db[f"archived_duplicate_conversations_{org_id}"]
+    merged_count = 0
+    for group in _duplicate_conversation_groups(conversations, primary_phone_id):
+        documents = list(conversations.find({"_id": {"$in": group["document_ids"]}}))
+        if len(documents) < 2:
             continue
-        key = (phone_id, customer_id)
-        if key in seen:
-            errors.append(f"WhatsApp conversations {seen[key]} and {conversation.get('_id')} in {org_id} share sender/customer {key}")
-        else:
-            seen[key] = conversation.get("_id")
-    return errors
+        merge = merge_conversation_documents(documents, group["_id"]["business_phone_id"])
+        canonical_id = str(merge["document"].get("conversation_id") or "")
+        old_ids = [value for value in merge["conversation_ids"] if value != canonical_id]
+        for document in documents:
+            if document["_id"] in merge["duplicate_ids"]:
+                archive.replace_one(
+                    {"_id": document["_id"]},
+                    {**document, "migration_archived_at": now, "merged_into": canonical_id},
+                    upsert=True,
+                )
+        if old_ids:
+            for collection_name in (f"messages_{org_id}", f"private_notes_{org_id}"):
+                db[collection_name].update_many(
+                    {"conversation_id": {"$in": old_ids}},
+                    {"$set": {"conversation_id": canonical_id}},
+                )
+            for collection_name in ("scheduled_messages", "automation_scheduled_followups"):
+                db[collection_name].update_many(
+                    {"org_id": org_id, "conversation_id": {"$in": old_ids}},
+                    {"$set": {"conversation_id": canonical_id}},
+                )
+            contacts.update_many(
+                {"conversation_id": {"$in": old_ids}},
+                {"$set": {"conversation_id": canonical_id}},
+            )
+            contacts.update_many(
+                {"conversation_ids": {"$in": old_ids}},
+                {"$addToSet": {"conversation_ids": canonical_id}},
+            )
+            contacts.update_many(
+                {"conversation_ids": {"$in": old_ids}},
+                {"$pull": {"conversation_ids": {"$in": old_ids}}},
+            )
+        conversations.update_one({"_id": merge["survivor_id"]}, {"$set": merge["document"]})
+        conversations.delete_many({"_id": {"$in": merge["duplicate_ids"]}})
+        merged_count += len(merge["duplicate_ids"])
+    return merged_count
 
 
 def organization_waba_errors(organizations: list[dict]) -> list[str]:
@@ -109,11 +190,8 @@ def build_plan(connections: list[dict]) -> dict:
             duplicate_ids.extend(item["_id"] for item in ordered[1:])
             duplicate_ids.extend(item["_id"] for item in same_phone if item.get("is_active") is False)
 
-        waba_ids = {str(item["wa_id"]) for item in distinct}
         if len(distinct) > MAX_WHATSAPP_CONNECTIONS:
             errors.append(f"Organization {org_id} has {len(distinct)} distinct WhatsApp numbers")
-        if len(waba_ids) > 1:
-            errors.append(f"Organization {org_id} has mixed WABAs: {sorted(waba_ids)}")
         used_labels: set[str] = set()
         updates = []
         for slot, connection in enumerate(sorted(distinct, key=_connected_at), start=1):
@@ -150,10 +228,13 @@ def migrate(apply: bool = False) -> dict:
             plan["errors"].append(f"Organization {org_id} has multiple active WaBot flows")
         actions["active_flow_id"] = active_flows[0].get("flow_id") if len(active_flows) == 1 else None
         primary = next((item for item in actions["updates"] if item["slot"] == 1), None)
-        conversations = list(db[f"conversations_{org_id}"].find({"platform": "whatsapp"}, {
-            "_id": 1, "customer_id": 1, "business_phone_id": 1,
-        }))
-        plan["errors"].extend(conversation_key_errors(org_id, conversations, (primary or {}).get("phone_id", "")))
+        if not apply:
+            actions["conversation_merge_count"] = sum(
+                max(0, group["count"] - 1)
+                for group in _duplicate_conversation_groups(
+                    db[f"conversations_{org_id}"], (primary or {}).get("phone_id", "")
+                )
+            )
 
     plan["errors"].extend(organization_waba_errors(list(db.organizations.find(
         {"wa_id": {"$type": "string"}}, {"_id": 1, "org_id": 1, "wa_id": 1},
@@ -207,6 +288,9 @@ def migrate(apply: bool = False) -> dict:
             ]},
             {"$set": {"business_phone_id": primary["phone_id"], "business_phone": primary.get("phone")}},
         )
+        actions["merged_conversations"] = _merge_duplicate_conversations(
+            db, org_id, primary["phone_id"], now,
+        )
 
         contacts = db[f"contacts_{org_id}"]
         for contact in contacts.find({"platform": "whatsapp", "phone_number": {"$type": "string"}}, {"phone_number": 1}):
@@ -228,7 +312,11 @@ def migrate(apply: bool = False) -> dict:
         conversations.create_index(
             [("platform", 1), ("business_phone_id", 1), ("customer_id", 1)],
             unique=True,
-            partialFilterExpression={"platform": "whatsapp", "business_phone_id": {"$type": "string"}},
+            partialFilterExpression={
+                "platform": "whatsapp",
+                "business_phone_id": {"$type": "string"},
+                "customer_id": {"$type": "string"},
+            },
             name="whatsapp_phone_customer_unique",
         )
 
