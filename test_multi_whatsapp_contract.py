@@ -60,6 +60,25 @@ def test_connection_and_webhook_contracts():
     assert "status_code=503" in webhook
     assert 'connection.get("wa_bot_flow_id")' in webhook
     assert 'business_phone_id=business_phone_id' in webhook
+    assert '"1248072875064563"' in webhook
+    routing_source = webhook[
+        webhook.index('if ENVIRONMENT == "production"'):
+        webhook.index("payload_str = body.decode('utf-8')")
+    ]
+    assert "account_id in DEV_WHATSAPP_WABA_IDS" in routing_source
+    assert "if not await forward_webhook_to_dev" in routing_source
+    assert "return Response(status_code=503)" in routing_source
+    assert 'object_type == "instagram"' in routing_source
+    assert "background_tasks.add_task(forward_webhook_to_dev" in routing_source
+    assert '"webhook_status": "pending"' in auth_source
+    assert '"webhook_status": connection.get("webhook_status")' in connection_service
+    wa_service = source("services/wa_service.py")
+    store_source = wa_service[
+        wa_service.index("async def store_whatsapp_message"):
+        wa_service.index("async def send_whatsapp_message")
+    ]
+    assert '"webhook_status": "healthy"' in store_source
+    assert '"last_webhook_at": received_at' in store_source
     assert 'len(value) > 24' in connection_service
     assert 'MAX_WHATSAPP_CONNECTIONS = 50' in connection_service
 

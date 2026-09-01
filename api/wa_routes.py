@@ -847,6 +847,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "access_token": access_token,
             "updated_at": now,
             "is_active": True,
+            "webhook_status": "pending",
             "business_info": {
                 "status": "Active"
             }
@@ -872,6 +873,8 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
                         "provider_revoke_attempts": "",
                         "provider_revoke_updated_at": "",
                         "superseded_by": "",
+                        "last_webhook_at": "",
+                        "webhook_error": "",
                     },
                 },
                 upsert=True,
@@ -1169,6 +1172,8 @@ async def _get_whatsapp_details(org_id: str, selector: str):
             "user_id": connection.get("user_id"),
             "wa_id": whatsapp_business_id,
             "phone_id": phone_id,
+            "webhook_status": connection.get("webhook_status"),
+            "last_webhook_at": connection.get("last_webhook_at"),
         },
     }
 

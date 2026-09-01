@@ -49,6 +49,12 @@ from services.shopify_service import record_whatsapp_preference, record_whatsapp
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
 
+DEV_WHATSAPP_WABA_IDS = {
+    value
+    for value in (SAHIL_WA_ID, EGENIE_WA_ID, "1248072875064563")
+    if value
+}
+
 
 async def pricing_runtime_mode(org_id: str) -> str:
     """Read rollout mode; retain the legacy allowlist as an outage fallback."""
@@ -138,10 +144,14 @@ def _apply_call_lifecycle(collection, org_id: str, call_id: str, existing: dict,
             return current
     return current
 
-async def forward_webhook_to_dev(body: bytes, headers: dict):
+async def forward_webhook_to_dev(body: bytes, headers: dict) -> bool:
     """
     Forwards the raw webhook body and necessary headers to the dev environment.
     """
+    if not DEV_WEBHOOK_URL:
+        logger.error("Failed to forward webhook to Dev: DEV_WEBHOOK_URL is not configured")
+        return False
+
     async with httpx.AsyncClient() as client:
         try:
             # We use `content=body` to send the exact raw bytes, 
@@ -149,8 +159,10 @@ async def forward_webhook_to_dev(body: bytes, headers: dict):
             response = await client.post(DEV_WEBHOOK_URL, content=body, headers=headers)
             response.raise_for_status()
             logger.info(f"Successfully replicated webhook to Dev. Status: {response.status_code}")
+            return True
         except Exception as e:
             logger.error(f"Failed to forward webhook to Dev: {e}")
+            return False
             
 async def forward_webhook_to_test(body: bytes, headers: dict):
     """
@@ -487,8 +499,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         except (KeyError, IndexError):
             logger.warning("Could not extract entry[0].id from webhook payload")
     
-        if (object_type == "whatsapp_business_account" and (account_id == SAHIL_WA_ID or account_id == EGENIE_WA_ID )) or (object_type == "instagram" and (account_id == SAHIL_IG_ID or account_id == EGENIE_IG_ID)):
-            logger.info(f"WhatsApp/Instagram webhook matched allowed account {account_id}. Forwarding.")
+        if object_type == "whatsapp_business_account" and account_id in DEV_WHATSAPP_WABA_IDS:
+            logger.info(f"WhatsApp webhook matched development WABA {account_id}. Forwarding.")
+            forward_headers = {
+                key: value
+                for key, value in request.headers.items()
+                if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
+            }
+            if not await forward_webhook_to_dev(body=body, headers=forward_headers):
+                return Response(status_code=503)
+            return Response(status_code=200)
+
+        if object_type == "instagram" and account_id in {SAHIL_IG_ID, EGENIE_IG_ID}:
+            logger.info(f"Instagram webhook matched allowed account {account_id}. Forwarding.")
             forward_headers = {
                 key: value
                 for key, value in request.headers.items()
@@ -1116,6 +1139,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context_type=context_type,
                                         context=context,
                                         notify_push=True,
+                                        business_phone_id=business_phone_id,
                                     )
 
                                 # === Purchase Intent Background Check ===
@@ -1480,6 +1504,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context_type=context_type,
                                         context=context,
                                         notify_push=True,
+                                        business_phone_id=business_phone_id,
                                     )
                                 except Exception:
                                     services.processed_message_ids.pop(message_id, None)
@@ -1628,6 +1653,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context_type=context_type,
                                         context=context,
                                         notify_push=True,
+                                        business_phone_id=business_phone_id,
                                     )
 
                                 if await handle_followup_customer_reply(org_id, conversation_id, content or "Interactive reply"):
@@ -1972,6 +1998,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 context_type=context_type,
                                 context=context,
                                 notify_push=True,
+                                business_phone_id=business_phone_id,
                             )
 
                             if await handle_followup_customer_reply(org_id, conversation_id, content):
