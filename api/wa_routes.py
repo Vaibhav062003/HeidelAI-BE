@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import cloudinary
 from loguru import logger
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, OperationFailure
 from fastapi import (
     Form,
     File,
@@ -817,6 +817,14 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             except DuplicateKeyError:
                 logger.warning(
                     "Skipped legacy WhatsApp {} unique index for org {} because duplicate records exist",
+                    index_field,
+                    org_id,
+                )
+            except OperationFailure as exc:
+                if exc.code not in {85, 86}:
+                    raise
+                logger.warning(
+                    "Kept existing legacy WhatsApp {} index for org {} because its options differ",
                     index_field,
                     org_id,
                 )
