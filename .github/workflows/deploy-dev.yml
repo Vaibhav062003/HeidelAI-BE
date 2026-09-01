@@ -46,7 +46,7 @@ jobs:
 
       - name: Redeploy Koyeb Instance
         # Replace 'heidelai-backend-dev' with your actual DEV service name
-        run: koyeb service redeploy heidelai-dev/heidelai-dev
+        run: koyeb service redeploy heidelai-dev/heidelai-dev --wait --wait-timeout 15m
 
       - name: Verify API health
         run: curl --fail --retry 30 --retry-delay 10 --retry-all-errors https://heidelai-dev.koyeb.app/health

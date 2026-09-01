@@ -1,4 +1,4 @@
-from scripts.migrate_multi_whatsapp import build_plan, conversation_key_errors, organization_waba_errors
+from scripts.migrate_multi_whatsapp import build_plan, merge_conversation_documents, organization_waba_errors
 
 
 def _connection(row_id, org_id, phone_id, wa_id="waba-1", connected_at="2026-01-01", **extra):
@@ -43,7 +43,7 @@ def test_plan_backfills_legacy_identifier_aliases():
     assert update["wa_id"] == "waba-1"
 
 
-def test_plan_refuses_cross_org_ownership_and_mixed_wabas():
+def test_plan_refuses_cross_org_ownership_and_allows_mixed_wabas():
     plan = build_plan([
         _connection("one", "org-1", "phone-1", "waba-1"),
         _connection("two", "org-1", "phone-2", "waba-2"),
@@ -52,7 +52,7 @@ def test_plan_refuses_cross_org_ownership_and_mixed_wabas():
 
     errors = "\n".join(plan["errors"])
     assert "multiple organizations" in errors
-    assert "mixed WABAs" in errors
+    assert "mixed WABAs" not in errors
 
 
 def test_plan_prefers_active_reconnect_and_does_not_resurrect_inactive_rows():
@@ -87,12 +87,30 @@ def test_plan_accepts_fifty_numbers_and_rejects_fifty_one():
     )
 
 
-def test_preflight_rejects_duplicate_conversation_keys_and_waba_owners():
-    errors = conversation_key_errors("org-1", [
-        {"_id": "legacy", "customer_id": "customer"},
-        {"_id": "bound", "customer_id": "customer", "business_phone_id": "primary"},
-    ], "primary")
-    assert len(errors) == 1 and "share sender/customer" in errors[0]
+def test_duplicate_conversations_keep_newest_state_and_oldest_start():
+    merged = merge_conversation_documents([
+        {
+            "_id": "old", "conversation_id": "legacy", "customer_id": "customer",
+            "created_at": "2026-01-01", "last_message_timestamp": "2026-01-02",
+            "message_counter": 5, "unread_count": 1, "customer_name": "Old",
+        },
+        {
+            "_id": "new", "conversation_id": "sender-aware", "customer_id": "customer",
+            "created_at": "2026-01-03", "last_message_timestamp": "2026-01-04",
+            "message_counter": 3, "unread_count": 2, "customer_name": "Current",
+        },
+    ], "phone")
+    assert merged["survivor_id"] == "new"
+    assert merged["duplicate_ids"] == ["old"]
+    assert merged["conversation_ids"] == ["legacy", "sender-aware"]
+    assert merged["document"]["business_phone_id"] == "phone"
+    assert merged["document"]["created_at"] == "2026-01-01"
+    assert merged["document"]["message_counter"] == 5
+    assert merged["document"]["unread_count"] == 2
+    assert merged["document"]["customer_name"] == "Current"
+
+
+def test_preflight_rejects_waba_owners():
     assert organization_waba_errors([
         {"org_id": "org-1", "wa_id": "waba"},
         {"org_id": "org-2", "wa_id": "waba"},
@@ -102,9 +120,10 @@ def test_preflight_rejects_duplicate_conversation_keys_and_waba_owners():
 if __name__ == "__main__":
     test_plan_deduplicates_reconnects_and_assigns_two_slots()
     test_plan_backfills_legacy_identifier_aliases()
-    test_plan_refuses_cross_org_ownership_and_mixed_wabas()
+    test_plan_refuses_cross_org_ownership_and_allows_mixed_wabas()
     test_plan_prefers_active_reconnect_and_does_not_resurrect_inactive_rows()
     test_plan_keeps_generated_labels_unique_when_defaults_are_already_used()
     test_plan_accepts_fifty_numbers_and_rejects_fifty_one()
-    test_preflight_rejects_duplicate_conversation_keys_and_waba_owners()
+    test_duplicate_conversations_keep_newest_state_and_oldest_start()
+    test_preflight_rejects_waba_owners()
     print("Multi-number WhatsApp migration tests passed.")

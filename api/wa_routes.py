@@ -117,7 +117,11 @@ def _initialize_whatsapp_schema(org_id: str) -> None:
     )
     db[f"conversations_{org_id}"].create_index(
         [("platform", 1), ("business_phone_id", 1), ("customer_id", 1)], unique=True,
-        partialFilterExpression={"platform": "whatsapp", "business_phone_id": {"$type": "string"}},
+        partialFilterExpression={
+            "platform": "whatsapp",
+            "business_phone_id": {"$type": "string"},
+            "customer_id": {"$type": "string"},
+        },
         name="whatsapp_phone_customer_unique",
     )
     db.organizations.update_one(
@@ -1884,7 +1888,7 @@ async def get_whatsapp_profile(request: Request, user: CurrentUser):
             {"wa_id": wa_id, "org_id": org_id},
             {"_id": 0}
         )
-        logger.success(f"Fetched WhatsApp connection: {connection} for wa_id: {wa_id}")
+        logger.success("Fetched WhatsApp connection for wa_id: {}", wa_id)
 
         if not connection or not connection.get("access_token"):
             raise HTTPException(status_code=404, detail="WhatsApp connection not found or inactive")

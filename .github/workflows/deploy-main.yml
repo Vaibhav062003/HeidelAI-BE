@@ -45,7 +45,7 @@ jobs:
           api_token: ${{ secrets.KOYEB_TOKEN_PROD }}
 
       - name: Redeploy Koyeb Instance
-        run: koyeb service redeploy backend/backend
+        run: koyeb service redeploy backend/backend --wait --wait-timeout 15m
 
       - name: Verify API health
         run: curl --fail --retry 30 --retry-delay 10 --retry-all-errors https://api.heidelai.com/health
