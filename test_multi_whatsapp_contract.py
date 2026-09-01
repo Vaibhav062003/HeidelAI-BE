@@ -42,6 +42,8 @@ def test_connection_and_webhook_contracts():
     ]
     assert "collection.create_index(index_field, unique=True)" in legacy_indexes
     assert "except DuplicateKeyError:" in legacy_indexes
+    assert "except OperationFailure as exc:" in legacy_indexes
+    assert "if exc.code not in {85, 86}:" in legacy_indexes
     assert auth_source.count("await _fence_whatsapp_reconnect_cleanup") == 2
     assert auth_source.index("await _fence_whatsapp_reconnect_cleanup") < auth_source.index("token_url")
     assert '@router.get("/connections/{phone_id}/details")' in routes
