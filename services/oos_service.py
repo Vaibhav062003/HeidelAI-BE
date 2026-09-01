@@ -32,6 +32,14 @@ PENDING_SEND_BATCH = 100
 SHEET_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
+def canonical_brand(value: Optional[str]) -> str:
+    """Normalize brand casing, hyphens, and whitespace for consistent dealer matching."""
+    if not value:
+        return ""
+    key = " ".join(value.casefold().replace("-", " ").split())
+    return {"lianli": "lian li"}.get(key, key)
+
+
 def is_within_dealer_hours() -> bool:
     return True
 
@@ -147,15 +155,22 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     all_dealers = await fetch_dealer_directory(org_id)
 
     # Filter by brand if known or detected in raw query
-    raw_query = (oos_doc.get("raw_query_text", "") or "").lower()
-    known_brands = ["lenovo", "asus", "dell", "msi", "hp", "apple", "mac", "macbook", "acer", "samsung", "gigabyte"]
+    raw_query_raw = oos_doc.get("raw_query_text", "") or ""
+    raw_query = raw_query_raw.lower()
+    normalized_raw_query = " ".join(raw_query.replace("-", " ").split())
+    compact_raw_query = normalized_raw_query.replace(" ", "")
+    known_brands = [
+        "lenovo", "asus", "dell", "msi", "hp", "apple", "mac", "macbook",
+        "acer", "samsung", "gigabyte", "lian li", "lianli", "nzxt"
+    ]
     detected_brand = None
     if brand:
-        detected_brand = brand.strip().lower()
+        detected_brand = canonical_brand(brand)
     else:
         for kb in known_brands:
-            if kb in raw_query:
-                detected_brand = kb
+            canonical_kb = canonical_brand(kb)
+            if canonical_kb in normalized_raw_query or kb in raw_query or canonical_kb.replace(" ", "") in compact_raw_query:
+                detected_brand = canonical_kb
                 break
 
     if detected_brand in ("mac", "macbook", "apple"):
@@ -166,7 +181,11 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     if detected_brand:
         target_dealers = []
         for d in all_dealers:
-            dealer_brands = [b.strip().lower() for b in d.get("brands", "").split(",")]
+            dealer_brands = [
+                canonical_brand(v)
+                for v in d.get("brands", "").split(",")
+                if v.strip()
+            ]
             if any(term in dealer_brands for term in brand_search_terms):
                 target_dealers.append(d)
         logger.info(f"[OOS] Filtered {len(all_dealers)} dealers down to {len(target_dealers)} dealers matching brand='{detected_brand}' (search terms={brand_search_terms})")
@@ -836,6 +855,6 @@ async def ensure_oos_indexes():
     await col.create_index([("org_id", 1), ("status", 1), ("sent_dealers.dealer_phone", 1)])
     await col.create_index([("org_id", 1), ("status", 1), ("sent_dealers.message_ids", 1)])
     await col.create_index([("org_id", 1), ("status", 1), ("target_dealers.phone", 1)])
-    await col.create_index([("conversation_id", 1), ("status", 1), ("extracted_attributes.brand", 1)])
+    await col.create_index([("org_id", 1), ("conversation_id", 1), ("status", 1), ("extracted_attributes.brand", 1)])
     await col.create_index([("status", 1), ("expires_at", 1)])
     logger.info("[OOS] Indexes ensured on oos_requests")
