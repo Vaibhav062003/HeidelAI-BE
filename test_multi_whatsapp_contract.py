@@ -72,13 +72,20 @@ def test_scoped_archive_and_cleanup_contracts():
     assert "asyncio.create_task(run_whatsapp_revocation_reconciler())" in source("core/lifespan.py")
 
 
-def test_deployment_runs_the_verified_migration_before_serving():
+def test_deployment_starts_the_api_without_running_migrations():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     migration = source("scripts/migrate_multi_whatsapp.py")
     deploy_dev = (ROOT / ".github/workflows/deploy-dev.yml").read_text(encoding="utf-8")
     deploy_main = (ROOT / ".github/workflows/deploy-main.yml").read_text(encoding="utf-8")
 
-    assert "python -m scripts.migrate_multi_whatsapp --apply && exec uvicorn" in dockerfile
+    assert 'CMD ["uvicorn", "main:app"' in dockerfile
+    assert "migrate_multi_whatsapp --apply" not in dockerfile
+    assert "sha-${{ github.sha }}" in deploy_dev
+    assert "sha-${{ github.sha }}" in deploy_main
+    assert "group: deploy-dev" in deploy_dev
+    assert "group: deploy-main" in deploy_main
+    assert "koyeb service update" in deploy_dev
+    assert "koyeb service update" in deploy_main
     assert "--wait --wait-timeout 15m" in deploy_dev
     assert "--wait --wait-timeout 15m" in deploy_main
     assert migration.index('plan["verified_indexes"] = True') < migration.index(
@@ -156,7 +163,7 @@ def test_primary_phone_scope_keeps_legacy_conversations_visible():
 if __name__ == "__main__":
     test_connection_and_webhook_contracts()
     test_scoped_archive_and_cleanup_contracts()
-    test_deployment_runs_the_verified_migration_before_serving()
+    test_deployment_starts_the_api_without_running_migrations()
     test_number_scoped_query_and_flow_binding_contracts()
     test_primary_phone_scope_keeps_legacy_conversations_visible()
     print("Multi-number WhatsApp backend contracts passed.")
