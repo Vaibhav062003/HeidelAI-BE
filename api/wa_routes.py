@@ -654,20 +654,36 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         await _fence_whatsapp_reconnect_cleanup(org_id, requested_phone_id, whatsapp_business_id)
 
         # Exchange code for access token with WhatsApp/Facebook
-        token_url = "https://graph.facebook.com/v22.0/oauth/access_token"
+        if not APP_ID or not APP_SECRET:
+            logger.error("WhatsApp OAuth is not configured: APP_ID or APP_SECRET is missing")
+            raise HTTPException(status_code=503, detail="WhatsApp connection is not configured. Contact support.")
+        graph_version = WA_VERSION or VERSION or "v24.0"
+        token_url = f"https://graph.facebook.com/{graph_version}/oauth/access_token"
         token_data = {
             "client_id": APP_ID,
-            "client_secret": APP_SECRET, 
-            # "redirect_uri": redirect_uri, Not needed now as using FB SDK
-            "grant_type": "authorization_code",
-            "code": code
+            "client_secret": APP_SECRET,
+            "code": code,
         }
-        
-        # Make request to Facebook Graph API
-        token_response = await meta_client.post(token_url, json=token_data)
+
+        token_response = await meta_client.get(token_url, params=token_data)
         
         if token_response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to exchange the WhatsApp authorization code")
+            try:
+                meta_error = token_response.json().get("error", {})
+            except (ValueError, AttributeError):
+                meta_error = {}
+            meta_code = meta_error.get("code") if isinstance(meta_error, dict) else None
+            meta_subcode = meta_error.get("error_subcode") if isinstance(meta_error, dict) else None
+            meta_trace = meta_error.get("fbtrace_id") if isinstance(meta_error, dict) else None
+            logger.error(
+                "WhatsApp OAuth exchange rejected: status={} code={} subcode={} trace_id={}",
+                token_response.status_code, meta_code, meta_subcode, meta_trace,
+            )
+            reference = f" (Meta code {meta_code}{f'/{meta_subcode}' if meta_subcode else ''})" if meta_code else ""
+            raise HTTPException(
+                status_code=400,
+                detail=f"Meta rejected the WhatsApp authorization. Start Add another number again.{reference}",
+            )
         
         token_info = token_response.json()
         access_token = token_info.get("access_token")
@@ -675,32 +691,12 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         if not access_token:
             raise HTTPException(status_code=400, detail="Failed to get valid access token")
         
-        # Get WhatsApp Business Account details
-        # request_data = {
-        # "fields": "id,name,currency,owner_business_info",
-        # "limit": 20,
-        # "access_token": ACCESS_TOKEN #our system access token, not the user access token
-        # }
-        # url = f"https://graph.facebook.com/v22.0/{BUSINESS_ID}/client_whatsapp_business_accounts"
-        # account_response = requests.get(url, params=request_data)
-        # print(f"Account response : {account_response.json()}")
-
-        # if account_response.status_code != 200:
-        #     print(f"Get whatsapp account details err: {account_response.text}")
-        #     raise HTTPException(
-        #         status_code=400, 
-        #         detail="Failed to get WhatsApp Business Account information"
-        #     )
-        
-        # account_data = account_response.json().get("data", [{}])[0]
-        # whatsapp_business_id = account_data.get("id")
-        
         # Get user phone number details
         params = {
             "fields": "id,cc,country_dial_code,display_phone_number,verified_name,status,quality_rating,search_visibility,platform_type,code_verification_status",
             "access_token": access_token # User's access token
         }
-        phone_url = f"https://graph.facebook.com/v22.0/{whatsapp_business_id}/phone_numbers"
+        phone_url = f"https://graph.facebook.com/{graph_version}/{whatsapp_business_id}/phone_numbers"
         phone_response = await meta_client.get(phone_url, params=params)
         if phone_response.status_code != 200:
             raise HTTPException(
@@ -773,7 +769,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         webhook_params = {
             "access_token": access_token
         }
-        webhook_url = f"https://graph.facebook.com/v22.0/{whatsapp_business_id}/subscribed_apps"
+        webhook_url = f"https://graph.facebook.com/{graph_version}/{whatsapp_business_id}/subscribed_apps"
         webhook_response = await meta_client.post(webhook_url, json=webhook_params)
 
         if webhook_response.status_code != 200:
@@ -797,7 +793,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "pin": "000000",
             "access_token": access_token
         }
-        phone_register_url = f"https://graph.facebook.com/v22.0/{phone_id}/register"
+        phone_register_url = f"https://graph.facebook.com/{graph_version}/{phone_id}/register"
 
         try:
             phone_register_response = await meta_client.post(phone_register_url, json=phone_register_params, timeout=5.0)

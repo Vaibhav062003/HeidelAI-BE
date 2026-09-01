@@ -28,6 +28,11 @@ def test_connection_and_webhook_contracts():
     auth_source = routes[routes.index("async def whatsapp_auth_exchange"):routes.index('@router.post("/disconnect")')]
     assert "await meta_client.post" in auth_source
     assert "await meta_client.get" in auth_source
+    assert 'graph_version = WA_VERSION or VERSION or "v24.0"' in auth_source
+    assert 'token_response = await meta_client.get(token_url, params=token_data)' in auth_source
+    assert "graph.facebook.com/v22.0" not in auth_source
+    assert "WhatsApp OAuth exchange rejected: status={}" in auth_source
+    assert "token_response.text" not in auth_source
     assert "token_response = requests" not in auth_source
     assert "phone_response = requests" not in auth_source
     assert "webhook_response = requests" not in auth_source
