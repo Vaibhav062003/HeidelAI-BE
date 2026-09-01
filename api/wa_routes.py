@@ -799,7 +799,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             phone_register_response = await meta_client.post(phone_register_url, json=phone_register_params, timeout=5.0)
             if phone_register_response.status_code != 200:
                 logger.warning("WhatsApp phone registration returned status {}", phone_register_response.status_code)
-            
+
         except Exception as e:
             logger.warning("WhatsApp phone registration request failed ({})", type(e).__name__)
         
