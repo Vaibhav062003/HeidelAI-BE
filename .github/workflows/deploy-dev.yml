@@ -53,7 +53,7 @@ jobs:
       - name: Deploy exact image to Koyeb
         env:
           IMAGE: ${{ secrets.DOCKER_USERNAME }}/heidelai-dev:sha-${{ github.sha }}
-        run: koyeb service update heidelai-dev/heidelai-dev --docker "$IMAGE" --scale 1 --wait --wait-timeout 15m
+        run: koyeb service update heidelai-dev/heidelai-dev --docker "$IMAGE" --wait --wait-timeout 15m
 
       - name: Verify API health
         env:
