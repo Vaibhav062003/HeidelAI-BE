@@ -31,8 +31,9 @@ assert "for account_id in ig_ids" in routes_source
 assert "for account_id in wa_ids" in routes_source
 assert '"ig_ids": sorted(ig_ids)' in routes_source
 assert '"wa_ids": sorted(wa_ids)' in routes_source
-assert "for ig_id in ig_ids" in service_source
-assert "for wa_id in wa_ids" in service_source
+assert "services.instagram_clients," in service_source
+assert "services.whatsapp_clients," in service_source
+assert "_discard_client(index, client_id)" in service_source
 assert "_payload_conversation_id(payload)" in service_source
 
 print("Inbox live delivery contract passed.")
