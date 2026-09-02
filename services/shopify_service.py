@@ -31,6 +31,7 @@ API_VERSION = "2025-10"
 OAUTH_SCOPES = "read_orders,read_customers,read_fulfillments"
 DEFAULT_REMINDER_DELAY_MINUTES = 10
 DEFAULT_TEMPLATE_LANGUAGE = "en_US"
+SHOPIFY_TEMPLATE_FOOTER = "Powered by Heidelai.com - AI Sales Agent"
 ALLOWED_DELAYS = {5, 10, 15, 30, 60, 120, 240, 1440}
 SHOP_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -1527,11 +1528,11 @@ async def create_default_template(
 
 def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGUAGE) -> dict:
     definitions = {
-        "abandoned_cart": ("heidelai_abandoned_cart_v1", "MARKETING", "Hi {{1}}, you left {{2}} in your cart. Complete your order here: {{3}}"),
-        "received": ("heidelai_order_received_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. We have received order {{2}} containing {{3}}. Our team is reviewing the order details and will notify you when its status changes."),
-        "shipped": ("heidelai_order_shipped_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been shipped. We will notify you when another delivery status update becomes available."),
-        "fulfilled": ("heidelai_order_fulfilled_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been fulfilled. Please review the delivered items and contact our support team if you need help."),
-        "cancelled": ("heidelai_order_cancelled_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been cancelled. Please contact our support team if you did not request this cancellation or need help."),
+        "abandoned_cart": ("heidelai_abandoned_cart_v3", "MARKETING", "Hello {{1}}! It looks like these items are still waiting in your cart: {{2}}. You can complete your purchase using this secure checkout link: {{3}}. We are here if you need any help."),
+        "received": ("heidelai_order_received_v3", "UTILITY", "Hello {{1}}! We have received your order {{2}}, which includes {{3}}. Our team is reviewing it, and we will keep you updated as the status changes."),
+        "shipped": ("heidelai_order_shipped_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been shipped. We will share another update when delivery information is available."),
+        "fulfilled": ("heidelai_order_fulfilled_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been fulfilled. We hope everything arrived as expected. Please contact our support team if you need any help."),
+        "cancelled": ("heidelai_order_cancelled_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been cancelled. If you did not request this or need assistance, please contact our support team."),
     }
     if event not in definitions:
         raise HTTPException(status_code=422, detail="Unsupported Shopify template event")
@@ -1543,11 +1544,14 @@ def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGU
         "name": name,
         "language": normalized_language,
         "category": category,
-        "components": [{
-            "type": "BODY",
-            "text": text,
-            "example": {"body_text": [["Aarav", "#1001", "Laptop stand, keyboard"]] if event != "abandoned_cart" else [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
-        }],
+        "components": [
+            {
+                "type": "BODY",
+                "text": text,
+                "example": {"body_text": [["Aarav", "#1001", "Laptop stand, keyboard"]] if event != "abandoned_cart" else [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
+            },
+            {"type": "FOOTER", "text": SHOPIFY_TEMPLATE_FOOTER},
+        ],
     }
 
 
@@ -1574,9 +1578,18 @@ def _template_compatible(template: dict, purpose: str = "cart") -> bool:
         return False
     components = template.get("components") or []
     bodies = [part for part in components if str(part.get("type") or "").upper() == "BODY"]
-    if len(bodies) != 1 or any(re.search(r"{{\s*\d+\s*}}", json.dumps(part)) for part in components if part is not bodies[0]):
+    footers = [part for part in components if str(part.get("type") or "").upper() == "FOOTER"]
+    if (
+        len(bodies) != 1
+        or len(footers) != 1
+        or footers[0].get("text") != SHOPIFY_TEMPLATE_FOOTER
+        or any(re.search(r"{{\s*\d+\s*}}", json.dumps(part)) for part in components if part is not bodies[0])
+    ):
         return False
-    placeholders = re.findall(r"{{\s*(\d+)\s*}}", str(bodies[0].get("text") or ""))
+    body_text = str(bodies[0].get("text") or "")
+    if re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", body_text):
+        return False
+    placeholders = re.findall(r"{{\s*(\d+)\s*}}", body_text)
     return sorted(placeholders) == ["1", "2", "3"]
 
 
