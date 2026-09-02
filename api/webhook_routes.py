@@ -44,7 +44,12 @@ from services.whatsapp_call_history import (
     provider_lifecycle_filter,
 )
 from services.intent_queue_worker import enqueue_intent_check
-from services.shopify_service import record_whatsapp_preference, record_whatsapp_provider_block, update_shopify_reminder_delivery
+from services.shopify_service import (
+    normalize_whatsapp_delivery_error,
+    record_whatsapp_preference,
+    record_whatsapp_provider_block,
+    update_shopify_reminder_delivery,
+)
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
@@ -760,6 +765,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         if not message_id or not status_type:
                             continue
 
+                        delivery_error = (
+                            normalize_whatsapp_delivery_error(status, stage="delivery")
+                            if status_type == "failed" else None
+                        )
                         if status_type == "failed":
                             await asyncio.to_thread(
                                 record_whatsapp_provider_block,
@@ -769,21 +778,23 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             )
                         
                         logger.info(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
-                        
-                        # Update the message status in the database
+
+                        try:
+                            shopify_error = await update_shopify_reminder_delivery(
+                                connection.get("org_id"), message_id, status_type, delivery_error,
+                            )
+                            if shopify_error:
+                                delivery_error = shopify_error
+                        except Exception as exc:
+                            logger.debug(f"Shopify reminder delivery propagation skipped for {message_id}: {exc}")
+
+                        # Update the message after Shopify augments retry state.
                         broadcast_message = await update_whatsapp_message_status(
                             org_id=connection.get("org_id"),
                             message_id=message_id,
                             status=status_type,
-                            # status_timestamp=status.get("timestamp")
+                            delivery_error=delivery_error,
                         )
-
-                        try:
-                            await update_shopify_reminder_delivery(
-                                connection.get("org_id"), message_id, status_type,
-                            )
-                        except Exception as exc:
-                            logger.debug(f"Shopify reminder delivery propagation skipped for {message_id}: {exc}")
 
                         try:
                             from services.sales_offer_service import update_offer_delivery

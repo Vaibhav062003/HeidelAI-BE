@@ -429,6 +429,7 @@ async def store_whatsapp_message(
     bot_context: Optional[dict] = None,
     notify_push: bool = False,
     business_phone_id: Optional[str] = None,
+    delivery_error: Optional[dict] = None,
 ) -> str:
     """
     Store a message in the WhatsApp-specific collection and notify appropriate WebSocket clients
@@ -475,7 +476,9 @@ async def store_whatsapp_message(
         "temp_id": temp_id,
         "raw_data": raw_data,
         "mode": mode,
-        "ai_metadata" : bot_context if bot_context else None
+        "ai_metadata": bot_context if bot_context else None,
+        "business_phone_id": str(business_phone_id) if business_phone_id else None,
+        "delivery_error": delivery_error,
     }   
     
     # Store message in WhatsApp-specific collection
@@ -551,7 +554,10 @@ async def store_whatsapp_message(
         "payload": payload,
         "mode": mode,
         "context_type": context_type,
-        "context": context
+        "context": context,
+        "ai_metadata": bot_context if bot_context else None,
+        "business_phone_id": str(business_phone_id) if business_phone_id else None,
+        "delivery_error": delivery_error,
     }
 
     await broadcast_main_ws(
@@ -1466,16 +1472,36 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
         logger.error(f"Error in upload_and_send_wa_media_message: {e}")
         return {"error": str(e), "success": False}
  
-async def update_whatsapp_message_status(org_id: str, message_id: str, status: str):
+async def update_whatsapp_message_status(
+    org_id: str,
+    message_id: str,
+    status: str,
+    delivery_error: Optional[dict] = None,
+):
     """
     Update the status of a WhatsApp message in the database
     """
     try:
         messages_collection = db[f"messages_{org_id}"]
-        
+
+        status = str(status).lower()
+        rank = {"sending": 0, "sent": 1, "delivered": 2, "read": 3, "failed": 4}.get(status)
+        status_filter = {"message_id": message_id, "platform": "whatsapp"}
+        if rank is not None:
+            rank_limit = 2 if status == "failed" else rank
+            status_filter["$or"] = [
+                {"delivery_rank": {"$lt": rank_limit}},
+                {"delivery_rank": {"$exists": False}},
+            ]
+        update = {"$set": {"status": status, **({"delivery_rank": rank} if rank is not None else {})}}
+        if status == "failed" and delivery_error:
+            update["$set"]["delivery_error"] = delivery_error
+        elif status in {"sent", "delivered", "read"}:
+            update["$unset"] = {"delivery_error": ""}
+
         result = messages_collection.find_one_and_update(
-            {"message_id": message_id, "platform": "whatsapp"},
-            {"$set": {"status": status}},
+            status_filter,
+            update,
             return_document=ReturnDocument.AFTER
         )
         

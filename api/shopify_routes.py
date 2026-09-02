@@ -21,6 +21,7 @@ from services.shopify_service import (
     process_webhook,
     request_sync,
     retry_checkout_reminder,
+    retry_shopify_notification,
     update_settings,
 )
 
@@ -70,6 +71,11 @@ class TemplateCreatePayload(BaseModel):
 
 class CheckoutRetryPayload(BaseModel):
     provider_id: str = Field(min_length=1, max_length=512)
+
+
+class ShopifyNotificationRetryPayload(BaseModel):
+    conversation_id: str = Field(min_length=1, max_length=240)
+    message_id: str = Field(min_length=1, max_length=512)
 
 
 @router.get("/api/integrations/shopify")
@@ -193,6 +199,16 @@ async def shopify_records(
 async def shopify_checkout_retry(payload: CheckoutRetryPayload, user: CurrentUser):
     await admin_required(user)
     return await retry_checkout_reminder(user.org_id, payload.provider_id)
+
+
+@router.post("/api/commerce/shopify/notifications/retry", status_code=202)
+async def shopify_notification_retry(payload: ShopifyNotificationRetryPayload, user: CurrentUser):
+    await require_conversation_access(
+        user.org_id, payload.conversation_id, user.user_id, user.role,
+    )
+    return await retry_shopify_notification(
+        user.org_id, payload.conversation_id, payload.message_id,
+    )
 
 
 @router.get("/api/conversations/{conversation_id}/shopify-activity")
