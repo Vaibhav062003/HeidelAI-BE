@@ -93,7 +93,7 @@ async def health_check_head(request: Request, response: Response):
 
 @router.get("/health")
 @limiter.exempt
-async def health_check_get(request: Request):
+async def health_check_revision(request: Request):
     return {"status": "ok", "revision": os.getenv("GIT_SHA", "unknown")}
 
 @router.get("/favicon.ico", include_in_schema=False)

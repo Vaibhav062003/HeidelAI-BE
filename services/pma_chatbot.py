@@ -15,6 +15,7 @@ from schemas.models import (
 from services.utils import get_first_name
 from services.wa_service import send_whatsapp_message
 from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
+from services.agent_service import _persist_handoff, _validated_handoff
 from services.internal_request import signed_json
 
 db = get_async_mongo_db()
@@ -84,7 +85,27 @@ async def send_to_pma_chatbot(
                 raise AIProviderUnavailable("malformed_response") from exc
             if not isinstance(response_data, dict):
                 raise AIProviderUnavailable("malformed_response")
-            final_response = validate_ai_reply(response_data.get("response"))
+            handoff = _validated_handoff(response_data.get("handoff"))
+            if handoff:
+                await _persist_handoff(
+                    handoff,
+                    org_id=org_id,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    customer_name=customer_name,
+                    customer_text=user_input,
+                    source=source,
+                )
+            try:
+                final_response = validate_ai_reply(response_data.get("response"))
+            except AIProviderUnavailable as exc:
+                if handoff:
+                    raise AIProviderUnavailable(
+                        exc.category,
+                        upstream_status=exc.upstream_status,
+                        escalation_required=False,
+                    ) from exc
+                raise
             logger.info(f"Received response from chatbot for ...{conversation_id[-6:]}")
             return {"final_response": final_response}
 

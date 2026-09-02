@@ -36,4 +36,22 @@ assert "services.whatsapp_clients," in service_source
 assert "_discard_client(index, client_id)" in service_source
 assert "_payload_conversation_id(payload)" in service_source
 
+webhook_source = Path("api/webhook_routes.py").read_text()
+deploy_source = Path(".github/workflows/deploy-main.yml").read_text()
+docker_source = Path("Dockerfile").read_text()
+common_source = Path("api/common_routes.py").read_text()
+assert 'DEV_WHATSAPP_PHONE_IDS = {"1248072875064563"}' in webhook_source
+assert 'get("phone_number_id")' in webhook_source
+assert "phone_number_ids & DEV_WHATSAPP_PHONE_IDS" in webhook_source
+assert "if not await forward_webhook_to_dev" in webhook_source
+assert "return Response(status_code=503)" in webhook_source
+assert "background_tasks.add_task(forward_webhook_to_dev" in webhook_source
+assert "backend:sha-${{ github.sha }}" in deploy_source
+assert "koyeb service update backend/backend" in deploy_source
+assert 'revision == $revision' in deploy_source
+assert "ARG GIT_SHA=unknown" in docker_source
+assert "ENV GIT_SHA=${GIT_SHA}" in docker_source
+assert '@router.get("/health")' in common_source
+assert 'os.getenv("GIT_SHA", "unknown")' in common_source
+
 print("Inbox live delivery contract passed.")

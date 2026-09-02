@@ -53,6 +53,8 @@ from services.shopify_service import (
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
+DEV_WHATSAPP_WABA_IDS = {SAHIL_WA_ID, EGENIE_WA_ID}
+DEV_WHATSAPP_PHONE_IDS = {"1248072875064563"}
 
 DEV_WHATSAPP_WABA_IDS = {
     value
@@ -155,7 +157,7 @@ async def forward_webhook_to_dev(body: bytes, headers: dict) -> bool:
     Forwards the raw webhook body and necessary headers to the dev environment.
     """
     if not DEV_WEBHOOK_URL:
-        logger.error("Failed to forward webhook to Dev: DEV_WEBHOOK_URL is not configured")
+        logger.error("Cannot forward webhook to Dev: DEV_WEBHOOK_URL is not configured")
         return False
 
     async with httpx.AsyncClient() as client:
@@ -504,7 +506,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
             account_id = payload["entry"][0]["id"]
         except (KeyError, IndexError):
             logger.warning("Could not extract entry[0].id from webhook payload")
-
+        # Merge note (dev x main, both routing this the same way in the end):
+        # keeps dev's null-safe extraction (a webhook payload with an
+        # explicit "value": null would crash main's plain .get("value", {})
+        # chain) and main's single combined dispatch point (avoids building
+        # forward_headers twice for what is otherwise identical logic).
         phone_number_ids = {
             str(((change.get("value") or {}).get("metadata") or {}).get("phone_number_id") or "").strip()
             for entry in payload.get("entry", [])
@@ -512,12 +518,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
         }
         phone_number_ids.discard("")
 
-        if object_type == "whatsapp_business_account" and (
-            account_id in DEV_WHATSAPP_WABA_IDS
-            or bool(phone_number_ids & DEV_WHATSAPP_PHONE_IDS)
-        ):
+        should_forward_whatsapp = (
+            object_type == "whatsapp_business_account"
+            and (account_id in DEV_WHATSAPP_WABA_IDS or bool(phone_number_ids & DEV_WHATSAPP_PHONE_IDS))
+        )
+        should_forward_instagram = (
+            object_type == "instagram"
+            and account_id in {SAHIL_IG_ID, EGENIE_IG_ID}
+        )
+
+        if should_forward_whatsapp or should_forward_instagram:
             logger.info(
-                f"WhatsApp webhook matched development routing: WABA={account_id}, "
+                f"Webhook matched development routing: WABA={account_id}, "
                 f"phone_number_ids={sorted(phone_number_ids)}. Forwarding."
             )
             forward_headers = {
@@ -525,18 +537,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                 for key, value in request.headers.items()
                 if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
             }
-            if not await forward_webhook_to_dev(body=body, headers=forward_headers):
-                return Response(status_code=503)
-            return Response(status_code=200)
-
-        if object_type == "instagram" and account_id in {SAHIL_IG_ID, EGENIE_IG_ID}:
-            logger.info(f"Instagram webhook matched allowed account {account_id}. Forwarding.")
-            forward_headers = {
-                key: value
-                for key, value in request.headers.items()
-                if key.lower() in {"content-type", "x-hub-signature", "x-hub-signature-256"}
-            }
-            background_tasks.add_task(forward_webhook_to_dev, body=body, headers=forward_headers)
+            if should_forward_whatsapp:
+                if not await forward_webhook_to_dev(body=body, headers=forward_headers):
+                    return Response(status_code=503)
+            else:
+                background_tasks.add_task(forward_webhook_to_dev, body=body, headers=forward_headers)
             return Response(status_code=200)
 
     payload_str = body.decode('utf-8')
