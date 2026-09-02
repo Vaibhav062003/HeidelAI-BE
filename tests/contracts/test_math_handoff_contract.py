@@ -119,6 +119,33 @@ async def _exercise():
         raise AssertionError("malformed handoff was accepted")
     assert len(records) == before
 
+    # A legitimate, catalogue-derived context is accepted and reaches the
+    # escalation alongside the customer's own message - still never taking
+    # customer_text from the model side (that key stays rejected above).
+    _Response.payload = {
+        "response": "A safe customer reply",
+        "handoff": {"requested": True, "reason_code": "discount",
+                    "context": "Asus Zephyrus G14 (Rs.67,381)"},
+    }
+    await _call(module, message_id="wamid.context1")
+    saved_with_context = records[-1][1]
+    assert saved_with_context["customer_text"] == (
+        "private customer text\n\nAsus Zephyrus G14 (Rs.67,381)")
+    assert saved_with_context["metadata"]["context"] == "Asus Zephyrus G14 (Rs.67,381)"
+
+    # An oversized context still fails the whole handoff closed, same as a
+    # malformed reason_code.
+    _Response.payload = {
+        "response": "A safe customer reply",
+        "handoff": {"requested": True, "reason_code": "discount", "context": "x" * 501},
+    }
+    try:
+        await _call(module, message_id="wamid.context2")
+    except AIProviderUnavailable as exc:
+        assert exc.category == "malformed_handoff"
+    else:
+        raise AssertionError("oversized handoff context was accepted")
+
     _Response.payload = {
         "response": "A safe customer reply",
         "handoff": {"requested": True, "reason_code": "customer_vinod"},

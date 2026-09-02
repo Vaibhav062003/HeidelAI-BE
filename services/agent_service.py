@@ -30,12 +30,17 @@ _HANDOFF_REASONS = {
 }
 
 
+_HANDOFF_KEYS = {"requested", "reason_code", "context"}
+_HANDOFF_CONTEXT_MAX_CHARS = 500
+
+
 def _validated_handoff(value: object) -> Optional[Dict[str, object]]:
     if value is None:
         return None
     if (
         not isinstance(value, dict)
-        or set(value) != {"requested", "reason_code"}
+        or not set(value) <= _HANDOFF_KEYS
+        or "reason_code" not in value
         or value.get("requested") is not True
     ):
         raise AIProviderUnavailable("malformed_handoff")
@@ -47,7 +52,18 @@ def _validated_handoff(value: object) -> Optional[Dict[str, object]]:
         or reason not in _HANDOFF_REASONS
     ):
         raise AIProviderUnavailable("malformed_handoff")
-    return {"requested": True, "reason_code": reason}
+    result: Dict[str, object] = {"requested": True, "reason_code": reason}
+    if "context" in value:
+        context = value.get("context")
+        # Optional and catalogue-derived only (product/price) - never the
+        # customer's own message. A malformed value here fails the whole
+        # handoff closed, same as a malformed reason_code.
+        if not isinstance(context, str) or len(context) > _HANDOFF_CONTEXT_MAX_CHARS:
+            raise AIProviderUnavailable("malformed_handoff")
+        context = context.strip()
+        if context:
+            result["context"] = context
+    return result
 
 
 async def _persist_handoff(
@@ -69,6 +85,20 @@ async def _persist_handoff(
         f"{org_id}\0{message_id}".encode("utf-8")
     ).hexdigest()[:32]
     platform = conversation_id.partition("_")[0].lower() or "unknown"
+    context = handoff.get("context")
+    # Shown to the reviewer right alongside the customer's own message - a
+    # bare "any discount on this?" told a reviewer nothing about what "this"
+    # was without opening the full chat.
+    escalation_text = f"{customer_text}\n\n{context}" if context else customer_text
+    metadata: Dict[str, object] = {
+        "reason": handoff["reason_code"],
+        "conversation_id": conversation_id,
+        "source_message_id": message_id,
+        "platform": platform,
+        "source": source,
+    }
+    if context:
+        metadata["context"] = context
     try:
         saved = await create_ai_escalation(
             org_id,
@@ -77,19 +107,13 @@ async def _persist_handoff(
                 "dedupe_id": escalation_id,
                 "user_name": customer_name,
                 "customer_number": conversation_id,
-                "customer_text": customer_text,
+                "customer_text": escalation_text,
                 "inferred_intent": handoff["reason_code"],
                 "priority": "high",
                 "kind": "actionable",
                 "status": "pending_human_review",
                 "sender_name": "AI Assistant",
-                "metadata": {
-                    "reason": handoff["reason_code"],
-                    "conversation_id": conversation_id,
-                    "source_message_id": message_id,
-                    "platform": platform,
-                    "source": source,
-                },
+                "metadata": metadata,
             },
         )
     except AIProviderUnavailable:
