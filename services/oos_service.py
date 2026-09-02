@@ -13,6 +13,7 @@ Handles:
 import asyncio
 import re
 import urllib.parse
+import uuid
 from datetime import datetime, timezone, timedelta, time as dt_time
 from typing import Optional, List, Dict
 
@@ -93,18 +94,85 @@ def _format_brand(brand: str) -> str:
     return b.title()
 
 
-def format_dealer_sourcing_message(extracted_attrs: dict) -> str:
+CONVERSATIONAL_PREFIXES = [
+    r"^(what|how)\s+about\s+",
+    r"^about\s+",
+    r"^do you have\s+",
+    r"^have you got\s+",
+    r"^is\s+(there\s+)?",
+    r"^are\s+(there\s+)?",
+    r"^can i get\s+",
+    r"^can you check\s+(about\s+)?",
+    r"^i need\s+",
+    r"^i want\s+",
+    r"^looking for\s+",
+    r"^price for\s+",
+    r"^cost of\s+",
+    r"^give me\s+",
+    r"^check\s+(about\s+)?",
+    r"^please check\s+(about\s+)?",
+]
+
+BUDGET_SUFFIXES = [
+    r",?\s*budget\s*(around|is|of)?\s*\d+.*$",
+    r",?\s*price\s*(around|is|of)?\s*\d+.*$",
+    r",?\s*under\s*\d+.*$",
+    r",?\s*around\s*\d+.*$",
+]
+
+
+def clean_product_query(raw_query: str) -> str:
+    """Strip conversational filler prefixes, punctuation, and budget mentions from customer queries."""
+    if not raw_query:
+        return ""
+    q = raw_query.strip()
+    for pat in CONVERSATIONAL_PREFIXES:
+        q = re.sub(pat, "", q, flags=re.IGNORECASE).strip()
+    for pat in BUDGET_SUFFIXES:
+        q = re.sub(pat, "", q, flags=re.IGNORECASE).strip()
+    q = q.rstrip("?!.,").strip()
+    return q
+
+
+def _format_product_title(text: str, brand: str = "") -> str:
+    """Format product words cleanly preserving brand and capitalizing model words."""
+    if not text:
+        return ""
+    if brand:
+        formatted_brand = _format_brand(brand)
+        pattern = re.compile(re.escape(brand), re.IGNORECASE)
+        if pattern.search(text):
+            remainder = pattern.sub("", text).strip()
+            vowels = {"a", "e", "i", "o", "u"}
+            rem_words = [
+                w.upper() if (len(w) <= 4 and not any(c in vowels for c in w.lower()) and not w.isdigit()) else w.capitalize()
+                for w in remainder.split()
+            ]
+            rem_str = " ".join(rem_words)
+            return f"{formatted_brand} {rem_str}".strip()
+
+    words = text.split()
+    formatted = []
+    vowels = {"a", "e", "i", "o", "u"}
+    for w in words:
+        if len(w) <= 4 and not any(c in vowels for c in w.lower()) and not w.isdigit():
+            formatted.append(w.upper())
+        else:
+            formatted.append(w.capitalize())
+    return " ".join(formatted)
+
+
+def format_dealer_sourcing_message(extracted_attrs: dict, raw_query: str = "") -> str:
     """
-    Format a concise, generic sourcing message for dealers across any brand/org.
-    Excludes budget, raw customer query, and internal labels.
+    Format a concise, redrafted sourcing message for dealers across any brand/org.
+    Excludes budget, raw customer query conversational noise, and internal labels.
     Produces:
         <Brand> <Model> <Category> in <Colour>
-        Price and availability?
-    If no usable extracted attributes exist, produces:
-        Product Inquiry
-        Price and availability?
+
+        bhai price and availability?
     """
-    brand = _format_brand(extracted_attrs.get("brand") or "")
+    raw_brand = (extracted_attrs.get("brand") or "").strip()
+    brand = _format_brand(raw_brand)
     model = (extracted_attrs.get("model_name") or "").strip()
     category = (extracted_attrs.get("category") or "").strip().title()
     specs = extracted_attrs.get("specs") or {}
@@ -112,16 +180,32 @@ def format_dealer_sourcing_message(extracted_attrs: dict) -> str:
     colour = specs.get("colour") or specs.get("color")
 
     parts = [p for p in (brand, model, category) if p]
-    title = " ".join(parts) if parts else "Product Inquiry"
-    if parts and colour:
-        title += f" in {str(colour).strip().capitalize()}"
-    return f"{title}\nPrice and availability?"
+
+    if len(parts) >= 2 or (len(parts) == 1 and not brand):
+        title = " ".join(parts)
+        if colour:
+            title += f" in {str(colour).strip().capitalize()}"
+    elif raw_query and raw_query.strip():
+        cleaned_raw = clean_product_query(raw_query)
+        if cleaned_raw:
+            title = _format_product_title(cleaned_raw, raw_brand)
+            if colour and colour.lower() not in title.lower():
+                title += f" in {str(colour).strip().capitalize()}"
+        else:
+            title = parts[0] if parts else "Product Inquiry"
+    elif parts:
+        title = parts[0]
+    else:
+        title = "Product Inquiry"
+
+    return f"{title}\n\nbhai price and availability?"
 
 
 def generate_dealer_message(oos_doc: dict) -> str:
     """Generate the concise sourcing message to send to dealers."""
     attrs = oos_doc.get("extracted_attributes", {})
-    return format_dealer_sourcing_message(attrs)
+    raw_query = oos_doc.get("raw_query_text", "")
+    return format_dealer_sourcing_message(attrs, raw_query)
 
 
 async def send_oos_to_dealers(oos_doc: dict, org_id: str):
@@ -173,11 +257,21 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     if brand:
         detected_brand = canonical_brand(brand)
     else:
-        for kb in known_brands:
-            canonical_kb = canonical_brand(kb)
-            if canonical_kb in normalized_raw_query or kb in raw_query or canonical_kb.replace(" ", "") in compact_raw_query:
-                detected_brand = canonical_kb
+        # Dynamically check if any brand configured in this tenant's dealer directory matches the raw query
+        for d in all_dealers:
+            for b in (d.get("brands") or "").split(","):
+                cb = canonical_brand(b)
+                if cb and (cb in normalized_raw_query or b.lower().strip() in raw_query or cb.replace(" ", "") in compact_raw_query):
+                    detected_brand = cb
+                    break
+            if detected_brand:
                 break
+        if not detected_brand:
+            for kb in known_brands:
+                canonical_kb = canonical_brand(kb)
+                if canonical_kb in normalized_raw_query or kb in raw_query or canonical_kb.replace(" ", "") in compact_raw_query:
+                    detected_brand = canonical_kb
+                    break
 
     if detected_brand in ("mac", "macbook", "apple"):
         brand_search_terms = ["apple", "mac", "macbook"]
@@ -332,13 +426,15 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
                     business_phone_id=wa_connection.get("phone_id"),
                     business_phone=wa_connection.get("phone"),
                 )
+                idempotency_key = f"oos_{oos_doc.get('query_id', uuid.uuid4().hex)}_{dealer_phone}_{uuid.uuid4().hex[:6]}"
                 res = await send_whatsapp_message({
                     "conversation_id": dealer_conversation_id,
                     "content": dealer_message,
                     "sender_id": wa_id,
                     "recipient_override": dealer_phone,
                     "customer_name": dealer_name,
-                }, org_id, "ai")
+                    "idempotency_key": idempotency_key,
+                }, org_id, "reply")
                 message_ids = res.get("message_ids", []) if res else []
                 logger.success(f"[OOS] WhatsApp successfully sent to dealer '{dealer_name}' at +{dealer_phone} (message_ids={message_ids})")
                 sent_dealers.append({
