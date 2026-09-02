@@ -11,6 +11,7 @@ Sending team messages is still handled by common_service.send_message
 WebSocket broadcasting (broadcast_team_message) is unchanged.
 """
 
+import asyncio
 import base64
 import json
 from datetime import datetime, timedelta, timezone
@@ -327,14 +328,20 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
             "expires_at": now + ESCALATION_RETENTION,
         })
 
-    # A deterministic id lets durable retry jobs safely repeat creation.
+    # Mongo's native unique _id makes concurrent retries safe without a new index.
+    dedupe_id = data.get("dedupe_id")
+    dedupe_filter = (
+        {"_id": dedupe_id}
+        if isinstance(dedupe_id, str) and 1 <= len(dedupe_id) <= 128
+        else {"id": escalation_doc["id"]}
+    )
     result = await collection.update_one(
-        {"id": escalation_doc["id"]},
+        dedupe_filter,
         {"$setOnInsert": escalation_doc.copy()},
         upsert=True,
     )
     if not result.upserted_id:
-        return await collection.find_one({"id": escalation_doc["id"]}, {"_id": 0})
+        return await collection.find_one(dedupe_filter, {"_id": 0})
     logger.success(f"[team_service] Created new AI escalation: {escalation_doc['id']} for org {org_id}")
 
     # Broadcast via WebSocket
@@ -347,11 +354,18 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
     try:
         from services.websocket_service import broadcast_ai_escalation
 
-        await broadcast_ai_escalation(org_id, broadcast_payload)
+        await asyncio.wait_for(
+            broadcast_ai_escalation(org_id, broadcast_payload),
+            timeout=1,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"[team_service] Escalation broadcast timed out id={escalation_doc['id']} org={org_id}"
+        )
     except Exception as exc:
-        logger.error(
-            f"[team_service] Escalation persisted but broadcast failed for "
-            f"org={org_id}, id={escalation_doc['id']}: {exc}"
+        logger.warning(
+            f"[team_service] Escalation broadcast failed id={escalation_doc['id']} "
+            f"org={org_id} error={type(exc).__name__}"
         )
 
     return escalation_doc

@@ -44,7 +44,6 @@ jobs:
           cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME_PROD }}/backend:buildcache
           cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME_PROD }}/backend:buildcache,mode=max
 
-      # Redeploy the MAIN service on Koyeb
       - name: Install Koyeb CLI
         uses: koyeb-community/koyeb-actions@v2
         with:
@@ -53,7 +52,7 @@ jobs:
       - name: Deploy exact image to Koyeb
         env:
           IMAGE: ${{ secrets.DOCKER_USERNAME_PROD }}/backend:sha-${{ github.sha }}
-        run: koyeb service update backend/backend --docker "$IMAGE" --scale 1 --wait --wait-timeout 15m
+        run: koyeb service update backend/backend --docker "$IMAGE" --wait --wait-timeout 15m
 
       - name: Verify API health
         env:
