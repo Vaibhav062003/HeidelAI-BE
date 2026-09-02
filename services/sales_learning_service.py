@@ -201,9 +201,11 @@ async def record_sales_learning_event(
 async def record_customer_response(
     org_id: str, conversation_id: str, message_id: str, text: str,
     *, target_message_id: str = "", channel: str = "",
+    case: dict[str, Any] | None = None,
 ) -> None:
-    from services.sales_case_service import get_active_sales_case
-    case = await get_active_sales_case(org_id, conversation_id)
+    if case is None:
+        from services.sales_case_service import get_active_sales_case
+        case = await get_active_sales_case(org_id, conversation_id)
     if case:
         await record_sales_learning_event(
             org_id=org_id, event_type="customer_reply", conversation_id=conversation_id,

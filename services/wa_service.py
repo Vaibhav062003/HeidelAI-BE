@@ -2,6 +2,7 @@
 import httpx
 import asyncio
 import json
+import time
 import uuid
 import io
 import cloudinary.uploader
@@ -31,6 +32,22 @@ from loguru import logger
 from schemas.models import WhatsAppInteractiveMessage
 
 MSG_SPLIT = "|MSG_SPLIT|"
+_meta_client: Optional[httpx.AsyncClient] = None
+
+
+def _meta_http_client() -> httpx.AsyncClient:
+    """Reuse Meta transport connections without caching API responses."""
+    global _meta_client
+    if _meta_client is None or getattr(_meta_client, "is_closed", False):
+        _meta_client = httpx.AsyncClient(timeout=30.0)
+    return _meta_client
+
+
+async def close_meta_http_client() -> None:
+    global _meta_client
+    if _meta_client is not None and not getattr(_meta_client, "is_closed", False):
+        await _meta_client.aclose()
+    _meta_client = None
 
 
 
@@ -746,8 +763,15 @@ async def send_whatsapp_message(
                         raise HTTPException(status_code=409, detail="This reply is already being sent")
                     provider_started = True
                     try:
-                        async with httpx.AsyncClient(timeout=30.0) as client:
-                            response = await client.post(url, headers=headers, json=data)
+                        provider_started_at = time.perf_counter()
+                        response = await _meta_http_client().post(
+                            url, headers=headers, json=data, timeout=30.0
+                        )
+                        logger.info(
+                            "Meta accepted outbound request for ...{} in {}ms",
+                            conversation_id[-6:],
+                            round((time.perf_counter() - provider_started_at) * 1000),
+                        )
                     except httpx.RequestError:
                         delivery_unknown = True
                         mark_unknown(db.whatsapp_outbound_sends, part_operation)

@@ -112,5 +112,7 @@ assert 'create_index("expires_at", expireAfterSeconds=0)' in service
 assert '"delivery_state": "accepted_pending_sync"' in service
 assert '"local_sync_pending": True' in service
 assert 'if status == "sending":\n        return message_id' not in service
+assert "await _meta_http_client().post(" in service
+assert "await close_meta_http_client()" in lifespan
 
 print("WhatsApp reply idempotency behavior passed.")

@@ -51,6 +51,15 @@ DEV_WHATSAPP_WABA_IDS = {SAHIL_WA_ID, EGENIE_WA_ID}
 DEV_WHATSAPP_PHONE_IDS = {"1248072875064563"}
 
 
+async def _best_effort_typing(whatsapp_id: str, message_id: str) -> None:
+    try:
+        await read_message_and_typing_indicator(
+            whatsapp_id=whatsapp_id, message_id=message_id
+        )
+    except Exception as exc:
+        logger.warning("Could not send WhatsApp typing indicator: {}", exc)
+
+
 def _apply_call_lifecycle(collection, org_id: str, call_id: str, existing: dict, **kwargs) -> dict:
     current = existing
     for _ in range(2):
@@ -1138,6 +1147,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
                                     logger.info(f"[AI_ROUTING] [{conversation_id}] ✅ Sending message to AI agent. org={org_id}, is_heidelai={is_heidelai}, content_length={len(content)}")
                                     try:
+                                        asyncio.create_task(
+                                            _best_effort_typing(whatsapp_business_id, message_id)
+                                        )
                                         chatbot_response = await send_to_agent(
                                             conversation_id=conversation_id,
                                             user_input=content,
@@ -1154,8 +1166,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             return {"status": "duplicate_ignored"}
                                         if not await is_effective_ai_enabled(org_id, conversation_id):
                                             return {"status": "ok"}
-
-                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id)
 
                                         sales_action = chatbot_response.get("sales_action")
                                         agent_reply_to = chatbot_response.get("reply_to_message_id")

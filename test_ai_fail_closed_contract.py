@@ -98,9 +98,35 @@ def _load_agent_service():
     settings.INTERNAL_HMAC_SECRET = "s" * 32
     config = types.ModuleType("config")
     config.settings = settings
+    sales_cases = types.ModuleType("services.sales_case_service")
+    sales_learning = types.ModuleType("services.sales_learning_service")
+
+    async def get_active_sales_case(*_args, **_kwargs):
+        return None
+
+    async def get_sales_context(*_args, **_kwargs):
+        return {"version": 0, "stage": "new", "facts": {}}
+
+    async def apply_sales_decision(*_args, **_kwargs):
+        raise AssertionError("unexpected sales decision")
+
+    async def get_sales_guidance(*_args, **_kwargs):
+        return {"policy_version": "default", "cohort": "control", "recommended_moves": []}
+
+    async def record_customer_response(*_args, **_kwargs):
+        return None
+
+    sales_cases.get_active_sales_case = get_active_sales_case
+    sales_cases.get_sales_context = get_sales_context
+    sales_cases.apply_sales_decision = apply_sales_decision
+    sales_cases.sales_context = lambda _case: {"version": 0, "stage": "new", "facts": {}}
+    sales_learning.get_sales_guidance = get_sales_guidance
+    sales_learning.record_customer_response = record_customer_response
     sys.modules["loguru"] = loguru
     sys.modules["config"] = config
     sys.modules["config.settings"] = settings
+    sys.modules["services.sales_case_service"] = sales_cases
+    sys.modules["services.sales_learning_service"] = sales_learning
     spec = importlib.util.spec_from_file_location("agent_service_contract", ROOT / "services/agent_service.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
