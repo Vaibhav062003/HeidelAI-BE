@@ -80,14 +80,15 @@ async def fetch_dealer_directory(org_id: str, sheet_id: Optional[str] = None, ta
         return []
 
 
-UPPERCASE_BRANDS = {"nzxt", "msi", "hp"}
-
-
 def _format_brand(brand: str) -> str:
+    """Format brand dynamically: uppercase short acronyms (e.g. NZXT, MSI, HP, AMD, LG) or title-case word brands."""
     if not brand:
         return ""
     b = brand.strip()
-    if b.lower() in UPPERCASE_BRANDS:
+    vowels = {"a", "e", "i", "o", "u"}
+    # Short acronym (<= 3 chars like HP/MSI/LG/AMD, or 4-char consonant acronym like NZXT)
+    is_consonant_acronym = len(b) <= 4 and not any(c in vowels for c in b.lower()) and " " not in b
+    if is_consonant_acronym or (len(b) <= 3 and " " not in b):
         return b.upper()
     return b.title()
 

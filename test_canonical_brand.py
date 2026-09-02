@@ -20,6 +20,7 @@ from services.oos_service import (
     canonical_brand,
     format_dealer_sourcing_message,
     generate_dealer_message,
+    handle_dealer_reply,
     send_oos_to_dealers,
 )
 
@@ -407,18 +408,84 @@ def test_send_oos_to_dealers_exact_payload_o11_vision():
     asyncio.run(_async_test_send_oos_to_dealers_exact_payload_o11_vision())
 
 
+def test_format_dealer_sourcing_message_empty_fallback():
+    """Verify empty extracted attributes safely fall back to generic Product Inquiry."""
+    assert format_dealer_sourcing_message({}) == "Product Inquiry\nPrice and availability?"
+    assert format_dealer_sourcing_message({"specs": {}}) == "Product Inquiry\nPrice and availability?"
+
+
+async def _async_test_handle_dealer_reply_flow():
+    """Verify full dealer reply lifecycle: matching by message_id, atomic MongoDB update, and escalation creation."""
+    org_id = "org_test_1"
+    dealer_phone = "910000000001"
+    reply_msg_id = "wamid_sent_to_dealer_1"
+
+    oos_doc = {
+        "query_id": "q_reply_123",
+        "org_id": org_id,
+        "conversation_id": "conv_cust_1",
+        "customer_name": "Test Customer",
+        "customer_number": "910000000099",
+        "raw_query_text": "Need Lian Li case",
+        "status": "dealers_contacted",
+        "sent_dealers": [
+            {
+                "dealer_phone": dealer_phone,
+                "dealer_name": "Lian Li / NZXT Dealer",
+                "message_ids": [reply_msg_id],
+            }
+        ],
+        "dealer_replies": [],
+    }
+
+    async_db = MagicMock()
+    oos_col = MagicMock()
+
+    oos_col.find_one = AsyncMock(return_value=oos_doc)
+    update_res = MagicMock()
+    update_res.modified_count = 1
+    oos_col.update_one = AsyncMock(return_value=update_res)
+    async_db.__getitem__.return_value = oos_col
+
+    with patch("services.oos_service.get_async_mongo_db", return_value=async_db), \
+         patch("services.oos_service.log_dealer_response_to_sheet", new=AsyncMock()), \
+         patch("services.pricing_service.record_oos_supplier_reply", new=AsyncMock()), \
+         patch("services.team_service.create_ai_escalation", new=AsyncMock()) as mock_escalate:
+
+        matched = await handle_dealer_reply(
+            org_id=org_id,
+            dealer_phone=dealer_phone,
+            content="Available in black for 13500. Can deliver tomorrow.",
+            message_context={"id": reply_msg_id},
+            source_message_id="wamid_dealer_reply_1",
+        )
+
+        assert matched is True, "Dealer reply should be matched and handled"
+        assert oos_col.update_one.call_count >= 1, "Should atomically update oos_requests"
+        assert mock_escalate.call_count == 1, "Should trigger team escalation with aggregated reply"
+        escalation_payload = mock_escalate.call_args[0][1]
+        assert escalation_payload["role"] == "oos_dealer_response"
+        assert escalation_payload["inferred_intent"] == "dealer_pricing"
+
+
+def test_handle_dealer_reply_flow():
+    asyncio.run(_async_test_handle_dealer_reply_flow())
+
+
 def run_all_tests():
     test_canonical_brand_normalization()
     test_dealer_matching_with_alias_variations()
     test_dealer_directory_hyphenated_in_db()
     test_format_dealer_sourcing_message_lian_li()
     test_format_dealer_sourcing_message_neutral_brands()
+    test_format_dealer_sourcing_message_empty_fallback()
     test_send_oos_to_dealers_lian_li_aliases()
     test_send_oos_to_dealers_nzxt()
     test_send_oos_to_dealers_tenant_and_inactive_isolation()
     test_send_oos_to_dealers_raw_query_fallback_with_spaces_and_hyphens()
     test_send_oos_to_dealers_exact_payload_o11_vision()
-    print("All 10 canonical brand, formatting, and routing integration tests passed successfully!")
+    test_handle_dealer_reply_flow()
+    print("All 12 canonical brand, formatting, routing, and reply lifecycle tests passed successfully!")
 
 
 if __name__ == "__main__":
