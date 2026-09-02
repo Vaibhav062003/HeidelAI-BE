@@ -111,7 +111,29 @@ def test_format_dealer_sourcing_message_lian_li():
         "raw_query_text": "I need Lian Li O11 Vision Cabinet in Black, budget around 14000",
     }
     msg = generate_dealer_message(oos_doc)
-    assert msg == "Lian Li O11 Vision Cabinet in Black\nPrice and availability?"
+    assert msg == "Lian Li O11 Vision Cabinet in Black\n\nbhai price and availability?"
+
+
+def test_format_dealer_sourcing_message_raw_query_redraft():
+    """Verify 'how about lian li 011 vision' redrafts cleanly to 'Lian Li 011 Vision\\n\\nbhai price and availability?'."""
+    oos_doc = {
+        "extracted_attributes": {"brand": "lian li"},
+        "raw_query_text": "how about lian li 011 vision",
+    }
+    msg = generate_dealer_message(oos_doc)
+    assert msg == "Lian Li 011 Vision\n\nbhai price and availability?"
+
+    oos_doc_letter_o = {
+        "extracted_attributes": {"brand": "lian li"},
+        "raw_query_text": "how about lian li o11 vision",
+    }
+    assert generate_dealer_message(oos_doc_letter_o) == "Lian Li O11 Vision\n\nbhai price and availability?"
+
+    nzxt_doc = {
+        "extracted_attributes": {"brand": "nzxt"},
+        "raw_query_text": "i want nzxt h5",
+    }
+    assert generate_dealer_message(nzxt_doc) == "NZXT H5\n\nbhai price and availability?"
 
 
 def test_format_dealer_sourcing_message_neutral_brands():
@@ -123,7 +145,7 @@ def test_format_dealer_sourcing_message_neutral_brands():
         "specs": {"colour": "grey", "budget": 95000},
     }
     lenovo_msg = format_dealer_sourcing_message(lenovo_attrs)
-    assert lenovo_msg == "Lenovo Legion 5 Laptop in Grey\nPrice and availability?"
+    assert lenovo_msg == "Lenovo Legion 5 Laptop in Grey\n\nbhai price and availability?"
 
     nzxt_attrs = {
         "brand": "nzxt",
@@ -132,7 +154,7 @@ def test_format_dealer_sourcing_message_neutral_brands():
         "specs": {"colour": "white"},
     }
     nzxt_msg = format_dealer_sourcing_message(nzxt_attrs)
-    assert nzxt_msg == "NZXT Kraken 360 Cooler in White\nPrice and availability?"
+    assert nzxt_msg == "NZXT Kraken 360 Cooler in White\n\nbhai price and availability?"
 
 
 # ==========================================
@@ -400,7 +422,7 @@ async def _async_test_send_oos_to_dealers_exact_payload_o11_vision():
 
         assert mock_send_wa.call_count == 1
         payload = mock_send_wa.call_args[0][0]
-        assert payload["content"] == "Lian Li O11 Vision Cabinet in Black\nPrice and availability?"
+        assert payload["content"] == "Lian Li O11 Vision Cabinet in Black\n\nbhai price and availability?"
         assert payload["recipient_override"] == "910000000001"
 
 
@@ -410,8 +432,8 @@ def test_send_oos_to_dealers_exact_payload_o11_vision():
 
 def test_format_dealer_sourcing_message_empty_fallback():
     """Verify empty extracted attributes safely fall back to generic Product Inquiry."""
-    assert format_dealer_sourcing_message({}) == "Product Inquiry\nPrice and availability?"
-    assert format_dealer_sourcing_message({"specs": {}}) == "Product Inquiry\nPrice and availability?"
+    assert format_dealer_sourcing_message({}) == "Product Inquiry\n\nbhai price and availability?"
+    assert format_dealer_sourcing_message({"specs": {}}) == "Product Inquiry\n\nbhai price and availability?"
 
 
 async def _async_test_handle_dealer_reply_flow():
@@ -477,6 +499,7 @@ def run_all_tests():
     test_dealer_matching_with_alias_variations()
     test_dealer_directory_hyphenated_in_db()
     test_format_dealer_sourcing_message_lian_li()
+    test_format_dealer_sourcing_message_raw_query_redraft()
     test_format_dealer_sourcing_message_neutral_brands()
     test_format_dealer_sourcing_message_empty_fallback()
     test_send_oos_to_dealers_lian_li_aliases()
@@ -485,7 +508,7 @@ def run_all_tests():
     test_send_oos_to_dealers_raw_query_fallback_with_spaces_and_hyphens()
     test_send_oos_to_dealers_exact_payload_o11_vision()
     test_handle_dealer_reply_flow()
-    print("All 12 canonical brand, formatting, routing, and reply lifecycle tests passed successfully!")
+    print("All 13 canonical brand, formatting, redrafting, and lifecycle tests passed successfully!")
 
 
 if __name__ == "__main__":
