@@ -75,6 +75,7 @@ def test_connection_and_webhook_contracts():
     assert 'if not isinstance(analytics.get("data_points"), list):' in details_source
     assert 'analytics["data_points"] = []' in details_source
     assert '"webhook_status": "pending"' in auth_source
+    assert '"$addToSet": {"ai_disabled_whatsapp_phone_ids": phone_id}' in auth_source
     assert '"webhook_status": connection.get("webhook_status")' in connection_service
     wa_service = source("services/wa_service.py")
     store_source = wa_service[

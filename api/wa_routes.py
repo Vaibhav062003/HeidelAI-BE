@@ -749,6 +749,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
                 limit=limit,
             )
             existing_connection = existing_connection or historical_connection
+            is_new_phone = existing_connection is None
             requested_label = req.label if req.label is not None else (existing_connection or {}).get("label")
             if not requested_label:
                 verified_name = " ".join(str(phones_data.get("verified_name") or "").split())[:24]
@@ -761,6 +762,11 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             label = normalize_connection_label(requested_label, slot)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if is_new_phone:
+            db.organizations.update_one(
+                {"org_id": org_id},
+                {"$addToSet": {"ai_disabled_whatsapp_phone_ids": phone_id}},
+            )
         if not active_connections:
             reservation_id = reserve_capacity(org_id, "CHANNELS", "whatsapp_accounts", str(whatsapp_business_id))
         
