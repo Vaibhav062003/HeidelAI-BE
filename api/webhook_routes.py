@@ -53,8 +53,6 @@ from services.shopify_service import (
 
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 db = get_mongo_db()
-DEV_WHATSAPP_WABA_IDS = {SAHIL_WA_ID, EGENIE_WA_ID}
-DEV_WHATSAPP_PHONE_IDS = {"1248072875064563"}
 
 DEV_WHATSAPP_WABA_IDS = {
     value
