@@ -74,11 +74,31 @@ class _Collection:
             raise self.document
         return self.document
 
+    def find(self, *_args, **_kwargs):
+        documents = self.document if isinstance(self.document, list) else ([self.document] if self.document else [])
+        return _Cursor(documents)
+
+    async def update_one(self, _query, update):
+        self.document.update(update.get("$set", {}))
+        return types.SimpleNamespace(matched_count=1)
+
+
+class _Cursor:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def sort(self, *_args, **_kwargs):
+        return self
+
+    async def to_list(self, *, length):
+        return self.documents[:length]
+
 
 class _DB:
-    def __init__(self, organization, conversation):
+    def __init__(self, organization, conversation, connection=None):
         self.organizations = _Collection(organization)
         self.conversation = _Collection(conversation)
+        self.whatsapp_connections = _Collection(connection if connection is not None else {"phone_id": "primary"})
 
     def __getitem__(self, _name):
         return self.conversation
@@ -186,6 +206,20 @@ def test_effective_ai_state_fails_closed():
         ({"is_ai_enabled": False}, {"is_ai_enabled": True}, False),
         ({"is_ai_enabled": True}, {"is_ai_enabled": False}, False),
         ({"is_ai_enabled": True}, {"is_ai_enabled": True}, True),
+        ({"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["line-two"]}, {
+            "platform": "whatsapp",
+            "business_phone_id": "line-two",
+            "is_ai_enabled": True,
+        }, False),
+        ({"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["line-two"]}, {
+            "platform": "whatsapp",
+            "business_phone_id": "line-one",
+            "is_ai_enabled": True,
+        }, True),
+        ({"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["line-two"]}, {
+            "platform": "instagram",
+            "is_ai_enabled": True,
+        }, True),
         ({"is_ai_enabled": True}, {
             "is_ai_enabled": True,
             "auto_ai_disabled": True,
@@ -201,6 +235,29 @@ def test_effective_ai_state_fails_closed():
     for organization, conversation, expected in cases:
         module.db = _DB(organization, conversation)
         assert asyncio.run(module.is_effective_ai_enabled("org", "whatsapp_123456")) is expected
+    module.db = _DB(
+        {"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["line-two"]},
+        {"platform": "whatsapp", "business_phone_id": "line-two", "is_ai_enabled": True},
+    )
+    assert asyncio.run(module.ai_access_state("org", "whatsapp_line-two_customer")) == "number_disabled"
+
+
+def test_whatsapp_number_policy_defaults_and_updates():
+    module = _load_ai_policy_service()
+    connections = [
+        {"phone_id": "line-one", "slot": 1},
+        {"phone_id": "line-two", "slot": 2},
+    ]
+    module.db = _DB(
+        {"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["historical-line"]},
+        {"is_ai_enabled": True},
+        connections,
+    )
+    policy = asyncio.run(module.get_org_ai_policy("org"))
+    assert policy["whatsapp_enabled_phone_ids"] == ["line-one", "line-two"]
+    updated = asyncio.run(module.update_org_ai_policy("org", True, 60, True, ["line-two"]))
+    assert updated["whatsapp_enabled_phone_ids"] == ["line-two"]
+    assert module.db.organizations.document["ai_disabled_whatsapp_phone_ids"] == ["historical-line", "line-one"]
 
 
 def test_channel_and_scheduler_contract():
@@ -275,6 +332,7 @@ if __name__ == "__main__":
     test_provider_contract()
     test_all_clients_use_shared_guard()
     test_effective_ai_state_fails_closed()
+    test_whatsapp_number_policy_defaults_and_updates()
     test_channel_and_scheduler_contract()
     test_reply_validator()
     print("AI fail-closed contract: ok")
