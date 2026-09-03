@@ -172,12 +172,11 @@ async def send_to_agent(
 
     try:
         active_sales_case = await get_active_sales_case(org_id, conversation_id)
+        current_sales_context = sales_context(active_sales_case)
     except Exception as exc:
         logger.warning(f"Could not load optional sales context for {conversation_id}: {exc}")
         active_sales_case = None
-        current_sales_context = {}
-    else:
-        current_sales_context = sales_context(active_sales_case)
+        current_sales_context = sales_context(None)
 
     from services.sales_learning_service import get_sales_guidance, record_customer_response
     channel = "instagram" if conversation_id.startswith("instagram_") else "whatsapp"
@@ -232,7 +231,7 @@ async def send_to_agent(
             f"input_length={len(user_input or '')}"
         )
         
-        # Make async HTTP request
+        math_started = time.perf_counter()
         response = await _chatbot_http_client().post(
             endpoint,
             content=body,
@@ -240,6 +239,7 @@ async def send_to_agent(
             timeout=timeout,
         )
         response.raise_for_status()
+        math_ms = round((time.perf_counter() - math_started) * 1000)
 
         try:
             response_data = response.json()
@@ -279,10 +279,16 @@ async def send_to_agent(
         result = {
             "final_response": final_response,
             "usage": _reported_usage(response_data.get("usage")),
+            "product_timings": {"math_ms": math_ms},
         }
         reply_to_message_id = response_data.get("reply_to_message_id")
         if reply_to_message_id:
             result["reply_to_message_id"] = reply_to_message_id
+        response_class = response_data.get("response_class")
+        if response_class in {
+            "product_match", "product_alternative", "oos", "discount", "other",
+        }:
+            result["response_class"] = response_class
         sales_decision = response_data.get("sales_decision")
         if sales_decision:
             result["sales_decision"] = sales_decision
@@ -296,50 +302,39 @@ async def send_to_agent(
                     source_message_text=user_input,
                 )
                 if applied.get("duplicate"):
-                    pending_action = str(applied["case"].get("next_action") or "none")
-                    if applied["case"].get("action_status") == "ready" and pending_action != "none":
-                        from services.sales_action_service import execute_sales_action
-
-                        action = await execute_sales_action(
-                            case=applied["case"], source_message_id=sales_event_id,
-                            action_type=pending_action, customer_text=user_input,
-                        )
-                        if action:
-                            result["final_response"] = action["reply"]
-                            result["sales_action"] = action
-                            result["sales_case"] = await get_sales_context(org_id, conversation_id)
-                            return result
-                    result["duplicate_event"] = True
-                    result["sales_case"] = await get_sales_context(org_id, conversation_id)
-                    return result
-
-                try:
-                    from services.sales_learning_service import record_sales_learning_event
-
-                    if not customer_response_recorded:
-                        await record_customer_response(
-                            org_id, conversation_id, sales_event_id, user_input,
-                            target_message_id=reply_context_message_id or "",
-                            channel=channel,
-                            case=applied["case"],
-                        )
-                    await record_sales_learning_event(
-                        org_id=org_id, event_type="ai_decision",
-                        conversation_id=conversation_id, source_id=sales_event_id,
-                        case=applied["case"], channel=channel,
+                    action_type = (
+                        str(applied["case"].get("next_action") or "none")
+                        if applied["case"].get("action_status") == "ready"
+                        else "none"
                     )
-                    if applied["case"].get("stage") == "commitment_received":
+                else:
+                    try:
+                        from services.sales_learning_service import record_sales_learning_event
+
+                        if not customer_response_recorded:
+                            await record_customer_response(
+                                org_id, conversation_id, sales_event_id, user_input,
+                                target_message_id=reply_context_message_id or "",
+                                channel=channel,
+                                case=applied["case"],
+                            )
                         await record_sales_learning_event(
-                            org_id=org_id, event_type="commitment",
-                            conversation_id=conversation_id,
-                            source_id=f"{sales_event_id}:commitment",
-                            case=applied["case"],
+                            org_id=org_id, event_type="ai_decision",
+                            conversation_id=conversation_id, source_id=sales_event_id,
+                            case=applied["case"], channel=channel,
                         )
-                except Exception as exc:
-                    logger.warning(f"Could not record internal sales decision: {exc}")
-                action_type = str(
-                    (sales_decision.get("requested_action") or {}).get("type") or "none"
-                )
+                        if applied["case"].get("stage") == "commitment_received":
+                            await record_sales_learning_event(
+                                org_id=org_id, event_type="commitment",
+                                conversation_id=conversation_id,
+                                source_id=f"{sales_event_id}:commitment",
+                                case=applied["case"],
+                            )
+                    except Exception as exc:
+                        logger.warning(f"Could not record internal sales decision: {exc}")
+                    action_type = str(
+                        (sales_decision.get("requested_action") or {}).get("type") or "none"
+                    )
                 from services.sales_action_service import execute_sales_action
 
                 action = None if applied["conflict"] else await execute_sales_action(
@@ -362,6 +357,9 @@ async def send_to_agent(
                 result["final_response"] = (
                     "I could not save that sales step safely. Please try again."
                 )
+        result["product_timings"]["agent_total_ms"] = round(
+            (time.perf_counter() - request_started) * 1000
+        )
         return result
 
     except AIProviderUnavailable:

@@ -180,7 +180,9 @@ def _failure_category(module, *, response=None, error=None):
 
 def test_provider_contract():
     module = _load_agent_service()
-    assert asyncio.run(_call(module)) == {"final_response": "Valid reply", "usage": {}}
+    valid = asyncio.run(_call(module))
+    assert valid["final_response"] == "Valid reply" and valid["usage"] == {}
+    assert valid["product_timings"]["math_ms"] >= 0
     assert _failure_category(module, response=_Response(status=500, payload={})) == "http_error"
     assert _failure_category(module, error=_TimeoutException("timeout")) == "timeout"
     assert _failure_category(module, response=_Response(malformed=True)) == "malformed_response"

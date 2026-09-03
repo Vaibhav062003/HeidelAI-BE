@@ -569,6 +569,7 @@ async def send_whatsapp_message(
         raise_on_partial_failure: If True, raises HTTPException if any message in a multi-message payload fails.
     """
     from services.entitlement_service import require_feature
+    send_started_at = time.perf_counter()
     require_feature(org_id, "CHANNELS")
     whatsapp_id = message.get("sender_id")
     outbound_operation = None
@@ -699,6 +700,7 @@ async def send_whatsapp_message(
 
         last_stored_id = None
         all_message_ids = []
+        first_meta_accepted_ms = None
 
         # Send each content part as a separate bubble
         for i, content_item in enumerate(contents):
@@ -767,11 +769,6 @@ async def send_whatsapp_message(
                         response = await _meta_http_client().post(
                             url, headers=headers, json=data, timeout=30.0
                         )
-                        logger.info(
-                            "Meta accepted outbound request for ...{} in {}ms",
-                            conversation_id[-6:],
-                            round((time.perf_counter() - provider_started_at) * 1000),
-                        )
                     except httpx.RequestError:
                         delivery_unknown = True
                         mark_unknown(db.whatsapp_outbound_sends, part_operation)
@@ -782,8 +779,11 @@ async def send_whatsapp_message(
                             from services.entitlement_service import release_quota_async
                             await release_quota_async(org_id, "monthly_messages", quota_event_key)
                             quota_consumed = False
-                        if i == 0:
-                            release_claim(db.whatsapp_outbound_sends, part_operation, provider_started=True)
+                        release_claim(
+                            db.whatsapp_outbound_sends,
+                            part_operation,
+                            provider_started=True,
+                        )
                         logger.error("WhatsApp API rejected outbound message with status {}", response.status_code)
                         raise HTTPException(
                             status_code=response.status_code,
@@ -796,6 +796,18 @@ async def send_whatsapp_message(
                         delivery_unknown = True
                         mark_unknown(db.whatsapp_outbound_sends, part_operation)
                         raise HTTPException(status_code=502, detail="WhatsApp accepted the request without a message ID. Refresh before retrying.")
+                    provider_accepted_ms = round(
+                        (time.perf_counter() - provider_started_at) * 1000
+                    )
+                    if first_meta_accepted_ms is None:
+                        first_meta_accepted_ms = round(
+                            (time.perf_counter() - send_started_at) * 1000
+                        )
+                    logger.info(
+                        "Meta accepted outbound request for ...{} in {}ms",
+                        conversation_id[-6:],
+                        provider_accepted_ms,
+                    )
                     if part_operation:
                         accepted_operation = record_acceptance(db.whatsapp_outbound_sends, part_operation, message_id, response_data)
                         if not accepted_operation:
@@ -935,6 +947,10 @@ async def send_whatsapp_message(
             "delivery_state": "sent",
             "local_sync_pending": False,
         }
+        if first_meta_accepted_ms is not None:
+            result["product_timings"] = {
+                "first_meta_accepted_ms": first_meta_accepted_ms,
+            }
         if len(contents) == 1 and not complete_reply(db.whatsapp_outbound_sends, outbound_operation, result):
             existing_operation = db.whatsapp_outbound_sends.find_one({"_id": outbound_operation["_id"], "org_id": org_id}) if outbound_operation else None
             if existing_operation and existing_operation.get("status") == "completed" and isinstance(existing_operation.get("result"), dict):

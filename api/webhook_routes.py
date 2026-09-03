@@ -60,6 +60,35 @@ async def _best_effort_typing(whatsapp_id: str, message_id: str) -> None:
         logger.warning("Could not send WhatsApp typing indicator: {}", exc)
 
 
+def _log_product_reply_latency(
+    org_id: str,
+    conversation_id: str,
+    chatbot_response: dict,
+    send_result: dict,
+    started_at: float,
+    send_started_at: float,
+) -> None:
+    response_class = chatbot_response.get("response_class")
+    if response_class not in {"product_match", "product_alternative"}:
+        return
+    agent_timings = chatbot_response.get("product_timings") or {}
+    meta_timings = send_result.get("product_timings") or {}
+    first_meta_ms = meta_timings.get("first_meta_accepted_ms")
+    if not isinstance(first_meta_ms, int):
+        return
+    total_to_first_meta_ms = round((send_started_at - started_at) * 1000) + first_meta_ms
+    logger.info(
+        "Product reply accepted org={} response_class={} conversation=...{} "
+        "Math={}ms Meta={}ms total={}ms",
+        org_id,
+        response_class,
+        conversation_id[-6:],
+        agent_timings.get("math_ms"),
+        first_meta_ms,
+        total_to_first_meta_ms,
+    )
+
+
 def _apply_call_lifecycle(collection, org_id: str, call_id: str, existing: dict, **kwargs) -> dict:
     current = existing
     for _ in range(2):
@@ -1147,6 +1176,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
                                     logger.info(f"[AI_ROUTING] [{conversation_id}] ✅ Sending message to AI agent. org={org_id}, is_heidelai={is_heidelai}, content_length={len(content)}")
                                     try:
+                                        product_reply_started = time.perf_counter()
                                         asyncio.create_task(
                                             _best_effort_typing(whatsapp_business_id, message_id)
                                         )
@@ -1162,13 +1192,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             message_id=wa_message_id,
                                             message_type=message_type,
                                         )
-                                        if chatbot_response.get("duplicate_event"):
-                                            return {"status": "duplicate_ignored"}
                                         if not await is_effective_ai_enabled(org_id, conversation_id):
                                             return {"status": "ok"}
 
                                         sales_action = chatbot_response.get("sales_action")
                                         agent_reply_to = chatbot_response.get("reply_to_message_id")
+                                        meta_send_started = time.perf_counter()
                                         send_result = await send_whatsapp_message({
                                             "conversation_id": conversation_id,
                                             "content": chatbot_response["final_response"],
@@ -1179,6 +1208,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             context_type="message_reply" if agent_reply_to else None,
                                             context={"mid": agent_reply_to} if agent_reply_to else None,
                                             bot_context={"sales_action_job_id": sales_action.get("job_id")} if sales_action else None,
+                                        )
+                                        _log_product_reply_latency(
+                                            org_id, conversation_id, chatbot_response, send_result,
+                                            product_reply_started, meta_send_started,
                                         )
                                         await mark_sales_action_delivered(org_id, sales_action, send_result)
                                     except AIProviderUnavailable as exc:
@@ -1320,6 +1353,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform="whatsapp", customer_number=customer_phone_no, customer_name=sender_name2)
                                     return {"status": "ok"}
                                 try:
+                                    product_reply_started = time.perf_counter()
                                     chatbot_response = await send_to_agent(
                                         conversation_id=conversation_id,
                                         user_input=content,
@@ -1332,12 +1366,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         message_id=wa_message_id,
                                         message_type=message_type,
                                     )
-                                    if chatbot_response.get("duplicate_event"):
-                                        return {"status": "duplicate_ignored"}
                                     if not await is_effective_ai_enabled(org_id, conversation_id):
                                         return {"status": "ok"}
                                     sales_action = chatbot_response.get("sales_action")
                                     agent_reply_to = chatbot_response.get("reply_to_message_id")
+                                    meta_send_started = time.perf_counter()
                                     send_result = await send_whatsapp_message({
                                         "conversation_id": conversation_id,
                                         "content": chatbot_response["final_response"],
@@ -1348,6 +1381,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context_type="message_reply" if agent_reply_to else None,
                                         context={"mid": agent_reply_to} if agent_reply_to else None,
                                         bot_context={"sales_action_job_id": sales_action.get("job_id")} if sales_action else None,
+                                    )
+                                    _log_product_reply_latency(
+                                        org_id, conversation_id, chatbot_response, send_result,
+                                        product_reply_started, meta_send_started,
                                     )
                                     await mark_sales_action_delivered(org_id, sales_action, send_result)
                                 except AIProviderUnavailable as exc:
@@ -2447,8 +2484,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         message_id=ig_message_id,
                                         message_type=attachment_type,
                                     )
-                                    if chatbot_response.get("duplicate_event"):
-                                        return {"status": "duplicate_ignored"}
                                     if await is_effective_ai_enabled(org_id, conversation_id):
                                         sales_action = chatbot_response.get("sales_action")
                                         if is_pricing_enabled(org_id) and not sales_action:

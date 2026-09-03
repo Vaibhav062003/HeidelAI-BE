@@ -147,14 +147,14 @@ assert 'response_data.get("reply_to_message_id")' in agent
 assert 'response_data.get("sales_decision")' in agent
 assert "await apply_sales_decision(" in agent
 assert "await execute_sales_action(" in agent
-assert 'result["duplicate_event"] = True' in agent
+assert 'result["duplicate_event"] = True' not in agent
 
 webhook = (root / "api/webhook_routes.py").read_text()
 assert webhook.count("message_type=message_type") >= 2
 assert "message_type=attachment_type" in webhook
 assert webhook.count('chatbot_response.get("reply_to_message_id")') >= 2
 assert webhook.count("await mark_sales_action_delivered(") >= 3
-assert webhook.count('chatbot_response.get("duplicate_event")') >= 3
+assert 'chatbot_response.get("duplicate_event")' not in webhook
 
 actions = (root / "services/sales_action_service.py").read_text()
 assert '"$setOnInsert"' in actions and 'status") in {"ready", "delivered"}' in actions

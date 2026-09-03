@@ -50,13 +50,15 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_entitlement_indexes)
     await start_push_notification_workers()
     await startup_intent_worker()
-    yield
-    # Shutdown
-    stop_scheduler()
-    await stop_push_notification_workers()
-    await shutdown_intent_worker()
-    await shutdown_scheduler()
-    await shutdown_google_scheduler()
-    await close_agent_http_client()
-    await close_meta_http_client()
-    clear_agents()
+    try:
+        yield
+    finally:
+        # Shutdown must also run when the application exits exceptionally.
+        stop_scheduler()
+        await stop_push_notification_workers()
+        await shutdown_intent_worker()
+        await shutdown_scheduler()
+        await shutdown_google_scheduler()
+        await close_agent_http_client()
+        await close_meta_http_client()
+        clear_agents()

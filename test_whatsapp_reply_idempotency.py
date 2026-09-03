@@ -105,8 +105,27 @@ ai_collection = FakeCollection()
 assert claim_reply(ai_collection, *ai_args, now=now)["action"] == "claimed"
 expect_conflict(lambda: claim_reply(ai_collection, *ai_args, now=now))
 
+# A definitive rejection of a later bubble is retryable without resending an
+# earlier accepted bubble.
+multipart = FakeCollection()
+part_one = ("org-a", "ai:wamid.2:part:0", "whatsapp_919999999999", "ai", ["First"])
+part_two = ("org-a", "ai:wamid.2:part:1", "whatsapp_919999999999", "ai", ["Second"])
+first_claim = claim_reply(multipart, *part_one, now=now)
+assert start_provider(multipart, first_claim, now=now)
+first_accepted = record_acceptance(
+    multipart, first_claim, "wamid.first", {"messages": [{"id": "wamid.first"}]}, now=now,
+)
+assert complete_reply(multipart, first_accepted, {"message_id": "wamid.first"}, now=now)
+second_claim = claim_reply(multipart, *part_two, now=now)
+assert start_provider(multipart, second_claim, now=now)
+release_claim(multipart, second_claim, provider_started=True)
+assert claim_reply(multipart, *part_one, now=now)["action"] == "replay"
+second_retry = claim_reply(multipart, *part_two, now=now)
+assert second_retry["action"] == "claimed" and start_provider(multipart, second_retry, now=now)
+
 lifespan = Path("core/lifespan.py").read_text()
 service = Path("services/wa_service.py").read_text()
+webhook = Path("api/webhook_routes.py").read_text()
 assert "ensure_whatsapp_outbound_indexes" in lifespan
 assert 'create_index("expires_at", expireAfterSeconds=0)' in service
 assert '"delivery_state": "accepted_pending_sync"' in service
@@ -114,5 +133,16 @@ assert '"local_sync_pending": True' in service
 assert 'if status == "sending":\n        return message_id' not in service
 assert "await _meta_http_client().post(" in service
 assert "await close_meta_http_client()" in lifespan
+assert "finally:\n        # Shutdown must also run" in lifespan
+rejection = service[service.index("if response.status_code != 200:"):service.index("response_data = response.json()")]
+assert "if i == 0" not in rejection and "release_claim(" in rejection
+accepted = service[service.index("response_data = response.json()"):service.index("if part_operation:", service.index("response_data = response.json()"))]
+assert accepted.index("if not message_id:") < accepted.index("Meta accepted outbound request")
+assert "if first_meta_accepted_ms is None:" in accepted
+assert '"first_meta_accepted_ms": first_meta_accepted_ms' in service
+latency = webhook[webhook.index("def _log_product_reply_latency("):webhook.index("def _apply_call_lifecycle")]
+assert 'response_class not in {"product_match", "product_alternative"}' in latency
+assert 'meta_timings.get("first_meta_accepted_ms")' in latency
+assert '"Product reply accepted org={}' in latency
 
 print("WhatsApp reply idempotency behavior passed.")

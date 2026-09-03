@@ -48,7 +48,10 @@ class _Client:
         self.is_closed = True
 
 
-def _load_service(records, failures, active_case=None, sales_state_failure=False):
+def _load_service(
+    records, failures, active_case=None, sales_state_failure=False,
+    applied_result=None, action_result=None,
+):
     _Client.instances = 0
     _Client.last_post = None
     httpx = types.ModuleType("httpx")
@@ -65,6 +68,7 @@ def _load_service(records, failures, active_case=None, sales_state_failure=False
     team = types.ModuleType("services.team_service")
     sales_cases = types.ModuleType("services.sales_case_service")
     sales_learning = types.ModuleType("services.sales_learning_service")
+    sales_actions = types.ModuleType("services.sales_action_service")
     sales_calls = []
 
     async def create_ai_escalation(org_id, data):
@@ -85,6 +89,8 @@ def _load_service(records, failures, active_case=None, sales_state_failure=False
         return {"version": 0, "stage": "new", "facts": {}}
 
     async def apply_sales_decision(*_args, **_kwargs):
+        if applied_result is not None:
+            return applied_result
         raise AssertionError("unexpected sales decision")
 
     async def get_sales_guidance(*_args, **_kwargs):
@@ -95,16 +101,30 @@ def _load_service(records, failures, active_case=None, sales_state_failure=False
         sales_calls.append(("record", _kwargs.get("case")))
         return None
 
+    async def record_sales_learning_event(*_args, **_kwargs):
+        return None
+
+    async def execute_sales_action(*_args, **_kwargs):
+        sales_calls.append(("action", _kwargs.get("action_type")))
+        return action_result
+
+    def checked_sales_context(case):
+        if (case or {}).get("malformed"):
+            raise ValueError("legacy sales state is malformed")
+        return {
+            "version": int((case or {}).get("version") or 0),
+            "stage": (case or {}).get("stage") or "new",
+            "facts": (case or {}).get("facts") or {},
+        }
+
     sales_cases.get_active_sales_case = get_active_sales_case
     sales_cases.get_sales_context = get_sales_context
     sales_cases.apply_sales_decision = apply_sales_decision
-    sales_cases.sales_context = lambda case: {
-        "version": int((case or {}).get("version") or 0),
-        "stage": (case or {}).get("stage") or "new",
-        "facts": (case or {}).get("facts") or {},
-    }
+    sales_cases.sales_context = checked_sales_context
     sales_learning.get_sales_guidance = get_sales_guidance
     sales_learning.record_customer_response = record_customer_response
+    sales_learning.record_sales_learning_event = record_sales_learning_event
+    sales_actions.execute_sales_action = execute_sales_action
     sys.modules.update(
         {
             "httpx": httpx,
@@ -114,6 +134,7 @@ def _load_service(records, failures, active_case=None, sales_state_failure=False
             "services.team_service": team,
             "services.sales_case_service": sales_cases,
             "services.sales_learning_service": sales_learning,
+            "services.sales_action_service": sales_actions,
         }
     )
     spec = importlib.util.spec_from_file_location("math_handoff_agent_service", ROOT / "services/agent_service.py")
@@ -136,6 +157,12 @@ async def _call(module, *, message_id="wamid.123"):
     )
 
 
+def _core_reply(result):
+    timings = result.pop("product_timings")
+    assert timings["math_ms"] >= 0 and timings["agent_total_ms"] >= timings["math_ms"]
+    return result
+
+
 async def _exercise():
     records = []
     failures = []
@@ -144,8 +171,8 @@ async def _exercise():
         "response": "A safe customer reply",
         "handoff": {"requested": True, "reason_code": "quotation"},
     }
-    assert await _call(module) == {"final_response": "A safe customer reply", "usage": {}}
-    assert await _call(module) == {"final_response": "A safe customer reply", "usage": {}}
+    assert _core_reply(await _call(module)) == {"final_response": "A safe customer reply", "usage": {}}
+    assert _core_reply(await _call(module)) == {"final_response": "A safe customer reply", "usage": {}}
     assert _Client.instances == 1
     assert len(records) == 2 and records[0][1]["id"] == records[1][1]["id"]
     saved = records[0][1]
@@ -162,7 +189,7 @@ async def _exercise():
             "context": "  Was looking at: Asus Zephyrus G14 (Rs.67,381).  ",
         },
     }
-    assert await _call(module) == {"final_response": "A safe customer reply", "usage": {}}
+    assert _core_reply(await _call(module)) == {"final_response": "A safe customer reply", "usage": {}}
     saved_context = records[-1][1]
     assert saved_context["customer_text"] == "private customer text"
     assert saved_context["metadata"]["catalogue_context"] == (
@@ -228,16 +255,39 @@ async def _exercise():
     active_case = {"version": 4, "stage": "negotiating", "facts": {"budget": 60000}}
     optimized = _load_service([], [], active_case=active_case)
     _Response.payload = {"response": "A safe customer reply"}
-    assert await _call(optimized) == {"final_response": "A safe customer reply", "usage": {}}
+    assert _core_reply(await _call(optimized)) == {"final_response": "A safe customer reply", "usage": {}}
     assert optimized.sales_calls.count(("get_active", None)) == 1
     assert ("record", active_case) in optimized.sales_calls
 
     degraded = _load_service([], [], sales_state_failure=True)
-    assert await _call(degraded) == {"final_response": "A safe customer reply", "usage": {}}
-    assert b'"sales_context":{}' in _Client.last_post[1]["content"]
+    assert _core_reply(await _call(degraded)) == {"final_response": "A safe customer reply", "usage": {}}
+    assert b'"sales_context":{"version":0,"stage":"new","facts":{}}' in _Client.last_post[1]["content"]
+
+    malformed = _load_service([], [], active_case={"malformed": True})
+    assert _core_reply(await _call(malformed)) == {"final_response": "A safe customer reply", "usage": {}}
+    assert b'"sales_context":{"version":0,"stage":"new","facts":{}}' in _Client.last_post[1]["content"]
+
+    persisted_case = {
+        "version": 2, "stage": "evaluating", "facts": {},
+        "next_action": "draft_quote", "action_status": "ready",
+    }
+    duplicate = _load_service([], [], applied_result={
+        "case": persisted_case, "duplicate": True, "conflict": False, "rebased": False,
+    })
+    _Response.payload = {
+        "response": "A safe product reply",
+        "response_class": "product_match",
+        "sales_decision": {"requested_action": {"type": "none"}},
+    }
+    duplicate_result = await _call(duplicate)
+    assert duplicate_result["final_response"] == "A safe product reply"
+    assert duplicate_result["response_class"] == "product_match"
+    assert "duplicate_event" not in duplicate_result
+    assert ("action", "draft_quote") in duplicate.sales_calls
     source = (ROOT / "services/agent_service.py").read_text(encoding="utf-8")
     assert "asyncio.gather(" in source
     assert "asyncio.wait_for" not in source
+    assert 'result["duplicate_event"]' not in source
 
 
 def main():
@@ -250,6 +300,8 @@ def main():
     assert "_validated_handoff" in pma_source and "_persist_handoff" in pma_source
     assert pma_source.index("await _persist_handoff(") < pma_source.index("final_response = validate_ai_reply")
     assert "asyncio.create_task(\n                                            _best_effort_typing" in webhook_source
+    assert 'chatbot_response.get("duplicate_event")' not in webhook_source
+    assert webhook_source.count('temp_id=f"ai:{wa_message_id}"') >= 2
     print("Math handoff persistence contract: ok")
 
 
