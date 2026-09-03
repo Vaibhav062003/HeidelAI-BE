@@ -3,7 +3,8 @@ from contextlib import asynccontextmanager
 import asyncio
 from core.scheduler import start_scheduler, stop_scheduler
 from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cache
-from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, recover_stale_bulk_jobs
+from services.wa_service import close_meta_http_client, ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, recover_stale_bulk_jobs
+from services.agent_service import close_agent_http_client
 from services.automation_scheduler import startup_scheduler, shutdown_scheduler
 from services.google_sheets_scheduler import startup_google_scheduler, shutdown_google_scheduler
 from services.intent_queue_worker import startup_intent_worker, shutdown_intent_worker
@@ -49,11 +50,15 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_entitlement_indexes)
     await start_push_notification_workers()
     await startup_intent_worker()
-    yield
-    # Shutdown
-    stop_scheduler()
-    await stop_push_notification_workers()
-    await shutdown_intent_worker()
-    await shutdown_scheduler()
-    await shutdown_google_scheduler()
-    clear_agents()
+    try:
+        yield
+    finally:
+        # Shutdown must also run when the application exits exceptionally.
+        stop_scheduler()
+        await stop_push_notification_workers()
+        await shutdown_intent_worker()
+        await shutdown_scheduler()
+        await shutdown_google_scheduler()
+        await close_agent_http_client()
+        await close_meta_http_client()
+        clear_agents()

@@ -93,8 +93,8 @@ class FakeCollection:
                 target = target.setdefault(part, {})
             target[parts[-1]] = value
         self.case["version"] += update["$inc"]["version"]
-        self.case["processed_events"].append(update["$push"]["processed_events"]["$each"][0])
-        self.case["stage_history"].append(update["$push"]["stage_history"]["$each"][0])
+        for field, operation in update.get("$push", {}).items():
+            self.case.setdefault(field, []).extend(operation["$each"])
         return dict(self.case)
 
 
@@ -131,6 +131,26 @@ rebased = asyncio.run(sales.apply_sales_decision(
 assert rebased["rebased"] is True and rebased["conflict"] is False
 assert rebased["case"]["facts"]["quantity"]["value"] == 2
 
+action_decision = {
+    "version": 1, "expected_case_version": 3, "stage_signal": "selected",
+    "sales_move": {"type": "start_quote"},
+    "requested_action": {"type": "create_quote"},
+}
+applied_action = asyncio.run(sales.apply_sales_decision(
+    org_id="org", conversation_id="c", source_message_id="m3", customer_name="A",
+    decision=action_decision,
+))
+replayed_action = asyncio.run(sales.apply_sales_decision(
+    org_id="org", conversation_id="c", source_message_id="m3", customer_name="A",
+    decision=action_decision,
+))
+assert replayed_action["duplicate"] is True
+assert replayed_action["action_receipt"] == applied_action["action_receipt"]
+assert applied_action["action_receipt"]["source_message_id"] == "m3"
+assert applied_action["action_receipt"]["action_type"] == "create_quote"
+assert applied_action["action_receipt"]["job_id"] == "case:m3:create_quote"
+assert applied_action["action_receipt"]["case_snapshot"]["facts"]["quantity"]["value"] == 2
+
 try:
     sales.normalize_sales_decision({
         "version": 1, "stage_signal": "won", "sales_move": {"type": "hack"},
@@ -147,17 +167,19 @@ assert 'response_data.get("reply_to_message_id")' in agent
 assert 'response_data.get("sales_decision")' in agent
 assert "await apply_sales_decision(" in agent
 assert "await execute_sales_action(" in agent
-assert 'result["duplicate_event"] = True' in agent
+assert 'result["duplicate_event"] = True' not in agent
 
 webhook = (root / "api/webhook_routes.py").read_text()
 assert webhook.count("message_type=message_type") >= 2
 assert "message_type=attachment_type" in webhook
 assert webhook.count('chatbot_response.get("reply_to_message_id")') >= 2
-assert webhook.count("await mark_sales_action_delivered(") >= 3
-assert webhook.count('chatbot_response.get("duplicate_event")') >= 3
+assert webhook.count("_finalize_whatsapp_sales_action(") >= 3
+assert "await mark_sales_action_delivered(" in webhook
+assert 'chatbot_response.get("duplicate_event")' not in webhook
 
 actions = (root / "services/sales_action_service.py").read_text()
-assert '"$setOnInsert"' in actions and 'status") in {"ready", "delivered"}' in actions
+assert '"$setOnInsert"' in actions and 'isinstance(existing.get("result"), dict)' in actions
+assert actions.count('"status": "processing", "claim_id": claim_id') >= 3
 assert "floor_snapshot(product)" in actions and "create_tally_invoice_draft" in actions
 assert "_floor_tax_basis(product)" in actions and '"gst_inclusive": tax_basis == "included"' in actions
 assert "default_gst_rate" not in actions

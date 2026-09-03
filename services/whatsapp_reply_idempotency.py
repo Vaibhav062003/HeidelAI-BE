@@ -6,7 +6,47 @@ from typing import Optional
 
 
 class ReplyOperationConflict(Exception):
-    pass
+    def __init__(self, message: str, *, status: str = ""):
+        super().__init__(message)
+        self.status = status
+
+
+def claim_reply_manifest(
+    collection, org_id: str, temp_id: Optional[str], conversation_id: str,
+    mode: str, contents: list[str], sales_action_job_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    if mode != "ai" or not temp_id:
+        return {"contents": contents, "sales_action_job_id": sales_action_job_id}
+    now = now or datetime.now(timezone.utc)
+    manifest = {
+        "_id": f"{org_id}:{temp_id}:manifest",
+        "org_id": org_id,
+        "temp_id": temp_id,
+        "conversation_id": conversation_id,
+        "mode": mode,
+        "contents": contents,
+        "sales_action_job_id": sales_action_job_id,
+        "created_at": now,
+        "expires_at": now + timedelta(days=30),
+    }
+    existing = collection.find_one_and_update(
+        {"_id": manifest["_id"]},
+        {"$setOnInsert": manifest},
+        upsert=True,
+        return_document=True,
+    ) or manifest
+    stored_contents = existing.get("contents")
+    if (
+        existing.get("org_id") != org_id
+        or existing.get("conversation_id") != conversation_id
+        or existing.get("mode") != mode
+        or not isinstance(stored_contents, list)
+        or not stored_contents
+        or not all(isinstance(item, str) and item and len(item) <= 4096 for item in stored_contents)
+    ):
+        raise ReplyOperationConflict("This AI reply manifest is invalid")
+    return existing
 
 
 def claim_reply(collection, org_id: str, temp_id: Optional[str], conversation_id: str, mode: str, contents: list[str], now: Optional[datetime] = None) -> Optional[dict]:
@@ -37,12 +77,22 @@ def claim_reply(collection, org_id: str, temp_id: Optional[str], conversation_id
         upsert=True,
         return_document=True,
     ) or operation
-    if existing.get("fingerprint") != fingerprint:
-        raise ReplyOperationConflict("This reply operation was already used for different content")
     if existing.get("claim_id") == claim_id:
         return {**existing, "action": "claimed"}
     if existing.get("status") == "completed" and isinstance(existing.get("result"), dict):
+        if mode == "ai":
+            return {**existing, "action": "replay"}
+        if existing.get("fingerprint") != fingerprint:
+            raise ReplyOperationConflict(
+                "This reply operation was already used for different content",
+                status=str(existing.get("status") or ""),
+            )
         return {**existing, "action": "replay"}
+    if existing.get("fingerprint") != fingerprint:
+        raise ReplyOperationConflict(
+            "This reply operation was already used for different content",
+            status=str(existing.get("status") or ""),
+        )
     if existing.get("status") == "provider_accepted" and existing.get("provider_message_id"):
         reconcile_id = str(uuid.uuid4())
         resumed = collection.find_one_and_update(
@@ -69,7 +119,10 @@ def claim_reply(collection, org_id: str, temp_id: Optional[str], conversation_id
         )
         if recovered:
             return {**recovered, "action": "claimed"}
-    raise ReplyOperationConflict("This reply is still being confirmed. Refresh the conversation before retrying.")
+    raise ReplyOperationConflict(
+        "This reply is still being confirmed. Refresh the conversation before retrying.",
+        status=str(existing.get("status") or ""),
+    )
 
 
 def start_provider(collection, operation: Optional[dict], now: Optional[datetime] = None) -> bool:

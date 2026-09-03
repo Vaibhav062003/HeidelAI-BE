@@ -224,16 +224,18 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
         {"$setOnInsert": document}, upsert=True,
     )
     quote = await db[f"quotes_{case['org_id']}"].find_one({"quote_id": quote_id}) or document
+    quote_item = (quote.get("items") or [{}])[0]
     gst = float(quote.get("private_gst_total") or 0)
     return {
         "reply": (
-            f"*Quotation {quote_number}*\n"
-            f"{_name(product)}\n"
-            f"Quantity: {quantity}\nUnit price: Rs.{unit_price:,.2f}\n"
+            f"*Quotation {quote['quote_number']}*\n"
+            f"{quote_item.get('description') or _name(product)}\n"
+            f"Quantity: {quote_item.get('quantity') or quantity}\n"
+            f"Unit price: Rs.{float(quote_item.get('private_unit_price') or unit_price):,.2f}\n"
             f"GST: Rs.{gst:,.2f}\n*Total: Rs.{float(quote['public_grand_total']):,.2f}*\n"
             f"Valid until: {quote['valid_until']}\n\nReply *proceed* when you are ready for billing."
         ),
-        "fields": {"quote_id": quote_id, "quote_number": quote_number},
+        "fields": {"quote_id": quote_id, "quote_number": quote["quote_number"]},
         "ready_stage": "stock_confirmation", "delivered_stage": "quote_sent",
     }
 
@@ -247,14 +249,21 @@ async def _stock_confirmation(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _invoice_draft(case: dict[str, Any], customer_text: str) -> dict[str, Any]:
+async def _invoice_draft(
+    case: dict[str, Any], customer_text: str, source_message_id: str,
+) -> dict[str, Any]:
     source_ids = [str(value) for value in case.get("action_source_message_ids") or [] if value]
     if not is_invoice_draft_intent(customer_text, has_source=bool(source_ids or case.get("quote_id"))):
         raise SalesActionBlocked("Please confirm which quoted products you want me to send for billing.")
     from services.tally_service import create_tally_invoice_draft
     draft = await create_tally_invoice_draft(
         str(case["org_id"]), "ai-sales", "admin", str(case["conversation_id"]),
-        {"source": "messages", "source_message_ids": source_ids},
+        {
+            "source": "messages", "source_message_ids": source_ids,
+            "idempotency_key": sales_action_job_id(
+                str(case["case_id"]), source_message_id, "create_invoice_draft"
+            ),
+        },
     )
     return {
         "reply": "I have prepared the order and sent it for billing review. The invoice will be shared after Billing confirms it in Tally.",
@@ -286,7 +295,12 @@ async def _handoff(case: dict[str, Any], source_message_id: str, customer_text: 
         raise SalesActionBlocked("I can continue helping with the product, price, quote, and billing here.")
     from services.team_service import create_ai_escalation
     phone = re.sub(r"\D", "", str(case["conversation_id"]))
+    handoff_id = str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"{case['org_id']}:{case['case_id']}:{source_message_id}:sales-handoff",
+    ))
     await create_ai_escalation(str(case["org_id"]), {
+        "id": handoff_id, "dedupe_id": f"sales-action:{handoff_id}",
         "user_name": case.get("customer_name") or "Customer",
         "customer_number": phone, "customer_text": customer_text,
         "inferred_intent": "customer_requested_human", "priority": "normal",
@@ -299,25 +313,16 @@ async def _handoff(case: dict[str, Any], source_message_id: str, customer_text: 
     }
 
 
-async def _escalate_block(case: dict[str, Any], source_message_id: str, reason: str) -> None:
-    try:
-        from services.team_service import create_ai_escalation
-        await create_ai_escalation(str(case["org_id"]), {
-            "user_name": case.get("customer_name") or "Customer",
-            "customer_number": re.sub(r"\D", "", str(case["conversation_id"])),
-            "customer_text": reason, "inferred_intent": "sales_action_blocked",
-            "priority": "normal", "metadata": {
-                "reason": "sales_action_blocked", "case_id": case["case_id"],
-                "source_message_id": source_message_id,
-            },
-        })
-    except Exception as exc:
-        logger.error(f"Could not create blocked sales escalation: {exc}")
+async def _job_result_or_pending(jobs, job_id: str) -> dict[str, Any]:
+    current = await jobs.find_one({"_id": job_id}) or {}
+    if isinstance(current.get("result"), dict):
+        return current["result"]
+    return {"pending": True, "job_id": job_id}
 
 
 async def execute_sales_action(
     *, case: dict[str, Any], source_message_id: str, action_type: str,
-    customer_text: str,
+    customer_text: str, recover_result_only: bool = False,
 ) -> dict[str, Any] | None:
     if action_type in {"none", "show_products"}:
         return None
@@ -325,8 +330,10 @@ async def execute_sales_action(
     job_id = sales_action_job_id(str(case["case_id"]), source_message_id, action_type)
     jobs = db[f"sales_action_jobs_{case['org_id']}"]
     existing = await jobs.find_one({"_id": job_id})
-    if existing and existing.get("status") in {"ready", "delivered"}:
+    if existing and isinstance(existing.get("result"), dict):
         return existing.get("result")
+    if recover_result_only:
+        return {"requires_review": True, "job_id": job_id}
     now = datetime.now(timezone.utc)
     claim_id = str(uuid.uuid4())
     claimed = None
@@ -355,8 +362,7 @@ async def execute_sales_action(
             return_document=ReturnDocument.AFTER,
         )
     if not claimed:
-        return {"reply": "I am still completing that safely. Please wait a moment.",
-                "blocked": True, "job_id": job_id}
+        return {"pending": True, "job_id": job_id}
     await set_sales_action_state(
         org_id=str(case["org_id"]), case_id=str(case["case_id"]),
         source_message_id=source_message_id, action_type=action_type, status="processing",
@@ -367,7 +373,7 @@ async def execute_sales_action(
         elif action_type == "request_stock_confirmation":
             result = await _stock_confirmation(case)
         elif action_type == "create_invoice_draft":
-            result = await _invoice_draft(case, customer_text)
+            result = await _invoice_draft(case, customer_text, source_message_id)
         elif action_type == "schedule_followup":
             result = await _schedule_followup(case)
         elif action_type == "create_handoff":
@@ -375,36 +381,84 @@ async def execute_sales_action(
         else:
             raise SalesActionBlocked("That sales action is not available yet.")
     except SalesActionBlocked as exc:
+        result = {
+            "reply": exc.customer_message, "blocked": True, "job_id": job_id,
+            "case_id": case["case_id"], "conversation_id": case["conversation_id"],
+            "source_message_id": source_message_id, "action_type": action_type,
+        }
         if exc.escalate:
-            await _escalate_block(case, source_message_id, exc.customer_message)
-        await jobs.update_one({"_id": job_id}, {"$set": {
-            "status": "blocked", "error": exc.customer_message, "updated_at": datetime.now(timezone.utc),
-        }, "$unset": {"claim_id": ""}})
-        await set_sales_action_state(
-            org_id=str(case["org_id"]), case_id=str(case["case_id"]),
-            source_message_id=source_message_id, action_type=action_type,
-            status="blocked", error=exc.customer_message,
+            result.update({
+                "requires_review": True,
+                "review_category": "sales_action_review_required",
+            })
+        saved = await jobs.find_one_and_update(
+            {"_id": job_id, "status": "processing", "claim_id": claim_id},
+            {"$set": {
+                "status": "blocked", "error": exc.customer_message, "result": result,
+                "updated_at": datetime.now(timezone.utc),
+            }, "$unset": {"claim_id": ""}},
+            return_document=ReturnDocument.AFTER,
         )
-        return {"reply": exc.customer_message, "blocked": True, "job_id": job_id}
+        if not saved:
+            return await _job_result_or_pending(jobs, job_id)
+        try:
+            await set_sales_action_state(
+                org_id=str(case["org_id"]), case_id=str(case["case_id"]),
+                source_message_id=source_message_id, action_type=action_type,
+                status="blocked", error=exc.customer_message,
+            )
+        except Exception:
+            result.update({
+                "requires_review": True,
+                "review_category": "sales_action_review_required",
+            })
+            await jobs.update_one(
+                {"_id": job_id, "status": "blocked"},
+                {"$set": {"result": result}},
+            )
+        return result
     except Exception as exc:
         logger.error(f"Sales action failed: {action_type}: {exc}", exc_info=True)
-        await jobs.update_one({"_id": job_id}, {"$set": {
-            "status": "failed", "error": str(exc)[:300], "updated_at": datetime.now(timezone.utc),
-        }, "$unset": {"claim_id": ""}})
-        await set_sales_action_state(
-            org_id=str(case["org_id"]), case_id=str(case["case_id"]),
-            source_message_id=source_message_id, action_type=action_type,
-            status="failed", error="The action could not be completed safely.",
+        result = {
+            "reply": "I could not complete that safely. Please contact the sales team.",
+            "blocked": True, "job_id": job_id, "case_id": case["case_id"],
+            "conversation_id": case["conversation_id"],
+            "source_message_id": source_message_id, "action_type": action_type,
+            "requires_review": True,
+            "review_category": "sales_action_review_required",
+        }
+        saved = await jobs.find_one_and_update(
+            {"_id": job_id, "status": "processing", "claim_id": claim_id},
+            {"$set": {
+                "status": "failed", "error": str(exc)[:300], "result": result,
+                "updated_at": datetime.now(timezone.utc),
+            }, "$unset": {"claim_id": ""}},
+            return_document=ReturnDocument.AFTER,
         )
-        return {"reply": "I could not complete that safely. Your request is saved for review.",
-                "blocked": True, "job_id": job_id}
+        if not saved:
+            return await _job_result_or_pending(jobs, job_id)
+        try:
+            await set_sales_action_state(
+                org_id=str(case["org_id"]), case_id=str(case["case_id"]),
+                source_message_id=source_message_id, action_type=action_type,
+                status="failed", error="The action could not be completed safely.",
+            )
+        except Exception as state_error:
+            logger.error(f"Could not synchronize failed sales action: {state_error}")
+        return result
 
     result.update({"job_id": job_id, "case_id": case["case_id"],
                    "conversation_id": case["conversation_id"],
                    "source_message_id": source_message_id, "action_type": action_type})
-    await jobs.update_one({"_id": job_id}, {"$set": {
-        "status": "ready", "result": result, "updated_at": datetime.now(timezone.utc),
-    }, "$unset": {"claim_id": ""}})
+    saved = await jobs.find_one_and_update(
+        {"_id": job_id, "status": "processing", "claim_id": claim_id},
+        {"$set": {
+            "status": "ready", "result": result, "updated_at": datetime.now(timezone.utc),
+        }, "$unset": {"claim_id": ""}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not saved:
+        return await _job_result_or_pending(jobs, job_id)
     await set_sales_action_state(
         org_id=str(case["org_id"]), case_id=str(case["case_id"]),
         source_message_id=source_message_id, action_type=action_type, status="ready",
@@ -430,11 +484,8 @@ async def mark_sales_action_delivered(
     if not action or action.get("blocked") or not action.get("job_id"):
         return
     jobs = get_async_mongo_db()[f"sales_action_jobs_{org_id}"]
-    result = await jobs.find_one_and_update(
-        {"_id": action["job_id"], "status": {"$ne": "delivered"}},
-        {"$set": {"status": "delivered", "delivered_at": datetime.now(timezone.utc)}},
-    )
-    if result is None:
+    job = await jobs.find_one({"_id": action["job_id"]})
+    if not job or job.get("status") != "ready":
         return
     await set_sales_action_state(
         org_id=org_id, case_id=str(action["case_id"]),
@@ -442,38 +493,33 @@ async def mark_sales_action_delivered(
         action_type=str(action["action_type"]), status="completed",
         stage=action.get("delivered_stage"),
     )
-    try:
-        from services.sales_learning_service import record_sales_learning_event
-        case = await get_async_mongo_db()[f"sales_cases_{org_id}"].find_one({"case_id": str(action["case_id"])})
-        if case:
-            await record_sales_learning_event(
-                org_id=org_id, event_type="message_delivered",
-                conversation_id=str(action.get("conversation_id") or ""),
-                source_id=str(action["job_id"]), case=case, channel=platform,
-            )
-    except Exception as exc:
-        logger.warning(f"Could not record internal delivery learning event: {exc}")
+    from services.sales_learning_service import record_sales_learning_event
+    case = await get_async_mongo_db()[f"sales_cases_{org_id}"].find_one({"case_id": str(action["case_id"])})
+    if case:
+        await record_sales_learning_event(
+            org_id=org_id, event_type="message_delivered",
+            conversation_id=str(action.get("conversation_id") or ""),
+            source_id=str(action["job_id"]), case=case, channel=platform,
+        )
     quote_id = (action.get("fields") or {}).get("quote_id")
     if quote_id and delivery_result:
-        try:
-            from services.sales_offer_service import enqueue_outbound_offer
-            await enqueue_outbound_offer(
-                org_id=org_id, agent_id="ai-sales", agent_name="AI Sales Agent",
-                conversation_id=str(action.get("conversation_id") or ""),
-                platform=platform, content=str(action.get("reply") or ""),
-                result=delivery_result,
-                context={"quote": {"id": quote_id, "revision": 1}},
-            )
-        except Exception as exc:
-            logger.error(f"Could not audit delivered AI quote: {exc}")
+        from services.sales_offer_service import enqueue_outbound_offer
+        await enqueue_outbound_offer(
+            org_id=org_id, agent_id="ai-sales", agent_name="AI Sales Agent",
+            conversation_id=str(action.get("conversation_id") or ""),
+            platform=platform, content=str(action.get("reply") or ""),
+            result=delivery_result,
+            context={"quote": {"id": quote_id, "revision": 1}},
+        )
     if action.get("action_type") == "create_quote":
-        try:
-            from services.followup_service import schedule_followup_message
-            await schedule_followup_message(
-                org_id, str(action.get("conversation_id") or ""),
-                source="quotation",
-                quote_id=str(quote_id or (action.get("fields") or {}).get("quote_id") or ""),
-                requested_by="ai-sales", requested_by_name="AI Sales Agent",
-            )
-        except Exception as exc:
-            logger.error(f"Could not schedule AI sales follow-up: {exc}")
+        from services.followup_service import schedule_followup_message
+        await schedule_followup_message(
+            org_id, str(action.get("conversation_id") or ""),
+            source="quotation",
+            quote_id=str(quote_id or (action.get("fields") or {}).get("quote_id") or ""),
+            requested_by="ai-sales", requested_by_name="AI Sales Agent",
+        )
+    await jobs.update_one(
+        {"_id": action["job_id"], "status": "ready"},
+        {"$set": {"status": "delivered", "delivered_at": datetime.now(timezone.utc)}},
+    )
