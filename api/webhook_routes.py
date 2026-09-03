@@ -1153,20 +1153,54 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     services.processed_message_ids.pop(wa_message_id, None)
                                     raise
 
-                                # Check if this is a registered dealer from the conversation doc first
-                                is_dealer = convo_doc.get("is_dealer", False) if convo_doc else False
-                                is_dealer_newly_detected = False
-                                if not is_dealer:
-                                    dealer_doc = db.dealer_directory.find_one({"org_id": org_id, "phone": customer_phone_no, "active": True})
-                                    if dealer_doc:
-                                        is_dealer = True
-                                        is_dealer_newly_detected = True
-                                        logger.info(f"Number {customer_phone_no} is a registered dealer for org {org_id}. Tagging conversation as dealer in next write.")
-                                        if convo_doc:
-                                            convo_doc["persona"] = "dealer"
-                                            convo_doc["is_dealer"] = True
-                                        else:
-                                            convo_doc = {"conversation_id": conversation_id, "persona": "dealer", "is_dealer": True, "is_ai_enabled": True}
+                                # Dealer membership is a live capability, not a
+                                # permanent conversation role. Revalidate it so
+                                # deactivated directory entries cannot leave a
+                                # conversation stuck in the dealer path forever.
+                                was_dealer = bool(convo_doc and convo_doc.get("is_dealer"))
+                                dealer_lookup_ok = True
+                                try:
+                                    is_dealer = bool(db.dealer_directory.find_one({
+                                        "org_id": org_id,
+                                        "phone": customer_phone_no,
+                                        "active": True,
+                                    }))
+                                except Exception:
+                                    logger.warning(
+                                        f"Could not refresh dealer state for ...{customer_phone_no[-4:]}; "
+                                        "keeping the existing conversation state",
+                                        exc_info=True,
+                                    )
+                                    is_dealer = was_dealer
+                                    dealer_lookup_ok = False
+                                dealer_state_updates = {}
+                                current_persona = str(
+                                    (convo_doc or {}).get("persona") or "fallback"
+                                )
+                                is_dealer_persona = (
+                                    current_persona.strip().lower().rstrip("s") == "dealer"
+                                )
+                                if dealer_lookup_ok:
+                                    if is_dealer != was_dealer:
+                                        dealer_state_updates["is_dealer"] = is_dealer
+                                    if is_dealer and not is_dealer_persona:
+                                        dealer_state_updates["persona"] = "dealer"
+                                    elif not is_dealer and is_dealer_persona:
+                                        dealer_state_updates["persona"] = "fallback"
+
+                                if dealer_state_updates:
+                                    logger.info(
+                                        f"Refreshing dealer state for ...{customer_phone_no[-4:]} "
+                                        f"in org {org_id}: active={is_dealer}"
+                                    )
+                                    if convo_doc:
+                                        convo_doc.update(dealer_state_updates)
+                                    else:
+                                        convo_doc = {
+                                            "conversation_id": conversation_id,
+                                            "is_ai_enabled": True,
+                                            **dealer_state_updates,
+                                        }
 
                                 # Check if this is a dealer reply to an out-of-stock request
                                 is_dealer_reply = await check_and_handle_dealer_reply(
@@ -1189,7 +1223,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         reply_window_expiry=reply_window_expiry_time_utc,
                                         is_ad_referral=is_ad_referral,
                                         mode="reply",
-                                        extra_updates={"persona": "dealer", "is_dealer": True} if is_dealer_newly_detected else None,
+                                        extra_updates=dealer_state_updates or None,
                                         idempotency_key=wa_message_id,
                                     )
                                     
