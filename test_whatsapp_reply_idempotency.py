@@ -5,6 +5,7 @@ from pathlib import Path
 from services.whatsapp_reply_idempotency import (
     ReplyOperationConflict,
     claim_reply,
+    claim_reply_manifest,
     complete_reply,
     mark_unknown,
     record_acceptance,
@@ -80,7 +81,12 @@ assert start_provider(collection, stale, now=now + timedelta(minutes=3))
 
 # Ambiguous provider delivery never becomes retryable automatically.
 mark_unknown(collection, stale, now=now + timedelta(minutes=3))
-expect_conflict(lambda: claim_reply(collection, *args, now=now + timedelta(minutes=4)))
+try:
+    claim_reply(collection, *args, now=now + timedelta(minutes=4))
+except ReplyOperationConflict as exc:
+    assert exc.status == "delivery_unknown"
+else:
+    raise AssertionError("uncertain provider result became retryable")
 
 # Confirmed provider acceptance survives a local storage failure and resumes without resending.
 collection = FakeCollection()
@@ -104,6 +110,41 @@ ai_args = ("org-a", "ai:wamid.1", "whatsapp_919999999999", "ai", ["AI reply"])
 ai_collection = FakeCollection()
 assert claim_reply(ai_collection, *ai_args, now=now)["action"] == "claimed"
 expect_conflict(lambda: claim_reply(ai_collection, *ai_args, now=now))
+
+# The first AI bubble plan remains authoritative if a retry changes cardinality.
+manifests = FakeCollection()
+first_manifest = claim_reply_manifest(
+    manifests, "org-a", "ai:wamid.manifest", "whatsapp_919999999999",
+    "ai", ["First", "Second"], "job-1", now=now,
+)
+collapsed_manifest = claim_reply_manifest(
+    manifests, "org-a", "ai:wamid.manifest", "whatsapp_919999999999",
+    "ai", ["Combined"], "job-2", now=now,
+)
+assert collapsed_manifest["contents"] == first_manifest["contents"] == ["First", "Second"]
+assert collapsed_manifest["sales_action_job_id"] == "job-1"
+single_manifest = claim_reply_manifest(
+    manifests, "org-a", "ai:wamid.single", "whatsapp_919999999999",
+    "ai", ["Single"], None, now=now,
+)
+expanded_manifest = claim_reply_manifest(
+    manifests, "org-a", "ai:wamid.single", "whatsapp_919999999999",
+    "ai", ["Different", "Bubbles"], "job-3", now=now,
+)
+assert expanded_manifest["contents"] == single_manifest["contents"] == ["Single"]
+assert expanded_manifest.get("sales_action_job_id") is None
+
+# A completed AI delivery replays even if a fresh model call words it differently.
+ai_replay = FakeCollection()
+ai_claim = claim_reply(ai_replay, *ai_args, now=now)
+assert start_provider(ai_replay, ai_claim, now=now)
+ai_accepted = record_acceptance(
+    ai_replay, ai_claim, "wamid.ai", {"messages": [{"id": "wamid.ai"}]}, now=now,
+)
+assert complete_reply(ai_replay, ai_accepted, {"message_id": "wamid.ai"}, now=now)
+changed_ai_args = (*ai_args[:-1], ["Differently worded AI reply"])
+assert claim_reply(ai_replay, *changed_ai_args, now=now)["action"] == "replay"
+expect_conflict(lambda: claim_reply(collection, *(*args[:-1], ["Changed manual reply"]), now=now))
 
 # A definitive rejection of a later bubble is retryable without resending an
 # earlier accepted bubble.
@@ -132,17 +173,43 @@ assert '"delivery_state": "accepted_pending_sync"' in service
 assert '"local_sync_pending": True' in service
 assert 'if status == "sending":\n        return message_id' not in service
 assert "await _meta_http_client().post(" in service
+assert "_is_definitive_meta_rejection" in service
 assert "await close_meta_http_client()" in lifespan
 assert "finally:\n        # Shutdown must also run" in lifespan
 rejection = service[service.index("if response.status_code != 200:"):service.index("response_data = response.json()")]
 assert "if i == 0" not in rejection and "release_claim(" in rejection
+assert rejection.index("mark_unknown(") < rejection.index("release_claim(")
+assert 'services.processed_message_ids.pop(temp_id.removeprefix("ai:"), None)' in rejection
+assert 'if mode == "ai":' in rejection and '"delivery_error"' in rejection
+request_error = service[service.index("except httpx.RequestError:"):service.index("if response.status_code != 200:")]
+assert "processed_message_ids.pop" not in request_error and "mark_unknown(" in request_error
 accepted = service[service.index("response_data = response.json()"):service.index("if part_operation:", service.index("response_data = response.json()"))]
 assert accepted.index("if not message_id:") < accepted.index("Meta accepted outbound request")
 assert "if first_meta_accepted_ms is None:" in accepted
 assert '"first_meta_accepted_ms": first_meta_accepted_ms' in service
 latency = webhook[webhook.index("def _log_product_reply_latency("):webhook.index("def _apply_call_lifecycle")]
+assert 'send_result.get("outbound_replay")' in latency
+assert "received_at" in latency and "send_started_wall - received_at" in latency
+assert "datetime.now(timezone.utc) - received_at" not in latency
 assert 'response_class not in {"product_match", "product_alternative"}' in latency
 assert 'meta_timings.get("first_meta_accepted_ms")' in latency
 assert '"Product reply accepted org={}' in latency
+assert 'idempotency_key=wa_message_id' in webhook
+assert 'error.category in {"sales_action_in_progress", "outbound_in_progress"}' in webhook
+assert "_finalize_whatsapp_sales_action" in webhook
+assert '"sales_action_delivery_conflict"' in webhook
+finalizer = webhook[webhook.index("async def _finalize_whatsapp_sales_action"):webhook.index("async def _send_quota_handoff")]
+assert finalizer.index('action_job_id = action.get("job_id") if action else None') < finalizer.index("if not action:")
+assert '"outbound_replay": True' in service
+assert "mark_active_delivery_unknown" in service
+assert 'raise AIProviderUnavailable("delivery_unknown") from e' in service
+assert '"outbound_in_progress", escalation_required=False' in service
+pending_marker = webhook[webhook.index("def mark_whatsapp_retry_pending"):webhook.index("now = datetime.now(timezone.utc)", webhook.index("def mark_whatsapp_retry_pending"))]
+assert "manual_review_required" not in pending_marker
+assert "finally:" in pending_marker
+assert pending_marker.index("finally:") < pending_marker.index("processed_message_ids.pop")
+assert "Sales action delivery is still being finalized" in webhook
+assert "Instagram delivery is still being synchronized" in webhook
+assert 'delivery_failure_required = error.category == "delivery_error"' in webhook
 
 print("WhatsApp reply idempotency behavior passed.")

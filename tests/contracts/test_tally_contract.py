@@ -196,6 +196,8 @@ class TallyContractTests(unittest.TestCase):
         self.assertNotIn('"connector_key_hash": integration', source)
         self.assertIn('"response_meta": response_meta', service)
         self.assertNotIn('"responses": result.get("responses")', service)
+        self.assertIn('payload.get("idempotency_key")', service)
+        self.assertIn('{"$setOnInsert": draft}', service)
 
     def test_failure_escalation_connects_customer_and_tally_context(self):
         customer = customer_snapshot(self.quote)

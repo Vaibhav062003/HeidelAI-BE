@@ -1642,18 +1642,14 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
         }}
     )
     await reconcile_default_payment_reminders(org_id)
-    try:
-        from services.sales_learning_service import record_verified_tally_outcome
-        for invoice in parsed["invoices"]:
-            previous = previous_invoices.get(invoice.get("master_id")) or {}
-            contact = invoice.get("billing_contact") or {}
-            if invoice.get("payment_status") == "paid" and previous.get("payment_status") != "paid" and contact.get("conversation_id"):
-                await record_verified_tally_outcome(
-                    org_id, str(contact["conversation_id"]),
-                    f"tally-paid:{invoice.get('invoice_id')}", "paid",
-                )
-    except Exception as error:
-        logger.warning(f"Could not record internal Tally payment learning: {type(error).__name__}")
+    from services.sales_learning_service import record_verified_tally_outcome
+    for invoice in parsed["invoices"]:
+        contact = invoice.get("billing_contact") or {}
+        if invoice.get("payment_status") == "paid" and contact.get("conversation_id"):
+            await record_verified_tally_outcome(
+                org_id, str(contact["conversation_id"]),
+                f"tally-paid:{invoice.get('invoice_id')}", "paid",
+            )
     return {"counts": counts, "contact_counts": contact_counts, "last_sync_at": now}
 
 
@@ -2177,6 +2173,7 @@ async def create_tally_invoice_draft(
     org_id: str, user_id: str, role: str, conversation_id: str, payload: dict,
 ) -> dict:
     conversation = await require_conversation_access(org_id, conversation_id, user_id, role)
+    idempotency_key = str(payload.get("idempotency_key") or "").strip()[:240]
     source = payload.get("source")
     items = []
     quote = None
@@ -2229,7 +2226,10 @@ async def create_tally_invoice_draft(
     })
     now = datetime.now(timezone.utc)
     draft = {
-        "draft_id": str(uuid.uuid4()), "org_id": org_id, "conversation_id": conversation_id,
+        "draft_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL, f"{org_id}:{conversation_id}:{idempotency_key}:tally-draft"
+        )) if idempotency_key else str(uuid.uuid4()),
+        "org_id": org_id, "conversation_id": conversation_id,
         "source": source, "reference": reference, "quote_id": (quote or {}).get("quote_id"),
         "source_message_ids": [item["message_id"] for item in source_messages],
         "source_messages": source_messages,
@@ -2242,9 +2242,21 @@ async def create_tally_invoice_draft(
         "created_by": user_id, "created_by_type": "ai" if user_id == "ai-sales" else "user",
         "created_at": now, "updated_at": now,
     }
-    await db.tally_invoice_drafts.insert_one(draft)
+    if idempotency_key:
+        await db.tally_invoice_drafts.update_one(
+            {"org_id": org_id, "draft_id": draft["draft_id"]},
+            {"$setOnInsert": draft},
+            upsert=True,
+        )
+        draft = await db.tally_invoice_drafts.find_one({
+            "org_id": org_id, "draft_id": draft["draft_id"],
+        }) or draft
+    else:
+        await db.tally_invoice_drafts.insert_one(draft)
     draft.pop("_id", None)
-    missing_products = [item["requested"] for item in items if not item["candidates"]]
+    missing_products = [
+        item["requested"] for item in draft.get("items") or [] if not item["candidates"]
+    ]
     if missing_products or not draft["party_candidates"]:
         missing = []
         if not draft["party_candidates"]:
@@ -2254,8 +2266,8 @@ async def create_tally_invoice_draft(
         await _sync_tally_escalation(org_id, {
             "job_id": f"draft:{draft['draft_id']}", "status": "failed", "attempts": 0,
             "conversation_id": conversation_id, "quote_id": draft.get("quote_id"),
-            "quote_number": reference, "party_ledger": "", "amount": 0,
-            "customer": customer, "error": "; ".join(missing),
+            "quote_number": draft.get("reference"), "party_ledger": "", "amount": 0,
+            "customer": draft.get("customer") or {}, "error": "; ".join(missing),
         })
     return serialize_mongo(draft)
 
@@ -3117,14 +3129,11 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
             if status == "completed":
                 await _remember_customer_mapping(integration["org_id"], existing)
                 await queue_tally_sync(integration["org_id"], force=True)
-                try:
-                    from services.sales_learning_service import record_verified_tally_outcome
-                    await record_verified_tally_outcome(
-                        integration["org_id"], str(existing.get("conversation_id") or ""),
-                        f"tally-billed:{existing['job_id']}", "billed",
-                    )
-                except Exception as learning_error:
-                    logger.warning(f"Could not record internal Tally billed learning: {type(learning_error).__name__}")
+                from services.sales_learning_service import record_verified_tally_outcome
+                await record_verified_tally_outcome(
+                    integration["org_id"], str(existing.get("conversation_id") or ""),
+                    f"tally-billed:{existing['job_id']}", "billed",
+                )
             if existing.get("draft_id"):
                 await db.tally_invoice_drafts.update_one(
                     {"org_id": integration["org_id"], "draft_id": existing["draft_id"]},
@@ -3143,14 +3152,11 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
     if status == "completed":
         await _remember_customer_mapping(integration["org_id"], updated)
         await queue_tally_sync(integration["org_id"], force=True)
-        try:
-            from services.sales_learning_service import record_verified_tally_outcome
-            await record_verified_tally_outcome(
-                integration["org_id"], str(updated.get("conversation_id") or ""),
-                f"tally-billed:{updated['job_id']}", "billed",
-            )
-        except Exception as learning_error:
-            logger.warning(f"Could not record internal Tally billed learning: {type(learning_error).__name__}")
+        from services.sales_learning_service import record_verified_tally_outcome
+        await record_verified_tally_outcome(
+            integration["org_id"], str(updated.get("conversation_id") or ""),
+            f"tally-billed:{updated['job_id']}", "billed",
+        )
     if updated.get("draft_id"):
         await db.tally_invoice_drafts.update_one(
             {"org_id": integration["org_id"], "draft_id": updated["draft_id"]},

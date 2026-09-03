@@ -178,6 +178,70 @@ async def send_to_agent(
         active_sales_case = None
         current_sales_context = sales_context(None)
 
+    recovery_receipt = next((
+        item for item in reversed((active_sales_case or {}).get("action_receipts") or [])
+        if isinstance(item, dict) and item.get("source_message_id") == sales_event_id
+    ), None)
+    legacy_action_type = ""
+    if (
+        active_sales_case
+        and active_sales_case.get("action_source_message_id") == sales_event_id
+        and active_sales_case.get("action_status") in {
+            "pending", "processing", "ready", "completed", "blocked", "failed",
+        }
+    ):
+        legacy_action_type = str(
+            active_sales_case.get("action_type")
+            or active_sales_case.get("next_action")
+            or ""
+        )
+    recovery_action_type = str(
+        (recovery_receipt or {}).get("action_type") or legacy_action_type
+    )
+    if recovery_action_type and recovery_action_type not in {"none", "show_products"}:
+        try:
+            from services.sales_action_service import execute_sales_action
+
+            recovery_case = (recovery_receipt or {}).get("case_snapshot")
+            has_recovery_snapshot = isinstance(recovery_case, dict)
+            if not has_recovery_snapshot:
+                recovery_case = active_sales_case
+            action = await execute_sales_action(
+                case=recovery_case,
+                source_message_id=sales_event_id,
+                action_type=recovery_action_type,
+                customer_text=user_input,
+                recover_result_only=not has_recovery_snapshot,
+            )
+            if action and action.get("requires_review"):
+                raise AIProviderUnavailable(
+                    action.get("review_category")
+                    or "legacy_sales_action_requires_review"
+                )
+            if action and action.get("pending"):
+                raise AIProviderUnavailable(
+                    "sales_action_in_progress", escalation_required=False
+                )
+            if action:
+                return {
+                    "final_response": action["reply"],
+                    "usage": {},
+                    "sales_action": action,
+                    "sales_case": await get_sales_context(org_id, conversation_id),
+                    "sales_case_conflict": False,
+                    "sales_case_rebased": False,
+                    "product_timings": {
+                        "math_ms": 0,
+                        "agent_total_ms": round(
+                            (time.perf_counter() - request_started) * 1000
+                        ),
+                    },
+                }
+        except AIProviderUnavailable:
+            raise
+        except Exception as exc:
+            raise AIProviderUnavailable("unexpected_error") from exc
+
     from services.sales_learning_service import get_sales_guidance, record_customer_response
     channel = "instagram" if conversation_id.startswith("instagram_") else "whatsapp"
 
@@ -301,13 +365,7 @@ async def send_to_agent(
                     decision=sales_decision,
                     source_message_text=user_input,
                 )
-                if applied.get("duplicate"):
-                    action_type = (
-                        str(applied["case"].get("next_action") or "none")
-                        if applied["case"].get("action_status") == "ready"
-                        else "none"
-                    )
-                else:
+                if not applied.get("duplicate"):
                     try:
                         from services.sales_learning_service import record_sales_learning_event
 
@@ -332,23 +390,49 @@ async def send_to_agent(
                             )
                     except Exception as exc:
                         logger.warning(f"Could not record internal sales decision: {exc}")
+                receipt = applied.get("action_receipt") or {}
+                action_type = str(receipt.get("action_type") or "none")
+                action_source_message_id = str(
+                    receipt.get("source_message_id") or sales_event_id
+                )
+                if (
+                    applied.get("duplicate")
+                    and not receipt
+                    and applied["case"].get("action_source_message_id") == sales_event_id
+                ):
                     action_type = str(
-                        (sales_decision.get("requested_action") or {}).get("type") or "none"
+                        applied["case"].get("action_type")
+                        or applied["case"].get("next_action")
+                        or "none"
                     )
                 from services.sales_action_service import execute_sales_action
 
-                action = None if applied["conflict"] else await execute_sales_action(
-                    case=applied["case"],
-                    source_message_id=sales_event_id,
+                action_case = receipt.get("case_snapshot")
+                if not isinstance(action_case, dict):
+                    action_case = applied["case"]
+                action = None if applied.get("conflict") else await execute_sales_action(
+                    case=action_case,
+                    source_message_id=action_source_message_id,
                     action_type=action_type,
                     customer_text=user_input,
                 )
+                if action and action.get("requires_review"):
+                    raise AIProviderUnavailable(
+                        action.get("review_category")
+                        or "sales_action_review_required"
+                    )
+                if action and action.get("pending"):
+                    raise AIProviderUnavailable(
+                        "sales_action_in_progress", escalation_required=False
+                    )
                 if action:
                     result["final_response"] = action["reply"]
                     result["sales_action"] = action
                 result["sales_case"] = await get_sales_context(org_id, conversation_id)
                 result["sales_case_conflict"] = applied["conflict"]
                 result["sales_case_rebased"] = applied.get("rebased", False)
+            except AIProviderUnavailable:
+                raise
             except Exception as exc:
                 logger.error(
                     f"Could not save sales decision for {conversation_id}: {exc}",

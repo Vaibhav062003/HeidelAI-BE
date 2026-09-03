@@ -106,6 +106,7 @@ def _load_service(
 
     async def execute_sales_action(*_args, **_kwargs):
         sales_calls.append(("action", _kwargs.get("action_type")))
+        sales_calls.append(("recover_only", _kwargs.get("recover_result_only")))
         return action_result
 
     def checked_sales_context(case):
@@ -269,10 +270,14 @@ async def _exercise():
 
     persisted_case = {
         "version": 2, "stage": "evaluating", "facts": {},
-        "next_action": "draft_quote", "action_status": "ready",
+        "next_action": "create_quote", "action_status": "ready",
     }
     duplicate = _load_service([], [], applied_result={
         "case": persisted_case, "duplicate": True, "conflict": False, "rebased": False,
+        "action_receipt": {
+            "source_message_id": "wamid.123", "action_type": "create_quote",
+            "job_id": "case:wamid.123:create_quote",
+        },
     })
     _Response.payload = {
         "response": "A safe product reply",
@@ -283,7 +288,78 @@ async def _exercise():
     assert duplicate_result["final_response"] == "A safe product reply"
     assert duplicate_result["response_class"] == "product_match"
     assert "duplicate_event" not in duplicate_result
-    assert ("action", "draft_quote") in duplicate.sales_calls
+    assert ("action", "create_quote") in duplicate.sales_calls
+
+    pending = _load_service([], [], applied_result={
+        "case": persisted_case, "duplicate": True, "conflict": False, "rebased": False,
+        "action_receipt": {
+            "source_message_id": "wamid.123", "action_type": "create_quote",
+            "job_id": "case:wamid.123:create_quote",
+        },
+    }, action_result={"pending": True, "job_id": "case:wamid.123:create_quote"})
+    try:
+        await _call(pending)
+    except AIProviderUnavailable as exc:
+        assert exc.category == "sales_action_in_progress" and not exc.escalation_required
+    else:
+        raise AssertionError("an in-progress sales action produced a customer reply")
+
+    recovered_action = {
+        "reply": "Your saved quote is ready.", "job_id": "job", "case_id": "case",
+        "conversation_id": "whatsapp_919999999999", "source_message_id": "wamid.123",
+        "action_type": "create_quote",
+    }
+    receipt_recovery = _load_service([], [], active_case={
+        "case_id": "case", "version": 3, "stage": "stock_confirmation", "facts": {},
+        "action_receipts": [{
+            "source_message_id": "wamid.123", "action_type": "create_quote",
+            "case_snapshot": {
+                "case_id": "case", "org_id": "org_test",
+                "conversation_id": "whatsapp_919999999999", "facts": {},
+            },
+        }],
+    }, action_result=recovered_action)
+    recovered = await _call(receipt_recovery)
+    assert recovered["final_response"] == "Your saved quote is ready."
+    assert recovered["product_timings"]["math_ms"] == 0
+    assert _Client.last_post is None
+
+    unsnapshotted_receipt = _load_service([], [], active_case={
+        "case_id": "case", "version": 3, "stage": "stock_confirmation", "facts": {},
+        "action_receipts": [{
+            "source_message_id": "wamid.123", "action_type": "create_quote",
+        }],
+    }, action_result={"requires_review": True, "job_id": "job"})
+    try:
+        await _call(unsnapshotted_receipt)
+    except AIProviderUnavailable as exc:
+        assert exc.category == "legacy_sales_action_requires_review"
+    else:
+        raise AssertionError("an intermediate unsnapshotted action was executed")
+    assert ("recover_only", True) in unsnapshotted_receipt.sales_calls
+    assert _Client.last_post is None
+
+    legacy_recovery = _load_service([], [], active_case={
+        "case_id": "case", "version": 3, "stage": "stock_confirmation", "facts": {},
+        "action_source_message_id": "wamid.123", "action_status": "ready",
+        "next_action": "create_quote",
+    }, action_result=recovered_action)
+    assert (await _call(legacy_recovery))["final_response"] == "Your saved quote is ready."
+    assert ("action", "create_quote") in legacy_recovery.sales_calls
+    assert _Client.last_post is None
+
+    unsafe_legacy = _load_service([], [], active_case={
+        "case_id": "case", "version": 3, "stage": "stock_confirmation", "facts": {},
+        "action_source_message_id": "wamid.123", "action_status": "processing",
+        "next_action": "create_quote",
+    }, action_result={"requires_review": True, "job_id": "job"})
+    try:
+        await _call(unsafe_legacy)
+    except AIProviderUnavailable as exc:
+        assert exc.category == "legacy_sales_action_requires_review"
+    else:
+        raise AssertionError("an unsnapshotted legacy action was executed")
+    assert _Client.last_post is None
     source = (ROOT / "services/agent_service.py").read_text(encoding="utf-8")
     assert "asyncio.gather(" in source
     assert "asyncio.wait_for" not in source

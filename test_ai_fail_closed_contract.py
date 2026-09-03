@@ -239,7 +239,8 @@ def test_channel_and_scheduler_contract():
     reply_claim = (ROOT / "services/whatsapp_reply_idempotency.py").read_text(encoding="utf-8")
     assert webhook.count("except AIProviderUnavailable") >= 5
     assert webhook.count("is_effective_ai_enabled") >= 10
-    assert '"reason": "ai_provider_unavailable"' in webhook
+    assert '"reason": failure_kind' in webhook
+    assert '"delivery_verification"' in webhook
     assert "HOLDING_REPLY" not in webhook
     assert "HOLDING_REPLY" not in sender
     assert 'user_input="hi"' not in scheduler
@@ -258,7 +259,7 @@ def test_channel_and_scheduler_contract():
     assert "is_effective_ai_enabled" in sender
     assert "any(len(content) > 4096 for content in contents)" in sender
     assert "not all(content.strip() for content in contents)" in sender
-    pending_resume = webhook.index("pending_ai_failure = messages_collection.find_one")
+    pending_resume = webhook.index("stored_inbound_message = messages_collection.find_one")
     text_dispatch = webhook.index('if message_type == "text":', pending_resume)
     assert pending_resume < text_dispatch
     assert "is_effective_ai_enabled" in instagram

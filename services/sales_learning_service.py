@@ -241,7 +241,7 @@ async def record_verified_tally_outcome(
 ) -> None:
     if outcome not in {"invoice_draft", "billed", "paid"} or not conversation_id:
         return
-    from services.sales_case_service import get_active_sales_case, set_sales_action_state
+    from services.sales_case_service import get_active_sales_case, set_verified_sales_outcome
     case = await get_active_sales_case(org_id, conversation_id)
     if not case:
         return
@@ -250,11 +250,7 @@ async def record_verified_tally_outcome(
         source_id=source_id, case=case, channel="tally",
     )
     if outcome in {"billed", "paid"}:
-        await set_sales_action_state(
-            org_id=org_id, case_id=str(case["case_id"]), source_message_id=source_id,
-            action_type="tally_invoice", status="completed",
-            fields={"billing_status": outcome}, stage="paid" if outcome == "paid" else "billed",
-        )
+        await set_verified_sales_outcome(org_id, str(case["case_id"]), outcome)
 
 
 async def get_sales_guidance(org_id: str, conversation_id: str, sales_context: dict[str, Any], text: str) -> dict[str, Any]:
