@@ -258,7 +258,8 @@ async def apply_sales_decision(
             "customer_name": customer_name, "status": "active", "stage": "new",
             "version": 0, "facts": {}, "signals": {}, "last_move": {},
             "catalogue_org_id": "", "question_field": "",
-            "next_action": "none", "processed_events": [], "stage_history": [],
+            "next_action": "none", "processed_events": [], "action_receipts": [],
+            "stage_history": [],
             "created_at": now, "updated_at": now,
         }
         try:
@@ -270,13 +271,23 @@ async def apply_sales_decision(
     rebased = False
     for _ in range(3):
         if source_message_id in (case.get("processed_events") or []):
-            return {"case": case, "duplicate": True, "conflict": False, "rebased": rebased}
+            receipt = next((
+                item for item in reversed(case.get("action_receipts") or [])
+                if isinstance(item, dict)
+                and item.get("source_message_id") == source_message_id
+            ), None)
+            return {
+                "case": case, "duplicate": True, "conflict": False,
+                "rebased": rebased, "action_receipt": receipt,
+            }
         current_version = int(case.get("version") or 0)
         rebased = rebased or expected != current_version
         next_stage = _later_stage(str(case.get("stage") or "new"), checked["stage_signal"])
         signals = dict(case.get("signals") or {})
         signals.update(checked["signals"])
+        facts_snapshot = dict(case.get("facts") or {})
         action_type = checked["requested_action"]["type"]
+        action_receipt = None
         updates: dict[str, Any] = {
             "stage": next_stage, "signals": signals,
             "last_move": checked["sales_move"], "next_action": action_type,
@@ -284,19 +295,53 @@ async def apply_sales_decision(
             "customer_name": customer_name or case.get("customer_name") or "",
             "updated_at": now,
         }
-        if action_type != "none":
+        if action_type not in {"none", "show_products"}:
+            action_receipt = {
+                "source_message_id": source_message_id,
+                "action_type": action_type,
+                "job_id": sales_action_job_id(
+                    str(case["case_id"]), source_message_id, action_type
+                ),
+            }
             updates.update({
                 "action_status": "pending", "action_error": "",
+                "action_type": action_type,
                 "action_source_message_id": source_message_id,
                 "action_source_message_ids": checked["requested_action"]["source_message_ids"],
             })
         if checked["learning_trace"]:
             updates["learning_trace"] = checked["learning_trace"]
         for item in checked["fact_updates"]:
-            updates[f"facts.{item['field']}"] = {
+            fact = {
                 "value": item["value"], "evidence": item["evidence"],
                 "confidence": item["confidence"],
                 "source_message_id": source_message_id, "updated_at": now,
+            }
+            updates[f"facts.{item['field']}"] = fact
+            facts_snapshot[item["field"]] = fact
+        if action_receipt:
+            action_receipt["case_snapshot"] = {
+                "case_id": str(case["case_id"]),
+                "org_id": org_id,
+                "conversation_id": conversation_id,
+                "customer_name": customer_name or case.get("customer_name") or "",
+                "facts": facts_snapshot,
+                "action_source_message_ids": list(
+                    checked["requested_action"]["source_message_ids"]
+                ),
+                "quote_id": case.get("quote_id"),
+            }
+        pushed = {
+            "processed_events": {"$each": [source_message_id], "$slice": -200},
+            "stage_history": {"$each": [{
+                "from": case.get("stage") or "new", "to": next_stage,
+                "source_message_id": source_message_id,
+                "move": checked["sales_move"]["type"], "at": now,
+            }], "$slice": -200},
+        }
+        if action_receipt:
+            pushed["action_receipts"] = {
+                "$each": [action_receipt], "$slice": -200,
             }
         updated = await collection.find_one_and_update(
             {
@@ -305,19 +350,15 @@ async def apply_sales_decision(
             },
             {
                 "$set": updates, "$inc": {"version": 1},
-                "$push": {
-                    "processed_events": {"$each": [source_message_id], "$slice": -200},
-                    "stage_history": {"$each": [{
-                        "from": case.get("stage") or "new", "to": next_stage,
-                        "source_message_id": source_message_id,
-                        "move": checked["sales_move"]["type"], "at": now,
-                    }], "$slice": -200},
-                },
+                "$push": pushed,
             },
             return_document=ReturnDocument.AFTER,
         )
         if updated:
-            return {"case": updated, "duplicate": False, "conflict": False, "rebased": rebased}
+            return {
+                "case": updated, "duplicate": False, "conflict": False,
+                "rebased": rebased, "action_receipt": action_receipt,
+            }
         case = await get_active_sales_case(org_id, conversation_id) or case
     return {"case": case, "duplicate": False, "conflict": True, "rebased": rebased}
 
@@ -328,7 +369,8 @@ async def set_sales_action_state(
     stage: str | None = None,
 ) -> dict[str, Any] | None:
     """Record a real action result without letting AI claim it happened."""
-    case = await _collection(org_id).find_one({"case_id": case_id, "status": "active"})
+    collection = _collection(org_id)
+    case = await collection.find_one({"case_id": case_id, "status": "active"})
     if not case:
         return None
     updates = {
@@ -339,7 +381,52 @@ async def set_sales_action_state(
     }
     if stage:
         updates["stage"] = _later_stage(str(case.get("stage") or "new"), stage)
-    return await _collection(org_id).find_one_and_update(
-        {"_id": case["_id"]}, {"$set": updates},
+    return await collection.find_one_and_update(
+        {
+            "case_id": case_id,
+            "status": "active",
+            "action_source_message_id": source_message_id,
+            "$or": [
+                {"action_type": action_type},
+                {"action_type": {"$exists": False}},
+            ],
+        },
+        {"$set": updates},
         return_document=ReturnDocument.AFTER,
     )
+
+
+async def set_verified_sales_outcome(
+    org_id: str, case_id: str, outcome: str,
+) -> dict[str, Any] | None:
+    """Apply a backend-verified billing outcome without changing action ownership."""
+    if outcome not in {"billed", "paid"}:
+        raise ValueError("invalid verified sales outcome")
+    collection = _collection(org_id)
+    for _ in range(3):
+        case = await collection.find_one({"case_id": case_id, "status": "active"})
+        if not case:
+            return None
+        verified_outcome = (
+            "paid" if outcome == "paid" or case.get("billing_status") == "paid"
+            else "billed"
+        )
+        updated = await collection.find_one_and_update(
+            {
+                "case_id": case_id,
+                "status": "active",
+                "stage": case.get("stage"),
+                "billing_status": case.get("billing_status"),
+            },
+            {"$set": {
+                "billing_status": verified_outcome,
+                "stage": _later_stage(
+                    str(case.get("stage") or "new"), verified_outcome
+                ),
+                "updated_at": datetime.now(timezone.utc),
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated:
+            return updated
+    raise RuntimeError("verified sales outcome changed repeatedly")

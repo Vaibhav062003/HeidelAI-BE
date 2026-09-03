@@ -4,7 +4,15 @@ import asyncio
 from loguru import logger
 from core.scheduler import start_scheduler, stop_scheduler
 from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cache
-from services.wa_service import ensure_bulk_job_indexes, ensure_whatsapp_call_indexes, ensure_whatsapp_outbound_indexes, run_whatsapp_revocation_reconciler, recover_stale_bulk_jobs
+from services.wa_service import (
+    close_meta_http_client,
+    ensure_bulk_job_indexes,
+    ensure_whatsapp_call_indexes,
+    ensure_whatsapp_outbound_indexes,
+    recover_stale_bulk_jobs,
+    run_whatsapp_revocation_reconciler,
+)
+from services.agent_service import close_agent_http_client
 from services.automation_scheduler import startup_scheduler, shutdown_scheduler
 from services.google_sheets_scheduler import startup_google_scheduler, shutdown_google_scheduler
 from services.intent_queue_worker import startup_intent_worker, shutdown_intent_worker
@@ -63,17 +71,21 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(ensure_entitlement_indexes)
     await start_push_notification_workers()
     await startup_intent_worker()
-    yield
-    # Shutdown
-    stop_scheduler()
-    await stop_push_notification_workers()
-    await shutdown_intent_worker()
-    await shutdown_scheduler()
-    await shutdown_google_scheduler()
-    if not bootstrap_task.done():
-        bootstrap_task.cancel()
-    await asyncio.gather(bootstrap_task, return_exceptions=True)
-    if not revocation_task.done():
-        revocation_task.cancel()
+    try:
+        yield
+    finally:
+        # Shutdown must also run when the application exits exceptionally.
+        stop_scheduler()
+        await stop_push_notification_workers()
+        await shutdown_intent_worker()
+        await shutdown_scheduler()
+        await shutdown_google_scheduler()
+        if not bootstrap_task.done():
+            bootstrap_task.cancel()
+        await asyncio.gather(bootstrap_task, return_exceptions=True)
+        if not revocation_task.done():
+            revocation_task.cancel()
         await asyncio.gather(revocation_task, return_exceptions=True)
-    clear_agents()
+        await close_agent_http_client()
+        await close_meta_http_client()
+        clear_agents()

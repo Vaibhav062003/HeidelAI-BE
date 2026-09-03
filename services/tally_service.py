@@ -2286,6 +2286,7 @@ async def create_tally_invoice_draft(
     org_id: str, user_id: str, role: str, conversation_id: str, payload: dict,
 ) -> dict:
     conversation = await require_conversation_access(org_id, conversation_id, user_id, role)
+    idempotency_key = str(payload.get("idempotency_key") or "").strip()[:240]
     source = payload.get("source")
     items = []
     quote = None
@@ -2338,7 +2339,10 @@ async def create_tally_invoice_draft(
     })
     now = datetime.now(timezone.utc)
     draft = {
-        "draft_id": str(uuid.uuid4()), "org_id": org_id, "conversation_id": conversation_id,
+        "draft_id": str(uuid.uuid5(
+            uuid.NAMESPACE_URL, f"{org_id}:{conversation_id}:{idempotency_key}:tally-draft"
+        )) if idempotency_key else str(uuid.uuid4()),
+        "org_id": org_id, "conversation_id": conversation_id,
         "source": source, "reference": reference, "quote_id": (quote or {}).get("quote_id"),
         "source_message_ids": [item["message_id"] for item in source_messages],
         "source_messages": source_messages,
@@ -2351,9 +2355,21 @@ async def create_tally_invoice_draft(
         "created_by": user_id, "created_by_type": "ai" if user_id == "ai-sales" else "user",
         "created_at": now, "updated_at": now,
     }
-    await db.tally_invoice_drafts.insert_one(draft)
+    if idempotency_key:
+        await db.tally_invoice_drafts.update_one(
+            {"org_id": org_id, "draft_id": draft["draft_id"]},
+            {"$setOnInsert": draft},
+            upsert=True,
+        )
+        draft = await db.tally_invoice_drafts.find_one({
+            "org_id": org_id, "draft_id": draft["draft_id"],
+        }) or draft
+    else:
+        await db.tally_invoice_drafts.insert_one(draft)
     draft.pop("_id", None)
-    missing_products = [item["requested"] for item in items if not item["candidates"]]
+    missing_products = [
+        item["requested"] for item in draft.get("items") or [] if not item["candidates"]
+    ]
     if missing_products or not draft["party_candidates"]:
         missing = []
         if not draft["party_candidates"]:
@@ -2363,8 +2379,8 @@ async def create_tally_invoice_draft(
         await _sync_tally_escalation(org_id, {
             "job_id": f"draft:{draft['draft_id']}", "status": "failed", "attempts": 0,
             "conversation_id": conversation_id, "quote_id": draft.get("quote_id"),
-            "quote_number": reference, "party_ledger": "", "amount": 0,
-            "customer": customer, "error": "; ".join(missing),
+            "quote_number": draft.get("reference"), "party_ledger": "", "amount": 0,
+            "customer": draft.get("customer") or {}, "error": "; ".join(missing),
         })
     return serialize_mongo(draft)
 

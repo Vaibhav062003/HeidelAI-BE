@@ -18,7 +18,8 @@ def _calls(function, name: str):
 
 
 def test_instagram_outbound_messages_are_confirmed_persisted_and_deduplicated():
-    instagram = ast.parse(Path("services/ig_service.py").read_text())
+    instagram_source = Path("services/ig_service.py").read_text()
+    instagram = ast.parse(instagram_source)
     for sender_name in ("send_ig_message", "send_ig_media_message"):
         sender = _function(instagram, sender_name)
         assert _calls(sender, "raise_for_status")
@@ -63,8 +64,31 @@ def test_instagram_outbound_messages_are_confirmed_persisted_and_deduplicated():
     )
     assert _calls(_function(instagram, "complete_instagram_webhook_message"), "update_one")
 
+    text_sender = ast.get_source_segment(
+        instagram_source, _function(instagram, "send_ig_message")
+    )
+    assert "provider_started = True" in text_sender
+    assert "response.status_code != 408" in text_sender
+    assert 'raise AIProviderUnavailable("delivery_unknown") from e' in text_sender
+    assert "authoritative_replay=enforce_ai_state" in text_sender
+    assert '_authoritative_content' in text_sender
+    claim_source = ast.get_source_segment(
+        instagram_source, _function(instagram, "_claim_instagram_send")
+    )
+    assert "and not authoritative_replay" in claim_source
+    assert 'result["_authoritative_content"] = existing.get("content")' in claim_source
+    assert 'result["sales_action_job_id"] = existing.get("sales_action_job_id")' in claim_source
+    finish = ast.get_source_segment(
+        instagram_source, _function(instagram, "_finish_instagram_send")
+    )
+    assert 'else "delivery_unknown" if result.get("delivery_unknown")' in finish
+
     webhook = ast.parse(Path("api/webhook_routes.py").read_text())
     handler = _function(webhook, "handle_webhook")
+    handler_source = ast.get_source_segment(
+        Path("api/webhook_routes.py").read_text(), handler
+    )
+    assert 'ai_result.get("sales_action_job_id") != (' in handler_source
     claim_line = _calls(handler, "claim_instagram_webhook_message")[0].lineno
     conversation_line = next(
         node.lineno for node in _calls(handler, "create_or_update_instagram_conversation")

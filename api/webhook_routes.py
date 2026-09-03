@@ -62,6 +62,59 @@ DEV_WHATSAPP_WABA_IDS = {
 DEV_WHATSAPP_PHONE_IDS = {"1248072875064563"}
 
 
+async def _best_effort_typing(
+    whatsapp_id: str, message_id: str, conversation_id: str
+) -> None:
+    try:
+        await read_message_and_typing_indicator(
+            whatsapp_id=whatsapp_id,
+            message_id=message_id,
+            conversation_id=conversation_id,
+        )
+    except Exception as exc:
+        logger.warning("Could not send WhatsApp typing indicator: {}", exc)
+
+
+def _log_product_reply_latency(
+    org_id: str,
+    conversation_id: str,
+    chatbot_response: dict,
+    send_result: dict,
+    started_at: float,
+    send_started_at: float,
+    received_at: datetime | None = None,
+    send_started_wall: datetime | None = None,
+) -> None:
+    if send_result.get("outbound_replay"):
+        return
+    response_class = chatbot_response.get("response_class")
+    if response_class not in {"product_match", "product_alternative"}:
+        return
+    agent_timings = chatbot_response.get("product_timings") or {}
+    meta_timings = send_result.get("product_timings") or {}
+    first_meta_ms = meta_timings.get("first_meta_accepted_ms")
+    if not isinstance(first_meta_ms, int):
+        return
+    if isinstance(received_at, datetime) and isinstance(send_started_wall, datetime):
+        if received_at.tzinfo is None:
+            received_at = received_at.replace(tzinfo=timezone.utc)
+        if send_started_wall.tzinfo is None:
+            send_started_wall = send_started_wall.replace(tzinfo=timezone.utc)
+        total_to_first_meta_ms = max(0, round(
+            (send_started_wall - received_at).total_seconds() * 1000
+        ) + first_meta_ms)
+    else:
+        total_to_first_meta_ms = round((send_started_at - started_at) * 1000) + first_meta_ms
+    logger.info(
+        "Product reply accepted org={} response_class={} conversation=...{} "
+        "Math={}ms Meta={}ms total={}ms",
+        org_id,
+        response_class,
+        conversation_id[-6:],
+        agent_timings.get("math_ms"),
+        first_meta_ms,
+        total_to_first_meta_ms,
+    )
 async def pricing_runtime_mode(org_id: str) -> str:
     """Read rollout mode; retain the legacy allowlist as an outage fallback."""
     try:
@@ -275,33 +328,66 @@ async def _handle_ai_provider_failure(
     resume_pending: bool = False,
 ) -> None:
     log_ai_failure(error, org_id=org_id, conversation_id=conversation_id)
+    if error.category in {"sales_action_in_progress", "outbound_in_progress"}:
+        if platform == "whatsapp" and source_message_id:
+            services.processed_message_ids.pop(source_message_id, None)
+        raise HTTPException(status_code=503, detail="AI reply is still processing")
     if error.category == "quota_exhausted":
         await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform=platform, customer_number=customer_number, customer_name=customer_name)
         return
+    delivery_verification_required = error.category in {
+        "delivery_unknown", "delivery_sync_failed", "sales_action_delivery_conflict",
+    }
+    delivery_failure_required = error.category == "delivery_error"
+    legacy_action_review_required = error.category == "legacy_sales_action_requires_review"
+    sales_action_review_required = error.category == "sales_action_review_required"
+    manual_review_required = (
+        delivery_verification_required
+        or delivery_failure_required
+        or legacy_action_review_required
+        or sales_action_review_required
+    )
     if not error.escalation_required:
         return
-    if not state_already_checked and not await is_effective_ai_enabled(org_id, conversation_id):
+    if (
+        not manual_review_required
+        and not state_already_checked
+        and not await is_effective_ai_enabled(org_id, conversation_id)
+    ):
         return
+    failure_kind = (
+        "delivery_verification"
+        if delivery_verification_required
+        else "delivery_failed"
+        if delivery_failure_required
+        else "legacy_sales_action_review"
+        if legacy_action_review_required
+        else "sales_action_review"
+        if sales_action_review_required
+        else "ai_provider_unavailable"
+    )
 
     def mark_whatsapp_retry_pending() -> None:
         if platform == "whatsapp" and source_message_id:
-            result = db[f"messages_{org_id}"].update_one(
-                {"message_id": source_message_id},
-                {
-                    "$set": {
-                        "ai_failure_pending": True,
-                        "ai_failure_category": error.category,
-                        "ai_failure_status": error.upstream_status,
-                    }
-                },
-            )
-            if not result.matched_count:
-                raise RuntimeError("AI failure retry state could not be persisted")
-            services.processed_message_ids.pop(source_message_id, None)
+            try:
+                result = db[f"messages_{org_id}"].update_one(
+                    {"message_id": source_message_id},
+                    {
+                        "$set": {
+                            "ai_failure_pending": True,
+                            "ai_failure_category": error.category,
+                            "ai_failure_status": error.upstream_status,
+                        }
+                    },
+                )
+                if not result.matched_count:
+                    raise RuntimeError("AI failure retry state could not be persisted")
+            finally:
+                services.processed_message_ids.pop(source_message_id, None)
 
     now = datetime.now(timezone.utc)
     dedupe_id = "ai-provider:" + hashlib.sha256(
-        f"{org_id}\0{platform}\0{conversation_id}\0ai_provider_unavailable".encode()
+        f"{org_id}\0{platform}\0{conversation_id}\0{failure_kind}".encode()
     ).hexdigest()[:32]
     escalation_id = f"{dedupe_id}:{int(now.timestamp())}"
     try:
@@ -353,23 +439,54 @@ async def _handle_ai_provider_failure(
     try:
         from services.team_service import create_ai_escalation
 
+        if delivery_verification_required:
+            escalation_text = (
+                "AI delivery could not be confirmed. Verify the provider and conversation "
+                "status before sending anything again."
+            )
+            escalation_action = "Verify delivery before any resend"
+        elif delivery_failure_required:
+            escalation_text = (
+                "The AI reply was rejected by the messaging provider. Open this "
+                "conversation and respond manually."
+            )
+            escalation_action = "Open the conversation and reply"
+        elif legacy_action_review_required:
+            escalation_text = (
+                "A saved legacy sales action has no immutable input snapshot. "
+                "Review the customer request before completing it."
+            )
+            escalation_action = "Review the saved sales request"
+        elif sales_action_review_required:
+            escalation_text = (
+                "A sales action could not be completed safely. Review the saved "
+                "customer request before continuing."
+            )
+            escalation_action = "Review the failed sales action"
+        else:
+            escalation_text = "AI could not prepare a reply. Open this conversation and respond."
+            escalation_action = "Open the conversation and reply"
         await create_ai_escalation(org_id, {
             "id": escalation_id,
             "user_name": customer_name or "Customer",
             "customer_number": customer_number,
-            "customer_text": "AI could not prepare a reply. Open this conversation and respond.",
-            "inferred_intent": "AI provider unavailable",
+            "customer_text": escalation_text,
+            "inferred_intent": (
+                "AI delivery requires verification"
+                if delivery_verification_required
+                else "AI provider unavailable"
+            ),
             "priority": "high",
             "kind": "actionable",
             "role": "system",
             "sender_name": "AI Assistant",
             "metadata": {
-                "reason": "ai_provider_unavailable",
+                "reason": failure_kind,
                 "failure_category": error.category,
                 "conversation_id": conversation_id,
                 "message_id": source_message_id,
                 "platform": platform,
-                "action": "Open the conversation and reply",
+                "action": escalation_action,
             },
         })
     except Exception as exc:
@@ -411,6 +528,40 @@ async def _handle_ai_provider_failure(
             )
             if not completed:
                 raise RuntimeError("AI failure retry state changed before completion")
+
+
+async def _finalize_whatsapp_sales_action(
+    *, org_id: str, conversation_id: str, action: dict | None,
+    send_result: dict, customer_name: str | None, customer_number: str,
+    source_message_id: str,
+) -> None:
+    action_job_id = action.get("job_id") if action else None
+    if send_result.get("sales_action_job_id") != action_job_id:
+        logger.error(
+            "Sales action reply did not own delivered WhatsApp message org={} conversation=...{}",
+            org_id,
+            conversation_id[-6:],
+        )
+        await _handle_ai_provider_failure(
+            AIProviderUnavailable("sales_action_delivery_conflict"),
+            org_id=org_id,
+            conversation_id=conversation_id,
+            platform="whatsapp",
+            customer_name=customer_name,
+            customer_number=customer_number,
+            source_message_id=source_message_id,
+        )
+        return
+    if not action:
+        return
+    try:
+        await mark_sales_action_delivered(org_id, action, send_result)
+    except Exception as exc:
+        services.processed_message_ids.pop(source_message_id, None)
+        raise HTTPException(
+            status_code=503,
+            detail="Sales action delivery is still being finalized",
+        ) from exc
 
 
 async def _send_quota_handoff(
@@ -1031,14 +1182,31 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "mid": replied_message_id
                                     }
 
-                            pending_ai_failure = messages_collection.find_one(
-                                {"message_id": wa_message_id, "ai_failure_pending": True},
+                            stored_inbound_message = messages_collection.find_one(
+                                {"message_id": wa_message_id},
                                 {
                                     "conversation_id": 1,
                                     "ai_failure_category": 1,
                                     "ai_failure_status": 1,
+                                    "ai_failure_pending": 1,
+                                    "timestamp": 1,
                                 },
                             )
+                            pending_ai_failure = (
+                                stored_inbound_message
+                                if (stored_inbound_message or {}).get("ai_failure_pending")
+                                else None
+                            )
+                            inbound_received_at = (
+                                stored_inbound_message or {}
+                            ).get("timestamp")
+                            if not isinstance(inbound_received_at, datetime):
+                                try:
+                                    inbound_received_at = datetime.fromtimestamp(
+                                        int(message.get("timestamp")), timezone.utc
+                                    )
+                                except (TypeError, ValueError, OverflowError):
+                                    inbound_received_at = None
                             if pending_ai_failure:
                                 conversation_id = pending_ai_failure.get("conversation_id") or conversation_id
                                 await _handle_ai_provider_failure(
@@ -1146,6 +1314,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         is_ad_referral=is_ad_referral,
                                         mode="reply",
                                         extra_updates={"persona": "dealer", "is_dealer": True} if is_dealer_newly_detected else None,
+                                        idempotency_key=wa_message_id,
                                         business_phone_id=business_phone_id,
                                         business_phone=business_phone,
                                     )
@@ -1274,6 +1443,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
                                     logger.info(f"[AI_ROUTING] [{conversation_id}] ✅ Sending message to AI agent. org={org_id}, is_heidelai={is_heidelai}, content_length={len(content)}")
                                     try:
+                                        product_reply_started = time.perf_counter()
+                                        asyncio.create_task(
+                                            _best_effort_typing(
+                                                whatsapp_business_id,
+                                                message_id,
+                                                conversation_id,
+                                            )
+                                        )
                                         chatbot_response = await send_to_agent(
                                             conversation_id=conversation_id,
                                             user_input=content,
@@ -1286,15 +1463,13 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             message_id=wa_message_id,
                                             message_type=message_type,
                                         )
-                                        if chatbot_response.get("duplicate_event"):
-                                            return {"status": "duplicate_ignored"}
                                         if not await is_effective_ai_enabled(org_id, conversation_id):
                                             return {"status": "ok"}
 
-                                        await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id, conversation_id=conversation_id)
-
                                         sales_action = chatbot_response.get("sales_action")
                                         agent_reply_to = chatbot_response.get("reply_to_message_id")
+                                        meta_send_started_wall = datetime.now(timezone.utc)
+                                        meta_send_started = time.perf_counter()
                                         send_result = await send_whatsapp_message({
                                             "conversation_id": conversation_id,
                                             "content": chatbot_response["final_response"],
@@ -1306,7 +1481,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             context={"mid": agent_reply_to} if agent_reply_to else None,
                                             bot_context={"sales_action_job_id": sales_action.get("job_id")} if sales_action else None,
                                         )
-                                        await mark_sales_action_delivered(org_id, sales_action, send_result)
+                                        _log_product_reply_latency(
+                                            org_id, conversation_id, chatbot_response, send_result,
+                                            product_reply_started, meta_send_started,
+                                            inbound_received_at, meta_send_started_wall,
+                                        )
+                                        await _finalize_whatsapp_sales_action(
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            action=sales_action,
+                                            send_result=send_result,
+                                            customer_name=sender_name2,
+                                            customer_number=customer_phone_no,
+                                            source_message_id=wa_message_id,
+                                        )
                                     except AIProviderUnavailable as exc:
                                         await _handle_ai_provider_failure(
                                             exc,
@@ -1446,6 +1634,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     await _send_quota_handoff(org_id=org_id, conversation_id=conversation_id, platform="whatsapp", customer_number=customer_phone_no, customer_name=sender_name2)
                                     return {"status": "ok"}
                                 try:
+                                    product_reply_started = time.perf_counter()
                                     chatbot_response = await send_to_agent(
                                         conversation_id=conversation_id,
                                         user_input=content,
@@ -1458,12 +1647,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         message_id=wa_message_id,
                                         message_type=message_type,
                                     )
-                                    if chatbot_response.get("duplicate_event"):
-                                        return {"status": "duplicate_ignored"}
                                     if not await is_effective_ai_enabled(org_id, conversation_id):
                                         return {"status": "ok"}
                                     sales_action = chatbot_response.get("sales_action")
                                     agent_reply_to = chatbot_response.get("reply_to_message_id")
+                                    meta_send_started_wall = datetime.now(timezone.utc)
+                                    meta_send_started = time.perf_counter()
                                     send_result = await send_whatsapp_message({
                                         "conversation_id": conversation_id,
                                         "content": chatbot_response["final_response"],
@@ -1475,7 +1664,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         context={"mid": agent_reply_to} if agent_reply_to else None,
                                         bot_context={"sales_action_job_id": sales_action.get("job_id")} if sales_action else None,
                                     )
-                                    await mark_sales_action_delivered(org_id, sales_action, send_result)
+                                    _log_product_reply_latency(
+                                        org_id, conversation_id, chatbot_response, send_result,
+                                        product_reply_started, meta_send_started,
+                                        inbound_received_at, meta_send_started_wall,
+                                    )
+                                    await _finalize_whatsapp_sales_action(
+                                        org_id=org_id,
+                                        conversation_id=conversation_id,
+                                        action=sales_action,
+                                        send_result=send_result,
+                                        customer_name=sender_name2,
+                                        customer_number=customer_phone_no,
+                                        source_message_id=wa_message_id,
+                                    )
                                 except AIProviderUnavailable as exc:
                                     await _handle_ai_provider_failure(
                                         exc,
@@ -2591,8 +2793,6 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         message_id=ig_message_id,
                                         message_type=attachment_type,
                                     )
-                                    if chatbot_response.get("duplicate_event"):
-                                        return {"status": "duplicate_ignored"}
                                     if await is_effective_ai_enabled(org_id, conversation_id):
                                         sales_action = chatbot_response.get("sales_action")
                                         ai_result = await send_ig_message(
@@ -2606,9 +2806,28 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             sender_name="AI",
                                             enforce_ai_state=True,
                                             ai_usage=chatbot_response.get("usage"),
+                                            bot_context={
+                                                "sales_action_job_id": sales_action.get("job_id")
+                                            } if sales_action else None,
                                         )
+                                        if ai_result.get("local_sync_pending"):
+                                            raise HTTPException(
+                                                status_code=503,
+                                                detail="Instagram delivery is still being synchronized",
+                                            )
                                         if not ai_result.get("success"):
-                                            raise AIProviderUnavailable("delivery_error")
+                                            raise AIProviderUnavailable(
+                                                "delivery_unknown"
+                                                if ai_result.get("delivery_unknown")
+                                                else "delivery_error"
+                                            )
+                                        if ai_result.get("sales_action_job_id") != (
+                                            sales_action.get("job_id")
+                                            if sales_action else None
+                                        ):
+                                            raise AIProviderUnavailable(
+                                                "sales_action_delivery_conflict"
+                                            )
                                         await mark_sales_action_delivered(
                                             org_id, sales_action, ai_result, platform="instagram",
                                         )

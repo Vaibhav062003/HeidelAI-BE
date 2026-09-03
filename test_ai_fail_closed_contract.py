@@ -118,9 +118,35 @@ def _load_agent_service():
     settings.INTERNAL_HMAC_SECRET = "s" * 32
     config = types.ModuleType("config")
     config.settings = settings
+    sales_cases = types.ModuleType("services.sales_case_service")
+    sales_learning = types.ModuleType("services.sales_learning_service")
+
+    async def get_active_sales_case(*_args, **_kwargs):
+        return None
+
+    async def get_sales_context(*_args, **_kwargs):
+        return {"version": 0, "stage": "new", "facts": {}}
+
+    async def apply_sales_decision(*_args, **_kwargs):
+        raise AssertionError("unexpected sales decision")
+
+    async def get_sales_guidance(*_args, **_kwargs):
+        return {"policy_version": "default", "cohort": "control", "recommended_moves": []}
+
+    async def record_customer_response(*_args, **_kwargs):
+        return None
+
+    sales_cases.get_active_sales_case = get_active_sales_case
+    sales_cases.get_sales_context = get_sales_context
+    sales_cases.apply_sales_decision = apply_sales_decision
+    sales_cases.sales_context = lambda _case: {"version": 0, "stage": "new", "facts": {}}
+    sales_learning.get_sales_guidance = get_sales_guidance
+    sales_learning.record_customer_response = record_customer_response
     sys.modules["loguru"] = loguru
     sys.modules["config"] = config
     sys.modules["config.settings"] = settings
+    sys.modules["services.sales_case_service"] = sales_cases
+    sys.modules["services.sales_learning_service"] = sales_learning
     spec = importlib.util.spec_from_file_location("agent_service_contract", ROOT / "services/agent_service.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -174,7 +200,9 @@ def _failure_category(module, *, response=None, error=None):
 
 def test_provider_contract():
     module = _load_agent_service()
-    assert asyncio.run(_call(module)) == {"final_response": "Valid reply", "usage": {}}
+    valid = asyncio.run(_call(module))
+    assert valid["final_response"] == "Valid reply" and valid["usage"] == {}
+    assert valid["product_timings"]["math_ms"] >= 0
     assert _failure_category(module, response=_Response(status=500, payload={})) == "http_error"
     assert _failure_category(module, error=_TimeoutException("timeout")) == "timeout"
     assert _failure_category(module, response=_Response(malformed=True)) == "malformed_response"
@@ -268,7 +296,8 @@ def test_channel_and_scheduler_contract():
     reply_claim = (ROOT / "services/whatsapp_reply_idempotency.py").read_text(encoding="utf-8")
     assert webhook.count("except AIProviderUnavailable") >= 5
     assert webhook.count("is_effective_ai_enabled") >= 10
-    assert '"reason": "ai_provider_unavailable"' in webhook
+    assert '"reason": failure_kind' in webhook
+    assert '"delivery_verification"' in webhook
     assert "HOLDING_REPLY" not in webhook
     assert "HOLDING_REPLY" not in sender
     assert 'user_input="hi"' not in scheduler
@@ -287,7 +316,7 @@ def test_channel_and_scheduler_contract():
     assert "is_effective_ai_enabled" in sender
     assert "any(len(content) > 4096 for content in contents)" in sender
     assert "not all(content.strip() for content in contents)" in sender
-    pending_resume = webhook.index("pending_ai_failure = messages_collection.find_one")
+    pending_resume = webhook.index("stored_inbound_message = messages_collection.find_one")
     text_dispatch = webhook.index('if message_type == "text":', pending_resume)
     assert pending_resume < text_dispatch
     assert "is_effective_ai_enabled" in instagram

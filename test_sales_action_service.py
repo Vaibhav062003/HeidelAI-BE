@@ -41,7 +41,14 @@ class Jobs:
 
     async def find_one_and_update(self, query, update, return_document=None):
         document = self.docs.get(query["_id"])
-        if not document or document.get("status") == query.get("status", {}).get("$ne"):
+        expected_status = query.get("status")
+        if not document:
+            return None
+        if isinstance(expected_status, str) and document.get("status") != expected_status:
+            return None
+        if isinstance(expected_status, dict) and document.get("status") == expected_status.get("$ne"):
+            return None
+        if query.get("claim_id") is not None and document.get("claim_id") != query["claim_id"]:
             return None
         if "$or" in query and document.get("status") not in {"blocked", "failed"}:
             return None
@@ -49,6 +56,8 @@ class Jobs:
         document.update(update.get("$set", {}))
         for field, amount in update.get("$inc", {}).items():
             document[field] = document.get(field, 0) + amount
+        for field in update.get("$unset", {}):
+            document.pop(field, None)
         return document if return_document is not None else old
 
 
@@ -215,12 +224,13 @@ def test_invoice_action_creates_review_only_tally_draft(monkeypatch):
         create_tally_invoice_draft=create,
     ))
     case = {
-        "org_id": "org", "conversation_id": "whatsapp_1", "quote_id": "q1",
+        "case_id": "case", "org_id": "org", "conversation_id": "whatsapp_1", "quote_id": "q1",
         "action_source_message_ids": ["m1"],
     }
-    result = asyncio.run(actions._invoice_draft(case, "bill karo"))
+    result = asyncio.run(actions._invoice_draft(case, "bill karo", "wamid.1"))
     assert result["fields"] == {"invoice_draft_id": "d1", "invoice_source_message_ids": ["m1"]}
     assert calls[0][1:3] == ("ai-sales", "admin")
+    assert calls[0][4]["idempotency_key"] == "case:wamid.1:create_invoice_draft"
 
 
 def test_same_sales_event_executes_only_once(monkeypatch):
@@ -254,6 +264,109 @@ def test_same_sales_event_executes_only_once(monkeypatch):
     assert states[-1]["status"] == "ready"
 
 
+def test_processing_sales_event_does_not_create_a_temporary_reply(monkeypatch):
+    database = DB()
+    database.jobs.docs["case:message:create_quote"] = {
+        "_id": "case:message:create_quote", "status": "processing",
+    }
+    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
+    result = asyncio.run(actions.execute_sales_action(
+        case={"case_id": "case", "org_id": "org", "conversation_id": "whatsapp_1"},
+        source_message_id="message", action_type="create_quote", customer_text="quote",
+    ))
+    assert result == {"pending": True, "job_id": "case:message:create_quote"}
+    assert "reply" not in result
+
+
+def test_legacy_action_without_a_saved_result_requires_review(monkeypatch):
+    database = DB()
+    calls = []
+
+    async def create_quote(_case, source_message_id):
+        calls.append(source_message_id)
+        return {"reply": "unsafe"}
+
+    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
+    monkeypatch.setattr(actions, "_create_quote", create_quote)
+    result = asyncio.run(actions.execute_sales_action(
+        case={"case_id": "case", "org_id": "org", "conversation_id": "whatsapp_1"},
+        source_message_id="message", action_type="create_quote", customer_text="quote",
+        recover_result_only=True,
+    ))
+    assert result == {"requires_review": True, "job_id": "case:message:create_quote"}
+    assert calls == []
+
+
+def test_stale_worker_cannot_overwrite_newer_action_result(monkeypatch):
+    database = DB()
+    winner = {"reply": "winner", "job_id": "case:message:create_quote"}
+
+    async def stale_quote(_case, _source_message_id):
+        job = database.jobs.docs["case:message:create_quote"]
+        job.update({"status": "ready", "claim_id": "new-owner", "result": winner})
+        return {"reply": "stale", "fields": {}, "ready_stage": None, "delivered_stage": None}
+
+    async def set_state(**_kwargs):
+        return None
+
+    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
+    monkeypatch.setattr(actions, "_create_quote", stale_quote)
+    monkeypatch.setattr(actions, "set_sales_action_state", set_state)
+    result = asyncio.run(actions.execute_sales_action(
+        case={"case_id": "case", "org_id": "org", "conversation_id": "whatsapp_1"},
+        source_message_id="message", action_type="create_quote", customer_text="quote",
+    ))
+    assert result == winner
+    assert database.jobs.docs["case:message:create_quote"]["result"] == winner
+
+
+def test_blocked_action_result_is_replayed_without_reexecution(monkeypatch):
+    database = DB()
+    calls = []
+
+    async def blocked_quote(_case, source_message_id):
+        calls.append(source_message_id)
+        raise actions.SalesActionBlocked("Need an exact product.")
+
+    async def set_state(**_kwargs):
+        return None
+
+    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
+    monkeypatch.setattr(actions, "_create_quote", blocked_quote)
+    monkeypatch.setattr(actions, "set_sales_action_state", set_state)
+    case = {"case_id": "case", "org_id": "org", "conversation_id": "whatsapp_1"}
+    first = asyncio.run(actions.execute_sales_action(
+        case=case, source_message_id="message", action_type="create_quote", customer_text="quote",
+    ))
+    second = asyncio.run(actions.execute_sales_action(
+        case=case, source_message_id="message", action_type="create_quote", customer_text="quote",
+    ))
+    assert first == second
+    assert calls == ["message"]
+
+
+def test_unsafe_block_requires_durable_webhook_review(monkeypatch):
+    database = DB()
+
+    async def blocked_quote(_case, _source_message_id):
+        raise actions.SalesActionBlocked("Live price needs review.", escalate=True)
+
+    async def set_state(**_kwargs):
+        return None
+
+    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
+    monkeypatch.setattr(actions, "_create_quote", blocked_quote)
+    monkeypatch.setattr(actions, "set_sales_action_state", set_state)
+    result = asyncio.run(actions.execute_sales_action(
+        case={"case_id": "case", "org_id": "org", "conversation_id": "whatsapp_1"},
+        source_message_id="message", action_type="create_quote", customer_text="quote",
+    ))
+
+    assert result["requires_review"] is True
+    assert result["review_category"] == "sales_action_review_required"
+    assert database.jobs.docs[result["job_id"]]["result"] == result
+
+
 def test_delivered_quote_schedules_one_existing_followup(monkeypatch):
     database = DB()
     database.jobs.docs["job"] = {"_id": "job", "status": "ready"}
@@ -281,3 +394,33 @@ def test_delivered_quote_schedules_one_existing_followup(monkeypatch):
     assert len(scheduled) == 1
     assert scheduled[0][1]["source"] == "quotation"
     assert scheduled[0][1]["quote_id"] == "quote"
+
+
+def test_delivery_finalization_retries_after_case_update_failure(monkeypatch):
+    database = DB()
+    database.jobs.docs["job"] = {"_id": "job", "status": "ready"}
+    attempts = []
+
+    async def set_state(**_kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
+    monkeypatch.setattr(actions, "set_sales_action_state", set_state)
+    action = {
+        "job_id": "job", "case_id": "case", "conversation_id": "whatsapp_1",
+        "source_message_id": "message", "action_type": "request_stock_confirmation",
+    }
+
+    try:
+        asyncio.run(actions.mark_sales_action_delivered("org", action))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("failed delivery finalization was marked complete")
+    assert database.jobs.docs["job"]["status"] == "ready"
+
+    asyncio.run(actions.mark_sales_action_delivered("org", action))
+    assert attempts == [True, True]
+    assert database.jobs.docs["job"]["status"] == "delivered"
