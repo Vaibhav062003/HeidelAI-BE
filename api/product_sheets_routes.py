@@ -18,7 +18,13 @@ from api.google_sheets_routes import (
     _fetch_sheet_tabs,
     _fetch_columns_from_tab,
 )
-from services.product_sheet_sync import auto_suggest_mapping, auto_detect_product_type, sync_product_sheet
+from services.product_sheet_sync import (
+    auto_detect_product_type,
+    auto_suggest_mapping,
+    begin_product_sheet_disconnect,
+    sync_product_sheet,
+    unlink_product_sheet_source,
+)
 from schemas.models import (
     PreviewProductSheetRequest,
     ConnectProductSheetRequest,
@@ -295,46 +301,23 @@ async def disconnect_product_sheet(sheet_id: str, user: CurrentUser):
     try:
         org_id = user.org_id
 
-        # Verify connection exists
-        connection = await asyncio.to_thread(
-            db.product_sheet_connections.find_one,
-            {"org_id": org_id, "sheet_id": sheet_id}
-        )
-        if not connection:
+        # Wait for the active write claim to finish before removing price authority.
+        try:
+            await begin_product_sheet_disconnect(org_id, sheet_id)
+        except ValueError as exc:
             raise HTTPException(status_code=404, detail="Product sheet connection not found.")
+        except TimeoutError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-        # Delete the connection
+        # Unlink source-specific values and clear stale price authority before
+        # deleting orphaned products.
+        products_col = db[f"products_{org_id}"]
+        products_removed = await unlink_product_sheet_source(org_id, sheet_id)
+
         await asyncio.to_thread(
             db.product_sheet_connections.delete_one,
-            {"org_id": org_id, "sheet_id": sheet_id}
+            {"org_id": org_id, "sheet_id": sheet_id, "status": "disconnecting"},
         )
-
-        # 1. Unlink: Remove this sheet from all products' source arrays
-        products_col = db[f"products_{org_id}"]
-        await asyncio.to_thread(
-            lambda: products_col.update_many(
-                {"source_sheet_ids": sheet_id},
-                {
-                    "$pull": {"source_sheet_ids": sheet_id},
-                    "$unset": {
-                        f"source_rows.{sheet_id}": "",
-                        f"source_values.{sheet_id}": "",
-                    },
-                }
-            )
-        )
-
-        # 2. Garbage Collect: Delete products that are now orphaned (no active sources)
-        delete_result = await asyncio.to_thread(
-            lambda: products_col.delete_many({"source_sheet_ids": {"$size": 0}})
-        )
-        
-        # 3. Clean up any legacy products that still use the scalar field
-        legacy_delete_result = await asyncio.to_thread(
-            lambda: products_col.delete_many({"source_sheet_id": sheet_id})
-        )
-        
-        products_removed = delete_result.deleted_count + legacy_delete_result.deleted_count
 
         # Update org metadata product count
         total_all_products = await asyncio.to_thread(

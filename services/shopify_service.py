@@ -31,6 +31,7 @@ API_VERSION = "2025-10"
 OAUTH_SCOPES = "read_orders,read_customers,read_fulfillments"
 DEFAULT_REMINDER_DELAY_MINUTES = 10
 DEFAULT_TEMPLATE_LANGUAGE = "en_US"
+SHOPIFY_TEMPLATE_FOOTER = "Powered by Heidelai.com - AI Sales Agent"
 ALLOWED_DELAYS = {5, 10, 15, 30, 60, 120, 240, 1440}
 SHOP_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
@@ -55,6 +56,8 @@ REMINDER_ATTEMPT_TIMEOUT_SECONDS = 45
 WORKER_STALE_SECONDS = 90
 OVERDUE_GRACE_SECONDS = 90
 INBOX_RETRY_MINUTES = (1, 5, 15)
+META_TRANSIENT_ERROR_CODES = {1, 2, 4, 17, 32, 613, 130429, 131000, 131016, 131056}
+META_CONFIGURATION_ERROR_CODES = {10, 100, 190, 200, 299, 131005, 131008, 131009}
 ORDER_EVENTS = ("received", "shipped", "fulfilled", "cancelled")
 ORDER_EVENT_TOPICS = {
     "orders/create": "received",
@@ -251,6 +254,83 @@ def _message_preference(content: Any) -> str | None:
 def _provider_reports_block(payload: dict) -> bool:
     errors = json.dumps(payload.get("errors") or payload.get("error") or [], ensure_ascii=True)
     return bool(re.search(r"\b(?:recipient|user|customer)\b.{0,40}\bblocked\b|\bblocked\b.{0,40}\b(?:recipient|user|customer)\b", errors, re.IGNORECASE))
+
+
+def _safe_meta_error_text(value: Any, limit: int = 300) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"\+?\d[\d\s().-]{6,}\d", "[redacted]", text)
+    return text[:limit]
+
+
+def normalize_whatsapp_delivery_error(
+    payload: Any,
+    *,
+    stage: str,
+    http_status: int | None = None,
+) -> dict[str, Any]:
+    value = payload if isinstance(payload, dict) else {}
+    error = value.get("error")
+    if not isinstance(error, dict):
+        errors = value.get("errors")
+        error = errors[0] if isinstance(errors, list) and errors and isinstance(errors[0], dict) else value
+    error_data = error.get("error_data") if isinstance(error.get("error_data"), dict) else {}
+
+    raw_code = error.get("code")
+    try:
+        code: int | str | None = int(raw_code) if raw_code is not None else None
+    except (TypeError, ValueError):
+        code = _safe_meta_error_text(raw_code, 40) or None
+    raw_subcode = error.get("error_subcode") or error.get("subcode")
+    try:
+        subcode: int | str | None = int(raw_subcode) if raw_subcode is not None else None
+    except (TypeError, ValueError):
+        subcode = _safe_meta_error_text(raw_subcode, 40) or None
+
+    message = _safe_meta_error_text(error.get("message"))
+    title = _safe_meta_error_text(error.get("title") or error.get("error_user_title") or message)
+    details = _safe_meta_error_text(error_data.get("details") or error.get("error_user_msg") or error.get("details"))
+    result: dict[str, Any] = {
+        "title": title or "WhatsApp could not deliver this message",
+        "stage": stage if stage in {"submission", "delivery"} else "delivery",
+        "retryable": bool(
+            http_status == 429
+            or (http_status is not None and http_status >= 500)
+            or isinstance(code, int) and code in META_TRANSIENT_ERROR_CODES
+        ),
+    }
+    if details and details != result["title"]:
+        result["details"] = details
+    if code is not None:
+        result["code"] = code
+    if subcode is not None:
+        result["subcode"] = subcode
+    if http_status is not None:
+        result["http_status"] = http_status
+    return result
+
+
+def _meta_configuration_error(error: dict[str, Any]) -> bool:
+    code = error.get("code")
+    return isinstance(code, int) and (code in META_CONFIGURATION_ERROR_CODES or 132000 <= code <= 132999)
+
+
+def _provider_retry_at(document: dict, error: dict[str, Any], now: datetime | None = None) -> datetime | None:
+    attempts = int(document.get("auto_retry_count") or 0)
+    if not error.get("retryable") or attempts >= len(INBOX_RETRY_MINUTES):
+        return None
+    return (now or utcnow()) + timedelta(minutes=INBOX_RETRY_MINUTES[attempts])
+
+
+def _failure_message_id(kind: str, identifier: Any, attempt: Any) -> str:
+    return f"shopify.{kind}.{identifier}.{int(attempt or 1)}.failed"
+
+
+def _message_delivery_error(error: dict[str, Any], retry_at: datetime | None) -> dict[str, Any]:
+    return {
+        **error,
+        "retry_state": "scheduled" if retry_at else "terminal",
+        **({"retry_at": _iso_utc(retry_at)} if retry_at else {}),
+    }
 
 
 def _cancel_suppressed_shopify_reminders(org_id: str, phone_key: str, now: datetime) -> None:
@@ -1527,11 +1607,11 @@ async def create_default_template(
 
 def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGUAGE) -> dict:
     definitions = {
-        "abandoned_cart": ("heidelai_abandoned_cart_v1", "MARKETING", "Hi {{1}}, you left {{2}} in your cart. Complete your order here: {{3}}"),
-        "received": ("heidelai_order_received_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. We have received order {{2}} containing {{3}}. Our team is reviewing the order details and will notify you when its status changes."),
-        "shipped": ("heidelai_order_shipped_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been shipped. We will notify you when another delivery status update becomes available."),
-        "fulfilled": ("heidelai_order_fulfilled_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been fulfilled. Please review the delivered items and contact our support team if you need help."),
-        "cancelled": ("heidelai_order_cancelled_v1", "UTILITY", "Hello {{1}}, this is an update about your recent purchase. Order {{2}} containing {{3}} has been cancelled. Please contact our support team if you did not request this cancellation or need help."),
+        "abandoned_cart": ("heidelai_abandoned_cart_v3", "MARKETING", "Hello {{1}}! It looks like these items are still waiting in your cart: {{2}}. You can complete your purchase using this secure checkout link: {{3}}. We are here if you need any help."),
+        "received": ("heidelai_order_received_v3", "UTILITY", "Hello {{1}}! We have received your order {{2}}, which includes {{3}}. Our team is reviewing it, and we will keep you updated as the status changes."),
+        "shipped": ("heidelai_order_shipped_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been shipped. We will share another update when delivery information is available."),
+        "fulfilled": ("heidelai_order_fulfilled_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been fulfilled. We hope everything arrived as expected. Please contact our support team if you need any help."),
+        "cancelled": ("heidelai_order_cancelled_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been cancelled. If you did not request this or need assistance, please contact our support team."),
     }
     if event not in definitions:
         raise HTTPException(status_code=422, detail="Unsupported Shopify template event")
@@ -1543,11 +1623,14 @@ def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGU
         "name": name,
         "language": normalized_language,
         "category": category,
-        "components": [{
-            "type": "BODY",
-            "text": text,
-            "example": {"body_text": [["Aarav", "#1001", "Laptop stand, keyboard"]] if event != "abandoned_cart" else [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
-        }],
+        "components": [
+            {
+                "type": "BODY",
+                "text": text,
+                "example": {"body_text": [["Aarav", "#1001", "Laptop stand, keyboard"]] if event != "abandoned_cart" else [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
+            },
+            {"type": "FOOTER", "text": SHOPIFY_TEMPLATE_FOOTER},
+        ],
     }
 
 
@@ -1574,9 +1657,18 @@ def _template_compatible(template: dict, purpose: str = "cart") -> bool:
         return False
     components = template.get("components") or []
     bodies = [part for part in components if str(part.get("type") or "").upper() == "BODY"]
-    if len(bodies) != 1 or any(re.search(r"{{\s*\d+\s*}}", json.dumps(part)) for part in components if part is not bodies[0]):
+    footers = [part for part in components if str(part.get("type") or "").upper() == "FOOTER"]
+    if (
+        len(bodies) != 1
+        or len(footers) != 1
+        or footers[0].get("text") != SHOPIFY_TEMPLATE_FOOTER
+        or any(re.search(r"{{\s*\d+\s*}}", json.dumps(part)) for part in components if part is not bodies[0])
+    ):
         return False
-    placeholders = re.findall(r"{{\s*(\d+)\s*}}", str(bodies[0].get("text") or ""))
+    body_text = str(bodies[0].get("text") or "")
+    if re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", body_text):
+        return False
+    placeholders = re.findall(r"{{\s*(\d+)\s*}}", body_text)
     return sorted(placeholders) == ["1", "2", "3"]
 
 
@@ -1890,6 +1982,72 @@ async def retry_checkout_reminder(org_id: str, provider_id: str) -> dict:
     return _safe_document(checkout, include_url=True) or {}
 
 
+async def retry_shopify_notification(
+    org_id: str,
+    conversation_id: str,
+    message_id: str,
+) -> dict[str, Any]:
+    messages = db[f"messages_{org_id}"]
+    message = await messages.find_one({
+        "conversation_id": conversation_id,
+        "$or": [{"message_id": message_id}, {"id": message_id}],
+        "status": "failed",
+    })
+    metadata = (message or {}).get("ai_metadata") or {}
+    error = (message or {}).get("delivery_error") or {}
+    source = str(metadata.get("source") or "")
+    if not message or not source.startswith("shopify_"):
+        raise HTTPException(status_code=404, detail="Shopify notification not found")
+    if _meta_configuration_error(error):
+        raise HTTPException(status_code=409, detail="Fix the WhatsApp template or authorization, then enable Shopify automation again")
+
+    now = utcnow()
+    blocked_categories = {"provider_outcome_unknown", "provider_block", "customer_opt_out"}
+    if source == "shopify_abandoned_checkout":
+        provider_id = str(metadata.get("checkout_id") or "")
+        checkout = await db.shopify_checkouts.find_one({"org_id": org_id, "provider_id": provider_id})
+        if not checkout or checkout.get("failure_category") in blocked_categories:
+            raise HTTPException(status_code=409, detail="This reminder cannot be retried safely")
+        if await _is_whatsapp_suppressed(org_id, checkout.get("phone") or ""):
+            raise HTTPException(status_code=409, detail="This customer has opted out of WhatsApp messages")
+        updated = await db.shopify_checkouts.find_one_and_update(
+            {"_id": checkout["_id"], "reminder_status": {"$in": ["failed", "retryable"]}},
+            {"$set": {"reminder_status": "retryable", "reminder_due_at": now, "status_updated_at": now}, "$unset": {
+                "claim_token": "", "claim_expires_at": "", "provider_started_at": "", "provider_message_id": "",
+                "provider_accepted_at": "", "sent_at": "", "delivery_status": "", "delivery_rank": "",
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        record_type, record_id = "checkout", provider_id
+    else:
+        order_id = str(metadata.get("order_id") or "")
+        event = source.removeprefix("shopify_order_")
+        notification = await db.shopify_order_notifications.find_one({
+            "org_id": org_id, "order_provider_id": order_id, "event": event,
+        })
+        order = await db.shopify_orders.find_one({"org_id": org_id, "provider_id": order_id})
+        if not notification or not order or notification.get("failure_category") in blocked_categories:
+            raise HTTPException(status_code=409, detail="This order update cannot be retried safely")
+        if await _is_whatsapp_suppressed(org_id, order.get("phone") or ""):
+            raise HTTPException(status_code=409, detail="This customer has opted out of WhatsApp messages")
+        updated = await db.shopify_order_notifications.find_one_and_update(
+            {"_id": notification["_id"], "status": {"$in": ["failed", "retryable"]}},
+            {"$set": {"status": "retryable", "due_at": now, "updated_at": now}, "$unset": {
+                "claim_token": "", "claim_expires_at": "", "provider_started_at": "", "provider_message_id": "",
+                "provider_accepted_at": "", "sent_at": "", "delivery_status": "", "delivery_rank": "",
+            }},
+            return_document=ReturnDocument.AFTER,
+        )
+        record_type, record_id = "order", order_id
+    if not updated:
+        raise HTTPException(status_code=409, detail="This notification is already being processed or was delivered")
+
+    queued_error = {**error, "retry_state": "queued", "retry_at": _iso_utc(now)}
+    await messages.update_one({"_id": message["_id"]}, {"$set": {"delivery_error": queued_error}})
+    await _commerce_event(org_id, record_type, record_id)
+    return {"status": "queued", "retry_at": _iso_utc(now)}
+
+
 def _product_summary(products: list[dict]) -> str:
     names = []
     for item in products:
@@ -1974,6 +2132,16 @@ async def process_shopify_reminders() -> None:
                 await _reconcile_accepted(checkout)
             except Exception as exc:
                 logger.warning("Shopify Inbox reconciliation failed for checkout suffix {}: {}", str(checkout.get("provider_id") or "")[-8:], type(exc).__name__)
+        failure_cursor = db.shopify_checkouts.find({
+            "failed_message_id": {"$exists": True}, "provider_error": {"$exists": True},
+            "inbox_sync_status": {"$in": ["pending", "retryable"]},
+            "$or": [{"inbox_next_attempt_at": {"$lte": utcnow()}}, {"inbox_next_attempt_at": None}],
+        }).sort([("inbox_next_attempt_at", 1), ("failed_at", 1)]).limit(10)
+        async for checkout in failure_cursor:
+            try:
+                await _reconcile_checkout_failure(checkout)
+            except Exception as exc:
+                logger.warning("Shopify failure Inbox reconciliation failed: {}", type(exc).__name__)
         await _process_order_notifications()
         await _finish_pending_disconnects()
         await db.shopify_worker_heartbeats.update_one(
@@ -2001,17 +2169,63 @@ async def _run_claimed_checkout(checkout: dict, token: str, semaphore: asyncio.S
                 await _fail_claim(checkout, token, "failed", "pre_provider_timeout", retry=retry)
 
 
-async def _fail_claim(checkout: dict, token: str, status: str, reason: str, *, retry: bool = False) -> None:
-    update: dict[str, Any] = {"reminder_status": "retryable" if retry else status, "failure_category": reason, "status_updated_at": utcnow()}
+async def _fail_claim(
+    checkout: dict,
+    token: str,
+    status: str,
+    reason: str,
+    *,
+    retry: bool = False,
+    delivery_error: dict[str, Any] | None = None,
+) -> None:
+    now = utcnow()
+    provider_retry_at = _provider_retry_at(checkout, delivery_error, now) if delivery_error else None
+    update: dict[str, Any] = {
+        "reminder_status": "retryable" if retry or provider_retry_at else status,
+        "failure_category": reason,
+        "status_updated_at": now,
+        "reminder_due_at": provider_retry_at,
+    }
     if retry:
         attempts = int(checkout.get("pre_provider_attempts") or 0)
-        update["reminder_due_at"] = utcnow() + timedelta(minutes=INBOX_RETRY_MINUTES[min(attempts, len(INBOX_RETRY_MINUTES) - 1)])
-    else:
-        update["reminder_due_at"] = None
-    operation: dict[str, Any] = {"$set": update, "$unset": {"claim_token": "", "claim_expires_at": ""}}
+        update["reminder_due_at"] = now + timedelta(minutes=INBOX_RETRY_MINUTES[min(attempts, len(INBOX_RETRY_MINUTES) - 1)])
+    unset = {"claim_token": "", "claim_expires_at": ""}
+    increments: dict[str, int] = {}
     if retry:
-        operation["$inc"] = {"pre_provider_attempts": 1}
-    await db.shopify_checkouts.update_one({"_id": checkout["_id"], "claim_token": token}, operation)
+        increments["pre_provider_attempts"] = 1
+    if delivery_error:
+        message_id = _failure_message_id("checkout", checkout["_id"], checkout.get("attempt_count"))
+        update.update({
+            "provider_error": _message_delivery_error(delivery_error, provider_retry_at),
+            "failed_message_id": message_id,
+            "failed_at": now,
+            "inbox_sync_status": "pending",
+            "inbox_next_attempt_at": now,
+        })
+        unset.update({
+            "provider_started_at": "", "provider_message_id": "", "provider_accepted_at": "",
+            "sent_at": "", "delivery_status": "", "delivery_rank": "",
+        })
+        if provider_retry_at:
+            increments["auto_retry_count"] = 1
+    operation: dict[str, Any] = {"$set": update, "$unset": unset}
+    if increments:
+        operation["$inc"] = increments
+    if delivery_error:
+        operation["$push"] = {"attempt_history": {"$each": [{
+            "failed_at": now, "failure_category": reason,
+            "delivery_error": _message_delivery_error(delivery_error, provider_retry_at),
+        }], "$slice": -10}}
+    result = await db.shopify_checkouts.update_one({"_id": checkout["_id"], "claim_token": token}, operation)
+    if result.matched_count and delivery_error:
+        latest = await db.shopify_checkouts.find_one({"_id": checkout["_id"]})
+        if latest:
+            try:
+                await _reconcile_checkout_failure(latest)
+            except Exception as exc:
+                logger.warning("Shopify failure Inbox reconciliation deferred: {}", type(exc).__name__)
+        if _meta_configuration_error(delivery_error):
+            await _admin_warning(checkout["org_id"], "meta_configuration", delivery_error["title"])
     await _commerce_event(checkout["org_id"], "checkout", checkout["provider_id"])
 
 
@@ -2175,6 +2389,9 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
                 provider_error = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
             except ValueError:
                 provider_error = {}
+            delivery_error = normalize_whatsapp_delivery_error(
+                provider_error, stage="submission", http_status=response.status_code,
+            )
             if _provider_reports_block(provider_error):
                 await db.whatsapp_suppressions.update_one(
                     {"org_id": org_id, "phone": _phone_key(phone)},
@@ -2183,7 +2400,9 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
                 )
                 await _fail_claim(checkout, token, "opted_out", "provider_block")
             else:
-                await _fail_claim(checkout, token, "failed", "provider_rejected")
+                await _fail_claim(
+                    checkout, token, "failed", "provider_rejected", delivery_error=delivery_error,
+                )
             return
         try:
             message_id = response.json()["messages"][0]["id"]
@@ -2199,7 +2418,10 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
                         "reminder_status": "sent", "provider_message_id": message_id, "provider_accepted_at": utcnow(),
                         "sent_at": utcnow(), "delivery_status": "accepted", "delivery_rank": 0,
                         "inbox_sync_status": "pending", "inbox_next_attempt_at": utcnow(), "status_updated_at": utcnow(),
-                    }, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+                    }, "$unset": {
+                        "claim_token": "", "claim_expires_at": "", "provider_error": "",
+                        "failed_message_id": "", "failed_at": "", "failure_category": "",
+                    }},
                     return_document=ReturnDocument.AFTER,
                 )
                 break
@@ -2224,19 +2446,65 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         await _fail_claim(checkout, token, "failed", "pre_provider_failure", retry=retry)
 
 
-async def _finish_order_notification(job: dict, token: str, status: str, reason: str | None = None, *, retry: bool = False) -> None:
+async def _finish_order_notification(
+    job: dict,
+    token: str,
+    status: str,
+    reason: str | None = None,
+    *,
+    retry: bool = False,
+    delivery_error: dict[str, Any] | None = None,
+) -> None:
+    now = utcnow()
     attempts = int(job.get("pre_provider_attempts") or 0)
+    provider_retry_at = _provider_retry_at(job, delivery_error, now) if delivery_error else None
     update: dict[str, Any] = {
-        "status": "retryable" if retry else status,
+        "status": "retryable" if retry or provider_retry_at else status,
         "failure_category": reason,
-        "updated_at": utcnow(),
+        "updated_at": now,
     }
     if retry:
-        update["due_at"] = utcnow() + timedelta(minutes=INBOX_RETRY_MINUTES[min(attempts, len(INBOX_RETRY_MINUTES) - 1)])
-    operation: dict[str, Any] = {"$set": update, "$unset": {"claim_token": "", "claim_expires_at": ""}}
+        update["due_at"] = now + timedelta(minutes=INBOX_RETRY_MINUTES[min(attempts, len(INBOX_RETRY_MINUTES) - 1)])
+    elif provider_retry_at:
+        update["due_at"] = provider_retry_at
+    elif delivery_error:
+        update["due_at"] = None
+    unset = {"claim_token": "", "claim_expires_at": ""}
+    increments: dict[str, int] = {}
     if retry:
-        operation["$inc"] = {"pre_provider_attempts": 1}
-    await db.shopify_order_notifications.update_one({"_id": job["_id"], "claim_token": token}, operation)
+        increments["pre_provider_attempts"] = 1
+    if delivery_error:
+        update.update({
+            "provider_error": _message_delivery_error(delivery_error, provider_retry_at),
+            "failed_message_id": _failure_message_id("order", job["_id"], job.get("attempt_count")),
+            "failed_at": now,
+            "inbox_sync_status": "pending",
+            "inbox_next_attempt_at": now,
+        })
+        unset.update({
+            "provider_started_at": "", "provider_message_id": "", "provider_accepted_at": "",
+            "sent_at": "", "delivery_status": "", "delivery_rank": "",
+        })
+        if provider_retry_at:
+            increments["auto_retry_count"] = 1
+    operation: dict[str, Any] = {"$set": update, "$unset": unset}
+    if increments:
+        operation["$inc"] = increments
+    if delivery_error:
+        operation["$push"] = {"attempt_history": {"$each": [{
+            "failed_at": now, "failure_category": reason,
+            "delivery_error": _message_delivery_error(delivery_error, provider_retry_at),
+        }], "$slice": -10}}
+    result = await db.shopify_order_notifications.update_one({"_id": job["_id"], "claim_token": token}, operation)
+    if result.matched_count and delivery_error:
+        latest = await db.shopify_order_notifications.find_one({"_id": job["_id"]})
+        if latest:
+            try:
+                await _reconcile_order_failure(latest)
+            except Exception as exc:
+                logger.warning("Shopify order failure Inbox reconciliation deferred: {}", type(exc).__name__)
+        if _meta_configuration_error(delivery_error):
+            await _admin_warning(job["org_id"], "meta_configuration", delivery_error["title"])
     await _commerce_event(job["org_id"], "order", job["order_provider_id"])
 
 
@@ -2293,6 +2561,16 @@ async def _process_order_notifications() -> None:
             await _reconcile_order_notification(job)
         except Exception as exc:
             logger.warning("Shopify order Inbox reconciliation failed: {}", type(exc).__name__)
+    failure_cursor = db.shopify_order_notifications.find({
+        "failed_message_id": {"$exists": True}, "provider_error": {"$exists": True},
+        "inbox_sync_status": {"$in": ["pending", "retryable"]},
+        "$or": [{"inbox_next_attempt_at": {"$lte": utcnow()}}, {"inbox_next_attempt_at": None}],
+    }).sort([("inbox_next_attempt_at", 1), ("failed_at", 1)]).limit(10)
+    async for job in failure_cursor:
+        try:
+            await _reconcile_order_failure(job)
+        except Exception as exc:
+            logger.warning("Shopify order failure Inbox reconciliation failed: {}", type(exc).__name__)
 
 
 async def _send_order_notification(job: dict, token: str) -> None:
@@ -2380,6 +2658,9 @@ async def _send_order_notification(job: dict, token: str) -> None:
                 provider_error = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
             except ValueError:
                 provider_error = {}
+            delivery_error = normalize_whatsapp_delivery_error(
+                provider_error, stage="submission", http_status=response.status_code,
+            )
             if _provider_reports_block(provider_error):
                 await db.whatsapp_suppressions.update_one(
                     {"org_id": org_id, "phone": _phone_key(phone)},
@@ -2387,7 +2668,9 @@ async def _send_order_notification(job: dict, token: str) -> None:
                 )
                 await _finish_order_notification(job, token, "opted_out", "provider_block")
             else:
-                await _finish_order_notification(job, token, "failed", "provider_rejected")
+                await _finish_order_notification(
+                    job, token, "failed", "provider_rejected", delivery_error=delivery_error,
+                )
             return
         try:
             message_id = response.json()["messages"][0]["id"]
@@ -2403,7 +2686,10 @@ async def _send_order_notification(job: dict, token: str) -> None:
                         "status": "sent", "provider_message_id": message_id, "provider_accepted_at": utcnow(),
                         "sent_at": utcnow(), "delivery_status": "accepted", "delivery_rank": 0,
                         "inbox_sync_status": "pending", "inbox_next_attempt_at": utcnow(), "updated_at": utcnow(),
-                    }, "$unset": {"claim_token": "", "claim_expires_at": ""}},
+                    }, "$unset": {
+                        "claim_token": "", "claim_expires_at": "", "provider_error": "",
+                        "failed_message_id": "", "failed_at": "", "failure_category": "",
+                    }},
                     return_document=ReturnDocument.AFTER,
                 )
                 break
@@ -2426,6 +2712,22 @@ async def _send_order_notification(job: dict, token: str) -> None:
         await _finish_order_notification(job, token, "failed", "pre_provider_failure", retry=int(job.get("pre_provider_attempts") or 0) < 3)
 
 
+def _order_message_content(order: dict, event: str) -> str:
+    event_text = {
+        "received": "we received order {order} for {products}.",
+        "shipped": "order {order} for {products} has shipped.",
+        "fulfilled": "order {order} for {products} has been fulfilled.",
+        "cancelled": "order {order} for {products} has been cancelled.",
+    }[event]
+    name = str(order.get("customer_name") or "there").split(" ", 1)[0]
+    return f"Hi {name}, {event_text.format(order=order.get('order_number') or 'Order', products=_product_summary(order.get('products') or []))}"
+
+
+def _checkout_message_content(checkout: dict) -> str:
+    name = str(checkout.get("customer_name") or "there").split(" ", 1)[0]
+    return f"Hi {name}, you left {_product_summary(checkout.get('products') or [])} in your cart. Complete your order here: {checkout.get('recovery_url') or ''}"
+
+
 async def _reconcile_order_notification(job: dict) -> None:
     message_id = job.get("provider_message_id")
     if not message_id or job.get("inbox_sync_status") == "complete":
@@ -2436,26 +2738,21 @@ async def _reconcile_order_notification(job: dict) -> None:
         whatsapp_id = job.get("send_whatsapp_id")
         if not order or not phone or not whatsapp_id:
             raise RuntimeError("inbox_identity_unavailable")
-        event_text = {
-            "received": "we received order {order} for {products}.",
-            "shipped": "order {order} for {products} has shipped.",
-            "fulfilled": "order {order} for {products} has been fulfilled.",
-            "cancelled": "order {order} for {products} has been cancelled.",
-        }[job["event"]]
-        name = str(order.get("customer_name") or "there").split(" ", 1)[0]
-        content = f"Hi {name}, {event_text.format(order=order.get('order_number') or 'Order', products=_product_summary(order.get('products') or []))}"
+        content = _order_message_content(order, job["event"])
         if not sync_db[f"messages_{job['org_id']}"].find_one({"message_id": message_id}, {"_id": 1}):
             conversation_id = await create_or_update_whatsapp_conversation(
                 org_id=job["org_id"], recipient_id=whatsapp_id, customer_phone_no=phone,
                 customer_name=order.get("customer_name") or phone, last_message=content,
                 last_sender="agent", is_auto_followup=True,
                 extra_updates={"last_message_source": f"shopify_order_{job['event']}"}, idempotency_key=message_id,
+                business_phone_id=job.get("send_phone_id"),
             )
             await store_whatsapp_message(
                 org_id=job["org_id"], content=content, conversation_id=conversation_id, customer_phone_no=phone,
                 type="template", payload=None, recipient_id=whatsapp_id, role=MessageRole.AGENT,
                 sender_name="Shopify order updates", message_id=message_id, status="sent",
                 bot_context={"source": f"shopify_order_{job['event']}", "order_id": job["order_provider_id"]},
+                business_phone_id=job.get("send_phone_id"),
             )
     except DuplicateKeyError:
         pass
@@ -2468,6 +2765,58 @@ async def _reconcile_order_notification(job: dict) -> None:
         raise
     await db.shopify_order_notifications.update_one(
         {"_id": job["_id"], "provider_message_id": message_id, "status": "sent"},
+        {"$set": {"inbox_sync_status": "complete", "inbox_synced_at": utcnow(), "updated_at": utcnow()}, "$unset": {"inbox_next_attempt_at": ""}},
+    )
+
+
+async def _reconcile_order_failure(job: dict) -> None:
+    message_id = job.get("failed_message_id")
+    error = job.get("provider_error")
+    if not message_id or not isinstance(error, dict) or job.get("inbox_sync_status") == "complete":
+        return
+    try:
+        order = await db.shopify_orders.find_one({"org_id": job["org_id"], "provider_id": job["order_provider_id"]})
+        phone = str((order or {}).get("phone") or "").lstrip("+")
+        whatsapp_id = job.get("send_whatsapp_id")
+        if not order or not phone or not whatsapp_id:
+            raise RuntimeError("inbox_identity_unavailable")
+        content = _order_message_content(order, job["event"])
+        messages = sync_db[f"messages_{job['org_id']}"]
+        if messages.find_one({"message_id": message_id}, {"_id": 1}):
+            messages.update_one(
+                {"message_id": message_id},
+                {"$set": {"status": "failed", "delivery_error": error}},
+            )
+        else:
+            conversation_id = await create_or_update_whatsapp_conversation(
+                org_id=job["org_id"], recipient_id=whatsapp_id, customer_phone_no=phone,
+                customer_name=order.get("customer_name") or phone, last_message=content,
+                last_sender="agent", is_auto_followup=True,
+                extra_updates={"last_message_source": f"shopify_order_{job['event']}"},
+                idempotency_key=message_id, business_phone_id=job.get("send_phone_id"),
+            )
+            await store_whatsapp_message(
+                org_id=job["org_id"], content=content, conversation_id=conversation_id,
+                customer_phone_no=phone, type="template", payload=None, recipient_id=whatsapp_id,
+                role=MessageRole.AGENT, sender_name="Shopify order updates", message_id=message_id,
+                status="failed", delivery_error=error, business_phone_id=job.get("send_phone_id"),
+                bot_context={"source": f"shopify_order_{job['event']}", "order_id": job["order_provider_id"]},
+            )
+    except DuplicateKeyError:
+        pass
+    except Exception:
+        attempts = int(job.get("inbox_attempts") or 0)
+        await db.shopify_order_notifications.update_one(
+            {"_id": job["_id"], "failed_message_id": message_id},
+            {"$set": {
+                "inbox_sync_status": "retryable",
+                "inbox_next_attempt_at": utcnow() + timedelta(minutes=INBOX_RETRY_MINUTES[min(attempts, len(INBOX_RETRY_MINUTES) - 1)]),
+                "updated_at": utcnow(),
+            }, "$inc": {"inbox_attempts": 1}},
+        )
+        raise
+    await db.shopify_order_notifications.update_one(
+        {"_id": job["_id"], "failed_message_id": message_id},
         {"$set": {"inbox_sync_status": "complete", "inbox_synced_at": utcnow(), "updated_at": utcnow()}, "$unset": {"inbox_next_attempt_at": ""}},
     )
 
@@ -2493,19 +2842,20 @@ async def _reconcile_accepted(checkout: dict) -> None:
         if not whatsapp_id or not phone:
             raise RuntimeError("inbox_identity_unavailable")
         if not sync_db[f"messages_{org_id}"].find_one({"message_id": message_id}, {"_id": 1}):
-            name = str(checkout.get("customer_name") or "there").split(" ", 1)[0]
-            content = f"Hi {name}, you left {_product_summary(checkout.get('products') or [])} in your cart. Complete your order here: {checkout.get('recovery_url') or ''}"
+            content = _checkout_message_content(checkout)
             conversation_id = await create_or_update_whatsapp_conversation(
                 org_id=org_id, recipient_id=whatsapp_id, customer_phone_no=phone,
                 customer_name=checkout.get("customer_name") or phone, last_message=content,
                 last_sender="agent", is_auto_followup=True, extra_updates={"last_message_source": "shopify_abandoned_checkout"},
                 idempotency_key=message_id,
+                business_phone_id=checkout.get("send_phone_id"),
             )
             await store_whatsapp_message(
                 org_id=org_id, content=content, conversation_id=conversation_id, customer_phone_no=phone,
                 type="template", payload=None, recipient_id=whatsapp_id, role=MessageRole.AGENT,
                 sender_name="Shopify recovery", message_id=message_id, status="sent",
                 bot_context={"source": "shopify_abandoned_checkout", "checkout_id": checkout["provider_id"]},
+                business_phone_id=checkout.get("send_phone_id"),
             )
     except DuplicateKeyError:
         pass
@@ -2528,23 +2878,149 @@ async def _reconcile_accepted(checkout: dict) -> None:
         await _commerce_event(org_id, "checkout", checkout["provider_id"])
 
 
-async def update_shopify_reminder_delivery(org_id: str, message_id: str, status: str) -> None:
+async def _reconcile_checkout_failure(checkout: dict) -> None:
+    message_id = checkout.get("failed_message_id")
+    error = checkout.get("provider_error")
+    if not message_id or not isinstance(error, dict) or checkout.get("inbox_sync_status") == "complete":
+        return
+    org_id = checkout["org_id"]
+    phone = str(checkout.get("phone") or "").lstrip("+")
+    whatsapp_id = checkout.get("send_whatsapp_id")
+    try:
+        if not phone or not whatsapp_id:
+            raise RuntimeError("inbox_identity_unavailable")
+        content = _checkout_message_content(checkout)
+        messages = sync_db[f"messages_{org_id}"]
+        if messages.find_one({"message_id": message_id}, {"_id": 1}):
+            messages.update_one(
+                {"message_id": message_id},
+                {"$set": {"status": "failed", "delivery_error": error}},
+            )
+        else:
+            conversation_id = await create_or_update_whatsapp_conversation(
+                org_id=org_id, recipient_id=whatsapp_id, customer_phone_no=phone,
+                customer_name=checkout.get("customer_name") or phone, last_message=content,
+                last_sender="agent", is_auto_followup=True,
+                extra_updates={"last_message_source": "shopify_abandoned_checkout"},
+                idempotency_key=message_id, business_phone_id=checkout.get("send_phone_id"),
+            )
+            await store_whatsapp_message(
+                org_id=org_id, content=content, conversation_id=conversation_id,
+                customer_phone_no=phone, type="template", payload=None, recipient_id=whatsapp_id,
+                role=MessageRole.AGENT, sender_name="Shopify recovery", message_id=message_id,
+                status="failed", delivery_error=error, business_phone_id=checkout.get("send_phone_id"),
+                bot_context={"source": "shopify_abandoned_checkout", "checkout_id": checkout["provider_id"]},
+            )
+    except DuplicateKeyError:
+        pass
+    except Exception:
+        attempts = int(checkout.get("inbox_attempts") or 0)
+        await db.shopify_checkouts.update_one(
+            {"_id": checkout["_id"], "failed_message_id": message_id},
+            {"$set": {
+                "inbox_sync_status": "retryable",
+                "inbox_next_attempt_at": utcnow() + timedelta(minutes=INBOX_RETRY_MINUTES[min(attempts, len(INBOX_RETRY_MINUTES) - 1)]),
+                "status_updated_at": utcnow(),
+            }, "$inc": {"inbox_attempts": 1}},
+        )
+        raise
+    await db.shopify_checkouts.update_one(
+        {"_id": checkout["_id"], "failed_message_id": message_id},
+        {"$set": {"inbox_sync_status": "complete", "inbox_synced_at": utcnow(), "status_updated_at": utcnow()}, "$unset": {"inbox_next_attempt_at": ""}},
+    )
+
+
+async def update_shopify_reminder_delivery(
+    org_id: str,
+    message_id: str,
+    status: str,
+    delivery_error: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     delivery_status = str(status or "").lower()
     rank = {"accepted": 0, "sent": 1, "delivered": 2, "read": 3, "failed": 4}.get(delivery_status)
     if rank is None:
-        return
+        return None
     now = utcnow()
+    if delivery_status == "failed":
+        delivery_error = delivery_error or normalize_whatsapp_delivery_error({}, stage="delivery")
+        failure_rank_filter = {"$or": [{"delivery_rank": {"$lt": 2}}, {"delivery_rank": {"$exists": False}}]}
+        checkout = await db.shopify_checkouts.find_one({
+            "org_id": org_id, "provider_message_id": message_id, **failure_rank_filter,
+        })
+        if checkout:
+            retry_at = _provider_retry_at(checkout, delivery_error, now)
+            message_error = _message_delivery_error(delivery_error, retry_at)
+            update = {
+                "delivery_status": "failed", "failure_category": "provider_delivery_failed",
+                "provider_error": message_error, "failed_message_id": message_id, "failed_at": now,
+                "reminder_status": "retryable" if retry_at else "failed", "reminder_due_at": retry_at,
+                "inbox_sync_status": "pending", "inbox_next_attempt_at": now, "status_updated_at": now,
+            }
+            operation: dict[str, Any] = {
+                "$set": update,
+                "$unset": {"provider_message_id": "", "provider_started_at": "", "provider_accepted_at": "", "sent_at": "", "delivery_rank": ""},
+                "$push": {"attempt_history": {"$each": [{"failed_at": now, "failure_category": "provider_delivery_failed", "message_id": message_id, "delivery_error": message_error}], "$slice": -10}},
+            }
+            if retry_at:
+                operation["$inc"] = {"auto_retry_count": 1}
+            updated = await db.shopify_checkouts.find_one_and_update(
+                {"_id": checkout["_id"], "provider_message_id": message_id, **failure_rank_filter}, operation,
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated:
+                try:
+                    await _reconcile_checkout_failure(updated)
+                except Exception as exc:
+                    logger.warning("Shopify failure Inbox reconciliation deferred: {}", type(exc).__name__)
+                if _meta_configuration_error(delivery_error):
+                    await _admin_warning(org_id, "meta_configuration", delivery_error["title"])
+                await _commerce_event(org_id, "checkout", updated["provider_id"])
+                return message_error
+
+        notification = await db.shopify_order_notifications.find_one({
+            "org_id": org_id, "provider_message_id": message_id, **failure_rank_filter,
+        })
+        if not notification:
+            return None
+        retry_at = _provider_retry_at(notification, delivery_error, now)
+        message_error = _message_delivery_error(delivery_error, retry_at)
+        update = {
+            "delivery_status": "failed", "failure_category": "provider_delivery_failed",
+            "provider_error": message_error, "failed_message_id": message_id, "failed_at": now,
+            "status": "retryable" if retry_at else "failed", "due_at": retry_at,
+            "inbox_sync_status": "pending", "inbox_next_attempt_at": now, "updated_at": now,
+        }
+        operation = {
+            "$set": update,
+            "$unset": {"provider_message_id": "", "provider_started_at": "", "provider_accepted_at": "", "sent_at": "", "delivery_rank": ""},
+            "$push": {"attempt_history": {"$each": [{"failed_at": now, "failure_category": "provider_delivery_failed", "message_id": message_id, "delivery_error": message_error}], "$slice": -10}},
+        }
+        if retry_at:
+            operation["$inc"] = {"auto_retry_count": 1}
+        updated = await db.shopify_order_notifications.find_one_and_update(
+            {"_id": notification["_id"], "provider_message_id": message_id, **failure_rank_filter}, operation,
+            return_document=ReturnDocument.AFTER,
+        )
+        if not updated:
+            return None
+        try:
+            await _reconcile_order_failure(updated)
+        except Exception as exc:
+            logger.warning("Shopify order failure Inbox reconciliation deferred: {}", type(exc).__name__)
+        if _meta_configuration_error(delivery_error):
+            await _admin_warning(org_id, "meta_configuration", delivery_error["title"])
+        await _commerce_event(org_id, "order", updated["order_provider_id"])
+        return message_error
+
     update: dict[str, Any] = {
         "delivery_status": delivery_status,
         "delivery_rank": rank,
         "status_updated_at": now,
     }
-    if delivery_status == "failed":
-        update.update({"reminder_status": "failed", "failure_category": "provider_delivery_failed", "failed_at": now})
-    elif delivery_status in {"sent", "delivered", "read"}:
+    if delivery_status in {"sent", "delivered", "read"}:
         update["reminder_status"] = "sent"
         update[f"{delivery_status}_at"] = now
-    rank_filter = {"$or": [{"delivery_rank": {"$lt": 2 if delivery_status == "failed" else rank}}, {"delivery_rank": {"$exists": False}}]}
+    rank_filter = {"$or": [{"delivery_rank": {"$lt": rank}}, {"delivery_rank": {"$exists": False}}]}
     checkout = await db.shopify_checkouts.find_one_and_update(
         {"org_id": org_id, "provider_message_id": message_id, **rank_filter},
         {"$set": update},
@@ -2552,18 +3028,16 @@ async def update_shopify_reminder_delivery(org_id: str, message_id: str, status:
     )
     if checkout:
         await _commerce_event(org_id, "checkout", checkout["provider_id"])
-        return
+        return None
     order_update = {"delivery_status": delivery_status, "delivery_rank": rank, "updated_at": now}
-    if delivery_status == "failed":
-        order_update.update({"status": "failed", "failure_category": "provider_delivery_failed", "failed_at": now})
-    else:
-        order_update[f"{delivery_status}_at"] = now
+    order_update[f"{delivery_status}_at"] = now
     notification = await db.shopify_order_notifications.find_one_and_update(
         {"org_id": org_id, "provider_message_id": message_id, **rank_filter},
         {"$set": order_update}, return_document=ReturnDocument.AFTER,
     )
     if notification:
         await _commerce_event(org_id, "order", notification["order_provider_id"])
+    return None
 
 
 async def _commerce_event(org_id: str, record_type: str, record_id: str) -> None:
@@ -2576,11 +3050,21 @@ async def _commerce_event(org_id: str, record_type: str, record_id: str) -> None
         logger.debug("Shopify Commerce WebSocket update skipped: {}", type(exc).__name__)
 
 
-async def _admin_warning(org_id: str, category: str) -> None:
+async def _admin_warning(org_id: str, category: str, detail: str | None = None) -> None:
     if category == "reminder_configuration":
         await db.shopify_connections.update_one(
             {"org_id": org_id, "status": "connected"},
             {"$set": {"reminder_error": "Shopify recovery needs an active WhatsApp number and approved template", "updated_at": utcnow()}},
+        )
+    elif category == "meta_configuration":
+        await db.shopify_connections.update_one(
+            {"org_id": org_id, "status": "connected"},
+            {"$set": {
+                "automation_enabled": False,
+                "order_notifications_enabled": False,
+                "reminder_error": f"WhatsApp needs attention: {detail or 'Meta rejected the message configuration'}",
+                "updated_at": utcnow(),
+            }},
         )
     try:
         await asyncio.wait_for(

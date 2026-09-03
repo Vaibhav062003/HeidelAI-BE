@@ -167,6 +167,8 @@ assert second_retry["action"] == "claimed" and start_provider(multipart, second_
 lifespan = Path("core/lifespan.py").read_text()
 service = Path("services/wa_service.py").read_text()
 webhook = Path("api/webhook_routes.py").read_text()
+common_routes = Path("api/common_routes.py").read_text()
+decision_service = Path("services/pricing_decision_service.py").read_text()
 assert "ensure_whatsapp_outbound_indexes" in lifespan
 assert 'create_index("expires_at", expireAfterSeconds=0)' in service
 assert '"delivery_state": "accepted_pending_sync"' in service
@@ -211,5 +213,8 @@ assert pending_marker.index("finally:") < pending_marker.index("processed_messag
 assert "Sales action delivery is still being finalized" in webhook
 assert "Instagram delivery is still being synchronized" in webhook
 assert 'delivery_failure_required = error.category == "delivery_error"' in webhook
+assert 'platform in {"whatsapp", "instagram"} and mode == "reply" and not temp_id' in common_routes
+assert 'provider_state in {' in common_routes
+assert '"temp_id": temp_id' in decision_service
 
 print("WhatsApp reply idempotency behavior passed.")

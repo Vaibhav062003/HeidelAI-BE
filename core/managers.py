@@ -8,10 +8,14 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, client_id: str, websocket: WebSocket, token: str):
+    async def connect(self, client_id: str, websocket: WebSocket, token: str) -> bool:
         await websocket.accept(subprotocol=token)
+        if client_id in self.active_connections:
+            await websocket.close(code=1008, reason="Client ID already connected")
+            return False
         self.active_connections[client_id] = websocket
         logger.success(f"Client connected: {client_id}")
+        return True
 
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
@@ -20,7 +24,7 @@ class ConnectionManager:
 
     async def broadcast(self, message: dict):
         disconnected_clients = []
-        for client_id, websocket in self.active_connections.items():
+        for client_id, websocket in list(self.active_connections.items()):
             try:
                 await websocket.send_json(message)
             except Exception as e:
@@ -38,10 +42,14 @@ class ConnectionManager2:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, client_id: str, websocket: WebSocket):
-        await websocket.accept()
+    async def connect(self, client_id: str, websocket: WebSocket, token: str) -> bool:
+        await websocket.accept(subprotocol=token)
+        if client_id in self.active_connections:
+            await websocket.close(code=1008, reason="Client ID already connected")
+            return False
         self.active_connections[client_id] = websocket
         logger.success(f"Client connected: {client_id}")
+        return True
 
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
@@ -50,7 +58,7 @@ class ConnectionManager2:
 
     async def broadcast(self, message: dict):
         disconnected_clients = []
-        for client_id, websocket in self.active_connections.items():
+        for client_id, websocket in list(self.active_connections.items()):
             try:
                 await websocket.send_json(message)
             except Exception as e:

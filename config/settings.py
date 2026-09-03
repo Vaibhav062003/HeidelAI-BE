@@ -158,4 +158,15 @@ PRICING_INTELLIGENCE_ORG_IDS = {
     for org_id in os.getenv("PRICING_INTELLIGENCE_ORG_IDS", "").split(",")
     if org_id.strip()
 }
-PRICING_FLOOR_MAX_AGE_MINUTES = int(os.getenv("PRICING_FLOOR_MAX_AGE_MINUTES", "60"))
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer without making application import fail closed."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+PRICING_FLOOR_MAX_AGE_MINUTES = _positive_int_env("PRICING_FLOOR_MAX_AGE_MINUTES", 60)

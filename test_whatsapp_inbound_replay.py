@@ -41,7 +41,11 @@ class _Conversations:
         self.updates = 0
 
     def find_one(self, query, *_args, **_kwargs):
-        return self.existing if query.get("conversation_id") == self.existing["conversation_id"] else None
+        comparable = {
+            key: value for key, value in query.items()
+            if not key.startswith("$") and not isinstance(value, dict)
+        }
+        return self.existing if all(self.existing.get(key) == value for key, value in comparable.items()) else None
 
     def find_one_and_update(self, *_args, **_kwargs):
         self.updates += 1
@@ -109,6 +113,8 @@ def test_message_id_reuse_with_different_content_fails(monkeypatch):
 def test_conversation_replay_does_not_increment_or_broadcast(monkeypatch):
     conversations = _Conversations({
         "conversation_id": "whatsapp_919999999999",
+        "platform": "whatsapp",
+        "customer_id": "919999999999",
         "applied_outbound_message_ids": ["wamid.1"],
     })
     monkeypatch.setattr(wa_service, "db", _DB(conversations))
