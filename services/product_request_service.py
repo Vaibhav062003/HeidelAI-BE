@@ -93,7 +93,8 @@ async def product_for(row):
         "status": {"$in": ["active", "syncing"]}, "disconnect_requested_at": {"$exists": False},
     }, {"_id": 1}):
         return None
-    return product
+    from services.stock_service import effective_stock_product
+    return await effective_stock_product(row["catalogue_org_id"], product, database=db)
 
 
 async def connection_for(org, phone):

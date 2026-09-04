@@ -793,11 +793,13 @@ async def _fetch_rows(
 
 def _get_wa_connection(org_id: str, phone_number_id: Optional[str] = None) -> Optional[dict]:
     """Resolve an exact sender or the organization's primary sender."""
+    from services.wa_service import resolve_outbound_whatsapp_connection
+
+    if phone_number_id:
+        return resolve_outbound_whatsapp_connection(org_id, None, phone_number_id)
     org = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1})
     if not org or not org.get("wa_id"):
         return None
-    from services.wa_service import resolve_outbound_whatsapp_connection
-
     return resolve_outbound_whatsapp_connection(org_id, org["wa_id"], phone_number_id)
 
 

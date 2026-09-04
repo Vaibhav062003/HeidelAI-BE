@@ -72,6 +72,12 @@ async def list_requests(request: Request, user: CurrentUser,
     ids = {row.get("product_id") for row in data["items"] if row.get("product_id") and row.get("catalogue_org_id") == selected_catalogue}
     lookup_ids = list(ids) + [ObjectId(value) for value in ids if ObjectId.is_valid(value)]
     products = await db[f"products_{selected_catalogue}"].find({"_id": {"$in": lookup_ids}}).to_list(100)
+    from services.stock_service import effective_stock_product
+    limit = asyncio.Semaphore(5)
+    async def resolve(product):
+        async with limit:
+            return await effective_stock_product(selected_catalogue, product, database=db)
+    products = await asyncio.gather(*(resolve(product) for product in products))
     products_by_id = {str(product["_id"]): product for product in products}
     message_ids = [row["notification_message_id"] for row in data["items"] if row.get("notification_message_id")]
     messages = await db[f"messages_{user.org_id}"].find(
@@ -80,6 +86,7 @@ async def list_requests(request: Request, user: CurrentUser,
     delivery = {message["message_id"]: message for message in messages}
     for row in data["items"]:
         row["in_stock"] = row.get("catalogue_org_id") == selected_catalogue and available_stock(products_by_id.get(row.get("product_id")))
+        row["stock_error"] = (products_by_id.get(row.get("product_id")) or {}).get("stock_resolution_error")
         row["delivery_status"] = delivery.get(row.get("notification_message_id"), {}).get("status")
     return serialize_mongo({"items": data["items"], "total": (data["total"] or [{"count": 0}])[0]["count"], "page": page})
 

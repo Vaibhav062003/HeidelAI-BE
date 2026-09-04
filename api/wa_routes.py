@@ -2163,7 +2163,7 @@ async def bulk_send_whatsapp_message(
         org_id = user.org_id
         from services.entitlement_service import consume_quota_async, feature_access, release_quota_async, require_feature
 
-        require_feature(org_id, "BROADCASTING")
+        await asyncio.to_thread(require_feature, org_id, "BROADCASTING")
         unique_recipients = {}
         for recipient in req.recipients:
             phone = "".join(character for character in recipient.phone_number if character.isdigit())
@@ -2180,22 +2180,23 @@ async def bulk_send_whatsapp_message(
 
         if not recipients:
             raise HTTPException(status_code=409, detail="All selected recipients have opted out of broadcasts")
-        batch_limit = feature_access(org_id, "BROADCASTING")["limits"].get("max_batch_recipients")
+        access = await asyncio.to_thread(feature_access, org_id, "BROADCASTING")
+        batch_limit = access["limits"].get("max_batch_recipients")
         if batch_limit is not None and len(recipients) > batch_limit:
             raise HTTPException(status_code=422, detail={"code": "broadcast_batch_limit", "feature": "BROADCASTING", "metric": "max_batch_recipients", "used": len(recipients), "limit": batch_limit, "message": f"This broadcast exceeds the {batch_limit}-recipient batch limit."})
 
         # Look up the org's WhatsApp connection
-        org_document = db.organizations.find_one({"org_id": org_id})
+        org_document = await asyncio.to_thread(db.organizations.find_one, {"org_id": org_id})
         if not org_document:
             raise HTTPException(status_code=404, detail="Organization not found")
 
         wa_id = org_document.get("wa_id")
-        if not wa_id:
+        if not wa_id and not req.phone_number_id:
             raise HTTPException(status_code=404, detail="No WhatsApp account connected to this organization")
 
-        connection = resolve_outbound_whatsapp_connection(
+        connection = await asyncio.to_thread(resolve_outbound_whatsapp_connection,
             org_id,
-            wa_id,
+            None if req.phone_number_id else wa_id,
             req.phone_number_id,
         )
 
@@ -2205,6 +2206,7 @@ async def bulk_send_whatsapp_message(
                 detail="Select a WhatsApp number before starting this bulk send"
             )
 
+        wa_id = connection.get("wa_id")
         access_token = connection.get("access_token")
         phone_id = connection.get("phone_id")
 

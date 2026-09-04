@@ -19,6 +19,7 @@ jobs:
           python test_pricing_policy_v1.py
           python test_product_sheet_pricing_foundation.py
           python test_pricing_service.py
+          python -c 'import test_pricing_service; import pytest; raise SystemExit(pytest.main(["-q", "tests/contracts/test_oos_dual_role_contract.py"]))'
           python test_pricing_decision_service.py
           python test_pricing_webhook_contract.py
           pytest -q test_sales_action_service.py
@@ -34,4 +35,8 @@ jobs:
           python test_inbox_live_delivery_contract.py
           python -m unittest test_stock_sheet_writeback test_product_sheet_pricing_foundation test_product_requests test_restock_dispatch -q
           python test_entitlement_contract.py
+          python test_release_catalogue.py
+          python test_release_messaging.py
+          python test_release_commerce.py
+          python tests/shopify/test_shopify_worker_runtime.py
           python -m py_compile api/*.py services/*.py schemas/*.py

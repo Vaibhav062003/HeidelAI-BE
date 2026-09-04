@@ -1,4 +1,6 @@
 import re
+import math
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -6,6 +8,7 @@ from typing import Any
 from bson import ObjectId
 from fastapi import HTTPException
 from pymongo import ReturnDocument
+from pymongo.errors import PyMongoError
 
 from database import get_async_mongo_db
 from services.product_sheet_sync import sync_product_sheet, write_product_sheet_gst_bulk, write_product_sheet_values
@@ -66,12 +69,120 @@ def _safe_error(prefix: str, error: Exception) -> str:
 
 
 def _sheet_quantity(product: dict) -> float:
+    if product.get("source_valid") is False:
+        return 0.0
     value = product.get("stock", product.get("quantity", product.get("available_qty")))
     if isinstance(value, bool):
         return 1.0 if value else 0.0
     if value is None and isinstance(product.get("in_stock"), bool):
         return 1.0 if product["in_stock"] else 0.0
     return _number(value)
+
+
+def _primary_source_product(product: dict, primary: dict | None) -> dict:
+    """Shared Stock/restock view of the primary snapshot (never secondary residue)."""
+    result = dict(product)
+    sheet_id = str((primary or {}).get("sheet_id") or "")
+    values = (product.get("source_values") or {}).get(sheet_id)
+    if values is not None:
+        for field in ("stock", "quantity", "available_qty", "in_stock"):
+            result.pop(field, None)
+        result.update(values)
+        result["updated_at"] = values.get("updated_at") or (primary or {}).get("last_synced_at")
+    return result
+
+
+def _stock_fresh(stamp) -> bool:
+    if not isinstance(stamp, datetime):
+        return False
+    stamp = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+    age = datetime.now(timezone.utc) - stamp
+    return -timedelta(minutes=5) <= age <= timedelta(hours=24)
+
+
+async def effective_stock_product(org_id: str, product: dict, database=None) -> dict:
+    try:
+        return await asyncio.wait_for(_effective_stock_product(org_id, product, database), timeout=5)
+    except (PyMongoError, TimeoutError):
+        return {**product, "stock_resolution_error": "Stock source could not be verified; retry after stock sync"}
+
+
+async def _effective_stock_product(org_id: str, product: dict, database=None) -> dict:
+    """Bounded, fail-closed restock lookup using Stock's merge/source precedence.
+
+    Only matching SKU candidates and explicit links are read, not the inventory.
+    Ambiguous/truncated matches must be reconciled in Stock before outreach.
+    """
+    database = database if database is not None else db
+    result = {**product, "stock_resolution_error": "Stock source is unverified"}
+    primary = await database.product_sheet_connections.find_one({"org_id": org_id, "is_primary": True})
+    effective = _primary_source_product(product, primary)
+    sources = product.get("source_sheet_ids") or []
+    sources = [sources] if isinstance(sources, str) else list(sources)
+    if product.get("source_sheet_id"):
+        sources.append(product["source_sheet_id"])
+    if sources:
+        primary_id = str((primary or {}).get("sheet_id") or "")
+        authority = primary if primary_id in sources else await database.product_sheet_connections.find_one({
+            "org_id": org_id, "sheet_id": product.get("price_source_sheet_id") or (sources[0] if len(set(sources)) == 1 else None),
+        })
+        if (not authority or authority.get("status") not in {"active", "syncing"}
+                or authority.get("disconnect_requested_at")):
+            return result
+        snapshot = (product.get("source_values") or {}).get(str(authority.get("sheet_id")))
+        if not isinstance(snapshot, dict) or snapshot.get("source_valid") is False:
+            return result
+        effective = _primary_source_product(product, authority)
+    if effective.get("source_valid") is False:
+        return result
+    key = normalize_sku(_sheet_sku(effective))
+    if not key or len(key) > 200:
+        return result
+    pattern = "^[^a-z0-9]*" + "[^a-z0-9]*".join(re.escape(c) for c in key) + "[^a-z0-9]*$"
+    fields = ["model_no", "sku", "sku_full", "unique_identifier", "product_name"]
+    if (primary or {}).get("sheet_id"):
+        fields.append(f"source_values.{primary['sheet_id']}.model_no")
+    candidates = await database[f"products_{org_id}"].find({"$or": [
+        {field: {"$regex": pattern, "$options": "i"}} for field in fields
+    ]}).limit(6).max_time_ms(2000).to_list(6)
+    if len(candidates) >= 6:
+        return result
+    sheets = [_primary_source_product(item, primary) for item in candidates]
+    sheets = [item for item in sheets if normalize_sku(_sheet_sku(item)) == key]
+    if len(sheets) != 1 or str(sheets[0].get("_id")) != str(product.get("_id")):
+        return result
+    # The candidate read is newer than the caller's product snapshot. Do not
+    # resurrect quantity that changed between the initial lookup and this check.
+    effective = _primary_source_product(sheets[0], authority if sources else primary)
+    if effective.get("source_valid") is False:
+        return result
+    tally = await database.tally_stock_items.find({"org_id": org_id, "$or": [
+        {field: {"$regex": pattern, "$options": "i"}} for field in ("model_number", "name")
+    ]}).limit(6).max_time_ms(2000).to_list(6)
+    if len(tally) >= 6:
+        return result
+    tally = [item for item in tally if normalize_sku(item.get("model_number") or item.get("name")) == key]
+    link = await database.stock_product_links.find_one({"org_id": org_id, "sheet_product_id": str(product.get("_id"))})
+    if link:
+        linked = await database.tally_stock_items.find_one({"org_id": org_id, "master_id": link.get("tally_master_id")})
+        if not linked:
+            return result
+        if not any(item.get("master_id") == linked.get("master_id") for item in tally):
+            tally.append(linked)
+    # A candidate linked elsewhere may have been moved out of this SKU group.
+    # Refuse uncertain conflicts rather than promise another product's stock.
+    if tally and await database.stock_product_links.find_one({"org_id": org_id,
+        "tally_master_id": {"$in": [str(item.get("master_id")) for item in tally]},
+        "sheet_product_id": {"$ne": str(product.get("_id"))}}):
+        return result
+    integration = await database.tally_integrations.find_one({"org_id": org_id}, {"last_seen_at": 1})
+    online = _tally_online(integration)
+    merged = _row([effective], tally, key, online)
+    stamp = tally[0].get("synced_at") if online and len(tally) == 1 else effective.get("updated_at")
+    quantity = merged["quantity"]
+    if merged["conflicts"] or not math.isfinite(quantity) or not _stock_fresh(stamp):
+        return result
+    return {**effective, "stock": quantity, "updated_at": stamp, "stock_resolution_error": None}
 
 
 def _version(sheet: dict | None, tally: dict | None) -> str:
@@ -168,14 +279,11 @@ async def _merged_stock(org_id: str) -> list[dict]:
         "target_selling_price": 1, "approved_floor_price": 1,
     }).to_list(length=50_000)
     primary = await db.product_sheet_connections.find_one(
-        {"org_id": org_id, "status": "active", "is_primary": True}, {"sheet_id": 1},
+        {"org_id": org_id, "status": "active", "is_primary": True}, {"sheet_id": 1, "last_synced_at": 1},
     )
     primary_sheet_id = str((primary or {}).get("sheet_id") or "")
     if primary_sheet_id:
-        for product in products:
-            values = (product.get("source_values") or {}).get(primary_sheet_id)
-            if values:
-                product.update(values)
+        products = [_primary_source_product(product, primary) for product in products]
     tally = await db.tally_stock_items.find({"org_id": org_id}, {"sync_id": 0}).to_list(length=50_000)
     confirmed_allocations = {
         str(item.get("tally_master_id")): item
@@ -226,7 +334,8 @@ def _tally_online(integration: dict | None) -> bool:
     if not isinstance(last_seen, datetime):
         return False
     seen = last_seen.replace(tzinfo=timezone.utc) if last_seen.tzinfo is None else last_seen
-    return seen >= datetime.now(timezone.utc) - timedelta(seconds=90)
+    now = datetime.now(timezone.utc)
+    return now - timedelta(seconds=90) <= seen <= now + timedelta(minutes=5)
 
 
 async def list_stock(

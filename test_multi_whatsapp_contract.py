@@ -149,8 +149,8 @@ def test_number_scoped_query_and_flow_binding_contracts():
     wa_service = source("services/wa_service.py")
 
     assert common_routes.count("business_phone_id: Optional[str]") >= 4
-    assert 'conditions.append(_business_phone_scope(org_id, business_phone_id))' in common_service
-    assert 'base_conditions.append(_business_phone_scope(org_id, business_phone_id))' in common_service
+    assert 'conditions.append(await _business_phone_scope(org_id, business_phone_id))' in common_service
+    assert 'base_conditions.append(await _business_phone_scope(org_id, business_phone_id))' in common_service
     assert '"business_phone_id": doc.get("business_phone_id")' in common_service
     assert common_service.count("_business_phone_scope(org_id, business_phone_id)") == 4
     assert '"wa_bot_flow_id": flow_id' in flow_service
