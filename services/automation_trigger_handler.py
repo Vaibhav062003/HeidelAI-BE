@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 # === Internal Modules ===
 from database import get_mongo_db
+from services.automation_keywords import message_contains_keyword
 
 from loguru import logger
 
@@ -249,9 +250,9 @@ def _check_keyword_match(trigger_config: Dict, trigger_data: Dict) -> bool:
     if not keywords:
         return True
     
-    # Check if ANY keyword is in the message
+    # Match complete keywords or phrases, not fragments inside unrelated words.
     for keyword in keywords:
-        if keyword in message_text:
+        if message_contains_keyword(message_text, keyword):
             logger.success(f"✅ Keyword matched: '{keyword}' found in '{message_text}'")
             return True
     
