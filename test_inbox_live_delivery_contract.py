@@ -27,6 +27,7 @@ assert extract({"message": {}}) is None
 
 routes_source = Path("api/websockets_routes.py").read_text()
 service_source = Path("services/websocket_service.py").read_text()
+whatsapp_source = Path("services/wa_service.py").read_text()
 assert "for account_id in ig_ids" in routes_source
 assert "for account_id in wa_ids" in routes_source
 assert '"ig_ids": sorted(ig_ids)' in routes_source
@@ -35,6 +36,10 @@ assert "services.instagram_clients," in service_source
 assert "services.whatsapp_clients," in service_source
 assert "_discard_client(index, client_id)" in service_source
 assert "_payload_conversation_id(payload)" in service_source
+media_start = whatsapp_source.index("async def send_wa_media_message")
+media_sender = whatsapp_source[media_start:whatsapp_source.index("\nasync def ", media_start + 1)]
+assert 'recipient_id=connection["wa_id"]' in media_sender
+assert '"timestamp": message["timestamp"].isoformat()' in whatsapp_source
 
 webhook_source = Path("api/webhook_routes.py").read_text()
 deploy_source = Path(".github/workflows/deploy-main.yml").read_text()
