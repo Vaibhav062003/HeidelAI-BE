@@ -198,6 +198,15 @@ def format_dealer_sourcing_message(extracted_attrs: dict, raw_query: str = "") -
     else:
         title = "Product Inquiry"
 
+    # Keep variant identity, but never forward budget/pricing or arbitrary customer text.
+    for key in ("cpu", "processor", "ram", "memory", "storage", "capacity", "gpu", "graphics", "size", "display", "screen_size", "refresh_rate"):
+        value = specs.get(key)
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            continue
+        value = str(value).strip()
+        if value and not re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", title, re.IGNORECASE):
+            title += f" / {value}"
+
     return f"{title}\n\nbhai price and availability?"
 
 
@@ -464,6 +473,17 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         logger.error(f"[OOS] Failed to contact any dealers for query_id={oos_doc['query_id']}. Status set to 'send_failed'")
 
 
+def _is_pending_dealer_acknowledgement(content: str) -> bool:
+    """A narrow deferral, not a buyer question or an availability/price claim."""
+    return bool(re.fullmatch(
+        r"\s*(?:(?:ok(?:ay)?|sure)[,.!]?\s+)?"
+        r"(?:let me|i(?:'ll| will)|will)\s+(?:check|confirm)"
+        r"(?:\s+and\s+(?:confirm|let you know|update you))?"
+        r"(?:\s+(?:tomorrow|later|soon|shortly))?[.!]?\s*",
+        content or "", re.IGNORECASE,
+    ))
+
+
 async def handle_dealer_reply(
     org_id: str,
     dealer_phone: str,
@@ -494,12 +514,15 @@ async def handle_dealer_reply(
     # Statuses where we expect dealer replies (only after message was actually sent)
     active_statuses = ["dealers_contacted", "partial_replies", "sending"]
 
-    from services.pricing_service import is_pricing_enabled, is_supplier_response
+    from services.pricing_service import is_supplier_response
 
     supplier_response = is_supplier_response(content)
+    pending_acknowledgement = False
     oos_doc = None
-    # Exact reply-to correlation establishes the supplier role; prose heuristics
-    # are only needed for the broader phone fallbacks.
+    # Reply-to correlation identifies the request, but the text still has to be
+    # a supplier answer. A dealer may also use this number as a customer and
+    # ask a question while quoting the request; that must continue to the
+    # conversational dealer/customer router instead of being stored as a quote.
     if replied_message_id:
         logger.info(f"[OOS] Attempting match by replied message_id: {replied_message_id}")
         oos_doc = await oos_col.find_one({
@@ -509,9 +532,21 @@ async def handle_dealer_reply(
         })
         if oos_doc:
             logger.success(f"[OOS] Match succeeded by message_id {replied_message_id} for query_id={oos_doc['query_id']}")
+            pending_acknowledgement = _is_pending_dealer_acknowledgement(content) and any(
+                row.get("dealer_phone") == dealer_phone and replied_message_id in (row.get("message_ids") or [])
+                for row in oos_doc.get("sent_dealers", [])
+            )
+            if not supplier_response and not pending_acknowledgement:
+                logger.info(
+                    f"[OOS] Reply to query_id={oos_doc['query_id']} is not a supplier answer; "
+                    "falling back to the chatbot agent"
+                )
+                return False
 
-    # Phone-only replies are safe only when exactly one active request matches.
-    allow_phone_fallback = not is_pricing_enabled(org_id) or supplier_response
+    # Without reply-to correlation, a supplier-shaped answer and one unique
+    # active request are both required. Otherwise normal customer questions
+    # from a registered dealer would be swallowed by the OOS workflow.
+    allow_phone_fallback = supplier_response
     if not oos_doc and allow_phone_fallback:
         logger.info(f"[OOS] Attempting unique match by dealer phone number: {dealer_phone}")
         matches = await oos_col.find(
@@ -548,10 +583,11 @@ async def handle_dealer_reply(
         "content": content,
         "source_message_id": source_message_id,
         "replied_at": datetime.now(timezone.utc),
+        "reply_kind": "pending_acknowledgement" if pending_acknowledgement else "supplier_response",
         "steps": {
-            "pricing": "pending",
+            "pricing": "done" if pending_acknowledgement else "pending",
             "sheet": "pending",
-            "escalation": "pending" if create_escalation else "done",
+            "escalation": "pending" if create_escalation and not pending_acknowledgement else "done",
         },
     }
 
@@ -566,7 +602,7 @@ async def handle_dealer_reply(
         },
         {
             "$push": {"dealer_replies": reply_entry},
-            "$set": {"status": "partial_replies"}
+            **({} if pending_acknowledgement else {"$set": {"status": "partial_replies"}}),
         }
     )
 

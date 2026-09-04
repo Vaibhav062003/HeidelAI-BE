@@ -1945,6 +1945,38 @@ def _checkout_status_clause(status: str, now: datetime) -> dict:
     return {"reminder_status": status}
 
 
+async def _record_conversation_id(org_id: str, item: dict, record_type: str, configured_phone_id: str) -> str | None:
+    """Link to a stored thread, never guess between a customer's business lines."""
+    phone = _phone_key(item.get("phone"))
+    if not phone:
+        return None
+    phone_id = str(item.get("send_phone_id") or "")
+    if record_type == "order" and not phone_id:
+        notification = await db.shopify_order_notifications.find_one(
+            {"org_id": org_id, "order_provider_id": item["provider_id"], "send_phone_id": {"$nin": [None, ""]}},
+            {"send_phone_id": 1}, sort=[("provider_started_at", -1), ("_id", -1)],
+        )
+        phone_id = str((notification or {}).get("send_phone_id") or "")
+    phone_id = phone_id or configured_phone_id
+    query = {"platform": "whatsapp", "$or": [
+        {"customer_id": {"$in": _phone_candidates(phone)}},
+        {"conversation_id": f"whatsapp_{phone}"},
+    ]}
+    if phone_id:
+        query["business_phone_id"] = phone_id
+    collection = db[f"conversations_{org_id}"]
+    matches = await collection.find(query, {"conversation_id": 1}).limit(2).to_list(length=2)
+    if not matches and phone_id:
+        # Only the primary line owns legacy rows lacking sender metadata.
+        primary = await db.whatsapp_connections.find_one(
+            {"org_id": org_id, "phone_id": phone_id, "slot": 1, "is_active": {"$ne": False}}, {"_id": 1},
+        )
+        if primary:
+            query["business_phone_id"] = None
+            matches = await collection.find(query, {"conversation_id": 1}).limit(2).to_list(length=2)
+    return matches[0].get("conversation_id") if len(matches) == 1 else None
+
+
 async def list_records(org_id: str, record_type: str, *, status: str = "", search: str = "", start: datetime | None = None, end: datetime | None = None, cursor: str | None = None, limit: int = 30) -> dict:
     collection = db.shopify_checkouts if record_type == "checkout" else db.shopify_orders
     sort_field = "provider_updated_at"
@@ -1966,16 +1998,16 @@ async def list_records(org_id: str, record_type: str, *, status: str = "", searc
     if has_more and items:
         value = json.dumps({"time": _provider_time(items[-1]).isoformat(), "id": items[-1]["provider_id"]}).encode()
         next_cursor = base64.urlsafe_b64encode(value).decode().rstrip("=")
-    conversation_ids = {f"whatsapp_{_phone_key(item.get('phone'))}" for item in items if _phone_key(item.get("phone"))}
-    existing_conversations = await db[f"conversations_{org_id}"].find(
-        {"conversation_id": {"$in": list(conversation_ids)}}, {"conversation_id": 1},
-    ).to_list(length=len(conversation_ids)) if conversation_ids else []
-    existing_ids = {item["conversation_id"] for item in existing_conversations}
+    connection = await db.shopify_connections.find_one({"org_id": org_id}, {"whatsapp_phone_id": 1}) if items else None
+    configured_phone_id = str((connection or {}).get("whatsapp_phone_id") or "")
+    # ponytail: bounded lookups for at most 50 records; batch if page limits grow.
+    conversation_ids = await asyncio.gather(*(
+        _record_conversation_id(org_id, item, record_type, configured_phone_id) for item in items
+    ))
     safe_items = []
-    for item in items:
+    for item, conversation_id in zip(items, conversation_ids):
         safe = _safe_document(item, include_url=True)
-        conversation_id = f"whatsapp_{_phone_key(item.get('phone'))}" if _phone_key(item.get("phone")) else ""
-        safe["conversation_id"] = conversation_id if conversation_id in existing_ids else None
+        safe["conversation_id"] = conversation_id
         safe_items.append(safe)
     return {"items": safe_items, "next_cursor": next_cursor}
 

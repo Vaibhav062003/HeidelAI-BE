@@ -974,7 +974,13 @@ class TeamEscalationTest(unittest.IsolatedAsyncioTestCase):
 
 
 class OOSRoleTest(unittest.IsolatedAsyncioTestCase):
-    async def test_exact_reply_link_establishes_supplier_role(self):
+    async def test_exact_supplier_reply_retries_only_failed_steps(self):
+        await self._exercise_reply_retry("YES AVAILABLE 15000 RS")
+
+    async def test_pending_acknowledgement_logs_once_without_offer_or_escalation(self):
+        await self._exercise_reply_retry("Let me check and confirm tomorrow", pending=True)
+
+    async def _exercise_reply_retry(self, content, pending=False):
         from services import oos_service
 
         oos_doc = {
@@ -1027,22 +1033,28 @@ class OOSRoleTest(unittest.IsolatedAsyncioTestCase):
             matched = await oos_service.handle_dealer_reply(
                 "lee",
                 "919999999999",
-                "Let me check and confirm tomorrow",
+                content,
                 {"id": "oos-message-1"},
                 source_message_id="incoming-1",
             )
             duplicate = await oos_service.handle_dealer_reply(
                 "lee",
                 "919999999999",
-                "Let me check and confirm tomorrow",
+                content,
                 {"id": "oos-message-1"},
                 source_message_id="incoming-1",
             )
         self.assertTrue(matched)
         self.assertTrue(duplicate)
         sheet.assert_awaited_once()
-        escalation.assert_awaited_once()
-        self.assertEqual(pricing.await_count, 2)
+        if pending:
+            escalation.assert_not_awaited()
+            pricing.assert_not_awaited()
+            self.assertEqual(collection.doc["status"], "dealers_contacted")
+            self.assertEqual(len(collection.doc["dealer_replies"]), 1)
+        else:
+            escalation.assert_awaited_once()
+            self.assertEqual(pricing.await_count, 2)
         self.assertEqual(collection.doc["dealer_replies"][0]["steps"]["pricing"], "done")
 
     async def test_phone_only_reply_is_not_assigned_when_two_requests_match(self):

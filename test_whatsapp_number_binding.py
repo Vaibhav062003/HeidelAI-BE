@@ -603,9 +603,9 @@ def test_all_outbound_paths_use_bound_sender_and_customer_fields():
 
     bulk_start = wa_routes.index("async def bulk_send_whatsapp_message")
     bulk_source = wa_routes[bulk_start:]
-    assert "resolve_outbound_whatsapp_connection(" in bulk_source
+    assert "await asyncio.to_thread(resolve_outbound_whatsapp_connection," in bulk_source
     assert "request.recipients" not in bulk_source
-    assert "whatsapp_conversation_id(phone_number, phone_id)" in wa_service
+    assert "whatsapp_conversation_id(phone, phone_id)" in wa_service
     webhook_tree = ast.parse((ROOT / "api/webhook_routes.py").read_text(encoding="utf-8"))
     typing_calls = [
         node for node in ast.walk(webhook_tree)

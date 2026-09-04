@@ -39,7 +39,8 @@ def grounded_request(raw, messages):
 
 
 def available_stock(product):
-    if not product or product.get("is_deleted") or product.get("deleted_at"):
+    if (not product or product.get("is_deleted") or product.get("deleted_at")
+            or product.get("stock_resolution_error") or product.get("source_valid") is False):
         return False
     # Unknown stock never counts as available; zero must not fall through to another field.
     for field in ("stock", "quantity", "available_qty"):

@@ -172,7 +172,9 @@ class StockSheetWritebackTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sync_claim_id", release[1]["$unset"])
 
     async def test_verified_product_and_price_provenance_are_published(self):
-        result = await self.write()
+        # The merchant removed the old approval column before this edit.
+        self.module._detect_header_row.return_value = (["Part", "Title", "Retail", "GST Rate", "GST Inclusive"], 1, 1)
+        result = await self.write(rows=[["", "SKU-1", "Laptop", 100, 18, False]])
         collection = Mock()
         collection.update_one.return_value = types.SimpleNamespace(matched_count=1)
         products = Mock()
@@ -192,6 +194,8 @@ class StockSheetWritebackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update["$set"]["source_values.sheet"]["target_selling_price"], 150)
         self.assertEqual(update["$set"]["source_rows.sheet"], 2)
         self.assertTrue(update["$set"]["price_version"])
+        self.assertIn("approved_floor_price", update["$unset"])
+        self.assertNotIn("approved_floor_price", update["$set"]["source_values.sheet"])
         self.assertNotIn("product_document", response)
 
     async def test_header_detection_preserves_internal_blank_columns(self):

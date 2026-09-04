@@ -2871,7 +2871,7 @@ def get_bulk_job(
             # Fetch the most recent 1000 results for this job_id
             cursor = (
                 db.bulk_job_results.find({"job_id": job_id})
-                .sort("_id", -1)
+                .sort("created_at", -1)
                 .limit(1000)
             )
             # Reverse to return results in chronological order
@@ -2894,12 +2894,83 @@ def get_bulk_job(
     return job
 
 
+def _persist_bulk_send_batch(
+    org_id: str, job_id: str, wa_id: str, phone_id: str, business_phone: Optional[str],
+    entries: list, template_name: str, language_code: str, components: Optional[list],
+    message_text: Optional[str], now: datetime, include_legacy: bool,
+) -> None:
+    """Retryable history writes only: never contact the message provider here."""
+    conversations = db[f"conversations_{org_id}"]
+    messages = db[f"messages_{org_id}"]
+    for entry in entries:
+        # Stable opaque _id avoids a new index and never exposes the phone in results IDs.
+        db.bulk_job_results.update_one(
+            {"_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{job_id}:{entry['phone_number']}"))},
+            {"$setOnInsert": {**entry, "org_id": org_id}}, upsert=True,
+        )
+    # Provider outcomes stay visible even if later history persistence fails.
+    counts = {status: db.bulk_job_results.count_documents({"job_id": job_id, "status": status})
+              for status in ("sent", "failed", "skipped")}
+    db.bulk_jobs.update_one({"job_id": job_id, "org_id": org_id},
+                            {"$set": {**counts, "updated_at": datetime.now(timezone.utc)}})
+    for entry in entries:
+        if entry["status"] != "sent":
+            continue
+        phone = entry["phone_number"]
+        query = {"platform": "whatsapp", "customer_id": phone}
+        existing = conversations.find_one({**query, "business_phone_id": phone_id})
+        if not existing and include_legacy:
+            existing = conversations.find_one({**query, "$or": [
+                {"business_phone_id": {"$exists": False}}, {"business_phone_id": None},
+            ]})
+        conversation_id = (existing or {}).get("conversation_id") or whatsapp_conversation_id(phone, phone_id)
+        content = message_text or f"Shared a template {template_name}"
+        # Do not overwrite a newer incoming message during a history retry.
+        last_at = (existing or {}).get("last_message_timestamp")
+        if isinstance(last_at, datetime) and last_at.tzinfo is None:
+            last_at = last_at.replace(tzinfo=timezone.utc)
+        if not isinstance(last_at, datetime) or last_at <= now:
+            summary = {
+                **query, "whatsapp_id": wa_id, "business_phone_id": phone_id,
+                "business_phone": business_phone, "last_message": f"AI: {content}",
+                "last_message_timestamp": now, "last_sender": "ai", "status": "open",
+                "reminder_stage": 0, "next_action_at": now + timedelta(hours=6),
+                "last_message_is_private_note": False,
+            }
+            if existing:
+                # Compare the observed timestamp atomically; an inbound update wins this race.
+                conversations.update_one({
+                    "conversation_id": conversation_id,
+                    "last_message_timestamp": existing.get("last_message_timestamp"),
+                }, {"$set": summary})
+            else:
+                # A concurrent creator may already have newer history: insert only, never overwrite.
+                conversations.update_one({"conversation_id": conversation_id}, {
+                    "$setOnInsert": {
+                        **summary, "is_ai_enabled": True, "started_at": now, "created_at": now,
+                        "unread_count": 0, "closed_at": None, "message_counter": 0,
+                    },
+                }, upsert=True)
+        # Conversation persistence must succeed before a message references it.
+        message_id = entry["message_id"]
+        messages.update_one({"message_id": message_id}, {"$setOnInsert": {
+            "id": message_id, "message_id": message_id, "platform": "whatsapp",
+            "conversation_id": conversation_id, "business_phone_id": phone_id,
+            "content": content, "type": "text" if message_text else "template",
+            "payload": None if message_text else {
+                "name": template_name, "language": {"code": language_code}, "components": components,
+            },
+            "sender_id": phone, "sender_name": "AI", "role": MessageRole.AI,
+            "timestamp": now, "status": "sent", "mode": "reply", "context": None, "context_type": None,
+        }}, upsert=True)
+
+
 async def run_bulk_send_job(
     wa_id: str,
     job_id: str,
     org_id: str,
     phone_id: str,
-        access_token: str,
+    access_token: str,
     template_name: str,
     language_code: str,
     recipients: list,
@@ -2911,7 +2982,7 @@ async def run_bulk_send_job(
     """
     Background worker: sends WhatsApp templates using a bounded worker queue,
     offloading sync DB updates to threads to avoid blocking the event loop.
-    All successful sends are saved to the messages and conversations collections in bulk.
+    Accepted sends retry only their idempotent history writes, never provider delivery.
     """
     total_recipients = len(recipients)
     if total_recipients > 2000:
@@ -2931,6 +3002,8 @@ async def run_bulk_send_job(
     if job_record is None:
         logger.error(f"Bulk WA | job={job_id} | org={org_id} | missing job record in MongoDB")
         return
+    if job_record.get("status") != "pending":
+        return
     sender_connection = await asyncio.to_thread(
         db.whatsapp_connections.find_one,
         {
@@ -2939,7 +3012,7 @@ async def run_bulk_send_job(
             "phone_id": phone_id,
             "is_active": {"$ne": False},
         },
-        {"phone": 1, "_id": 0},
+        {"phone": 1, "slot": 1, "_id": 0},
     )
     if not sender_connection:
         logger.error(f"Bulk WA | job={job_id} | sender connection is no longer active")
@@ -2950,11 +3023,14 @@ async def run_bulk_send_job(
         )
         return
     business_phone = sender_connection.get("phone")
-    await asyncio.to_thread(
+    claim = await asyncio.to_thread(
         db.bulk_jobs.update_one,
-        {"job_id": job_id, "org_id": org_id},
+        {"job_id": job_id, "org_id": org_id, "status": "pending"},
         {"$set": {"status": "running", "updated_at": datetime.now(timezone.utc)}}
     )
+    if not claim.modified_count:
+        # Existing stale-running recovery marks interrupted jobs failed; never replay sends.
+        return
 
     def mask_phone(phone: str) -> str:
         if not phone or len(phone) < 4:
@@ -2998,6 +3074,8 @@ async def run_bulk_send_job(
             if response.status_code == 200:
                 messages = response.json().get("messages") or [{}]
                 message_id = messages[0].get("id")
+                if not isinstance(message_id, str) or not message_id.strip():
+                    raise ValueError("Provider returned no message ID; delivery outcome unknown. Do not resend automatically.")
                 result_entry = {
                     "job_id": job_id,
                     "phone_number": phone_number,
@@ -3039,9 +3117,6 @@ async def run_bulk_send_job(
         return result_entry, update_fields
 
     try:
-        messages_collection_name = f"messages_{org_id}"
-        conversations_collection_name = f"conversations_{org_id}"
-        
         async with httpx.AsyncClient(timeout=30.0) as client:
             # Process in chunks of max_concurrent
             for i in range(0, len(recipients), max_concurrent):
@@ -3072,104 +3147,23 @@ async def run_bulk_send_job(
                 if tasks:
                     batch_results.extend(await asyncio.gather(*tasks))
                 
-                # Batch DB operations
+                # Keep accepted results fixed while retrying persistence, not delivery.
                 entries = [res[0] for res in batch_results]
-                
-                total_sent = sum(res[1]["$inc"].get("sent", 0) for res in batch_results)
-                total_failed = sum(res[1]["$inc"].get("failed", 0) for res in batch_results)
-                total_skipped = sum(res[1]["$inc"].get("skipped", 0) for res in batch_results)
-                
-                # Prepare message and conversation bulk operations for successful sends
-                message_docs = []
-                convo_updates = []
                 now = datetime.now(timezone.utc)
-                
-                for entry, _ in batch_results:
-                    if entry["status"] == "sent":
-                        phone_number = entry["phone_number"]
-                        msg_id = entry["message_id"]
-                        convo_id = whatsapp_conversation_id(phone_number, phone_id)
-                        
-                        # Prepare individual message doc
-                        message_doc = {
-                            "id": msg_id,
-                            "message_id": msg_id,
-                            "platform": "whatsapp",
-                            "conversation_id": convo_id,
-                            "content": f"Shared a template {template_name}",
-                            "type": "template",
-                            "payload": {
-                                "name": template_name,
-                                "language": {"code": language_code},
-                                "components": components
-                            },
-                            "sender_id": phone_number, # Matching existing convention for agent messages
-                            "sender_name": "AI",
-                            "role": MessageRole.AI,
-                            "timestamp": now,
-                            "status": "sent",
-                            "mode": "reply",
-                            "context": None,
-                            "context_type": None
-                        }
-                        message_docs.append(message_doc)
-                        
-                        # Prepare individual conversation update (upsert if session doesn't exist)
-                        convo_updates.append(UpdateOne(
-                            {"conversation_id": convo_id},
-                            {
-                                "$set": {
-                                    "platform": "whatsapp",
-                                    "whatsapp_id": wa_id,
-                                    "business_phone_id": phone_id,
-                                    "business_phone": business_phone,
-                                    "customer_id": phone_number,
-                                    "last_message": f"AI: Shared a template {template_name}",
-                                    "last_message_timestamp": now,
-                                    "last_sender": "ai",
-                                    "status": "open",
-                                    "reminder_stage": 0,
-                                    "next_action_at": now + timedelta(hours=6),
-                                    "last_message_is_private_note": False
-                                },
-                                "$setOnInsert": {
-                                    "is_ai_enabled": True,
-                                    "started_at": now,
-                                    "created_at": now,
-                                    "unread_count": 0,
-                                    "closed_at": None,
-                                    "message_counter": 0
-                                }
-                            },
-                            upsert=True
-                        ))
-
-                # Combine atomic updates for bulk_jobs
-                combined_update = {
-                    "$inc": {},
-                    "$set": {"updated_at": datetime.now(timezone.utc)}
-                }
-                if total_sent > 0: combined_update["$inc"]["sent"] = total_sent
-                if total_failed > 0: combined_update["$inc"]["failed"] = total_failed
-                if total_skipped > 0: combined_update["$inc"]["skipped"] = total_skipped
-
-                db_tasks = [
-                    asyncio.to_thread(db.bulk_job_results.insert_many, entries),
-                    asyncio.to_thread(db.bulk_jobs.update_one, {"job_id": job_id, "org_id": org_id}, combined_update)
-                ]
-                
-                # Execute bulk writes for messages and conversations if there are successes
-                if message_docs:
-                    db_tasks.append(asyncio.to_thread(db[messages_collection_name].insert_many, message_docs, ordered=False))
-                if convo_updates:
-                    db_tasks.append(asyncio.to_thread(db[conversations_collection_name].bulk_write, convo_updates, ordered=False))
-
-                try:
-                    await asyncio.gather(*db_tasks)
-                except Exception as db_err:
-                    logger.error(f"Bulk WA | job={job_id} | database error during batch tracking: {db_err}")
-                    # We don't raise here to allow subsequent batches to try, 
-                    # but the job results might be incomplete in DB.
+                for attempt in range(3):
+                    try:
+                        await asyncio.to_thread(
+                            _persist_bulk_send_batch, org_id, job_id, wa_id, phone_id, business_phone,
+                            entries, template_name, language_code, components, message_text, now,
+                            sender_connection.get("slot") == 1,
+                        )
+                        break
+                    except Exception as db_err:
+                        if attempt == 2:
+                            raise RuntimeError(
+                                "Message history tracking failed after delivery; do not resend accepted recipients"
+                            ) from db_err
+                        await asyncio.sleep(0.25 * (attempt + 1))
 
                 # Delay between batches if there are more messages left
                 if i + max_concurrent < len(recipients) and delay_seconds > 0:

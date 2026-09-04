@@ -65,6 +65,11 @@ class RestockSafetyTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(caught.exception.status_code, 409)
 
     async def test_sheet_product_requires_active_source_but_manual_does_not(self):
+        stock = types.ModuleType("services.stock_service")
+        stock.effective_stock_product = AsyncMock(side_effect=lambda org, product, **kwargs: product)
+        module_patch = patch.dict("sys.modules", {"services.stock_service": stock})
+        module_patch.start()
+        self.addCleanup(module_patch.stop)
         products = types.SimpleNamespace(find_one=AsyncMock(return_value={"_id": "product", "stock": 2, "source_sheet_ids": ["sheet"]}))
         connections = types.SimpleNamespace(find_one=AsyncMock(return_value=None))
         class CatalogueDB:
@@ -86,6 +91,7 @@ class RestockSafetyTest(unittest.IsolatedAsyncioTestCase):
         connections.find_one.reset_mock()
         self.assertIsNotNone(await self.scope["product_for"](self.row))
         connections.find_one.assert_not_awaited()
+        self.assertEqual(stock.effective_stock_product.await_count, 2)
 
     async def test_publisher_updates_request_before_exposing_job(self):
         sequence = []

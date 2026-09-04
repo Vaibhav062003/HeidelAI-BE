@@ -247,9 +247,66 @@ def _price_version(sheet_id: str, doc: dict) -> str:
 def _source_value_snapshot(doc: dict) -> dict:
     fields = (
         "product_name", "model_no", "sku", "description", "stock", "category",
-        *_PRICE_PROVENANCE_FIELDS,
+        "quantity", "available_qty", "in_stock", "updated_at", *_PRICE_PROVENANCE_FIELDS,
     )
-    return {key: doc.get(key) for key in fields if key in doc}
+    return {"source_valid": True, **{key: doc.get(key) for key in fields if key in doc}}
+
+
+def source_snapshot_update(doc: dict, sheet_id: str, sheet_row: int, *, authoritative: bool) -> dict:
+    """Publish a complete source snapshot, not a patch to old price approvals."""
+    values = {k: v for k, v in doc.items() if k not in (
+        "_id", "source", "source_sheet_id", "source_sheet_ids", "created_at", "_sheet_row",
+    )}
+    unset = {}
+    if authoritative:
+        unset = {field: "" for field in _PRICE_PROVENANCE_FIELDS if field not in values}
+    else:
+        for field in _PRICE_PROVENANCE_FIELDS:
+            values.pop(field, None)
+    values[f"source_rows.{sheet_id}"] = sheet_row
+    values[f"source_values.{sheet_id}"] = _source_value_snapshot(doc)
+    update = {"$set": values, "$addToSet": {"source_sheet_ids": sheet_id},
+              "$setOnInsert": {"source": "google_sheet", "created_at": datetime.now(timezone.utc)}}
+    if unset:
+        update["$unset"] = unset
+    return update
+
+
+def source_row_identity(row_data: dict, column_mapping: dict) -> str | None:
+    """Read identity independently of price validation; never guess from a price/name."""
+    mapped = apply_saved_column_mapping(row_data, column_mapping)
+    for key in ("sku", "sku_full", "model_no", "model_name", "id"):
+        value = mapped.get(key)
+        if value is not None and str(value).strip():
+            value = str(value).strip()
+            # Match legacy transform_row's numeric identity normalization.
+            try:
+                lowered = value.lower()
+                if lowered in {"yes", "true", "no", "false"}:
+                    value = str(lowered in {"yes", "true"})
+                else:
+                    value = str(int(lowered)) if lowered.isdigit() or (lowered.startswith("-") and lowered[1:].isdigit()) else str(float(lowered))
+            except ValueError:
+                pass
+            return value
+    return None
+
+
+async def invalidate_sheet_rows(products_col, org_id: str, sheet_id: str, identities: set | None, reason: str) -> None:
+    """Keep product IDs and other-source authority when source rows are invalid."""
+    query = {"org_id": org_id, "source_sheet_ids": sheet_id}
+    if identities is not None:
+        if not identities:
+            return
+        query["unique_identifier"] = {"$in": list(identities)}
+    snapshot = {"source_valid": False, "error": reason[:300], "updated_at": datetime.now(timezone.utc)}
+    await asyncio.to_thread(products_col.update_many, query,
+        {"$set": {f"source_values.{sheet_id}": snapshot}})
+    # Another source's canonical prices must not be invalidated by this Sheet.
+    await asyncio.to_thread(products_col.update_many,
+        {**query, "$or": [{"price_source_sheet_id": sheet_id},
+                          {"price_source_sheet_id": {"$exists": False}}]},
+        {"$unset": {field: "" for field in _PRICE_PROVENANCE_FIELDS}})
 
 
 def source_unlink_update(doc: dict, removed_sheet_id: str) -> dict:
@@ -488,11 +545,7 @@ def transform_row(
         return None, "empty row"
 
     # Find a unique identifier — try known unique key columns in priority order
-    unique_key = None
-    for k in ["sku", "sku_full", "model_no", "model_name", "id"]:
-        if doc.get(k) is not None and str(doc[k]).strip():
-            unique_key = str(doc[k]).strip()
-            break
+    unique_key = source_row_identity(row_data, column_mapping)
             
     if not unique_key:
         # Fallback to the first non-empty value in the row
@@ -863,6 +916,7 @@ async def sync_product_sheet(
             sheet_id, tab_name, access_token, org_id
         )
         if not headers:
+            await invalidate_sheet_rows(products_col, org_id, sheet_id, None, "Source headers could not be verified")
             raise Exception("Could not detect headers in the sheet")
 
         data_start_row = header_row + 1
@@ -910,6 +964,13 @@ async def sync_product_sheet(
         errors = []
         # Fix 4: Use unique_identifier for in-memory dedup (consistent with DB index)
         seen_unique_ids = set()
+        invalid_unique_ids = set()
+        identity_safe = bool(source_row_identity(
+            {header: "identity-probe" for header in headers}, column_mapping))
+        nonempty_headers = [header.strip() for header in headers if header.strip()]
+        if len(set(nonempty_headers)) != len(nonempty_headers):
+            identity_safe = False
+            errors.append("Duplicate Sheet headers: source rows cannot be safely reconciled")
 
         for row_idx, raw_row in enumerate(raw_rows):
             row_data = {}
@@ -920,19 +981,28 @@ async def sync_product_sheet(
                 else:
                     row_data[header] = ""
 
+            uid = source_row_identity(row_data, column_mapping)
+            if not uid and any(str(value).strip() for value in row_data.values() if value is not None):
+                identity_safe = False
+                errors.append(f"Row {data_start_row + row_idx}: missing stable product identifier")
+                continue
+            if uid in seen_unique_ids:
+                invalid_unique_ids.add(uid)
+                errors.append(f"Row {data_start_row + row_idx}: duplicate unique_identifier '{uid}'")
+                continue
+            if uid:
+                seen_unique_ids.add(uid)
             product_doc, error = transform_row(row_data, column_mapping, sheet_id, org_id, product_type)
             if error:
                 errors.append(f"Row {data_start_row + row_idx}: {error}")
+                if uid:
+                    invalid_unique_ids.add(uid)
                 continue
-
-            uid = product_doc["unique_identifier"]
-            if uid in seen_unique_ids:
-                errors.append(f"Row {data_start_row + row_idx}: duplicate unique_identifier '{uid}'")
-                continue
-
-            seen_unique_ids.add(uid)
             product_doc["_sheet_row"] = data_start_row + row_idx
             products_to_upsert.append(product_doc)
+        products_to_upsert = [doc for doc in products_to_upsert if doc["unique_identifier"] not in invalid_unique_ids]
+        if len(set(nonempty_headers)) != len(nonempty_headers):
+            products_to_upsert = []
 
         # ── Reconcile with MongoDB ───────────────────────────────────────────
         still_connected = await asyncio.to_thread(
@@ -951,34 +1021,21 @@ async def sync_product_sheet(
         now = datetime.now(timezone.utc)
         added = 0
         updated = 0
+        await invalidate_sheet_rows(products_col, org_id, sheet_id,
+            invalid_unique_ids if identity_safe else None,
+            "Source row is invalid or ambiguous; correct the Sheet and sync again")
+        if not identity_safe:
+            errors.append("Destructive reconciliation skipped: source identities could not be verified")
 
         # Fix 1 + Fix 5: Upsert with source tracking and ordered=False
         if products_to_upsert:
             operations = []
             for doc in products_to_upsert:
                 sheet_row = doc.pop("_sheet_row")
-                # Strip fields managed by $setOnInsert and $addToSet to avoid
-                # MongoDB "Updating the path 'X' would create a conflict" errors
-                set_doc = {k: v for k, v in doc.items()
-                           if k not in ("source", "source_sheet_id", "source_sheet_ids", "created_at")}
-                if not is_primary_source:
-                    for field in _PRICE_PROVENANCE_FIELDS:
-                        set_doc.pop(field, None)
-                set_doc[f"source_rows.{sheet_id}"] = sheet_row
-                set_doc[f"source_values.{sheet_id}"] = _source_value_snapshot(doc)
                 operations.append(
                     UpdateOne(
                         {"unique_identifier": doc["unique_identifier"], "type": doc["type"]},
-                        {
-                            # Update product data fields
-                            "$set": set_doc,
-                            # Track this sheet as a source (array, no duplicates)
-                            "$addToSet": {"source_sheet_ids": sheet_id},
-                            "$setOnInsert": {
-                                "created_at": now,
-                                "source": "google_sheet",
-                            },
-                        },
+                        source_snapshot_update(doc, sheet_id, sheet_row, authoritative=is_primary_source),
                         upsert=True
                     )
                 )
@@ -1010,7 +1067,7 @@ async def sync_product_sheet(
         # ── Fix 1: Safe stale product deletion ───────────────────────────────
         # Only delete products that are EXCLUSIVELY owned by this sheet
         # (i.e. source_sheet_ids == [this_sheet] and no other sources)
-        current_unique_ids = {doc["unique_identifier"] for doc in products_to_upsert}
+        current_unique_ids = seen_unique_ids
         removed = 0
 
         if current_unique_ids:
@@ -1029,7 +1086,7 @@ async def sync_product_sheet(
 
         # Find candidates for deletion
         await _renew_product_sheet_sync_claim(db, org_id, sheet_id, sync_claim_id)
-        stale_docs = await asyncio.to_thread(
+        stale_docs = [] if not identity_safe else await asyncio.to_thread(
                 lambda: list(products_col.find(
                     delete_filter,
                     {
@@ -1371,14 +1428,10 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
         result = await _write_product_sheet_values(org_id, product, changes, connection)
         doc = result.pop("product_document")
         await _renew_product_sheet_sync_claim(database, org_id, sheet_id, claim_id)
-        snapshot = _source_value_snapshot(doc)
-        doc[f"source_values.{sheet_id}"] = snapshot
-        doc[f"source_rows.{sheet_id}"] = result["row_number"]
         await asyncio.to_thread(
             database[f"products_{org_id}"].update_one,
             {"_id": product["_id"]} if product.get("_id") else {"unique_identifier": doc["unique_identifier"], "type": doc["type"]},
-            {"$set": doc, "$addToSet": {"source_sheet_ids": sheet_id},
-             "$setOnInsert": {"source": "google_sheet", "created_at": now}}, upsert=True,
+            source_snapshot_update(doc, sheet_id, result["row_number"], authoritative=True), upsert=True,
         )
         return result
     finally:
