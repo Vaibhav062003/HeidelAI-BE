@@ -22,28 +22,26 @@ MAX_CONCURRENT = 5
 MESSAGE_CONTEXT_LIMIT = 30
 
 _polling_task: Optional[asyncio.Task] = None
+_restock_task: Optional[asyncio.Task] = None
 
 # =============================================================================
 # STARTUP / SHUTDOWN
 # =============================================================================
 
 async def startup_intent_worker() -> None:
-    global _polling_task
+    global _polling_task, _restock_task
     await asyncio.to_thread(_ensure_indexes)
     await asyncio.to_thread(_recover_stuck_jobs)
-    from services.product_request_service import ensure_product_request_indexes
-    await ensure_product_request_indexes()
     _polling_task = asyncio.create_task(_polling_loop())
+    # Restock setup/dispatch must not gate startup or the existing intent queue.
+    _restock_task = asyncio.create_task(_restock_polling_loop())
     logger.success("Purchase intent queue worker started.")
 
 async def shutdown_intent_worker() -> None:
-    global _polling_task
-    if _polling_task and not _polling_task.done():
-        _polling_task.cancel()
-        try:
-            await _polling_task
-        except asyncio.CancelledError:
-            pass
+    tasks = [task for task in (_polling_task, _restock_task) if task is not None]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     logger.success("Purchase intent queue worker stopped.")
 
 # =============================================================================
@@ -104,12 +102,27 @@ async def _polling_loop() -> None:
     while True:
         try:
             await _process_due_jobs()
-            from services.product_request_service import process_restock_outbox
-            await process_restock_outbox()
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.error(f"Intent polling loop error: {e}")
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+async def _restock_polling_loop() -> None:
+    from services.product_request_service import ensure_product_request_indexes, process_restock_outbox
+    ready = False
+    while True:
+        try:
+            if not ready:
+                await ensure_product_request_indexes()
+                ready = True
+            await process_restock_outbox()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Restock polling failed ({}); retrying in 60 seconds", type(exc).__name__)
+            await asyncio.sleep(60)
+            continue
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 async def _process_due_jobs() -> None:

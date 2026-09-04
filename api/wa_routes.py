@@ -977,7 +977,7 @@ async def whatsapp_disconnect(
 
 @router.get("/connections")
 @limiter.limit("30/minute")
-async def list_whatsapp_connections(request: Request, user: CurrentUser):
+def list_whatsapp_connections(request: Request, user: CurrentUser):
     limit = whatsapp_connection_limit(user.org_id)
     connections = list(db.whatsapp_connections.find({
         "org_id": user.org_id,

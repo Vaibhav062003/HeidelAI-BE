@@ -1820,7 +1820,7 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
         {"provider_revoke_status": "processing", "provider_revoke_updated_at": {"$lt": stale_before}},
         {"provider_revoke_status": "processing", "provider_revoke_updated_at": {"$exists": False}},
     ]}
-    connection = db.whatsapp_connections.find_one({
+    connection = await asyncio.to_thread(db.whatsapp_connections.find_one, {
         "org_id": org_id,
         "phone_id": phone_id,
         "is_active": False,
@@ -1829,13 +1829,13 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
     if not connection:
         return {"provider_cleanup": "not_pending"}
     wa_id = str(connection.get("wa_id") or connection.get("waba_id") or "")
-    active_sibling = db.whatsapp_connections.find_one({
+    active_sibling = await asyncio.to_thread(db.whatsapp_connections.find_one, {
         "_id": {"$ne": connection["_id"]},
         "$or": [{"wa_id": wa_id}, {"waba_id": wa_id}],
         "is_active": {"$ne": False},
     })
     if active_sibling:
-        db.whatsapp_connections.update_one(
+        await asyncio.to_thread(db.whatsapp_connections.update_one,
             {"_id": connection["_id"], "is_active": False},
             {"$set": {
                 "provider_revoke_status": "not_needed",
@@ -1846,7 +1846,7 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
         return {"provider_cleanup": "not_needed"}
     attempts = int(connection.get("provider_revoke_attempts") or 0)
     if attempts >= WHATSAPP_PROVIDER_CLEANUP_MAX_ATTEMPTS:
-        db.whatsapp_connections.update_one(
+        await asyncio.to_thread(db.whatsapp_connections.update_one,
             {"_id": connection["_id"], "is_active": False},
             {"$set": {
                 "provider_revoke_status": "abandoned",
@@ -1857,14 +1857,14 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
         return {"provider_cleanup": "abandoned"}
     access_token = str(connection.get("access_token") or "")
     if not access_token:
-        db.whatsapp_connections.update_one(
+        await asyncio.to_thread(db.whatsapp_connections.update_one,
             {"_id": connection["_id"], "is_active": False},
             {"$set": {"provider_revoke_status": "complete", "provider_revoke_error": None}},
         )
-        db.whatsapp_waba_owners.delete_one({"_id": wa_id, "org_id": org_id})
+        await asyncio.to_thread(db.whatsapp_waba_owners.delete_one, {"_id": wa_id, "org_id": org_id})
         return {"provider_cleanup": "complete"}
 
-    claim = db.whatsapp_connections.update_one(
+    claim = await asyncio.to_thread(db.whatsapp_connections.update_one,
         {
             "_id": connection["_id"],
             "is_active": False,
@@ -1887,19 +1887,19 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
     }
     if success:
         update["$unset"] = {"access_token": ""}
-    db.whatsapp_connections.update_one(
+    await asyncio.to_thread(db.whatsapp_connections.update_one,
         {"_id": connection["_id"], "is_active": False, "provider_revoke_status": "processing"},
         update,
     )
     if success:
-        db.whatsapp_waba_owners.delete_one({"_id": wa_id, "org_id": org_id})
+        await asyncio.to_thread(db.whatsapp_waba_owners.delete_one, {"_id": wa_id, "org_id": org_id})
     return {"provider_cleanup": "complete" if success else "failed"}
 
 
 async def reconcile_pending_whatsapp_revocations(limit: int = 10) -> int:
-    # ponytail: one bounded startup batch; add a scheduled worker if this backlog becomes sustained.
+    # Materialize the synchronous cursor in a thread, including server selection.
     try:
-        pending = list(db.whatsapp_connections.find({
+        pending = await asyncio.to_thread(lambda: list(db.whatsapp_connections.find({
             "is_active": False,
             "$or": [
                 {"provider_revoke_status": {"$in": ["pending", "failed"]}},
@@ -1909,7 +1909,7 @@ async def reconcile_pending_whatsapp_revocations(limit: int = 10) -> int:
                 },
                 {"provider_revoke_status": "processing", "provider_revoke_updated_at": {"$exists": False}},
             ],
-        }, {"org_id": 1, "phone_id": 1}).limit(limit))
+        }, {"org_id": 1, "phone_id": 1}).limit(limit)))
         if pending:
             await asyncio.gather(*(
                 finalize_whatsapp_revocation(str(row.get("org_id") or ""), str(row.get("phone_id") or ""))

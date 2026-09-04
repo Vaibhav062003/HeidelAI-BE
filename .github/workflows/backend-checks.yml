@@ -30,5 +30,8 @@ jobs:
           python test_whatsapp_number_binding.py
           python test_whatsapp_outbound_binding.py
           python test_runtime_safety_contract.py
+          python test_inbox_outage.py
+          python test_inbox_live_delivery_contract.py
+          python -m unittest test_stock_sheet_writeback test_product_sheet_pricing_foundation test_product_requests test_restock_dispatch -q
           python test_entitlement_contract.py
           python -m py_compile api/*.py services/*.py schemas/*.py
