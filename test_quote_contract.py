@@ -98,7 +98,8 @@ def test_quote_item_accepts_full_laptop_model():
     quote_item = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "QuoteItem")
     namespace = {"__name__": "quote_item_contract", "BaseModel": BaseModel, "Field": Field}
     exec(compile(ast.Module(body=[quote_item], type_ignores=[]), "api/quote_routes.py", "exec"), namespace)
-    description = "Inspiron 7440 Inspiron 7440 2-in-1 OIC74401512F1RINU1O Core™️ 5 120U Win 11 + Office H&S 2024 + M365  16GB DDR5 512GB SSD Intel®️ Graphics 14.0-inch 16:10 FHD +Touch 300nits WVA Display with ComfortView Backlit Keyboard Ice Blue Dell Essential/Ecoloop Essential 1 Year Onsite Hardware Service"
+    description = ("Inspiron 7440 Inspiron 7440 2-in-1 OIC74401512F1RINU1O Core™️ 5 120U Win 11 + Office H&S 2024 + M365  16GB DDR5 512GB SSD Intel®️ Graphics 14.0-inch 16:10 FHD +Touch 300nits WVA Display with ComfortView Backlit Keyboard Ice Blue Dell Essential/Ecoloop Essential 1 Year Onsite Hardware Service " + "Additional configuration detail. " * 20)[:750]
+    assert len(description) == 750
     assert namespace["QuoteItem"](id="1", description=description, unit_price=92000).description == description
 
 
