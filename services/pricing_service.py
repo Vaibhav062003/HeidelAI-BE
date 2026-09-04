@@ -118,6 +118,11 @@ _REQUEST_WORDS = re.compile(
     r"\b(what|send|share|tell|check|need|please|pls|kitna|batao|availability|available)\b",
     re.IGNORECASE,
 )
+_DIRECT_QUESTION_RE = re.compile(
+    r"\?|^\s*(?:what|which|where|when|why|how|show|list|send|share|tell|check|"
+    r"do\s+you|have\s+you|can\s+you|could\s+you|would\s+you|is\s+there|are\s+there)\b",
+    re.IGNORECASE,
+)
 _OFFER_WORDS = re.compile(
     r"\b(our price|my price|best|final|offer|quoted?|can do|de denge|rate is|price is)\b",
     re.IGNORECASE,
@@ -209,7 +214,7 @@ def is_supplier_response(text: str) -> bool:
     """True for a direct procurement answer, not a fresh buyer price question."""
     return bool(
         text
-        and not _looks_like_request(text)
+        and not _DIRECT_QUESTION_RE.search(text)
         and (
             re.fullmatch(r"\s*\d{5,7}\s*", text)
             or extract_prices(text, established_context=True)

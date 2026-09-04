@@ -494,12 +494,14 @@ async def handle_dealer_reply(
     # Statuses where we expect dealer replies (only after message was actually sent)
     active_statuses = ["dealers_contacted", "partial_replies", "sending"]
 
-    from services.pricing_service import is_pricing_enabled, is_supplier_response
+    from services.pricing_service import is_supplier_response
 
     supplier_response = is_supplier_response(content)
     oos_doc = None
-    # Exact reply-to correlation establishes the supplier role; prose heuristics
-    # are only needed for the broader phone fallbacks.
+    # Reply-to correlation identifies the request, but the text still has to be
+    # a supplier answer. A dealer may also use this number as a customer and
+    # ask a question while quoting the request; that must continue to the
+    # conversational dealer/customer router instead of being stored as a quote.
     if replied_message_id:
         logger.info(f"[OOS] Attempting match by replied message_id: {replied_message_id}")
         oos_doc = await oos_col.find_one({
@@ -509,9 +511,17 @@ async def handle_dealer_reply(
         })
         if oos_doc:
             logger.success(f"[OOS] Match succeeded by message_id {replied_message_id} for query_id={oos_doc['query_id']}")
+            if not supplier_response:
+                logger.info(
+                    f"[OOS] Reply to query_id={oos_doc['query_id']} is not a supplier answer; "
+                    "falling back to the chatbot agent"
+                )
+                return False
 
-    # Phone-only replies are safe only when exactly one active request matches.
-    allow_phone_fallback = not is_pricing_enabled(org_id) or supplier_response
+    # Without reply-to correlation, a supplier-shaped answer and one unique
+    # active request are both required. Otherwise normal customer questions
+    # from a registered dealer would be swallowed by the OOS workflow.
+    allow_phone_fallback = supplier_response
     if not oos_doc and allow_phone_fallback:
         logger.info(f"[OOS] Attempting unique match by dealer phone number: {dealer_phone}")
         matches = await oos_col.find(
