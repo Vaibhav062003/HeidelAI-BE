@@ -1248,16 +1248,24 @@ async def reconcile_active_product_sheets(*, limit: int = 25) -> dict:
 
 async def primary_product_sheet(org_id: str) -> dict:
     """Return the explicit write-back Sheet; a lone active Sheet becomes primary."""
+    db = get_mongo_db()
     connections = await asyncio.to_thread(
-        lambda: list(db.product_sheet_connections.find({"org_id": org_id, "status": "active"}))
+        lambda: list(db.product_sheet_connections.find({
+            "org_id": org_id, "status": {"$in": ["active", "syncing", "error"]},
+            "disconnect_requested_at": {"$exists": False},
+        }))
     )
     if not connections:
         raise ValueError("Connect a Google product Sheet before editing Sheet-backed stock")
     primary = [item for item in connections if item.get("is_primary")]
     if len(primary) == 1:
+        if primary[0].get("status", "active") != "active":
+            raise ValueError("Primary product Sheet is syncing or needs attention. Refresh stock and retry")
         return primary[0]
     if len(connections) != 1:
         raise ValueError("Choose one primary product Sheet before editing stock")
+    if connections[0].get("status", "active") != "active":
+        raise ValueError("Product Sheet is syncing or needs attention. Refresh stock and retry")
     await asyncio.to_thread(
         db.product_sheet_connections.update_one,
         {"_id": connections[0]["_id"]},
@@ -1284,7 +1292,7 @@ def _column_letter(index: int) -> str:
 def _sheet_value_equal(field: str, current, expected) -> bool:
     if expected is None:
         return str(current or "").strip() == ""
-    if field in {"price", "stock", "gst_rate"}:
+    if field in {"price", "stock", "gst_rate", *_PRICE_FIELDS}:
         try:
             clean = re.sub(r"(?i)\b(?:inr|rs\.?)\b|₹|,|\s", "", str(current))
             return abs(float(clean or 0) - float(expected)) <= 0.001
@@ -1297,14 +1305,14 @@ def _sheet_value_equal(field: str, current, expected) -> bool:
 
 async def _ensure_gst_columns(
     org_id: str, sheet_id: str, tab_name: str, headers: list[str], header_row: int,
-    access_token: str, fields: set[str],
+    access_token: str, fields: set[str], column_mapping: dict | None = None,
 ) -> tuple[list[str], dict[str, int], str]:
-    by_field = {_sheet_field(header): index for index, header in enumerate(headers)}
+    by_field = _write_columns(headers, column_mapping or {})
     missing = [field for field in ("gst_inclusive", "gst_rate") if field in fields and field not in by_field]
     if not missing:
         return headers, by_field, access_token
     labels = {"gst_inclusive": "GST Inclusive", "gst_rate": "GST Rate"}
-    encoded_tab = urllib.parse.quote(tab_name, safe="")
+    encoded_tab = urllib.parse.quote("'" + tab_name.replace("'", "''") + "'", safe="")
     data = []
     for field in missing:
         index = len(headers)
@@ -1329,13 +1337,71 @@ async def _ensure_gst_columns(
     return headers, by_field, access_token
 
 
+def _write_columns(headers: list[str], mapping: dict) -> dict[str, int]:
+    nonempty = [header for header in headers if header.strip()]
+    if len(set(nonempty)) != len(nonempty):
+        raise ValueError("Duplicate Sheet headers must be resolved before writing stock")
+    columns = apply_saved_column_mapping(
+        {header: index for index, header in enumerate(headers) if header.strip()}, mapping,
+    )
+    # The stock UI's GST flag is the selling-price tax treatment.
+    if "selling_gst_inclusive" in columns:
+        columns["gst_inclusive"] = columns["selling_gst_inclusive"]
+    return columns
+
+
 async def write_product_sheet_values(org_id: str, product: dict, changes: dict) -> dict:
-    """Safely update or append one product in the primary Google Sheet."""
+    """Serialize Sheet writes with reconciliation, then publish verified values."""
     connection = await primary_product_sheet(org_id)
+    database = get_mongo_db()
+    sheet_id = connection["sheet_id"]
+    claim_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    claimed = await asyncio.to_thread(
+        database.product_sheet_connections.update_one,
+        {"org_id": org_id, "sheet_id": sheet_id, "status": "active",
+         "disconnect_requested_at": {"$exists": False}},
+        {"$set": {"status": "syncing", "sync_claim_id": claim_id,
+                  "sync_claim_until": now + PRODUCT_SHEET_SYNC_LEASE,
+                  "next_reconcile_at": now}},
+    )
+    if not claimed.matched_count:
+        raise ValueError("Product Sheet is syncing or being edited. Refresh stock and retry")
+    try:
+        result = await _write_product_sheet_values(org_id, product, changes, connection)
+        doc = result.pop("product_document")
+        await _renew_product_sheet_sync_claim(database, org_id, sheet_id, claim_id)
+        snapshot = _source_value_snapshot(doc)
+        doc[f"source_values.{sheet_id}"] = snapshot
+        doc[f"source_rows.{sheet_id}"] = result["row_number"]
+        await asyncio.to_thread(
+            database[f"products_{org_id}"].update_one,
+            {"_id": product["_id"]} if product.get("_id") else {"unique_identifier": doc["unique_identifier"], "type": doc["type"]},
+            {"$set": doc, "$addToSet": {"source_sheet_ids": sheet_id},
+             "$setOnInsert": {"source": "google_sheet", "created_at": now}}, upsert=True,
+        )
+        return result
+    finally:
+        # A failed/ambiguous write is reconciled by the existing durable scheduler.
+        async def release():
+            for disconnecting in (True, False):
+                await asyncio.to_thread(
+                    database.product_sheet_connections.update_one,
+                    {"org_id": org_id, "sheet_id": sheet_id, "sync_claim_id": claim_id,
+                     "disconnect_requested_at": {"$exists": disconnecting}},
+                    {"$set": {"status": "disconnecting" if disconnecting else "active",
+                              "next_reconcile_at": datetime.now(timezone.utc)},
+                     "$unset": {"sync_claim_id": "", "sync_claim_until": ""}},
+                )
+        await asyncio.shield(release())
+
+
+async def _write_product_sheet_values(org_id: str, product: dict, changes: dict, connection: dict) -> dict:
     sheet_id = connection["sheet_id"]
     tab_name = connection.get("tab_name") or "Sheet1"
     access_token = await refresh_google_token(org_id)
-    headers, header_row, _ = await _detect_header_row(sheet_id, tab_name, access_token, org_id)
+    headers, header_row, col_offset = await _detect_header_row(sheet_id, tab_name, access_token, org_id)
+    headers = [""] * col_offset + headers
     requested = {
         "price": changes.get("price"),
         "description": changes.get("description"),
@@ -1346,13 +1412,20 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
     requested = {key: value for key, value in requested.items() if value is not None}
     headers, by_field, access_token = await _ensure_gst_columns(
         org_id, sheet_id, tab_name, headers, header_row, access_token, set(requested),
+        connection.get("column_mapping") or {},
     )
+    # Match transform_row's display-price precedence. Never mutate an approved floor.
+    if "price" in requested:
+        if "target_selling_price" in by_field:
+            requested["target_selling_price"] = requested.pop("price")
+        elif "approved_floor_price" in by_field:
+            raise ValueError("Map a Target Selling Price column before editing selling price; approved floor prices are not changed by Stock")
     missing = [key for key in requested if key not in by_field]
     if missing:
         raise ValueError(f"Primary Sheet is missing column(s): {', '.join(missing)}")
 
-    encoded_tab = urllib.parse.quote(tab_name, safe="")
-    row_number = (product.get("source_rows") or {}).get(sheet_id)
+    encoded_tab = urllib.parse.quote("'" + tab_name.replace("'", "''") + "'", safe="")
+    row_number = None
     async with httpx.AsyncClient() as client:
         if not row_number:
             sku_field = "model_no" if "model_no" in by_field else "sku" if "sku" in by_field else None
@@ -1372,6 +1445,8 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
             if lookup.status_code != 200:
                 raise ValueError("Google Sheet products could not be checked before writing")
             wanted = re.sub(r"[^a-z0-9]+", "", str(product.get("sku") or product.get("model_no") or product.get("name") or "").casefold())
+            if not wanted:
+                raise ValueError("A product SKU is required before writing stock")
             matches = []
             for offset, existing in enumerate(lookup.json().get("values") or []):
                 index = by_field[sku_field]
@@ -1381,6 +1456,8 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
             if len(matches) > 1:
                 raise ValueError("Primary Sheet contains duplicate rows for this SKU")
             row_number = matches[0] if matches else None
+            if not row_number and sheet_id in (product.get("source_sheet_ids") or []):
+                raise ValueError("Product was removed or renamed in the primary Sheet. Sync stock and retry")
         if row_number:
             row_range = f"{encoded_tab}!A{row_number}:ZZ{row_number}"
             row_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{row_range}"
@@ -1401,6 +1478,10 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
             if response.status_code != 200:
                 raise ValueError("Google Sheet row could not be checked before writing")
             row = (response.json().get("values") or [[]])[0]
+            sku_index = by_field[sku_field]
+            actual = re.sub(r"[^a-z0-9]+", "", str(row[sku_index] if sku_index < len(row) else "").casefold())
+            if actual != wanted:
+                raise ValueError("Sheet row moved before the update; refresh stock and retry")
             protected = [
                 headers[by_field[field]] for field in requested
                 if by_field[field] < len(row) and str(row[by_field[field]]).startswith("=")
@@ -1410,6 +1491,7 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
             baseline = (product.get("source_values") or {}).get(sheet_id) or product
             if product.get("source_sheet_ids") and any(
                 not _sheet_value_equal(field, row[by_field[field]] if by_field[field] < len(row) else "", baseline.get(field))
+                and not _sheet_value_equal(field, row[by_field[field]] if by_field[field] < len(row) else "", requested[field])
                 for field in requested
             ):
                 raise ValueError("Primary Sheet changed since the last sync. Refresh stock and retry")
@@ -1423,6 +1505,13 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
                 headers={"Authorization": f"Bearer {access_token}"},
                 timeout=30,
             )
+            if response.status_code == 401:
+                access_token = await _force_token_refresh(org_id)
+                response = await client.post(
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchUpdate",
+                    json={"valueInputOption": "RAW", "data": data},
+                    headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+                )
         else:
             row = [""] * len(headers)
             row[by_field[sku_field]] = product.get("sku") or product.get("model_no") or product.get("name")
@@ -1444,10 +1533,48 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
                 headers={"Authorization": f"Bearer {access_token}"},
                 timeout=30,
             )
-    if response.status_code not in {200, 201}:
-        message = response.json().get("error", {}).get("message", "Google Sheet rejected the stock update")
-        raise ValueError(message)
-    return {"sheet_id": sheet_id, "row_number": row_number, "updated_fields": sorted(requested)}
+            if response.status_code == 401:
+                access_token = await _force_token_refresh(org_id)
+                response = await client.post(
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A:ZZ:append",
+                    params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+                    json={"values": [row]}, headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+                )
+            match = re.search(r"![A-Z]+(\d+):", response.json().get("updates", {}).get("updatedRange", ""))
+            row_number = int(match.group(1)) if match else None
+        if response.status_code not in {200, 201}:
+            raise ValueError("Google Sheet rejected the stock update; check Sheet permissions and retry")
+        if not row_number:
+            raise ValueError("Sheet write could not be verified; refresh stock before retrying")
+        readback = await client.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A{row_number}:ZZ{row_number}",
+            params={"valueRenderOption": "UNFORMATTED_VALUE"},
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+        )
+        if readback.status_code == 401:
+            access_token = await _force_token_refresh(org_id)
+            readback = await client.get(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_tab}!A{row_number}:ZZ{row_number}",
+                params={"valueRenderOption": "UNFORMATTED_VALUE"},
+                headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+            )
+        if readback.status_code != 200:
+            raise ValueError("Sheet was written but read-back failed; refresh stock before retrying")
+        values = (readback.json().get("values") or [[]])[0]
+        if any(not _sheet_value_equal(field, values[index] if index < len(values) else "", value)
+               for field, value in requested.items() for index in [by_field[field]]):
+            raise ValueError("Sheet values changed during the update; refresh stock and review")
+        index = by_field[sku_field]
+        actual = re.sub(r"[^a-z0-9]+", "", str(values[index] if index < len(values) else "").casefold())
+        if actual != wanted:
+            raise ValueError("Sheet row moved during the update; review the Sheet before retrying")
+        document, error = transform_row(
+            {header: values[index] if index < len(values) else "" for index, header in enumerate(headers) if header},
+            connection.get("column_mapping") or {}, sheet_id, org_id, connection.get("product_type", "laptop"),
+        )
+        if error:
+            raise ValueError(f"Sheet was written but catalogue validation failed: {error}")
+    return {"sheet_id": sheet_id, "row_number": row_number, "updated_fields": sorted(requested), "product_document": document}
 
 
 async def write_product_sheet_gst_bulk(
@@ -1458,9 +1585,11 @@ async def write_product_sheet_gst_bulk(
     sheet_id = connection["sheet_id"]
     tab_name = connection.get("tab_name") or "Sheet1"
     access_token = await refresh_google_token(org_id)
-    headers, header_row, _ = await _detect_header_row(sheet_id, tab_name, access_token, org_id)
+    headers, header_row, col_offset = await _detect_header_row(sheet_id, tab_name, access_token, org_id)
+    headers = [""] * col_offset + headers
     headers, by_field, access_token = await _ensure_gst_columns(
         org_id, sheet_id, tab_name, headers, header_row, access_token, {"gst_inclusive", "gst_rate"},
+        connection.get("column_mapping") or {},
     )
     sku_field = "model_no" if "model_no" in by_field else "sku" if "sku" in by_field else None
     if not sku_field:
@@ -1497,8 +1626,7 @@ async def write_product_sheet_gst_bulk(
         for product in products:
             sku = str(product.get("sku") or product.get("model_no") or product.get("name") or "").strip()
             key = re.sub(r"[^a-z0-9]+", "", sku.casefold())
-            source_row = (product.get("source_rows") or {}).get(sheet_id)
-            matches = [int(source_row)] if source_row else by_sku.get(key, [])
+            matches = by_sku.get(key, [])
             if len(matches) > 1:
                 skipped.append({"sku": sku, "reason": "duplicate primary-Sheet rows"})
                 continue

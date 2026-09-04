@@ -1327,6 +1327,9 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
             
             response_data = response.json()
             message_id = response_data.get("messages", [{}])[0].get("id")
+            if not isinstance(message_id, str) or not message_id:
+                # A 200 without a provider message ID is not confirmed acceptance.
+                raise HTTPException(502, "WhatsApp returned no message ID; delivery outcome is unknown")
         else:
             message_id = f"privatenote_{uuid.uuid4()}"
             response_data = {"status": "Private note created, no API call made"}
@@ -2240,7 +2243,7 @@ async def send_message_reaction(message_id: str, phone_id: str, access_token: st
         logger.error(f"Error sending message reaction: {str(e)}")
         return "error"
 
-async def get_templates(org_id: str, wa_id: str, access_token: str):
+async def get_templates(org_id: str, wa_id: str, access_token: str, *, name: Optional[str] = None):
     """
     Fetch WhatsApp message templates associated with an organization.
 
@@ -2264,7 +2267,10 @@ async def get_templates(org_id: str, wa_id: str, access_token: str):
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
         if wa_id:
             org_url = f"https://graph.facebook.com/v24.0/{wa_id}/message_templates"
-            response = await client.get(org_url, headers=headers)
+            response = await client.get(org_url, headers=headers, **({"params": {"name": name, "limit": 100}} if name else {}))
+
+            if name and response.status_code != 200:
+                raise HTTPException(502, "Could not verify the WhatsApp template; please retry")
 
             if response.status_code == 200:
                 templates = response.json().get("data", [])

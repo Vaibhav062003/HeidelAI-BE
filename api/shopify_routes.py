@@ -30,6 +30,24 @@ router = APIRouter(tags=["Shopify commerce"])
 MAX_WEBHOOK_BYTES = 2_000_000
 
 
+@router.post("/api/shopify/storefront/cart")
+async def shopify_storefront_cart(request: Request):
+    from services.shopify_storefront_cart import capture_cart
+
+    # A cross-origin HTML form cannot set this header. The storefront uses a
+    # same-origin JSON fetch through Shopify's authenticated proxy.
+    if request.headers.get("x-heidel-cart") != "1":
+        raise HTTPException(403, "Use the storefront cart integration")
+    if len(request.url.query) > 4096:
+        raise HTTPException(413, "Cart query is too large")
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > 16_384:
+            raise HTTPException(413, "Cart payload is too large")
+    return await capture_cart(request.url.query, bytes(raw))
+
+
 class OAuthStartPayload(BaseModel):
     shop: str = Field(min_length=15, max_length=255)
 
