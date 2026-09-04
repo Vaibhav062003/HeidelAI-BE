@@ -1,7 +1,6 @@
 """Deterministic pricing guardrails for dealer WhatsApp conversations."""
 
 import hashlib
-import math
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -10,18 +9,20 @@ from typing import Optional
 from loguru import logger
 
 from config.settings import (
-    KOMAL_ORG_ID,
-    LEE_DEALER_ORG_ID,
     PRICING_FLOOR_MAX_AGE_MINUTES,
     PRICING_INTELLIGENCE_ORG_IDS,
 )
 from database import get_async_mongo_db
+from services.pricing_policy import normalize_inr
 from services.utils import normalize_phone
 
 
 HOURS_24 = timedelta(hours=24)
 FLOOR_MAX_AGE = timedelta(minutes=PRICING_FLOOR_MAX_AGE_MINUTES)
 EVENT_RETENTION = timedelta(days=30)
+AUDIT_CLAIM_TIMEOUT = timedelta(minutes=5)
+AUDIT_MAX_ATTEMPTS = 5
+AUDIT_MAX_BACKOFF = timedelta(minutes=15)
 HOLDING_REPLY = "Our sales team is reviewing this price and will get back to you shortly."
 
 _PRICE_RE = re.compile(
@@ -50,6 +51,13 @@ _QUOTE_RANGE_RE = re.compile(
     r"\s*(?P<scale1>k|thousand|lakh|lac)?\s*(?:-|–|to)\s*"
     r"(?:₹|rs\.?|inr)?\s*(?P<amount2>\d{1,3}(?:[ ,]\d{2,3})+|\d+(?:\.\d{1,2})?)"
     r"\s*(?P<scale2>k|thousand|lakh|lac)?",
+    re.IGNORECASE,
+)
+_CONTEXT_RANGE_RE = re.compile(
+    r"^\s*(?:₹|rs\.?|inr)?\s*(?P<amount1>\d{1,3}(?:[ ,]\d{2,3})+|\d+(?:\.\d{1,2})?)"
+    r"\s*(?P<scale1>k|thousand|lakh|lac)?\s*(?:-|–|to)\s*"
+    r"(?:₹|rs\.?|inr)?\s*(?P<amount2>\d{1,3}(?:[ ,]\d{2,3})+|\d+(?:\.\d{1,2})?)"
+    r"\s*(?P<scale2>k|thousand|lakh|lac)?\s*$",
     re.IGNORECASE,
 )
 _SHORT_QUOTE_RE = re.compile(
@@ -139,8 +147,62 @@ _PRODUCT_MODEL_RE = re.compile(
 
 
 def is_pricing_enabled(org_id: str) -> bool:
-    supported = {item for item in (LEE_DEALER_ORG_ID, KOMAL_ORG_ID) if item}
-    return bool(org_id and org_id in supported and org_id in PRICING_INTELLIGENCE_ORG_IDS)
+    return bool(org_id and org_id in PRICING_INTELLIGENCE_ORG_IDS)
+
+
+def pricing_failure_intercept(enabled: bool) -> dict:
+    return {"intercept": bool(enabled), "reply": HOLDING_REPLY if enabled else None}
+
+
+async def get_pricing_mode(org_id: str) -> str:
+    """Resolve the central rollout mode after applying the environment kill switch."""
+    if not is_pricing_enabled(org_id):
+        return "off"
+    from services.pricing_decision_service import get_pricing_settings
+
+    settings = await get_pricing_settings(org_id)
+    mode = str(settings.get("mode") or "off")
+    return mode if mode in {"off", "shadow", "review"} else "off"
+
+
+def _scaled_price(amount: str, scale: Optional[str]) -> float:
+    value = float(amount.replace(",", "").replace(" ", ""))
+    normalized_scale = (scale or "").lower()
+    if normalized_scale in {"k", "thousand"}:
+        value *= 1_000
+    elif normalized_scale in {"lakh", "lac"}:
+        value *= 100_000
+    return value
+
+
+def _range_prices(match: re.Match) -> list[float]:
+    """Parse a range, inheriting a suffix shared by either endpoint."""
+    scale1 = match.group("scale1")
+    scale2 = match.group("scale2")
+    if bool(scale1) != bool(scale2):
+        shared_scale = scale1 or scale2
+        scale1 = scale1 or shared_scale
+        scale2 = scale2 or shared_scale
+    values = [
+        _scaled_price(match.group("amount1"), scale1),
+        _scaled_price(match.group("amount2"), scale2),
+    ]
+    return [value for value in values if 0 < value <= 9_999_999]
+
+
+def _remove_unscaled_range_endpoints(values: list[float], match: re.Match) -> None:
+    """Remove the misleading raw endpoint when one suffix applies to the range."""
+    for suffix in ("1", "2"):
+        if match.group(f"scale{suffix}"):
+            continue
+        other = "2" if suffix == "1" else "1"
+        if not match.group(f"scale{other}"):
+            continue
+        raw = _scaled_price(match.group(f"amount{suffix}"), None)
+        scaled = _scaled_price(match.group(f"amount{suffix}"), match.group(f"scale{other}"))
+        if raw != scaled:
+            while raw in values:
+                values.remove(raw)
 
 
 def is_price_signal(text: str) -> bool:
@@ -170,6 +232,14 @@ def extract_prices(text: str, *, established_context: bool = False) -> list[floa
     if not text:
         return []
     values = []
+    range_patterns = [_QUOTE_RANGE_RE]
+    if established_context:
+        range_patterns.append(_CONTEXT_RANGE_RE)
+    for pattern in range_patterns:
+        for match in pattern.finditer(text):
+            for value in _range_prices(match):
+                if value not in values:
+                    values.append(value)
     for match in _PRICE_RE.finditer(text):
         before = text[max(0, match.start() - 48):match.start()]
         has_price_cue = bool(_PRICE_CUE_RE.search(before))
@@ -177,15 +247,18 @@ def extract_prices(text: str, *, established_context: bool = False) -> list[floa
             continue
         if not has_price_cue and _NON_PRICE_PREFIX_RE.search(before):
             continue
-        raw = match.group("amount").replace(",", "").replace(" ", "")
-        value = float(raw)
+        value = _scaled_price(match.group("amount"), match.group("scale"))
         scale = (match.group("scale") or "").lower()
-        if scale in {"k", "thousand"}:
-            value *= 1_000
-        elif scale in {"lakh", "lac"}:
-            value *= 100_000
         if (match.group("currency") or scale or value >= 1_000) and value <= 9_999_999:
+            if value not in values:
+                values.append(value)
+    if established_context and re.fullmatch(r"\s*\d{5,7}\s*", text):
+        value = float(text.strip())
+        if value not in values:
             values.append(value)
+    for pattern in range_patterns:
+        for match in pattern.finditer(text):
+            _remove_unscaled_range_endpoints(values, match)
     return values
 
 
@@ -207,24 +280,14 @@ def extract_quoted_prices(text: str) -> list[float]:
         _LINE_ITEM_QUOTE_RE,
     ):
         for match in pattern.finditer(text or ""):
-            value = float(match.group("amount").replace(",", "").replace(" ", ""))
-            scale = (match.groupdict().get("scale") or "").lower()
-            if scale in {"k", "thousand"}:
-                value *= 1_000
-            elif scale in {"lakh", "lac"}:
-                value *= 100_000
+            value = _scaled_price(match.group("amount"), match.groupdict().get("scale"))
             if 0 < value <= 9_999_999 and value not in values:
                 values.append(value)
     for match in _QUOTE_RANGE_RE.finditer(text or ""):
-        for suffix in ("1", "2"):
-            value = float(match.group(f"amount{suffix}").replace(",", "").replace(" ", ""))
-            scale = (match.group(f"scale{suffix}") or "").lower()
-            if scale in {"k", "thousand"}:
-                value *= 1_000
-            elif scale in {"lakh", "lac"}:
-                value *= 100_000
+        for value in _range_prices(match):
             if 0 < value <= 9_999_999 and value not in values:
                 values.append(value)
+        _remove_unscaled_range_endpoints(values, match)
     stripped = (text or "").strip()
     if re.fullmatch(r"\d{5,7}", stripped):
         value = float(stripped)
@@ -270,6 +333,15 @@ def _phone(conversation_id: str) -> str:
     return normalize_phone(raw)
 
 
+def _conversation_channel(conversation_id: str) -> str:
+    value = str(conversation_id or "").lower()
+    if value.startswith("instagram_"):
+        return "instagram"
+    if value.startswith(("whatsapp_", "dealer_")):
+        return "whatsapp"
+    return "unknown"
+
+
 def _sku(product: Optional[dict]) -> Optional[str]:
     if not product:
         return None
@@ -296,30 +368,16 @@ def _as_utc(value) -> Optional[datetime]:
 
 
 def floor_snapshot(product: Optional[dict], now: Optional[datetime] = None) -> tuple[Optional[float], str]:
-    """Return a usable Sheet floor and a stable reason when it cannot be used."""
+    """Return a fresh, explicitly approved Sheet floor and a stable reason."""
     if not product:
         return None, "product_unresolved"
-    price = product.get("price")
-    if isinstance(price, str):
-        cleaned = re.sub(r"(?i)\b(?:inr|rs\.?)\b|₹|,|\s", "", price)
-        try:
-            price = float(cleaned)
-        except ValueError:
-            price = None
-    if (
-        isinstance(price, bool)
-        or not isinstance(price, (int, float))
-        or not math.isfinite(price)
-        or price <= 0
-    ):
+    try:
+        price = float(normalize_inr(product.get("approved_floor_price"), field="approved_floor_price"))
+    except (TypeError, ValueError):
         return None, "missing_floor"
-    if not (
-        product.get("source") == "google_sheet"
-        or product.get("source_sheet_id")
-        or product.get("source_sheet_ids")
-    ):
+    if not product.get("price_source_sheet_id"):
         return None, "non_sheet_floor"
-    updated_at = _as_utc(product.get("updated_at"))
+    updated_at = _as_utc(product.get("price_verified_at"))
     if not updated_at:
         return None, "missing_floor_timestamp"
     age = (now or datetime.now(timezone.utc)) - updated_at
@@ -338,8 +396,8 @@ def _floor_tax_basis(product: Optional[dict]) -> Optional[str]:
         return "included"
     if value in {"extra", "exclusive", "gst_extra"}:
         return "extra"
-    if isinstance(product.get("gst_inclusive"), bool):
-        return "included" if product["gst_inclusive"] else "extra"
+    if isinstance(product.get("selling_gst_inclusive"), bool):
+        return "included" if product["selling_gst_inclusive"] else "extra"
     return None
 
 
@@ -359,9 +417,7 @@ async def ensure_pricing_indexes() -> None:
     db = get_async_mongo_db()
     if not PRICING_INTELLIGENCE_ORG_IDS:
         logger.warning("Pricing intelligence is disabled: PRICING_INTELLIGENCE_ORG_IDS is empty")
-    for org_id in (LEE_DEALER_ORG_ID, KOMAL_ORG_ID):
-        if not is_pricing_enabled(org_id):
-            continue
+    for org_id in PRICING_INTELLIGENCE_ORG_IDS:
         col = db[f"pricing_events_{org_id}"]
         try:
             await col.create_index("event_key", unique=True)
@@ -373,16 +429,28 @@ async def ensure_pricing_indexes() -> None:
             await col.create_index([("sku", 1), ("event_type", 1), ("created_at", -1)])
             await col.create_index([("dealer_phone", 1), ("sku", 1), ("hold_until", -1)])
             await col.create_index("expires_at", expireAfterSeconds=0)
-            await db[f"pricing_delivery_{org_id}"].create_index("updated_at", expireAfterSeconds=86_400)
+            receipt_col = db[f"pricing_delivery_{org_id}"]
+            await receipt_col.create_index("expires_at", expireAfterSeconds=0)
             audit_col = db[f"pricing_audit_outbox_{org_id}"]
             await audit_col.create_index([("status", 1), ("next_attempt_at", 1)])
             await audit_col.create_index("expires_at", expireAfterSeconds=0)
+            decision_col = db[f"pricing_decisions_{org_id}"]
+            await decision_col.create_index("expires_at", expireAfterSeconds=0)
+            await decision_col.create_index([("conversation_id", 1), ("created_at", -1)])
         except Exception as exc:
             logger.error(f"Pricing indexes unavailable for org={org_id}: {exc}")
 
 
 async def _record(org_id: str, event: dict) -> bool:
+    if not is_pricing_enabled(org_id):
+        return False
+    mode = str(event.get("pricing_mode") or "")
+    if mode not in {"shadow", "review"}:
+        mode = await get_pricing_mode(org_id)
+    if mode == "off":
+        return False
     now = datetime.now(timezone.utc)
+    event.setdefault("pricing_mode", mode)
     event.setdefault("created_at", now)
     event.setdefault("expires_at", now + EVENT_RETENTION)
     event.setdefault("learnable", False)
@@ -602,6 +670,8 @@ async def _escalate(
     org_id: str,
     *,
     event_key: str,
+    conversation_id: str,
+    channel: str,
     dealer_phone: str,
     customer_name: str,
     raw_text: str,
@@ -615,6 +685,47 @@ async def _escalate(
     from services.team_service import create_ai_escalation
 
     market = await _market_summary(org_id, sku, floor)
+    try:
+        product = await _resolve_product(org_id, sku or product_context)
+    except Exception as exc:
+        logger.warning(f"Pricing escalation catalogue enrichment unavailable for org={org_id}: {type(exc).__name__}")
+        product = None
+    verified_at = (product or {}).get("price_verified_at")
+    if isinstance(verified_at, datetime):
+        verified_at = verified_at.replace(tzinfo=timezone.utc) if verified_at.tzinfo is None else verified_at.astimezone(timezone.utc)
+        age_minutes = max(0, int((datetime.now(timezone.utc) - verified_at).total_seconds() // 60))
+        verified_text = verified_at.isoformat()
+    else:
+        age_minutes = None
+        verified_text = None
+    _, floor_status = floor_snapshot(product)
+    source = (product or {}).get("source_sheet_name") or (product or {}).get("price_source_sheet_id")
+    pricing_context = {
+        "product": product_context or (product or {}).get("product_name"),
+        "sku": sku or _sku(product),
+        "proposed_unit_price": observed_price,
+        "floor_unit_price": floor,
+        "target_unit_price": (product or {}).get("target_selling_price"),
+        "mrp": (product or {}).get("mrp"),
+        "gst_rate": (product or {}).get("gst_rate"),
+        "gst_inclusive": (product or {}).get("selling_gst_inclusive"),
+        "source": source,
+        "price_source_sheet_id": (product or {}).get("price_source_sheet_id"),
+        "price_version": (product or {}).get("price_version"),
+        "decision_status": "needs_review",
+        "review_reason_codes": [reason],
+        "freshness": {
+            "status": floor_status,
+            "synced_at": verified_text,
+            "age_minutes": age_minutes,
+        },
+        "evidence": ([{
+            "label": "Current approved floor",
+            "value": floor,
+            "source": source,
+        }] if floor is not None else []),
+        "market_summary": market,
+    }
     details = [
         f"Dealer: {dealer_phone}",
         f"Product: {product_context or sku or 'unresolved'}",
@@ -630,20 +741,30 @@ async def _escalate(
         org_id,
         {
             "id": f"pricing:{hashlib.sha256(event_key.encode()).hexdigest()}",
+            "type": "pricing",
+            "schema_version": 2,
             "user_name": customer_name or "Dealer",
             "customer_number": dealer_phone,
+            "conversation_id": conversation_id,
+            "channel": channel,
             "customer_text": "\n".join(details),
             "inferred_intent": event_type,
             "status": "pending_human_review",
             "role": "pricing_guardrail",
             "sender_name": "Pricing Intelligence",
+            "context": {"pricing": pricing_context},
             "metadata": {
+                "type": "pricing_guardrail",
+                "schema_version": 2,
+                "conversation_id": conversation_id,
+                "channel": channel,
                 "sku": sku,
                 "product_context": product_context,
                 "sheet_floor_price": floor,
                 "observed_price": observed_price,
                 "reason": reason,
                 "market_summary": market,
+                "pricing": {**pricing_context, "event_type": event_type, "reason": reason},
             },
         },
     )
@@ -651,6 +772,8 @@ async def _escalate(
 
 async def _deliver_pricing_escalation(org_id: str, event_key: str) -> None:
     """Claim and deliver one durable pricing escalation."""
+    if await get_pricing_mode(org_id) != "review":
+        return
     col = get_async_mongo_db()[f"pricing_events_{org_id}"]
     now = datetime.now(timezone.utc)
     claim_id = uuid.uuid4().hex
@@ -674,6 +797,14 @@ async def _deliver_pricing_escalation(org_id: str, event_key: str) -> None:
             {"$set": {"escalation_status": "failed", "next_attempt_at": now + timedelta(minutes=1)}},
         )
         return
+    payload = dict(payload)
+    conversation_id = str(
+        payload.get("conversation_id")
+        or (event or {}).get("conversation_id")
+        or f"whatsapp_{payload.get('dealer_phone') or ''}"
+    )
+    payload.setdefault("conversation_id", conversation_id)
+    payload.setdefault("channel", _conversation_channel(conversation_id))
     try:
         await _escalate(org_id, event_key=event_key, **payload)
     except Exception as exc:
@@ -693,6 +824,8 @@ async def _deliver_pricing_escalation(org_id: str, event_key: str) -> None:
 
 
 async def _queue_pricing_escalation(org_id: str, event_key: str, **payload) -> None:
+    if await get_pricing_mode(org_id) != "review":
+        return
     col = get_async_mongo_db()[f"pricing_events_{org_id}"]
     now = datetime.now(timezone.utc)
     await col.update_one(
@@ -705,7 +838,7 @@ async def _queue_pricing_escalation(org_id: str, event_key: str, **payload) -> N
 async def process_pending_pricing_escalations() -> None:
     now = datetime.now(timezone.utc)
     for org_id in PRICING_INTELLIGENCE_ORG_IDS:
-        if not is_pricing_enabled(org_id):
+        if await get_pricing_mode(org_id) == "off":
             continue
         col = get_async_mongo_db()[f"pricing_events_{org_id}"]
         rows = await col.find(
@@ -720,7 +853,13 @@ async def process_pending_pricing_escalations() -> None:
         for row in rows:
             await _deliver_pricing_escalation(org_id, row["event_key"])
         audits = await get_async_mongo_db()[f"pricing_audit_outbox_{org_id}"].find(
-            {"status": {"$in": ["pending", "failed"]}, "next_attempt_at": {"$lte": now}},
+            {
+                "$or": [
+                    {"status": {"$in": ["pending", "failed"]}, "next_attempt_at": {"$lte": now}},
+                    {"status": "processing", "claimed_at": {"$lt": now - AUDIT_CLAIM_TIMEOUT}},
+                ],
+                "attempts": {"$lt": AUDIT_MAX_ATTEMPTS},
+            },
             {"_id": 1},
         ).limit(50).to_list(length=50)
         for audit in audits:
@@ -734,8 +873,9 @@ async def validate_ai_pricing_response(
     source_message_id: Optional[str],
     content: str,
 ) -> tuple[bool, str]:
-    """Fail closed unless every AI price is backed by one current Sheet product."""
-    if not is_pricing_enabled(org_id):
+    """Audit in shadow; block only in review when a price is not safely backed."""
+    pricing_mode = await get_pricing_mode(org_id)
+    if pricing_mode == "off":
         return True, "pricing_disabled"
     quoted_prices = extract_quoted_prices(content)
     if not quoted_prices:
@@ -792,15 +932,17 @@ async def validate_ai_pricing_response(
     if not reason:
         return True, "validated_ai_prices"
 
+    event_type = "ai_output_blocked" if pricing_mode == "review" else "ai_output_shadow_warning"
     event_key = (
-        f"{source_message_id or conversation_id}:ai_output_blocked:"
+        f"{source_message_id or conversation_id}:{event_type}:"
         f"{hashlib.sha256(content.encode()).hexdigest()}"
     )
     await _record(
         org_id,
         {
             "event_key": event_key,
-            "event_type": "ai_output_blocked",
+            "event_type": event_type,
+            "pricing_mode": pricing_mode,
             "direction": "outbound",
             "actor": "ai",
             "counterparty_role": "buyer",
@@ -817,20 +959,24 @@ async def validate_ai_pricing_response(
             "learnable": False,
         },
     )
-    await _queue_pricing_escalation(
-        org_id,
-        event_key,
-        dealer_phone=_phone(conversation_id),
-        customer_name="Dealer",
-        raw_text=content,
-        event_type="ai_output_blocked",
-        sku=sku,
-        product_context=product_context,
-        floor=floor,
-        observed_price=min(quoted_prices) if quoted_prices else None,
-        reason=reason,
-    )
-    return False, reason
+    if pricing_mode == "review":
+        await _queue_pricing_escalation(
+            org_id,
+            event_key,
+            conversation_id=conversation_id,
+            channel=_conversation_channel(conversation_id),
+            dealer_phone=_phone(conversation_id),
+            customer_name="Dealer",
+            raw_text=content,
+            event_type="ai_output_blocked",
+            sku=sku,
+            product_context=product_context,
+            floor=floor,
+            observed_price=min(quoted_prices) if quoted_prices else None,
+            reason=reason,
+        )
+        return False, reason
+    return True, f"shadow_{reason}"
 
 
 async def _record_accepted_ai_response(
@@ -887,27 +1033,71 @@ async def _record_accepted_ai_response(
 
 
 async def _process_accepted_ai_audit(org_id: str, message_id: str) -> None:
+    if await get_pricing_mode(org_id) == "off":
+        return
     col = get_async_mongo_db()[f"pricing_audit_outbox_{org_id}"]
-    job = await col.find_one({"_id": message_id})
+    now = datetime.now(timezone.utc)
+    claim_id = uuid.uuid4().hex
+    result = await col.update_one(
+        {
+            "_id": message_id,
+            "$or": [
+                {
+                    "status": {"$in": ["pending", "failed"]},
+                    "next_attempt_at": {"$lte": now},
+                    "attempts": {"$lt": AUDIT_MAX_ATTEMPTS},
+                },
+                {
+                    "status": "processing",
+                    "claimed_at": {"$lt": now - AUDIT_CLAIM_TIMEOUT},
+                    "attempts": {"$lt": AUDIT_MAX_ATTEMPTS},
+                },
+            ],
+        },
+        {"$set": {"status": "processing", "claim_id": claim_id, "claimed_at": now}},
+    )
+    if result.modified_count != 1:
+        return
+    job = await col.find_one({"_id": message_id, "claim_id": claim_id})
     if not job:
         return
     try:
         await _record_accepted_ai_response(org_id=org_id, **job["payload"])
     except Exception as exc:
         logger.error(f"Accepted AI pricing audit failed for org={org_id}: {exc}")
+        attempts = int(job.get("attempts") or 0) + 1
+        terminal = attempts >= AUDIT_MAX_ATTEMPTS
+        backoff = min(
+            AUDIT_MAX_BACKOFF,
+            timedelta(seconds=30 * (2 ** max(0, attempts - 1))),
+        )
+        changes = {
+            "status": "dead" if terminal else "failed",
+            "last_error": str(exc)[:500],
+            "attempts": attempts,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if terminal:
+            changes["dead_at"] = datetime.now(timezone.utc)
+        else:
+            changes["next_attempt_at"] = datetime.now(timezone.utc) + backoff
         await col.update_one(
-            {"_id": message_id},
-            {
-                "$set": {
-                    "status": "failed",
-                    "last_error": str(exc)[:500],
-                    "next_attempt_at": datetime.now(timezone.utc) + timedelta(minutes=1),
-                },
-                "$inc": {"attempts": 1},
-            },
+            {"_id": message_id, "claim_id": claim_id},
+            {"$set": changes, "$unset": {"claim_id": "", "claimed_at": ""}},
         )
         return
-    await col.delete_one({"_id": message_id})
+    completed_at = datetime.now(timezone.utc)
+    await col.update_one(
+        {"_id": message_id, "claim_id": claim_id},
+        {
+            "$set": {
+                "status": "completed",
+                "completed_at": completed_at,
+                "updated_at": completed_at,
+            },
+            "$unset": {"claim_id": "", "claimed_at": "", "last_error": ""},
+        },
+    )
 
 
 async def record_accepted_ai_response(
@@ -919,7 +1109,7 @@ async def record_accepted_ai_response(
     content: str,
 ) -> None:
     """Durably audit a provider-accepted AI price without retrying the send."""
-    if not is_pricing_enabled(org_id) or not outbound_message_id:
+    if not outbound_message_id or await get_pricing_mode(org_id) == "off":
         return
     now = datetime.now(timezone.utc)
     await get_async_mongo_db()[f"pricing_audit_outbox_{org_id}"].update_one(
@@ -952,6 +1142,8 @@ async def _reconcile_ai_pricing_delivery(org_id: str, message_id: str) -> None:
         return
     incoming = str(receipt.get("status") or "")
     rank = {"provider_accepted": 0, "sent": 1, "delivered": 2, "read": 3, "failed": 4}
+    if incoming not in rank:
+        return
     col = db[f"pricing_events_{org_id}"]
     rows = await col.find(
         {"source_message_id": message_id, "event_type": "ai_customer_quote"},
@@ -971,11 +1163,14 @@ async def _reconcile_ai_pricing_delivery(org_id: str, message_id: str) -> None:
         elif next_status == "failed":
             changes["ignored_reason"] = "delivery_failed"
         await col.update_one({"event_key": row["event_key"]}, {"$set": changes})
-    await receipt_col.delete_one({"_id": message_id})
+    await receipt_col.update_one(
+        {"_id": message_id},
+        {"$set": {"reconciled_at": datetime.now(timezone.utc)}},
+    )
 
 
 async def update_ai_pricing_delivery(org_id: str, message_id: str, status: str) -> None:
-    if not is_pricing_enabled(org_id) or not message_id:
+    if not message_id or await get_pricing_mode(org_id) == "off":
         return
     from services.sales_offer_policy import DELIVERY_RANK
 
@@ -994,6 +1189,7 @@ async def update_ai_pricing_delivery(org_id: str, message_id: str, status: str) 
             ]},
             "rank": {"$max": [{"$ifNull": ["$rank", 0]}, rank]},
             "updated_at": now,
+            "expires_at": now + EVENT_RETENTION,
         }}],
         upsert=True,
     )
@@ -1014,7 +1210,10 @@ async def observe_agent_message(
     sender_name: str,
 ) -> None:
     """Log a successfully sent human message without blocking its delivery."""
-    if not is_pricing_enabled(org_id) or not content:
+    if not content:
+        return
+    pricing_mode = await get_pricing_mode(org_id)
+    if pricing_mode == "off":
         return
     dealer_phone = _phone(conversation_id)
     reply_event = await _event_for_message(org_id, reply_to_message_id)
@@ -1101,6 +1300,7 @@ async def observe_agent_message(
                 ).hexdigest()
             ),
             "event_type": event_type,
+            "pricing_mode": pricing_mode,
             "direction": "outbound",
             "actor": "human_agent",
             "counterparty_role": role,
@@ -1113,7 +1313,7 @@ async def observe_agent_message(
             "observed_prices": prices,
             "quoted_price": observed if event_type == "human_customer_quote" else None,
             "sheet_floor_price": floor,
-            "floor_updated_at": (product or {}).get("updated_at"),
+            "floor_updated_at": (product or {}).get("price_verified_at"),
             "markup_amount": markup,
             "price_difference": difference,
             "learnable": learnable,
@@ -1144,6 +1344,9 @@ async def observe_customer_message(
     """Observe an inbound turn and return whether normal automation must stop."""
     if not content:
         return {"intercept": False}
+    pricing_mode = await get_pricing_mode(org_id)
+    if pricing_mode == "off":
+        return {"intercept": False}
     if re.search(r"\b(price|quote|quotation|available|availability|stock|buy|need|want|qty|quantity)\b", content, re.I) or _has_product_identifier(content):
         interest_product = await _resolve_product(org_id, content)
         interest_sku = _sku(interest_product)
@@ -1151,6 +1354,7 @@ async def observe_customer_message(
             await _record(org_id, {
                 "event_key": f"{source_message_id}:buyer_product_interest",
                 "event_type": "buyer_product_interest",
+                "pricing_mode": pricing_mode,
                 "direction": "inbound",
                 "actor": "buyer",
                 "counterparty_role": "buyer",
@@ -1162,8 +1366,6 @@ async def observe_customer_message(
                 "source_message_id": source_message_id,
                 "reply_to_message_id": reply_to_message_id,
             })
-    if not is_pricing_enabled(org_id):
-        return {"intercept": False}
     dealer_phone = _phone(conversation_id)
     reply_event = await _event_for_message(org_id, reply_to_message_id)
     reply_message = await _message_for_id(org_id, reply_to_message_id)
@@ -1190,6 +1392,7 @@ async def observe_customer_message(
             {
                 "event_key": f"{source_message_id}:supplier_offer",
                 "event_type": "supplier_offer",
+                "pricing_mode": pricing_mode,
                 "direction": "inbound",
                 "actor": "supplier",
                 "counterparty_role": "supplier",
@@ -1204,7 +1407,9 @@ async def observe_customer_message(
                 "decision_reason": "linked_supplier_request",
             },
         )
-        return {"intercept": True, "reply": None}
+        if pricing_mode == "review":
+            return {"intercept": True, "reply": None}
+        return {"intercept": False, "shadow_intercept": True, "shadow_reason": "supplier_offer"}
 
     buyer_context = bool(
         (reply_event or {}).get("counterparty_role") == "buyer"
@@ -1241,6 +1446,7 @@ async def observe_customer_message(
             {
                 "event_key": event_key,
                 "event_type": "unresolved_price_direction",
+                "pricing_mode": pricing_mode,
                 "direction": "inbound",
                 "actor": "external_contact",
                 "counterparty_role": "unknown",
@@ -1254,20 +1460,24 @@ async def observe_customer_message(
                 "ignored_reason": unresolved_reason,
             },
         )
-        await _queue_pricing_escalation(
-            org_id,
-            event_key,
-            dealer_phone=dealer_phone,
-            customer_name=customer_name,
-            raw_text=content,
-            event_type="unresolved_price_direction",
-            sku=sku,
-            product_context=product_name,
-            floor=None,
-            observed_price=observed,
-            reason=unresolved_reason,
-        )
-        return {"intercept": True, "reply": None}
+        if pricing_mode == "review":
+            await _queue_pricing_escalation(
+                org_id,
+                event_key,
+                conversation_id=conversation_id,
+                channel=_conversation_channel(conversation_id),
+                dealer_phone=dealer_phone,
+                customer_name=customer_name,
+                raw_text=content,
+                event_type="unresolved_price_direction",
+                sku=sku,
+                product_context=product_name,
+                floor=None,
+                observed_price=observed,
+                reason=unresolved_reason,
+            )
+            return {"intercept": True, "reply": None}
+        return {"intercept": False, "shadow_intercept": True, "shadow_reason": unresolved_reason}
 
     floor, floor_reason = floor_snapshot(product)
     existing_hold = await _active_hold(org_id, dealer_phone, sku) if sku else None
@@ -1281,7 +1491,8 @@ async def observe_customer_message(
         intercept, reason = True, floor_reason
     elif is_claim and floor is not None and observed is not None and observed < floor:
         intercept, reason = True, "below_floor_claim"
-        hold_until = datetime.now(timezone.utc) + HOURS_24
+        if pricing_mode == "review":
+            hold_until = datetime.now(timezone.utc) + HOURS_24
 
     event_key = f"{source_message_id}:{event_type}"
     await _record(
@@ -1289,6 +1500,7 @@ async def observe_customer_message(
         {
             "event_key": event_key,
             "event_type": event_type,
+            "pricing_mode": pricing_mode,
             "direction": "inbound",
             "actor": "buyer",
             "counterparty_role": "buyer",
@@ -1300,7 +1512,7 @@ async def observe_customer_message(
             "observed_price": observed,
             "observed_prices": prices,
             "sheet_floor_price": floor,
-            "floor_updated_at": (product or {}).get("updated_at"),
+            "floor_updated_at": (product or {}).get("price_verified_at"),
             "floor_status": floor_reason,
             "hold_until": hold_until,
             "stock_snapshot": (product or {}).get(
@@ -1313,10 +1525,12 @@ async def observe_customer_message(
             "decision_reason": reason or "continue_to_sales_agent",
         },
     )
-    if intercept and not existing_hold:
+    if pricing_mode == "review" and intercept and not existing_hold:
         await _queue_pricing_escalation(
             org_id,
             event_key,
+            conversation_id=conversation_id,
+            channel=_conversation_channel(conversation_id),
             dealer_phone=dealer_phone,
             customer_name=customer_name,
             raw_text=content,
@@ -1327,6 +1541,8 @@ async def observe_customer_message(
             observed_price=observed,
             reason=reason,
         )
+    if pricing_mode != "review" and intercept:
+        return {"intercept": False, "shadow_intercept": True, "shadow_reason": reason}
     return {"intercept": intercept, "reply": HOLDING_REPLY if intercept else None}
 
 
@@ -1339,7 +1555,7 @@ async def record_oos_supplier_reply(
     oos_doc: dict,
 ) -> None:
     """Mirror only the price signal; the existing OOS document stays canonical."""
-    if not is_pricing_enabled(org_id):
+    if await get_pricing_mode(org_id) == "off":
         return
     attrs = oos_doc.get("extracted_attributes", {})
     context = " ".join(

@@ -1,0 +1,42 @@
+name: Backend checks
+
+on:
+  pull_request:
+  workflow_call:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt pytest
+      - name: Pricing and sales contracts
+        run: |
+          python test_pricing_policy_v1.py
+          python test_product_sheet_pricing_foundation.py
+          python test_pricing_service.py
+          python -c 'import test_pricing_service; import pytest; raise SystemExit(pytest.main(["-q", "tests/contracts/test_oos_dual_role_contract.py"]))'
+          python test_pricing_decision_service.py
+          python test_pricing_webhook_contract.py
+          pytest -q test_sales_action_service.py
+          python test_sales_offer_contract.py
+          python test_ai_fail_closed_contract.py
+          python test_whatsapp_reply_idempotency.py
+          python test_multi_whatsapp_contract.py
+          python test_multi_whatsapp_migration.py
+          python test_whatsapp_number_binding.py
+          python test_whatsapp_outbound_binding.py
+          python test_runtime_safety_contract.py
+          python test_inbox_outage.py
+          python test_inbox_live_delivery_contract.py
+          python -m unittest test_stock_sheet_writeback test_product_sheet_pricing_foundation test_product_requests test_restock_dispatch -q
+          python test_entitlement_contract.py
+          python test_release_catalogue.py
+          python test_release_messaging.py
+          python test_release_commerce.py
+          python tests/shopify/test_shopify_worker_runtime.py
+          python -m py_compile api/*.py services/*.py schemas/*.py
