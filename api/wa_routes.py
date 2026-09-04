@@ -954,9 +954,7 @@ async def whatsapp_disconnect(
         )
         if not connection:
             raise HTTPException(status_code=404, detail="WhatsApp connection not found")
-        if not _whatsapp_schema_ready(org_id) and db.whatsapp_connections.count_documents({
-            "org_id": org_id, "is_active": {"$ne": False},
-        }) > 1:
+        if not _whatsapp_schema_ready(org_id):
             raise HTTPException(status_code=503, detail="WhatsApp number upgrade is still being finalized. Try again shortly.")
         connection_id = connection.get("phone_id") or connection.get("phone_number_id") or connection.get("wa_id")
         removal_result = await whatsapp_service.disconnect(org_id, connection_id)
@@ -987,7 +985,25 @@ def list_whatsapp_connections(request: Request, user: CurrentUser):
         "org_id": user.org_id,
         "is_active": False,
     }, {"_id": 0, "access_token": 0}).sort("disconnected_at", -1))
-    schema_ready = _whatsapp_schema_ready(user.org_id) or not connections
+    organization = db.organizations.find_one(
+        {"org_id": user.org_id}, {"wa_id": 1, "whatsapp_connection_schema_version": 1},
+    ) or {}
+    schema_ready = organization.get("whatsapp_connection_schema_version") == 2 or not connections
+    # Read-only compatibility for a single, unambiguously owned legacy line.
+    # Never persist a guessed slot or relax the validator used by mutations.
+    if not schema_ready and len(connections) == 1:
+        connection = connections[0]
+        phone_id = connection.get("phone_id") or connection.get("phone_number_id")
+        waba_id = connection.get("wa_id") or connection.get("waba_id")
+        if (
+            connection.get("org_id") == user.org_id
+            and connection.get("slot") is None
+            and isinstance(phone_id, str) and phone_id.isascii() and phone_id.isdigit()
+            and waba_id and waba_id == organization.get("wa_id")
+            and all(connection.get(key) in (None, "", phone_id) for key in ("phone_id", "phone_number_id"))
+            and all(connection.get(key) in (None, "", waba_id) for key in ("wa_id", "waba_id"))
+        ):
+            connections = [{**connection, "slot": 1}]
     try:
         connections = validate_active_connection_slots(connections, limit=limit)
     except ValueError as exc:
