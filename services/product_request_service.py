@@ -32,6 +32,8 @@ async def ensure_product_request_indexes():
 
 
 async def capture_product_requests(job, raw_requests, messages):
+    if not raw_requests:
+        return
     db = get_async_mongo_db()
     org = job["org_id"]
     conversation = await db[f"conversations_{org}"].find_one({"conversation_id": job["conversation_id"]})
@@ -207,7 +209,7 @@ async def prepare_template(user, phone):
 async def queue_restock(user, ids):
     from services.entitlement_service import require_feature
     from services.wa_service import get_templates
-    require_feature(user.org_id, "BROADCASTING")
+    await asyncio.to_thread(require_feature, user.org_id, "BROADCASTING")
     preview = await restock_preview(user, ids)
     if any(not item["eligible"] for item in preview):
         raise HTTPException(409, "Audience changed or includes ineligible customers; refresh the preview")
@@ -262,7 +264,7 @@ async def retry_restock(user, request_id):
     from services.wa_service import get_templates, get_broadcast_suppressed_phone_keys
     if user.role not in {"admin", "org:admin"}:
         raise HTTPException(403, "Only an administrator can retry a broadcast")
-    require_feature(user.org_id, "BROADCASTING")
+    await asyncio.to_thread(require_feature, user.org_id, "BROADCASTING")
     row = await accessible_request(user, request_id)
     reason = eligibility_reason({**row, "notification_status": None}, await product_for(row))
     if reason:
@@ -384,7 +386,7 @@ async def process_restock_outbox():
         templates = await get_templates(user.org_id, connection["wa_id"], connection["access_token"], name=RESTOCK_TEMPLATE)
         if not approved_restock_template(templates["templates"]):
             raise HTTPException(409, "Restock template is not approved")
-        require_feature(user.org_id, "BROADCASTING")
+        await asyncio.to_thread(require_feature, user.org_id, "BROADCASTING")
         await consume_quota_async(user.org_id, "BROADCASTING", "monthly_recipients", 1, quota_event_key)
         # Recheck after external template/quota calls. Any cancellation wins the
         # following atomic boundary unless sending has already begun.

@@ -54,7 +54,8 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
            
         org_id = user.org_id
 
-        instagram_id = db.organizations.find_one({"org_id": org_id}, {"ig_id": 1}).get("ig_id")
+        org = await asyncio.to_thread(db.organizations.find_one, {"org_id": org_id}, {"ig_id": 1})
+        instagram_id = (org or {}).get("ig_id")
         
         if not instagram_id:
             logger.error("No Instagram ID found for organization")
@@ -127,7 +128,7 @@ async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, what
         return
 
     # query whatsapp_connections to retrieve whatsapp_business_id based on user_id
-    wa_connection = db.whatsapp_connections.find_one(
+    wa_connection = await asyncio.to_thread(db.whatsapp_connections.find_one,
             {"user_id": whatsapp_id, "org_id": user.org_id, "is_active": {"$ne": False}},
             {"wa_id": 1, "_id": 0}
         )
@@ -238,12 +239,13 @@ async def main_ws(websocket: WebSocket, client_id: str):
         await websocket.close(code=1008, reason="Client ID already connected")
         return
     heartbeat_task = None
+    registered = False
     try:
-        org = db.organizations.find_one(
+        org = await asyncio.to_thread(db.organizations.find_one,
             {"org_id": user.org_id},
             {"ig_id": 1, "wa_id": 1, "_id": 0}
         ) or {}
-        ig_ids = _active_account_ids(
+        ig_ids = await asyncio.to_thread(_active_account_ids,
             org.get("ig_id"),
             db.instagram_connections.find(
                 {"org_id": user.org_id, "is_active": {"$ne": False}},
@@ -251,7 +253,7 @@ async def main_ws(websocket: WebSocket, client_id: str):
             ),
             "instagram_id",
         )
-        wa_ids = _active_account_ids(
+        wa_ids = await asyncio.to_thread(_active_account_ids,
             org.get("wa_id"),
             db.whatsapp_connections.find(
                 {"org_id": user.org_id, "is_active": {"$ne": False}},
@@ -262,7 +264,12 @@ async def main_ws(websocket: WebSocket, client_id: str):
         ig_id = str(org.get("ig_id") or next(iter(ig_ids), "")) or None
         wa_id = str(org.get("wa_id") or next(iter(wa_ids), "")) or None
 
+        # Database awaits allow another handshake with this ID to finish first.
+        if websocket_client_id_in_use(client_id):
+            await websocket.close(code=1008, reason="Client ID already connected")
+            return
         services.active_clients[client_id] = websocket
+        registered = True
         services.client_metadata[client_id] = {
             "ig_id": ig_id,
             "wa_id": wa_id,
@@ -315,4 +322,5 @@ async def main_ws(websocket: WebSocket, client_id: str):
             heartbeat_task.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat_task
-        await cleanup_client(client_id)
+        if registered:
+            await cleanup_client(client_id)

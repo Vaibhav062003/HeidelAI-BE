@@ -355,6 +355,7 @@ def test_provider_cleanup_is_claimed_and_idempotent():
     )
     namespace = {
         "datetime": datetime, "timezone": timezone, "timedelta": timedelta,
+        "asyncio": asyncio,
         "WHATSAPP_PROVIDER_CLEANUP_MAX_ATTEMPTS": 5,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "finalize", "exec"), namespace)
@@ -404,6 +405,7 @@ def test_provider_cleanup_never_unsubscribes_a_waba_with_any_active_line():
     )
     namespace = {
         "datetime": datetime, "timezone": timezone, "timedelta": timedelta,
+        "asyncio": asyncio,
         "WHATSAPP_PROVIDER_CLEANUP_MAX_ATTEMPTS": 5,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "finalize", "exec"), namespace)
