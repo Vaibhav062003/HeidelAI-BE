@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+from pydantic import BaseModel, Field
+
 from services.quote_math import quote_line_amounts
 from services.quote_service import build_quote_document
 
@@ -91,8 +93,19 @@ def test_shared_quote_document_keeps_inclusive_gst_total_exact():
     assert document["items"][0]["private_unit_price"] == 118
 
 
+def test_quote_item_accepts_full_laptop_model():
+    tree = ast.parse(Path("api/quote_routes.py").read_text())
+    quote_item = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "QuoteItem")
+    namespace = {"__name__": "quote_item_contract", "BaseModel": BaseModel, "Field": Field}
+    exec(compile(ast.Module(body=[quote_item], type_ignores=[]), "api/quote_routes.py", "exec"), namespace)
+    description = ("Inspiron 7440 Inspiron 7440 2-in-1 OIC74401512F1RINU1O Core™️ 5 120U Win 11 + Office H&S 2024 + M365  16GB DDR5 512GB SSD Intel®️ Graphics 14.0-inch 16:10 FHD +Touch 300nits WVA Display with ComfortView Backlit Keyboard Ice Blue Dell Essential/Ecoloop Essential 1 Year Onsite Hardware Service " + "Additional configuration detail. " * 20)[:750]
+    assert len(description) == 750
+    assert namespace["QuoteItem"](id="1", description=description, unit_price=92000).description == description
+
+
 if __name__ == "__main__":
     test_quote_routes_are_authenticated_and_store_private_pricing()
     test_quote_math_handles_inclusive_and_extra_gst()
     test_shared_quote_document_keeps_inclusive_gst_total_exact()
+    test_quote_item_accepts_full_laptop_model()
     print("Quote contract checks passed.")
