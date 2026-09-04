@@ -40,7 +40,7 @@ class QuoteParty(BaseModel):
 
 class QuoteItem(BaseModel):
     id: str = Field(..., min_length=1, max_length=80)
-    description: str = Field(..., min_length=1, max_length=240)
+    description: str = Field(..., min_length=1, max_length=500)
     category: str = Field(default="", max_length=40)
     sku: str = Field(default="", max_length=60)
     quantity: float = Field(default=1, gt=0, le=9999)
