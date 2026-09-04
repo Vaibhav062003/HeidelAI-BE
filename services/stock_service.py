@@ -165,6 +165,7 @@ async def _merged_stock(org_id: str) -> list[dict]:
         "available_qty": 1, "in_stock": 1, "unit": 1, "source_sheet_ids": 1,
         "source_rows": 1, "source_values": 1, "category": 1, "type": 1,
         "gst_inclusive": 1, "gst_rate": 1, "updated_at": 1,
+        "target_selling_price": 1, "approved_floor_price": 1,
     }).to_list(length=50_000)
     primary = await db.product_sheet_connections.find_one(
         {"org_id": org_id, "status": "active", "is_primary": True}, {"sheet_id": 1},
@@ -541,26 +542,8 @@ async def _apply_sheet(change: dict, row: dict) -> dict:
         "category": row["category"], "source_rows": {},
     }
     result = await write_product_sheet_values(change["org_id"], product, change["changes"])
-    if row["_sheet_document"] and ObjectId.is_valid(row["id"]):
-        update = {}
-        if "price" in change["changes"]:
-            update["price"] = float(change["changes"]["price"])
-        if "description" in change["changes"]:
-            update["description"] = change["changes"]["description"]
-        if "quantity" in change["changes"]:
-            update["stock"] = float(change["changes"]["quantity"])
-        if "gst_inclusive" in change["changes"]:
-            update["gst_inclusive"] = change["changes"]["gst_inclusive"] is True
-        if "gst_rate" in change["changes"]:
-            update["gst_rate"] = float(change["changes"]["gst_rate"])
-        sheet_id = result["sheet_id"]
-        for field, value in update.copy().items():
-            if field != "updated_at":
-                update[f"source_values.{sheet_id}.{field}"] = value
-        update["updated_at"] = datetime.now(timezone.utc)
-        await db[f"products_{change['org_id']}"].update_one({"_id": ObjectId(row["id"])}, {"$set": update})
-    else:
-        await sync_product_sheet(change["org_id"], result["sheet_id"])
+    # The writer publishes the verified row through the same normalizer as sync,
+    # including selling price, tax treatment and price provenance.
     return result
 
 

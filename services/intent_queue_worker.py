@@ -31,6 +31,8 @@ async def startup_intent_worker() -> None:
     global _polling_task
     await asyncio.to_thread(_ensure_indexes)
     await asyncio.to_thread(_recover_stuck_jobs)
+    from services.product_request_service import ensure_product_request_indexes
+    await ensure_product_request_indexes()
     _polling_task = asyncio.create_task(_polling_loop())
     logger.success("Purchase intent queue worker started.")
 
@@ -63,6 +65,7 @@ def enqueue_intent_check(
     # so a new message arriving now won't be in that analysis.
     # Allow a fresh job so the newer message gets analyzed later (Bug #4 fix).
     existing = db[COLLECTION].find_one({
+        "org_id": org_id,
         "conversation_id": conversation_id,
         "status": "pending",
         "created_at": {"$gt": cutoff}
@@ -101,6 +104,8 @@ async def _polling_loop() -> None:
     while True:
         try:
             await _process_due_jobs()
+            from services.product_request_service import process_restock_outbox
+            await process_restock_outbox()
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -173,7 +178,7 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                 )
             )
             
-            if len(docs) < 3:
+            if not docs:
                 logger.info(f"[{job_id}] Skipped job for {conversation_id} (not enough context).")
                 await asyncio.to_thread(
                     lambda: db[COLLECTION].update_one(
@@ -196,8 +201,8 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                 older_docs = docs[:-recent_cutoff]
                 recent_docs = docs[-recent_cutoff:]
                 
-                older_str = "\n".join([f"{d.get('role', 'unknown')}: {d.get('content', '')}" for d in older_docs])
-                recent_str = "\n".join([f"{d.get('role', 'unknown')}: {d.get('content', '')}" for d in recent_docs])
+                older_str = "\n".join([f"[{d.get('message_id') or d.get('_id')}] {d.get('role', 'unknown')}: {d.get('content', '')}" for d in older_docs if d.get('mode') != 'private'])
+                recent_str = "\n".join([f"[{d.get('message_id') or d.get('_id')}] {d.get('role', 'unknown')}: {d.get('content', '')}" for d in recent_docs if d.get('mode') != 'private'])
                 
                 messages_str = (
                     "--- OLDER CONTEXT (For product reference only) ---\n"
@@ -206,7 +211,7 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                     f"{recent_str}"
                 )
             else:
-                recent_str = "\n".join([f"{d.get('role', 'unknown')}: {d.get('content', '')}" for d in docs])
+                recent_str = "\n".join([f"[{d.get('message_id') or d.get('_id')}] {d.get('role', 'unknown')}: {d.get('content', '')}" for d in docs if d.get('mode') != 'private'])
                 messages_str = (
                     "--- RECENT MESSAGES (Determine intent and timeline ONLY from these) ---\n"
                     f"{recent_str}"
@@ -215,11 +220,14 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
             ist_now = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
             
             result = await extract_purchase_intent(messages_str, ist_now)
+            if result is not None:
+                from services.product_request_service import capture_product_requests
+                await capture_product_requests(job, [item.model_dump() for item in getattr(result, "product_requests", [])], docs[-10:])
             
             # Branch 1: LLM returned None → transient error (network, malformed response).
             # Do NOT cancel existing follow-ups on transient failures (Bug #2 fix).
             if result is None:
-                logger.warning(f"[{job_id}] LLM returned None for {conversation_id} — treating as transient error.")
+                raise RuntimeError("Intent extraction returned no result; retry without cancelling follow-ups")
 
             # Branch 2: AI explicitly detected purchase intent.
             elif result.has_intent and result.confidence != "low":

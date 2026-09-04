@@ -28,7 +28,7 @@ from services.websocket_service import broadcast_org_admin_ws, broadcast_org_ws
 
 
 API_VERSION = "2025-10"
-OAUTH_SCOPES = "read_orders,read_customers,read_fulfillments"
+OAUTH_SCOPES = "read_orders,read_customers,read_fulfillments,read_products"
 DEFAULT_REMINDER_DELAY_MINUTES = 10
 DEFAULT_TEMPLATE_LANGUAGE = "en_US"
 SHOPIFY_TEMPLATE_FOOTER = "Powered by Heidelai.com - AI Sales Agent"
@@ -544,6 +544,7 @@ async def ensure_shopify_indexes() -> None:
     await db.shopify_checkouts.create_index([("org_id", 1), ("phone", 1), ("updated_at", -1)])
     await db.shopify_checkouts.create_index([("org_id", 1), ("phone", 1), ("provider_updated_at", -1), ("provider_id", -1)])
     await db.shopify_checkouts.create_index([("org_id", 1), ("checkout_token", 1)])
+    await db.shopify_checkouts.create_index([("org_id", 1), ("customer_id", 1), ("source", 1), ("provider_updated_at", -1)])
     await db.shopify_checkouts.create_index([("org_id", 1), ("updated_at", -1), ("provider_id", -1)])
     await db.shopify_checkouts.create_index([("org_id", 1), ("reminder_status", 1), ("updated_at", -1)])
     await db.shopify_checkouts.create_index([("shop", 1), ("provider_id", 1)])
@@ -945,6 +946,8 @@ async def _reconcile_phone_checkouts(org_id: str, phone: str, connection: dict, 
         status, reason = "phone_missing", "phone_missing"
     elif await _is_whatsapp_suppressed(org_id, phone):
         status, reason = "opted_out", "customer_opt_out"
+    elif latest.get("source") == "storefront_cart" and not latest.get("storefront_consent"):
+        status, reason = "opted_out", "storefront_consent_missing"
     elif not connection.get("automation_enabled"):
         status, reason = "cancelled", "automation_disabled"
     activity_time = _recovery_activity_time(_provider_time(latest), activation)
@@ -959,7 +962,8 @@ async def _reconcile_phone_checkouts(org_id: str, phone: str, connection: dict, 
             {"provider_started_at": 1}, sort=[("provider_started_at", -1)],
         )
         frequency_after = (_parse_datetime((prior or {}).get("provider_started_at")) + timedelta(hours=24)) if prior and _parse_datetime(prior.get("provider_started_at")) else None
-        due = _reminder_due(activity_time, int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES), frequency_after)
+        delay = 5 if latest.get("source") == "storefront_cart" else int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES)
+        due = _reminder_due(activity_time, delay, frequency_after)
         if frequency_after and frequency_after > now:
             reason = "phone_frequency_cap"
     update = {"reminder_status": status, "reminder_due_at": due, "status_updated_at": now}
@@ -1047,7 +1051,8 @@ async def ensure_shopify_runtime_ready() -> None:
 
 
 async def _mark_order_conversion(org_id: str, order: dict) -> set[str]:
-    tokens = [value for value in {order.get("cart_token"), order.get("checkout_token")} if value]
+    tokens = list({token for value in (order.get("cart_token"), order.get("checkout_token")) if value
+                  for token in (str(value), str(value).split("?", 1)[0])})
     if not tokens:
         return set()
     query = {"org_id": org_id, "checkout_token": {"$in": tokens}}
@@ -1277,6 +1282,7 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
         else:
             customer_id = str(payload.get("customer", {}).get("id") or payload.get("customer_id") or "")
             customer_ids = [customer_id, f"gid://shopify/Customer/{customer_id}"]
+            await db.shopify_storefront_consents.delete_many({"org_id": org_id, "customer_id": {"$in": customer_ids}})
             order_ids = await db.shopify_orders.distinct("provider_id", {"org_id": org_id, "customer_id": {"$in": customer_ids}})
             await db.shopify_checkouts.delete_many({"org_id": org_id, "customer_id": {"$in": [customer_id, f"gid://shopify/Customer/{customer_id}"]}})
             await db.shopify_orders.delete_many({"org_id": org_id, "customer_id": {"$in": [customer_id, f"gid://shopify/Customer/{customer_id}"]}})
@@ -1318,6 +1324,18 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
         await _commerce_event(org_id, "order", order["provider_id"])
         return
     if topic.startswith("checkouts/"):
+        # Starting checkout permanently retires pre-checkout recovery for that
+        # cart; the existing abandoned-checkout lifecycle owns it from here.
+        cart_token = str(payload.get("cart_token") or "").split("?", 1)[0]
+        if cart_token:
+            await db.shopify_checkouts.update_many(
+                {"org_id": org_id, "source": "storefront_cart", "checkout_token": cart_token,
+                 "provider_started_at": {"$exists": False}},
+                {"$set": {"storefront_checkout_started": True, "record_status": "deleted",
+                          "reminder_status": "cancelled", "reminder_due_at": None,
+                          "failure_category": "checkout_started", "status_updated_at": utcnow()},
+                 "$unset": {"claim_token": "", "claim_expires_at": ""}},
+            )
         provider_id = _provider_gid("AbandonedCheckout", payload.get("admin_graphql_api_id") or payload.get("id") or payload.get("token"))
         checkout_token = str(payload.get("token") or "")
         if topic.endswith("delete"):
@@ -1403,6 +1421,16 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
                 "$or": [{"consent_updated_at": {"$lte": consent_time}}, {"consent_updated_at": {"$exists": False}}],
             }
             await db.shopify_checkouts.update_many(consent_filter, {"$set": {"whatsapp_consent": consent, "consent_updated_at": consent_time, "status_updated_at": utcnow()}})
+            if consent in {"UNSUBSCRIBED", "NOT_SUBSCRIBED"}:
+                await db.shopify_storefront_consents.update_one(
+                    {"_id": f"{org_id}:{customer_id}", "updated_at": {"$lte": consent_time}},
+                    {"$set": {"granted": False, "updated_at": consent_time}},
+                )
+                await db.shopify_checkouts.update_many(
+                    {**consent_filter, "source": "storefront_cart", "provider_started_at": {"$exists": False}},
+                    {"$set": {"storefront_consent": False, "reminder_status": "opted_out", "reminder_due_at": None},
+                     "$unset": {"claim_token": "", "claim_expires_at": ""}},
+                )
         if phone:
             affected.add(phone)
         await _repair_org_checkout_states(org_id, connection, {value for value in affected if value})
@@ -1464,7 +1492,7 @@ def _order_from_webhook(org_id: str, shop: str, payload: dict) -> dict:
         "org_id": org_id, "shop": shop, "provider_id": provider_id,
         "order_url": f"https://{shop}/admin/orders/{provider_id.rsplit('/', 1)[-1]}",
         "order_number": str(payload.get("name") or payload.get("order_number") or ""),
-        "cart_token": str(payload.get("cart_token") or ""), "checkout_token": str(payload.get("checkout_token") or ""),
+        "cart_token": str(payload.get("cart_token") or "").split("?", 1)[0], "checkout_token": str(payload.get("checkout_token") or ""),
         "customer_id": _provider_gid("Customer", customer.get("admin_graphql_api_id") or customer.get("id")) if customer.get("id") or customer.get("admin_graphql_api_id") else "",
         "customer_name": " ".join(part for part in (customer.get("first_name") or address.get("first_name"), customer.get("last_name") or address.get("last_name")) if part).strip(),
         "phone": phone, "products": items, "total": {"amount": float(payload.get("total_price") or 0), "currency": payload.get("currency") or ""},
@@ -1809,6 +1837,7 @@ async def _finish_shopify_disconnect(org_id: str, *, provider_uninstall: bool = 
         {"$set": {"status": "disconnected", "updated_at": utcnow(), "last_error": "Shopify app was uninstalled" if provider_uninstall else None}, "$unset": {"shop": "", "access_token": "", "refresh_token": "", "token_expires_at": "", "sync_claim_token": "", "sync_claimed_at": "", "cleanup_pending": ""}},
     )
     await db.shopify_checkouts.delete_many({"org_id": org_id})
+    await db.shopify_storefront_consents.delete_many({"org_id": org_id})
     await db.shopify_orders.delete_many({"org_id": org_id})
     await db.shopify_order_notifications.delete_many({"org_id": org_id})
     await _commerce_event(org_id, "connection", org_id)
@@ -2241,6 +2270,9 @@ async def _defer_claim(checkout: dict, token: str, due: datetime, reason: str, *
 
 
 async def _refresh_checkout_before_send(checkout: dict, token: str, connection: dict) -> dict | None:
+    if checkout.get("source") == "storefront_cart":
+        from services.shopify_storefront_cart import refresh_cart_before_send
+        return await refresh_cart_before_send(checkout, token, connection)
     data = await _graphql(connection, CHECKOUT_NODE_QUERY, {"id": checkout["provider_id"]}, timeout=20)
     node = data.get("node")
     if not node:
