@@ -28,6 +28,7 @@ assert extract({"message": {}}) is None
 routes_source = Path("api/websockets_routes.py").read_text()
 service_source = Path("services/websocket_service.py").read_text()
 whatsapp_source = Path("services/wa_service.py").read_text()
+common_tree = ast.parse(Path("services/common_service.py").read_text())
 assert "for account_id in ig_ids" in routes_source
 assert "for account_id in wa_ids" in routes_source
 assert '"ig_ids": sorted(ig_ids)' in routes_source
@@ -40,6 +41,31 @@ media_start = whatsapp_source.index("async def send_wa_media_message")
 media_sender = whatsapp_source[media_start:whatsapp_source.index("\nasync def ", media_start + 1)]
 assert 'recipient_id=connection["wa_id"]' in media_sender
 assert '"timestamp": message["timestamp"].isoformat()' in whatsapp_source
+
+wa_tree = ast.parse(whatsapp_source)
+blocking_names = {"count_documents", "delete_one", "find_one", "find_one_and_update", "insert_one", "update_one"}
+for function_name in ("create_or_update_whatsapp_conversation", "store_whatsapp_message"):
+    function = next(node for node in wa_tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name)
+    assert not any(
+        isinstance(node, ast.Call) and (
+            isinstance(node.func, ast.Attribute) and node.func.attr in blocking_names
+            or isinstance(node.func, ast.Name) and node.func.id == "resolve_active_whatsapp_connection"
+        )
+        for node in ast.walk(function)
+    ), f"{function_name} must not run synchronous MongoDB calls on the event loop"
+
+fetch_conversations = next(
+    node for node in common_tree.body
+    if isinstance(node, ast.AsyncFunctionDef) and node.name == "fetch_conversations_new"
+)
+assert any(
+    isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and isinstance(node.func.value, ast.Name)
+    and node.func.value.id == "asyncio"
+    and node.func.attr == "gather"
+    for node in ast.walk(fetch_conversations)
+), "conversation rows and metadata must be fetched concurrently"
 
 webhook_source = Path("api/webhook_routes.py").read_text()
 deploy_source = Path(".github/workflows/deploy-main.yml").read_text()

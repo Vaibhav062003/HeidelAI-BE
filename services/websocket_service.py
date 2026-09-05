@@ -66,28 +66,37 @@ def _payload_conversation_id(payload: dict) -> str | None:
     return None
 
 
-async def _eligible_conversation_clients(client_ids, conversation_id: str | None):
+async def _eligible_conversation_clients(client_ids, conversation_id: str | None, conversation: dict | None = None):
     if not conversation_id:
         return set(client_ids)
-    from services.work_team_service import can_user_access_conversation, list_work_teams
+    from services.work_team_service import can_user_access_conversation, is_admin, list_work_teams
     allowed_clients = set()
     clients_by_org = {}
     for client_id in list(client_ids):
         org_id = services.client_metadata.get(client_id, {}).get("org_id")
         if org_id:
             clients_by_org.setdefault(org_id, []).append(client_id)
-    async_db = get_async_mongo_db()
     for org_id, org_client_ids in clients_by_org.items():
-        conversation = await async_db[f"conversations_{org_id}"].find_one(
-            {"conversation_id": conversation_id}
-        )
-        if not conversation:
+        admin_clients = {
+            client_id for client_id in org_client_ids
+            if is_admin(services.client_metadata.get(client_id, {}).get("role") or "org:member")
+        }
+        allowed_clients.update(admin_clients)
+        member_clients = [client_id for client_id in org_client_ids if client_id not in admin_clients]
+        if not member_clients:
+            continue
+        org_conversation = conversation
+        if not org_conversation:
+            org_conversation = await get_async_mongo_db()[f"conversations_{org_id}"].find_one(
+                {"conversation_id": conversation_id}
+            )
+        if not org_conversation:
             continue
         teams = await list_work_teams(org_id)
-        for client_id in org_client_ids:
+        for client_id in member_clients:
             meta = services.client_metadata.get(client_id, {})
             if can_user_access_conversation(
-                meta.get("user_id") or "", meta.get("role") or "org:member", conversation, teams
+                meta.get("user_id") or "", meta.get("role") or "org:member", org_conversation, teams
             ):
                 allowed_clients.add(client_id)
     return allowed_clients
@@ -250,6 +259,7 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
         client_ids = await _eligible_conversation_clients(
             client_ids,
             _payload_conversation_id(payload),
+            payload.get("conversation") if isinstance(payload.get("conversation"), dict) else None,
         )
     except Exception as error:
         logger.error(f"WebSocket access filtering failed: {type(error).__name__}")

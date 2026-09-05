@@ -133,6 +133,28 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
                     scope["cleanup_client"].assert_not_awaited()
                 await self.assert_nonblocking(invoke)
 
+    async def test_admin_conversation_broadcast_does_not_wait_for_database(self):
+        state = SimpleNamespace(client_metadata={
+            "admin-client": {"org_id": "org", "role": "org:admin", "user_id": "admin"},
+        })
+        scope = functions(
+            "services/websocket_service.py",
+            ["_eligible_conversation_clients"],
+            services=state,
+            get_async_mongo_db=Mock(side_effect=AssertionError("broadcast accessed database")),
+        )
+        work_teams = SimpleNamespace(
+            can_user_access_conversation=Mock(),
+            is_admin=lambda role: role in {"admin", "org:admin"},
+            list_work_teams=AsyncMock(side_effect=AssertionError("broadcast loaded work teams")),
+        )
+        with patch.dict("sys.modules", {"services.work_team_service": work_teams}):
+            allowed = await scope["_eligible_conversation_clients"](
+                {"admin-client"}, "conversation", {"conversation_id": "conversation"}
+            )
+        self.assertEqual(allowed, {"admin-client"})
+        work_teams.list_work_teams.assert_not_awaited()
+
     async def test_websocket_duplicate_race_does_not_clean_up_other_connection(self):
         db = SimpleNamespace(organizations=SimpleNamespace(find_one=lambda *_: {}),
                              instagram_connections=SimpleNamespace(find=lambda *_: []),
