@@ -225,7 +225,7 @@ def test_immediate_push_delivery_is_bounded_and_lifecycle_managed() -> None:
         for node in ast.walk(stop)
     )
     lifecycle = Path("core/lifespan.py").read_text()
-    assert "await start_push_notification_workers()" in lifecycle
+    assert "(\"push notification workers\", start_push_notification_workers)" in lifecycle
     assert "await stop_push_notification_workers()" in lifecycle
 
 
