@@ -2,17 +2,59 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 from typing import Iterable, Optional
 
 
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+_ORG_ID = re.compile(r"^org_[A-Za-z0-9]+$")
 MAX_WHATSAPP_CONNECTIONS = 50
+logger = logging.getLogger(__name__)
 
 
-def whatsapp_connection_limit(_org_id: str) -> int:
-    """Every organization can connect up to 50 WhatsApp numbers."""
-    return MAX_WHATSAPP_CONNECTIONS
+def _parse_org_number_limits(raw: str) -> dict[str, int]:
+    limits: dict[str, int] = {}
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            logger.warning("Ignoring malformed WHATSAPP_ORG_NUMBER_LIMITS entry")
+            continue
+        org_id, value = (part.strip() for part in item.split("=", 1))
+        if not _ORG_ID.fullmatch(org_id):
+            logger.warning("Ignoring WHATSAPP_ORG_NUMBER_LIMITS entry with invalid organization id")
+            continue
+        if org_id in seen:
+            limits.pop(org_id, None)
+            duplicates.add(org_id)
+            logger.warning("Ignoring duplicate WhatsApp number limit for org %s", org_id)
+            continue
+        seen.add(org_id)
+        try:
+            limit = int(value)
+        except ValueError:
+            logger.warning("Ignoring invalid WhatsApp number limit for org %s", org_id)
+            continue
+        if not 1 <= limit <= MAX_WHATSAPP_CONNECTIONS:
+            logger.warning("Ignoring out-of-range WhatsApp number limit for org %s", org_id)
+            continue
+        limits[org_id] = limit
+    for org_id in duplicates:
+        limits.pop(org_id, None)
+    return limits
+
+
+WHATSAPP_ORG_NUMBER_LIMITS = _parse_org_number_limits(os.getenv("WHATSAPP_ORG_NUMBER_LIMITS", ""))
+
+
+def whatsapp_connection_limit(org_id: str) -> int:
+    """Return the configured entitlement; unlisted organizations get one number."""
+    return WHATSAPP_ORG_NUMBER_LIMITS.get(str(org_id), 1)
 
 
 def normalize_connection_label(label: Optional[str], slot: int) -> str:
@@ -50,7 +92,7 @@ def choose_connection_slot(
 ) -> tuple[int, Optional[dict]]:
     """Validate capacity rules and return a stable connection slot."""
     connections = [row for row in existing_connections if row.get("is_active") is not False]
-    validate_active_connection_slots(connections, limit=limit)
+    validate_active_connection_slots(connections)
     existing = next(
         (row for row in connections if str(row.get("phone_id") or row.get("phone_number_id") or "") == phone_number_id),
         None,
