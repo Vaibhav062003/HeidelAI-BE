@@ -143,6 +143,7 @@ def test_migration_is_dry_run_bounded_and_cli_only():
     assert "workflow_dispatch:" in workflow
     assert '[[ "$CONFIRMATION" == "APPLY" ]]' in workflow
     assert workflow.index("- name: Dry run") < workflow.index("- name: Apply")
+    assert workflow.count("script --quiet --return --command") == 2
     assert "--org-id \"$ORG_ID\" --apply" in workflow
 
 
