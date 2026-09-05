@@ -22,7 +22,7 @@ from config.settings import (
     FIREBASE_SERVICE_ACCOUNT_B64,
     PUSH_TOKEN_ENCRYPTION_KEY,
 )
-from database import get_mongo_db
+from database import get_mongo_db, wait_for_mongo_available
 
 
 db = get_mongo_db()
@@ -661,6 +661,7 @@ async def _immediate_push_worker(queue: asyncio.Queue[str]) -> None:
     while True:
         event_id = await queue.get()
         try:
+            await wait_for_mongo_available()
             await process_push_event(event_id)
         except asyncio.CancelledError:
             raise

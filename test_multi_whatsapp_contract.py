@@ -56,7 +56,8 @@ def test_connection_and_webhook_contracts():
     assert 'error.get("code") == 190' in routes
     assert 'requested_phone_id = str(req.phone_number_id or "").strip()' in routes
     assert '(value.get("metadata") or {}).get("phone_number_id")' in webhook
-    assert "active_whatsapp_connection_candidates(whatsapp_business_id)" in webhook
+    assert "active_whatsapp_connection_candidates," in webhook
+    assert "await asyncio.to_thread(" in webhook
     assert "status_code=503" in webhook
     assert 'connection.get("wa_bot_flow_id")' in webhook
     assert 'business_phone_id=business_phone_id' in webhook
@@ -143,6 +144,7 @@ def test_migration_is_dry_run_bounded_and_cli_only():
     assert "workflow_dispatch:" in workflow
     assert '[[ "$CONFIRMATION" == "APPLY" ]]' in workflow
     assert workflow.index("- name: Dry run") < workflow.index("- name: Apply")
+    assert workflow.count("script --quiet --return --command") == 2
     assert "--org-id \"$ORG_ID\" --apply" in workflow
 
 
@@ -155,9 +157,9 @@ def test_number_scoped_query_and_flow_binding_contracts():
 
     assert common_routes.count("business_phone_id: Optional[str]") >= 4
     assert 'conditions.append(await _business_phone_scope(org_id, business_phone_id))' in common_service
-    assert 'base_conditions.append(await _business_phone_scope(org_id, business_phone_id))' in common_service
+    assert 'phone_scope = await _business_phone_scope(org_id, business_phone_id)' in common_service
     assert '"business_phone_id": doc.get("business_phone_id")' in common_service
-    assert common_service.count("_business_phone_scope(org_id, business_phone_id)") == 4
+    assert common_service.count("_business_phone_scope(org_id, business_phone_id)") == 3
     assert '"wa_bot_flow_id": flow_id' in flow_service
     assert '"phone_ids", "wa_bot_flow_id"' in flow_service
     assert '"conversation_ids": contact_data["conversation_id"]' in contacts_service

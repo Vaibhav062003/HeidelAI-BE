@@ -75,6 +75,49 @@ async def _best_effort_typing(
         logger.warning("Could not send WhatsApp typing indicator: {}", exc)
 
 
+async def _propagate_whatsapp_delivery_status(
+    org_id: str,
+    message_id: str,
+    status_type: str,
+    status_payload: dict,
+    delivery_error: dict | None,
+    include_shopify: bool,
+) -> None:
+    if status_type == "failed":
+        try:
+            await asyncio.to_thread(
+                record_whatsapp_provider_block,
+                org_id,
+                status_payload.get("recipient_id"),
+                status_payload,
+            )
+        except Exception as exc:
+            logger.debug("WhatsApp provider block propagation skipped for {}: {}", message_id, type(exc).__name__)
+    if include_shopify:
+        try:
+            await update_shopify_reminder_delivery(org_id, message_id, status_type, delivery_error)
+        except Exception as exc:
+            logger.debug("Shopify reminder delivery propagation skipped for {}: {}", message_id, type(exc).__name__)
+    try:
+        from services.sales_offer_service import update_offer_delivery
+
+        await update_offer_delivery(org_id, message_id, status_type)
+    except Exception as exc:
+        logger.debug("Offer delivery propagation skipped for {}: {}", message_id, type(exc).__name__)
+    try:
+        from services.pricing_service import update_ai_pricing_delivery
+
+        await update_ai_pricing_delivery(org_id, message_id, status_type)
+    except Exception as exc:
+        logger.debug("AI price delivery propagation skipped for {}: {}", message_id, type(exc).__name__)
+    try:
+        from services.google_sheet_automation import update_sheet_sent_status
+
+        await update_sheet_sent_status(org_id=org_id, message_id=message_id, status=status_type)
+    except Exception as exc:
+        logger.debug("Sheet status propagation skipped for {}: {}", message_id, type(exc).__name__)
+
+
 def _log_product_reply_latency(
     org_id: str,
     conversation_id: str,
@@ -724,7 +767,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     metadata_phone_id = str(
                         (value.get("metadata") or {}).get("phone_number_id") or ""
                     ).strip()
-                    connection = resolve_active_whatsapp_connection(
+                    connection = await asyncio.to_thread(
+                        resolve_active_whatsapp_connection,
                         metadata_phone_id,
                         whatsapp_business_id,
                     )
@@ -734,7 +778,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             "No unambiguous active WhatsApp connection for "
                             f"WABA={whatsapp_business_id}, phone_number_id={metadata_phone_id or 'missing'}"
                         )
-                        if active_whatsapp_connection_candidates(whatsapp_business_id):
+                        if await asyncio.to_thread(
+                            active_whatsapp_connection_candidates,
+                            whatsapp_business_id,
+                        ):
                             raise HTTPException(
                                 status_code=503,
                                 detail="WhatsApp connection metadata is temporarily inconsistent",
@@ -759,7 +806,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             call_id = call.get("id")
                             if not call_id:
                                 continue
-                            existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or {}
+                            existing = await asyncio.to_thread(
+                                calls_collection.find_one,
+                                {"call_id": call_id, "org_id": org_id},
+                            ) or {}
                             session = call.get("session")
                             session_type = session.get("sdp_type") if isinstance(session, dict) else None
                             direction = call.get("direction") or existing.get("direction") or (
@@ -767,13 +817,19 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             )
                             phone = contact_phone or (call.get("from") if direction == "USER_INITIATED" else call.get("to")) or existing.get("phone")
                             digits = "".join(character for character in str(phone or "") if character.isdigit())
-                            conversation = db[f"conversations_{org_id}"].find_one({
-                                "business_phone_id": business_phone_id,
-                                "$or": [
-                                    {"customer_id": {"$in": [phone, digits]}},
-                                    {"conversation_id": {"$in": [f"whatsapp_{phone}", f"whatsapp_{digits}"]}},
-                                ]
-                            }) if phone else None
+                            conversation = (
+                                await asyncio.to_thread(
+                                    db[f"conversations_{org_id}"].find_one,
+                                    {
+                                        "business_phone_id": business_phone_id,
+                                        "$or": [
+                                            {"customer_id": {"$in": [phone, digits]}},
+                                            {"conversation_id": {"$in": [f"whatsapp_{phone}", f"whatsapp_{digits}"]}},
+                                        ],
+                                    },
+                                )
+                                if phone else None
+                            )
                             conversation_id = (conversation or {}).get("conversation_id") or existing.get("conversation_id")
                             now = datetime.now(timezone.utc)
                             provider_time = meta_datetime(call.get("timestamp"), now)
@@ -786,7 +842,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 "contact_name": (conversation or {}).get("customer_name") or contact_name,
                                 "phone": phone,
                             }
-                            calls_collection.update_one(
+                            await asyncio.to_thread(
+                                calls_collection.update_one,
                                 {"call_id": call_id, "org_id": org_id},
                                 {
                                     "$setOnInsert": {
@@ -799,8 +856,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 },
                                 upsert=True,
                             )
-                            existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or metadata_fields
-                            stored = _apply_call_lifecycle(
+                            existing = await asyncio.to_thread(
+                                calls_collection.find_one,
+                                {"call_id": call_id, "org_id": org_id},
+                            ) or metadata_fields
+                            stored = await asyncio.to_thread(
+                                _apply_call_lifecycle,
                                 calls_collection,
                                 org_id,
                                 call_id,
@@ -846,12 +907,16 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             call_id = status.get("id")
                             if not call_id:
                                 continue
-                            existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or {}
+                            existing = await asyncio.to_thread(
+                                calls_collection.find_one,
+                                {"call_id": call_id, "org_id": org_id},
+                            ) or {}
                             now = datetime.now(timezone.utc)
                             status_value = status.get("status")
                             connected_event = str(status_value or "").upper() == "ACCEPTED"
                             provider_time = meta_datetime(status.get("timestamp"), now)
-                            calls_collection.update_one(
+                            await asyncio.to_thread(
+                                calls_collection.update_one,
                                 {"call_id": call_id, "org_id": org_id},
                                 {
                                     "$setOnInsert": {
@@ -863,8 +928,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 },
                                 upsert=True,
                             )
-                            existing = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or existing
-                            stored = _apply_call_lifecycle(
+                            existing = await asyncio.to_thread(
+                                calls_collection.find_one,
+                                {"call_id": call_id, "org_id": org_id},
+                            ) or existing
+                            stored = await asyncio.to_thread(
+                                _apply_call_lifecycle,
                                 calls_collection,
                                 org_id,
                                 call_id,
@@ -876,7 +945,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 connected_event=connected_event,
                             )
                             if connected_event and not stored.get("agent_id"):
-                                calls_collection.update_one(
+                                await asyncio.to_thread(
+                                    calls_collection.update_one,
                                     {
                                         "call_id": call_id,
                                         "org_id": org_id,
@@ -885,7 +955,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     },
                                     {"$set": {"handled_by": "linked_device"}},
                                 )
-                                stored = calls_collection.find_one({"call_id": call_id, "org_id": org_id}) or stored
+                                stored = await asyncio.to_thread(
+                                    calls_collection.find_one,
+                                    {"call_id": call_id, "org_id": org_id},
+                                ) or stored
                             await broadcast_main_ws(whatsapp_business_id, "whatsapp", "whatsapp_call", {
                                 **status,
                                 "id": call_id,
@@ -923,24 +996,21 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             normalize_whatsapp_delivery_error(status, stage="delivery")
                             if status_type == "failed" else None
                         )
-                        if status_type == "failed":
-                            await asyncio.to_thread(
-                                record_whatsapp_provider_block,
-                                connection.get("org_id"),
-                                status.get("recipient_id"),
-                                status,
-                            )
-                        
                         logger.info(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
 
-                        try:
-                            shopify_error = await update_shopify_reminder_delivery(
-                                connection.get("org_id"), message_id, status_type, delivery_error,
-                            )
-                            if shopify_error:
-                                delivery_error = shopify_error
-                        except Exception as exc:
-                            logger.debug(f"Shopify reminder delivery propagation skipped for {message_id}: {exc}")
+                        if status_type == "failed":
+                            try:
+                                shopify_error = await update_shopify_reminder_delivery(
+                                    connection.get("org_id"), message_id, status_type, delivery_error,
+                                )
+                                if shopify_error:
+                                    delivery_error = shopify_error
+                            except Exception as exc:
+                                logger.debug(
+                                    "Shopify reminder delivery propagation skipped for {}: {}",
+                                    message_id,
+                                    type(exc).__name__,
+                                )
 
                         # Update the message after Shopify augments retry state.
                         broadcast_message = await update_whatsapp_message_status(
@@ -950,31 +1020,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             delivery_error=delivery_error,
                         )
 
-                        try:
-                            from services.sales_offer_service import update_offer_delivery
-
-                            await update_offer_delivery(connection.get("org_id"), message_id, status_type)
-                        except Exception as exc:
-                            logger.debug(f"Offer delivery propagation skipped for {message_id}: {exc}")
-
-                        try:
-                            from services.pricing_service import update_ai_pricing_delivery
-
-                            await update_ai_pricing_delivery(connection.get("org_id"), message_id, status_type)
-                        except Exception as exc:
-                            logger.debug(f"AI price delivery propagation skipped for {message_id}: {exc}")
-
-                        # Propagate delivery status to Google Sheet automation tracking
-                        # (no-op if message_id doesn't exist in the sheet sent collection)
-                        try:
-                            from services.google_sheet_automation import update_sheet_sent_status
-                            await update_sheet_sent_status(
-                                org_id=connection.get("org_id"),
-                                message_id=message_id,
-                                status=status_type,
-                            )
-                        except Exception as e:
-                            logger.debug(f"Sheet status propagation skipped for {message_id}: {e}")
+                        delivery_task = (
+                            connection.get("org_id"),
+                            message_id,
+                            status_type,
+                            status,
+                            delivery_error,
+                            status_type != "failed",
+                        )
+                        if background_tasks:
+                            background_tasks.add_task(_propagate_whatsapp_delivery_status, *delivery_task)
+                        else:
+                            asyncio.create_task(_propagate_whatsapp_delivery_status(*delivery_task))
 
                         if not broadcast_message:
                             logger.warning(f"No message found with ID {message_id} to update status.")
@@ -1053,7 +1110,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     # Update the message with the reaction info in  database and it for broadcasting
                                     try:
                                         # Update the message with the reaction info
-                                        broadcast_message = messages_collection.find_one_and_update(
+                                        broadcast_message = await asyncio.to_thread(
+                                            messages_collection.find_one_and_update,
                                             {"message_id": message_id},
                                             {"$set": {
                                                 "reaction": {
@@ -1064,7 +1122,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                                     "timestamp": timestamp
                                                 }
                                             }}, 
-                                            return_document=ReturnDocument.AFTER
+                                            return_document=ReturnDocument.AFTER,
                                         )
                                         
                                         if not broadcast_message:
@@ -1079,10 +1137,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     # Update the message with the reaction info in  database and it for broadcasting
                                     try:
                                         # Update the message with the reaction info
-                                        broadcast_message = messages_collection.find_one_and_update(
+                                        broadcast_message = await asyncio.to_thread(
+                                            messages_collection.find_one_and_update,
                                             {"message_id": message_id},
                                             {"$unset": {"reaction": 1}}, 
-                                            return_document=ReturnDocument.AFTER
+                                            return_document=ReturnDocument.AFTER,
                                         )
                                         
                                         if not broadcast_message:
@@ -1182,7 +1241,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         "mid": replied_message_id
                                     }
 
-                            stored_inbound_message = messages_collection.find_one(
+                            stored_inbound_message = await asyncio.to_thread(
+                                messages_collection.find_one,
                                 {"message_id": wa_message_id},
                                 {
                                     "conversation_id": 1,
@@ -1226,11 +1286,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 return {"status": "ok"}
                                     
                             # Get conversation doc to check if AI is enabled
-                            convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                            convo_doc = await asyncio.to_thread(
+                                conversations_collection.find_one,
+                                {"conversation_id": conversation_id},
+                            )
                             is_conv_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else True
                             stage = convo_doc.get("onboarding_stage", "welcome") if convo_doc else "welcome"
                             
-                            org_doc = db.organizations.find_one({"org_id": org_id},{"is_ai_enabled": 1})
+                            org_doc = await asyncio.to_thread(
+                                db.organizations.find_one,
+                                {"org_id": org_id},
+                                {"is_ai_enabled": 1},
+                            )
                             is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
                             
                             is_heidelai = whatsapp_business_id == HEIDELAI_ORG_WA_ID
@@ -1258,12 +1325,15 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.info(f"ai_enabled: {ai_enabled}") 
 
                             bound_flow_id = connection.get("wa_bot_flow_id")
-                            whatsapp_flow = flow_collection.find_one({
-                                "flow_id": bound_flow_id,
-                                "trigger_from": "webhook",
-                                "trigger_event": "message_received",
-                                "status": "active",
-                            }) if bound_flow_id else None
+                            whatsapp_flow = await asyncio.to_thread(
+                                flow_collection.find_one,
+                                {
+                                    "flow_id": bound_flow_id,
+                                    "trigger_from": "webhook",
+                                    "trigger_event": "message_received",
+                                    "status": "active",
+                                },
+                            ) if bound_flow_id else None
                             logger.info(
                                 f"[{org_id}] WhatsApp automation flow: "
                                 f"{'found' if whatsapp_flow else 'no active flow found'}"
@@ -1284,11 +1354,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 was_dealer = bool(convo_doc and convo_doc.get("is_dealer"))
                                 dealer_lookup_ok = True
                                 try:
-                                    is_dealer = bool(db.dealer_directory.find_one({
-                                        "org_id": org_id,
-                                        "phone": customer_phone_no,
-                                        "active": True,
-                                    }))
+                                    is_dealer = bool(await asyncio.to_thread(
+                                        db.dealer_directory.find_one,
+                                        {
+                                            "org_id": org_id,
+                                            "phone": customer_phone_no,
+                                            "active": True,
+                                        },
+                                    ))
                                 except Exception:
                                     logger.warning(
                                         f"Could not refresh dealer state for ...{customer_phone_no[-4:]}; "
@@ -1473,7 +1546,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 # Fallback to AI Agent (only if AI is enabled for this org+conversation)
                                 if ai_enabled and await is_effective_ai_enabled(org_id, conversation_id):
                                     if not convo_doc:
-                                        convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                                        convo_doc = await asyncio.to_thread(
+                                            conversations_collection.find_one,
+                                            {"conversation_id": conversation_id},
+                                        )
                                     # Fallback to Agent (executes if no flow exists OR flow didn't return a response)
                                     logger.info(f"[AI_ROUTING] [{conversation_id}] ✅ Sending message to AI agent. org={org_id}, is_heidelai={is_heidelai}, content_length={len(content)}")
                                     try:
@@ -1545,9 +1621,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 # Check and send OOS dealer messages if a recent request was logged
                                 try:
                                     from services.oos_service import send_oos_to_dealers
-                                    recent_oos = db.oos_requests.find_one(
+                                    recent_oos = await asyncio.to_thread(
+                                        db.oos_requests.find_one,
                                         {"org_id": org_id, "conversation_id": conversation_id, "status": "pending_send"},
-                                        sort=[("created_at", -1)]
+                                        sort=[("created_at", -1)],
                                     )
                                     if recent_oos:
                                         created_at = recent_oos.get("created_at")
@@ -2270,8 +2347,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 return {"status": "ok"}
 
                             # Check if conversation exists
-                            existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
-                            conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+                            existing_conversation = await asyncio.to_thread(
+                                conversations_collection.find_one,
+                                {"conversation_id": conversation_id},
+                            )
+                            conversation = await asyncio.to_thread(
+                                conversations_collection.find_one,
+                                {"conversation_id": conversation_id},
+                            )
 
                             if conversation:
                                 # Convert ObjectId to string for JSON serialization
@@ -2332,9 +2415,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         logger.info(f"Message deletion event detected - mid: {deleted_message_id}")
 
                         # Find the corresponding Instagram account in our connections
-                        instagram_connection = db.instagram_connections.find_one(
+                        instagram_connection = await asyncio.to_thread(
+                            db.instagram_connections.find_one,
                             {"instagram_id": recipient_id, "is_active": True},
-                            sort=[("last_updated", -1)]
+                            sort=[("last_updated", -1)],
                         )
                         
                         logger.info(f"Instagram Connection: {instagram_connection}")
@@ -2346,19 +2430,25 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         conversations_collection_name = f"conversations_{org_id}" 
 
                         # Check if collection exists
-                        if messages_collection_name in db.list_collection_names():
+                        if messages_collection_name in await asyncio.to_thread(db.list_collection_names):
 
                             messages_collection = db[messages_collection_name]
                             conversations_collection = db[conversations_collection_name]  
                             
                             # Find the message to be deleted
-                            message_to_delete = messages_collection.find_one({"message_id": deleted_message_id})
+                            message_to_delete = await asyncio.to_thread(
+                                messages_collection.find_one,
+                                {"message_id": deleted_message_id},
+                            )
                             
                             if message_to_delete:
                                 conversation_id = message_to_delete.get("conversation_id")
                                 
                                 # Get the conversation
-                                conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+                                conversation = await asyncio.to_thread(
+                                    conversations_collection.find_one,
+                                    {"conversation_id": conversation_id},
+                                )
                                 
                                 # Check if this was the last message in the conversation
                                 was_last_message = False
@@ -2372,19 +2462,24 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         was_last_message = True
                                 
                                 # Delete the message
-                                delete_result = messages_collection.delete_one({"message_id": deleted_message_id})
+                                delete_result = await asyncio.to_thread(
+                                    messages_collection.delete_one,
+                                    {"message_id": deleted_message_id},
+                                )
                                 
                                 # If this was the last message, update the conversation with previous message
                                 if was_last_message:
                                     # Find the new most recent message
-                                    newest_message = messages_collection.find_one(
+                                    newest_message = await asyncio.to_thread(
+                                        messages_collection.find_one,
                                         {"conversation_id": conversation_id},
-                                        sort=[("timestamp", -1)]  # Sort by timestamp descending
+                                        sort=[("timestamp", -1)],  # Sort by timestamp descending
                                     )
                                     
                                     if newest_message:
                                         # Update conversation with new last message and timestamp
-                                        conversations_collection.update_one(
+                                        await asyncio.to_thread(
+                                            conversations_collection.update_one,
                                             {"conversation_id": conversation_id},
                                             {"$set": {
                                                 "last_message": newest_message.get("content", ""),
@@ -2393,7 +2488,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         )
                                     else:
                                         # If no messages left, set default
-                                        conversations_collection.update_one(
+                                        await asyncio.to_thread(
+                                            conversations_collection.update_one,
                                             {"conversation_id": conversation_id},
                                             {"$set": {
                                                 "last_message": "(No messages)",
@@ -2402,7 +2498,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         )
                                 
                                 # Get updated conversation for broadcasting
-                                conversation = conversations_collection.find_one({"id": conversation_id})
+                                conversation = await asyncio.to_thread(
+                                    conversations_collection.find_one,
+                                    {"id": conversation_id},
+                                )
                                 
                                 # Format for broadcasting
                                 if conversation:
@@ -2480,16 +2579,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         services.processed_message_reaction_ids[key] = timestamp
 
                         # Find the corresponding Instagram account in our connections
-                        instagram_connection = db.instagram_connections.find_one(
+                        instagram_connection = await asyncio.to_thread(
+                            db.instagram_connections.find_one,
                             {"instagram_id": recipient_id, "is_active": True},
-                            sort=[("last_updated", -1)]
+                            sort=[("last_updated", -1)],
                         )
 
                         if not instagram_connection:
                             logger.error(f"No active Instagram connection found for recipient ID: {recipient_id}")
                             return {"status": "ok"}
                         
-                        org_collection = db.organizations.find_one({"ig_id": recipient_id})
+                        org_collection = await asyncio.to_thread(
+                            db.organizations.find_one,
+                            {"ig_id": recipient_id},
+                        )
 
                         if not org_collection:
                             logger.error(f"No active organization found for Instagram ID: {recipient_id}")
@@ -2526,7 +2629,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Update the message with the reaction info in  database and it for broadcasting
                             try:
                                 # Update the message with the reaction info
-                                broadcast_message = messages_collection.find_one_and_update(
+                                broadcast_message = await asyncio.to_thread(
+                                    messages_collection.find_one_and_update,
                                     {"message_id": mid},
                                     {"$set": {
                                         "reaction": {
@@ -2537,7 +2641,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                             "timestamp": timestamp
                                         }
                                     }}, 
-                                    return_document=ReturnDocument.AFTER
+                                    return_document=ReturnDocument.AFTER,
                                 )
                                 
                                 if not broadcast_message:
@@ -2552,10 +2656,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             # Update the message with the reaction info in  database and it for broadcasting
                             try:
                                 # Update the message with the reaction info
-                                broadcast_message = messages_collection.find_one_and_update(
+                                broadcast_message = await asyncio.to_thread(
+                                    messages_collection.find_one_and_update,
                                     {"message_id": mid},
                                     {"$unset": {"reaction": 1}}, 
-                                    return_document=ReturnDocument.AFTER
+                                    return_document=ReturnDocument.AFTER,
                                 )
                                 
                                 if not broadcast_message:
@@ -2617,7 +2722,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                     if message_echo:
                         recipient_id, sender_id = sender_id, recipient_id
 
-                    org_collection = db.organizations.find_one({"ig_id": recipient_id})
+                    org_collection = await asyncio.to_thread(
+                        db.organizations.find_one,
+                        {"ig_id": recipient_id},
+                    )
 
                     if not org_collection:
                         logger.error(f"No active organization found for Instagram ID: {recipient_id}")
@@ -2630,9 +2738,10 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                         return {"status": "ok"}
 
                     # Resolve credentials only after the account's organization is known.
-                    instagram_connection = db.instagram_connections.find_one(
+                    instagram_connection = await asyncio.to_thread(
+                        db.instagram_connections.find_one,
                         {"org_id": org_id, "instagram_id": recipient_id, "is_active": True},
-                        sort=[("last_updated", -1)]
+                        sort=[("last_updated", -1)],
                     )
 
                     if not instagram_connection:
@@ -2713,10 +2822,17 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                     logger.info(f"Message Received from {user}, Message: {message_text}")
 
-                    webhook_claim_token = claim_instagram_webhook_message(org_id, ig_message_id)
+                    webhook_claim_token = await asyncio.to_thread(
+                        claim_instagram_webhook_message,
+                        org_id,
+                        ig_message_id,
+                    )
                     downstream_claim_token = webhook_claim_token
                     if not webhook_claim_token:
-                        existing_message = messages_collection.find_one({"id": ig_message_id})
+                        existing_message = await asyncio.to_thread(
+                            messages_collection.find_one,
+                            {"id": ig_message_id},
+                        )
                         if existing_message and existing_message.get("queue_sync_pending"):
                             try:
                                 await sync_instagram_outbound_conversation(
@@ -2727,7 +2843,11 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 )
                             except Exception:
                                 logger.exception("Could not reconcile duplicate Instagram echo")
-                        downstream_claim_token = claim_instagram_webhook_downstream(org_id, ig_message_id)
+                        downstream_claim_token = await asyncio.to_thread(
+                            claim_instagram_webhook_downstream,
+                            org_id,
+                            ig_message_id,
+                        )
                         if not downstream_claim_token:
                             logger.info(f"Duplicate Instagram message ignored: {ig_message_id}")
                             continue
@@ -2768,31 +2888,52 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 claim_token=webhook_claim_token,
                             )
                         except Exception:
-                            release_instagram_webhook_claim(org_id, ig_message_id, webhook_claim_token)
+                            await asyncio.to_thread(
+                                release_instagram_webhook_claim,
+                                org_id,
+                                ig_message_id,
+                                webhook_claim_token,
+                            )
                             raise
 
-                    downstream_state = messages_collection.find_one({"id": ig_message_id}) or {}
+                    downstream_state = await asyncio.to_thread(
+                        messages_collection.find_one,
+                        {"id": ig_message_id},
+                    ) or {}
                     if (
                         not message_echo
                         and isinstance(message_text, str)
                         and not downstream_state.get("followup_processed")
                     ):
                         intercepted = await handle_followup_customer_reply(org_id, conversation_id, message_text)
-                        messages_collection.update_one(
+                        await asyncio.to_thread(
+                            messages_collection.update_one,
                             {"id": ig_message_id, "webhook_claim_token": downstream_claim_token},
                             {"$set": {"followup_processed": True}},
                         )
                         if intercepted:
                             logger.info(f"Follow-up reply intercepted for {conversation_id}")
-                            complete_instagram_webhook_message(org_id, ig_message_id, downstream_claim_token)
+                            await asyncio.to_thread(
+                                complete_instagram_webhook_message,
+                                org_id,
+                                ig_message_id,
+                                downstream_claim_token,
+                            )
                             return {"status": "ok"}
                     
                     if not message_echo:
                         # Get conversation doc to check if AI is enabled
-                        convo_doc = conversations_collection.find_one({"conversation_id": conversation_id})
+                        convo_doc = await asyncio.to_thread(
+                            conversations_collection.find_one,
+                            {"conversation_id": conversation_id},
+                        )
                         is_conv_ai_enabled = convo_doc.get("is_ai_enabled", False) if convo_doc else True
                         
-                        org_doc = db.organizations.find_one({"org_id": org_id},{"is_ai_enabled": 1})
+                        org_doc = await asyncio.to_thread(
+                            db.organizations.find_one,
+                            {"org_id": org_id},
+                            {"is_ai_enabled": 1},
+                        )
                         is_org_ai_enabled = org_doc.get("is_ai_enabled", False) if org_doc else False
                         
                         is_heidelai_ig = recipient_id == HEIDELAI_ORG_IG_ID
@@ -2880,33 +3021,44 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         source_message_id=ig_message_id,
                                     )
                                 except Exception:
-                                    release_instagram_webhook_downstream(
-                                        org_id, ig_message_id, downstream_claim_token
+                                    await asyncio.to_thread(
+                                        release_instagram_webhook_downstream,
+                                        org_id,
+                                        ig_message_id,
+                                        downstream_claim_token,
                                     )
                                     raise
                                 ai_processing_complete = True
                             except Exception:
-                                release_instagram_webhook_downstream(
-                                    org_id, ig_message_id, downstream_claim_token
+                                await asyncio.to_thread(
+                                    release_instagram_webhook_downstream,
+                                    org_id,
+                                    ig_message_id,
+                                    downstream_claim_token,
                                 )
                                 raise
                             finally:
                                 if ai_processing_complete:
                                     try:
-                                        finalized = messages_collection.update_one(
+                                        finalized = await asyncio.to_thread(
+                                            messages_collection.update_one,
                                             {"id": ig_message_id, "webhook_claim_token": downstream_claim_token},
                                             {"$set": {"ai_processed": True}},
                                         )
                                         if not finalized.matched_count:
                                             raise RuntimeError("Instagram AI downstream claim was replaced")
                                     except Exception:
-                                        release_instagram_webhook_downstream(
-                                            org_id, ig_message_id, downstream_claim_token
+                                        await asyncio.to_thread(
+                                            release_instagram_webhook_downstream,
+                                            org_id,
+                                            ig_message_id,
+                                            downstream_claim_token,
                                         )
                                         raise
 
                         if background_tasks and not downstream_state.get("automation_queued"):
-                            messages_collection.update_one(
+                            await asyncio.to_thread(
+                                messages_collection.update_one,
                                 {"id": ig_message_id, "webhook_claim_token": downstream_claim_token},
                                 {"$set": {"automation_queued": True}},
                             )
@@ -2931,8 +3083,14 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             logger.warning("No background_tasks provided, skipping automation trigger for message_received.")
 
                     # Check if conversation exists
-                    existing_conversation = conversations_collection.find_one({"conversation_id": conversation_id})
-                    conversation = conversations_collection.find_one({"conversation_id": conversation_id})
+                    existing_conversation = await asyncio.to_thread(
+                        conversations_collection.find_one,
+                        {"conversation_id": conversation_id},
+                    )
+                    conversation = await asyncio.to_thread(
+                        conversations_collection.find_one,
+                        {"conversation_id": conversation_id},
+                    )
 
                     if recipient_id in services.instagram_connections_map:
                         for connection_key in services.instagram_connections_map[recipient_id]:
@@ -2987,7 +3145,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                         store_contact_background(background_tasks, org_id, "instagram", contact_data)
 
-                    complete_instagram_webhook_message(org_id, ig_message_id, downstream_claim_token)
+                    await asyncio.to_thread(
+                        complete_instagram_webhook_message,
+                        org_id,
+                        ig_message_id,
+                        downstream_claim_token,
+                    )
                     return {"status": "ok"}
                     # Broadcast the new message to Instagram-specific clients
                     # await broadcast_instagram_message(recipient_id, "new_message", {

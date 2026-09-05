@@ -89,7 +89,10 @@ def test_instagram_outbound_messages_are_confirmed_persisted_and_deduplicated():
         Path("api/webhook_routes.py").read_text(), handler
     )
     assert 'ai_result.get("sales_action_job_id") != (' in handler_source
-    claim_line = _calls(handler, "claim_instagram_webhook_message")[0].lineno
+    claim_line = next(
+        node.lineno for node in ast.walk(handler)
+        if isinstance(node, ast.Name) and node.id == "claim_instagram_webhook_message"
+    )
     conversation_line = next(
         node.lineno for node in _calls(handler, "create_or_update_instagram_conversation")
         if node.lineno > claim_line

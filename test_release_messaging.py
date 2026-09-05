@@ -262,7 +262,7 @@ class MessagingTests(unittest.IsolatedAsyncioTestCase):
         parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name) and node.func.id == "_business_phone_scope"]
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 3)
         self.assertTrue(all(isinstance(parents[node], ast.Await) for node in calls))
 
     async def test_bulk_route_uses_explicit_secondary_waba(self):

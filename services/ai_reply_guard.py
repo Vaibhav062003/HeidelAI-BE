@@ -50,8 +50,19 @@ def log_ai_failure(
     org_id: str,
     conversation_id: str,
 ) -> None:
+    subject = (
+        "AI reply delivery unavailable"
+        if error.category in {
+            "delivery_error",
+            "delivery_sync_failed",
+            "delivery_unknown",
+            "sales_action_delivery_conflict",
+        }
+        else "AI provider unavailable"
+    )
     logger.warning(
-        "AI provider unavailable category=%s status=%s org=%s conversation=...%s",
+        "%s category=%s status=%s org=%s conversation=...%s",
+        subject,
         error.category,
         error.upstream_status,
         org_id,

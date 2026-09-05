@@ -39,8 +39,9 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
             pass
         class InvalidFrame(Exception):
             pass
-        scope = functions("api/websockets_routes.py", ["main_ws", "_active_account_ids"],
+        scope = functions("api/websockets_routes.py", ["main_ws", "_active_account_ids", "_reject_if_mongo_unavailable"],
                           db=db, services=state, suppress=suppress,
+                          mongo_retry_allowed=lambda: True,
                           validate_websocket_identifier=Mock(),
                           HTTPAuthorizationCredentials=lambda **kw: SimpleNamespace(**kw),
                           authenticate_credentials=AsyncMock(return_value=SimpleNamespace(org_id="org", user_id="user", role="admin", full_name="Agent")),
@@ -49,6 +50,15 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
                           WebSocketDisconnect=Disconnect, get_org_presence_snapshot=Mock(return_value={}),
                           start_heartbeat=AsyncMock(), receive_websocket_control_frame=AsyncMock(side_effect=Disconnect))
         return scope, socket, state
+
+    async def test_websocket_rejects_before_database_access_during_outage(self):
+        db = Mock(side_effect=AssertionError("outage websocket accessed database"))
+        scope, socket, _ = self.websocket_scope(db)
+        scope["mongo_retry_allowed"] = lambda: False
+        await scope["main_ws"](socket, "client")
+        socket.accept.assert_awaited_once()
+        socket.close.assert_awaited_once_with(code=1013, reason="Service temporarily unavailable")
+        scope["authenticate_credentials"].assert_not_awaited()
 
     async def assert_nonblocking(self, invoke, **kwargs):
         """A real thread-blocking fake must not hold the event loop until it returns."""
@@ -90,7 +100,10 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
             collection = Mock()
             collection.find.return_value.limit.return_value.__iter__ = lambda _: stalled()
             scope = functions("services/wa_service.py", ["reconcile_pending_whatsapp_revocations"],
-                              db=SimpleNamespace(whatsapp_connections=collection))
+                              db=SimpleNamespace(whatsapp_connections=collection),
+                              mongo_retry_allowed=lambda: True,
+                              mark_mongo_unavailable=Mock(),
+                              ConnectionFailure=TimeoutError)
             return await scope["reconcile_pending_whatsapp_revocations"]()
         await self.assert_nonblocking(invoke)
 
@@ -119,6 +132,28 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
                     socket.close.assert_awaited_once_with(code=1011, reason="Internal websocket error")
                     scope["cleanup_client"].assert_not_awaited()
                 await self.assert_nonblocking(invoke)
+
+    async def test_admin_conversation_broadcast_does_not_wait_for_database(self):
+        state = SimpleNamespace(client_metadata={
+            "admin-client": {"org_id": "org", "role": "org:admin", "user_id": "admin"},
+        })
+        scope = functions(
+            "services/websocket_service.py",
+            ["_eligible_conversation_clients"],
+            services=state,
+            get_async_mongo_db=Mock(side_effect=AssertionError("broadcast accessed database")),
+        )
+        work_teams = SimpleNamespace(
+            can_user_access_conversation=Mock(),
+            is_admin=lambda role: role in {"admin", "org:admin"},
+            list_work_teams=AsyncMock(side_effect=AssertionError("broadcast loaded work teams")),
+        )
+        with patch.dict("sys.modules", {"services.work_team_service": work_teams}):
+            allowed = await scope["_eligible_conversation_clients"](
+                {"admin-client"}, "conversation", {"conversation_id": "conversation"}
+            )
+        self.assertEqual(allowed, {"admin-client"})
+        work_teams.list_work_teams.assert_not_awaited()
 
     async def test_websocket_duplicate_race_does_not_clean_up_other_connection(self):
         db = SimpleNamespace(organizations=SimpleNamespace(find_one=lambda *_: {}),
@@ -149,6 +184,7 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
         scope = functions("services/intent_queue_worker.py",
                           ["startup_intent_worker", "shutdown_intent_worker", "_restock_polling_loop"],
                           _polling_task=None, _restock_task=None, POLL_INTERVAL_SECONDS=15,
+                          wait_for_mongo_available=AsyncMock(),
                           _ensure_indexes=Mock(), _recover_stuck_jobs=Mock())
         running = asyncio.Event()
         async def intent_loop():
@@ -173,6 +209,7 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
         scope = functions("services/intent_queue_worker.py",
                           ["startup_intent_worker", "shutdown_intent_worker", "_restock_polling_loop", "_polling_loop"],
                           _polling_task=None, _restock_task=None, POLL_INTERVAL_SECONDS=0.001,
+                          wait_for_mongo_available=AsyncMock(),
                           _ensure_indexes=Mock(), _recover_stuck_jobs=Mock())
         polled = asyncio.Event()
         blocked = asyncio.Event()
@@ -206,7 +243,12 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
             sleeps.append(delay)
             if len(sleeps) == 2:
                 raise asyncio.CancelledError
-        scope = functions("services/intent_queue_worker.py", ["_restock_polling_loop"], POLL_INTERVAL_SECONDS=15)
+        scope = functions(
+            "services/intent_queue_worker.py",
+            ["_restock_polling_loop"],
+            POLL_INTERVAL_SECONDS=15,
+            wait_for_mongo_available=AsyncMock(),
+        )
         scope["asyncio"] = SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError)
         product = SimpleNamespace(ensure_product_request_indexes=AsyncMock(side_effect=[RuntimeError("index"), None]),
                                   process_restock_outbox=AsyncMock())

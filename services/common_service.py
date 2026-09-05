@@ -627,8 +627,9 @@ async def fetch_conversations_new(
     access = await conversation_access_condition(org_id, current_user_id or "", current_user_role)
     if access:
         base_conditions.append(access)
-    if business_phone_id:
-        base_conditions.append(await _business_phone_scope(org_id, business_phone_id))
+    phone_scope = await _business_phone_scope(org_id, business_phone_id) if business_phone_id else None
+    if phone_scope:
+        base_conditions.append(phone_scope)
     if active_tab == "team" and team_id:
         await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
     base_conditions.extend(_queue_filter_conditions(
@@ -708,9 +709,30 @@ async def fetch_conversations_new(
         .limit(limit) # <-- Added limit
     )
 
-    # Fetch all docs
-    raw_docs = await cursor.to_list(length=limit)
-    total = await collection.count_documents(query) if include_meta else None
+    if include_meta:
+        count_scope_parts = [{"type": {"$ne": "team"}}]
+        if access:
+            count_scope_parts.append(access)
+        if phone_scope:
+            count_scope_parts.append(phone_scope)
+        count_scope = {"$and": count_scope_parts} if len(count_scope_parts) > 1 else count_scope_parts[0]
+        team_conditions = _queue_filter_conditions("team", current_user_id, None, None, None, None, team_id)
+        facets = {
+            "all": [{"$match": count_scope}, {"$count": "value"}],
+            "mine": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("mine", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
+            "transferred": [{"$match": {"$and": [count_scope, _transferred_condition(current_user_id)]}}, {"$count": "value"}],
+            "team": [{"$match": {"$and": [count_scope, *team_conditions]}} if team_conditions else {"$match": {"_id": None}}, {"$count": "value"}],
+            "unassigned": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("unassigned", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
+            "escalated": [{"$match": {"$and": [count_scope, _escalated_condition()]}}, {"$count": "value"}],
+        }
+        raw_docs, total, count_result = await asyncio.gather(
+            cursor.to_list(length=limit),
+            collection.count_documents(query),
+            collection.aggregate([{"$facet": facets}]).to_list(length=1),
+        )
+    else:
+        raw_docs = await cursor.to_list(length=limit)
+        total = None
 
     fetch_time = time.time()
     logger.info(f"[TIMING] Mongo fetch: {fetch_time - start_time:.4f}s")
@@ -778,22 +800,6 @@ async def fetch_conversations_new(
     if not include_meta:
         return result
 
-    count_scope_parts = [{"type": {"$ne": "team"}}]
-    if access:
-        count_scope_parts.append(access)
-    if business_phone_id:
-        count_scope_parts.append(await _business_phone_scope(org_id, business_phone_id))
-    count_scope = {"$and": count_scope_parts} if len(count_scope_parts) > 1 else count_scope_parts[0]
-    team_conditions = _queue_filter_conditions("team", current_user_id, None, None, None, None, team_id)
-    facets = {
-        "all": [{"$match": count_scope}, {"$count": "value"}],
-        "mine": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("mine", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
-        "transferred": [{"$match": {"$and": [count_scope, _transferred_condition(current_user_id)]}}, {"$count": "value"}],
-        "team": [{"$match": {"$and": [count_scope, *team_conditions]}} if team_conditions else {"$match": {"_id": None}}, {"$count": "value"}],
-        "unassigned": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("unassigned", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
-        "escalated": [{"$match": {"$and": [count_scope, _escalated_condition()]}}, {"$count": "value"}],
-    }
-    count_result = await collection.aggregate([{"$facet": facets}]).to_list(length=1)
     raw_counts = count_result[0] if count_result else {}
     counts = {
         key: (raw_counts.get(key) or [{"value": 0}])[0].get("value", 0)

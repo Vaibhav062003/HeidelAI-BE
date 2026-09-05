@@ -46,10 +46,10 @@ jobs:
       - name: Dry run
         env:
           ORG_ID: ${{ inputs.org_id }}
-        run: koyeb services exec backend/backend python -- -m scripts.migrate_multi_whatsapp --org-id "$ORG_ID"
+        run: script --quiet --return --command 'koyeb services exec backend/backend python -- -m scripts.migrate_multi_whatsapp --org-id "$ORG_ID"' /dev/null
 
       - name: Apply
         if: ${{ inputs.apply }}
         env:
           ORG_ID: ${{ inputs.org_id }}
-        run: koyeb services exec backend/backend python -- -m scripts.migrate_multi_whatsapp --org-id "$ORG_ID" --apply
+        run: script --quiet --return --command 'koyeb services exec backend/backend python -- -m scripts.migrate_multi_whatsapp --org-id "$ORG_ID" --apply' /dev/null
