@@ -1754,19 +1754,26 @@ async def update_whatsapp_message_status(
         elif status in {"sent", "delivered", "read"}:
             update["$unset"] = {"delivery_error": ""}
 
-        result = messages_collection.find_one_and_update(
+        result = await asyncio.to_thread(
+            messages_collection.find_one_and_update,
             status_filter,
             update,
-            return_document=ReturnDocument.AFTER
+            return_document=ReturnDocument.AFTER,
         )
         
         if result:
             logger.success(f"WhatsApp message {message_id} status updated to {status}")
             return result
-        return None
+        return await asyncio.to_thread(
+            messages_collection.find_one,
+            {"message_id": message_id, "platform": "whatsapp"},
+        )
     
+    except ConnectionFailure:
+        raise
     except Exception as e:
         logger.error(f"Error updating WhatsApp message status: {e}")
+        return None
 
 async def archive_whatsapp_data(org_id: str, phone_id: str, expire_days=30):
     """Archive only the conversations owned by one WhatsApp phone number."""

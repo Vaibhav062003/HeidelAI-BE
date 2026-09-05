@@ -9,6 +9,7 @@ from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
 from services.followup_service import process_scheduled_messages as drain_scheduled_followups
 from services.ai_policy_service import resume_expired_ai_pauses
+from pymongo.errors import PyMongoError
 # from services.websocket_service import broadcast_on_stats_update
 from loguru import logger
 
@@ -23,7 +24,10 @@ messaging_services = {
 }
 
 async def process_scheduled_messages():
-    await drain_scheduled_followups(messaging_services)
+    try:
+        await drain_scheduled_followups(messaging_services)
+    except PyMongoError as exc:
+        logger.warning("Scheduled follow-up polling deferred: MongoDB unavailable ({})", type(exc).__name__)
 
 async def process_inactivity_for_org(org_id: str):
     

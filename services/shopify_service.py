@@ -18,7 +18,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from fastapi import HTTPException
 from loguru import logger
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from config.settings import SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, SHOPIFY_PUBLIC_BASE_URL, WA_VERSION
 from database import get_async_mongo_db, get_mongo_db
@@ -1179,16 +1179,19 @@ async def sync_shopify_org(org_id: str) -> None:
 
 
 async def process_shopify_syncs() -> None:
-    await db.shopify_connections.update_many(
-        {"status": "connected", "sync_status": "complete", "last_sync_at": {"$lte": utcnow() - timedelta(minutes=5)}},
-        {"$set": {"sync_status": "pending", "sync_full": False, "sync_requested_at": utcnow(), "sync_cursor": {}, "sync_completed_resources": []}, "$unset": {"sync_cutoff_at": "", "sync_filter_field": "", "next_sync_attempt_at": ""}},
-    )
-    cursor = db.shopify_connections.find(
-        {"status": "connected", "sync_status": {"$in": ["pending", "failed", "syncing"]}, "next_sync_attempt_at": {"$not": {"$gt": utcnow()}}},
-        {"org_id": 1},
-    ).sort([("next_sync_attempt_at", 1), ("sync_requested_at", 1)]).limit(5)
-    async for item in cursor:
-        await sync_shopify_org(item["org_id"])
+    try:
+        await db.shopify_connections.update_many(
+            {"status": "connected", "sync_status": "complete", "last_sync_at": {"$lte": utcnow() - timedelta(minutes=5)}},
+            {"$set": {"sync_status": "pending", "sync_full": False, "sync_requested_at": utcnow(), "sync_cursor": {}, "sync_completed_resources": []}, "$unset": {"sync_cutoff_at": "", "sync_filter_field": "", "next_sync_attempt_at": ""}},
+        )
+        cursor = db.shopify_connections.find(
+            {"status": "connected", "sync_status": {"$in": ["pending", "failed", "syncing"]}, "next_sync_attempt_at": {"$not": {"$gt": utcnow()}}},
+            {"org_id": 1},
+        ).sort([("next_sync_attempt_at", 1), ("sync_requested_at", 1)]).limit(5)
+        async for item in cursor:
+            await sync_shopify_org(item["org_id"])
+    except PyMongoError as exc:
+        logger.warning("Shopify sync polling deferred: MongoDB unavailable ({})", type(exc).__name__)
 
 
 def verify_webhook_hmac(raw_body: bytes, supplied: str) -> None:
@@ -2150,10 +2153,10 @@ async def _is_whatsapp_suppressed(org_id: str, phone: str) -> bool:
 async def process_shopify_reminders() -> None:
     started_at = utcnow()
     claimed: list[tuple[dict, str]] = []
-    await db.shopify_worker_heartbeats.update_one(
-        {"_id": "recovery"}, {"$set": {"last_started_at": started_at, "last_error_code": None}}, upsert=True,
-    )
     try:
+        await db.shopify_worker_heartbeats.update_one(
+            {"_id": "recovery"}, {"$set": {"last_started_at": started_at, "last_error_code": None}}, upsert=True,
+        )
         stale_claim = {"$or": [
             {"claim_expires_at": {"$lte": started_at}}, {"claim_expires_at": None}, {"claim_expires_at": {"$exists": False}},
         ]}
@@ -2208,10 +2211,15 @@ async def process_shopify_reminders() -> None:
         await db.shopify_worker_heartbeats.update_one(
             {"_id": "recovery"}, {"$set": {"last_completed_at": utcnow(), "claimed_count": len(claimed), "last_error_code": None}}, upsert=True,
         )
+    except PyMongoError as exc:
+        logger.warning("Shopify reminder polling deferred: MongoDB unavailable ({})", type(exc).__name__)
     except Exception as exc:
-        await db.shopify_worker_heartbeats.update_one(
-            {"_id": "recovery"}, {"$set": {"last_error_at": utcnow(), "last_error_code": type(exc).__name__, "claimed_count": len(claimed)}}, upsert=True,
-        )
+        try:
+            await db.shopify_worker_heartbeats.update_one(
+                {"_id": "recovery"}, {"$set": {"last_error_at": utcnow(), "last_error_code": type(exc).__name__, "claimed_count": len(claimed)}}, upsert=True,
+            )
+        except PyMongoError:
+            logger.warning("Could not record Shopify reminder worker failure: MongoDB unavailable")
         raise
 
 

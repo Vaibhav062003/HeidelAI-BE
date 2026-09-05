@@ -75,6 +75,49 @@ async def _best_effort_typing(
         logger.warning("Could not send WhatsApp typing indicator: {}", exc)
 
 
+async def _propagate_whatsapp_delivery_status(
+    org_id: str,
+    message_id: str,
+    status_type: str,
+    status_payload: dict,
+    delivery_error: dict | None,
+    include_shopify: bool,
+) -> None:
+    if status_type == "failed":
+        try:
+            await asyncio.to_thread(
+                record_whatsapp_provider_block,
+                org_id,
+                status_payload.get("recipient_id"),
+                status_payload,
+            )
+        except Exception as exc:
+            logger.debug("WhatsApp provider block propagation skipped for {}: {}", message_id, type(exc).__name__)
+    if include_shopify:
+        try:
+            await update_shopify_reminder_delivery(org_id, message_id, status_type, delivery_error)
+        except Exception as exc:
+            logger.debug("Shopify reminder delivery propagation skipped for {}: {}", message_id, type(exc).__name__)
+    try:
+        from services.sales_offer_service import update_offer_delivery
+
+        await update_offer_delivery(org_id, message_id, status_type)
+    except Exception as exc:
+        logger.debug("Offer delivery propagation skipped for {}: {}", message_id, type(exc).__name__)
+    try:
+        from services.pricing_service import update_ai_pricing_delivery
+
+        await update_ai_pricing_delivery(org_id, message_id, status_type)
+    except Exception as exc:
+        logger.debug("AI price delivery propagation skipped for {}: {}", message_id, type(exc).__name__)
+    try:
+        from services.google_sheet_automation import update_sheet_sent_status
+
+        await update_sheet_sent_status(org_id=org_id, message_id=message_id, status=status_type)
+    except Exception as exc:
+        logger.debug("Sheet status propagation skipped for {}: {}", message_id, type(exc).__name__)
+
+
 def _log_product_reply_latency(
     org_id: str,
     conversation_id: str,
@@ -953,24 +996,21 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             normalize_whatsapp_delivery_error(status, stage="delivery")
                             if status_type == "failed" else None
                         )
-                        if status_type == "failed":
-                            await asyncio.to_thread(
-                                record_whatsapp_provider_block,
-                                connection.get("org_id"),
-                                status.get("recipient_id"),
-                                status,
-                            )
-                        
                         logger.info(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
 
-                        try:
-                            shopify_error = await update_shopify_reminder_delivery(
-                                connection.get("org_id"), message_id, status_type, delivery_error,
-                            )
-                            if shopify_error:
-                                delivery_error = shopify_error
-                        except Exception as exc:
-                            logger.debug(f"Shopify reminder delivery propagation skipped for {message_id}: {exc}")
+                        if status_type == "failed":
+                            try:
+                                shopify_error = await update_shopify_reminder_delivery(
+                                    connection.get("org_id"), message_id, status_type, delivery_error,
+                                )
+                                if shopify_error:
+                                    delivery_error = shopify_error
+                            except Exception as exc:
+                                logger.debug(
+                                    "Shopify reminder delivery propagation skipped for {}: {}",
+                                    message_id,
+                                    type(exc).__name__,
+                                )
 
                         # Update the message after Shopify augments retry state.
                         broadcast_message = await update_whatsapp_message_status(
@@ -980,31 +1020,18 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             delivery_error=delivery_error,
                         )
 
-                        try:
-                            from services.sales_offer_service import update_offer_delivery
-
-                            await update_offer_delivery(connection.get("org_id"), message_id, status_type)
-                        except Exception as exc:
-                            logger.debug(f"Offer delivery propagation skipped for {message_id}: {exc}")
-
-                        try:
-                            from services.pricing_service import update_ai_pricing_delivery
-
-                            await update_ai_pricing_delivery(connection.get("org_id"), message_id, status_type)
-                        except Exception as exc:
-                            logger.debug(f"AI price delivery propagation skipped for {message_id}: {exc}")
-
-                        # Propagate delivery status to Google Sheet automation tracking
-                        # (no-op if message_id doesn't exist in the sheet sent collection)
-                        try:
-                            from services.google_sheet_automation import update_sheet_sent_status
-                            await update_sheet_sent_status(
-                                org_id=connection.get("org_id"),
-                                message_id=message_id,
-                                status=status_type,
-                            )
-                        except Exception as e:
-                            logger.debug(f"Sheet status propagation skipped for {message_id}: {e}")
+                        delivery_task = (
+                            connection.get("org_id"),
+                            message_id,
+                            status_type,
+                            status,
+                            delivery_error,
+                            status_type != "failed",
+                        )
+                        if background_tasks:
+                            background_tasks.add_task(_propagate_whatsapp_delivery_status, *delivery_task)
+                        else:
+                            asyncio.create_task(_propagate_whatsapp_delivery_status(*delivery_task))
 
                         if not broadcast_message:
                             logger.warning(f"No message found with ID {message_id} to update status.")

@@ -53,6 +53,9 @@ def load_service():
     class DuplicateKeyError(Exception):
         pass
 
+    class PyMongoError(Exception):
+        pass
+
     class MessageRole:
         AGENT = "agent"
 
@@ -67,7 +70,11 @@ def load_service():
     _module("fastapi", HTTPException=HTTPException)
     _module("loguru", logger=_Logger())
     pymongo = _module("pymongo", ReturnDocument=types.SimpleNamespace(AFTER="after"), UpdateOne=object)
-    pymongo.errors = _module("pymongo.errors", DuplicateKeyError=DuplicateKeyError)
+    pymongo.errors = _module(
+        "pymongo.errors",
+        DuplicateKeyError=DuplicateKeyError,
+        PyMongoError=PyMongoError,
+    )
     config = _module("config")
     config.settings = _module(
         "config.settings",
@@ -367,6 +374,22 @@ async def test_concurrent_workers_claim_once(service):
 
     await asyncio.gather(run_worker(service, database, send), run_worker(service, database, send))
     assert attempts == 1, f"expected one provider attempt, got {attempts}"
+
+
+async def test_database_outage_defers_worker_ticks(service):
+    class OfflineCollection:
+        async def update_one(self, *_args, **_kwargs):
+            raise service.PyMongoError("offline")
+
+        async def update_many(self, *_args, **_kwargs):
+            raise service.PyMongoError("offline")
+
+    service.db = FakeDB(
+        shopify_connections=OfflineCollection(),
+        shopify_worker_heartbeats=OfflineCollection(),
+    )
+    await service.process_shopify_syncs()
+    await service.process_shopify_reminders()
 
 
 async def test_expired_claim_recovery(service):
@@ -916,6 +939,7 @@ async def main():
     test_delays_and_product_summary(load_service())
     await test_hanging_checkout_does_not_block_next(load_service())
     await test_concurrent_workers_claim_once(load_service())
+    await test_database_outage_defers_worker_ticks(load_service())
     await test_expired_claim_recovery(load_service())
     await test_checkout_update_and_order_races(load_service())
     await test_refresh_shape_change_does_not_restart_elapsed_timer(load_service())

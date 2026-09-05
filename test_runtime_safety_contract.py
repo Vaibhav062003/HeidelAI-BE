@@ -319,6 +319,38 @@ def test_webhook_sync_database_operations_leave_the_event_loop() -> None:
     } <= threaded
 
 
+def test_duplicate_whatsapp_status_returns_the_existing_message() -> None:
+    node = copy.deepcopy(_function("services/wa_service.py", "update_whatsapp_message_status"))
+    node.decorator_list = []
+    node.returns = None
+    for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
+        arg.annotation = None
+
+    existing = {"message_id": "mid", "platform": "whatsapp", "status": "read"}
+
+    class Collection:
+        def find_one_and_update(self, *_args, **_kwargs):
+            return None
+
+        def find_one(self, *_args, **_kwargs):
+            return existing
+
+    class Logger:
+        def __getattr__(self, _):
+            return lambda *args, **kwargs: None
+
+    namespace = {
+        "asyncio": asyncio,
+        "db": {"messages_org": Collection()},
+        "ReturnDocument": SimpleNamespace(AFTER="after"),
+        "ConnectionFailure": OSError,
+        "logger": Logger(),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "status", "exec"), namespace)
+    result = asyncio.run(namespace["update_whatsapp_message_status"]("org", "mid", "read"))
+    assert result == existing
+
+
 if __name__ == "__main__":
     test_rate_keys_separate_bearer_identities_behind_one_proxy()
     test_control_frames_are_bounded_and_typed()
@@ -329,4 +361,5 @@ if __name__ == "__main__":
     test_readiness_fails_closed_on_mongo_timeout()
     test_whatsapp_critical_sync_operations_leave_the_event_loop()
     test_webhook_sync_database_operations_leave_the_event_loop()
+    test_duplicate_whatsapp_status_returns_the_existing_message()
     print("Runtime safety contracts passed.")
