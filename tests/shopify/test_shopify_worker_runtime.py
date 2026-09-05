@@ -83,7 +83,12 @@ def load_service():
         SHOPIFY_PUBLIC_BASE_URL="https://example.test",
         WA_VERSION="v24.0",
     )
-    _module("database", get_async_mongo_db=lambda: FakeDB(), get_mongo_db=lambda: FakeDB())
+    _module(
+        "database",
+        get_async_mongo_db=lambda: FakeDB(),
+        get_mongo_db=lambda: FakeDB(),
+        mark_mongo_unavailable=lambda: None,
+    )
     schemas = _module("schemas")
     schemas.models = _module("schemas.models", MessageRole=MessageRole)
     _module(

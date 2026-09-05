@@ -90,7 +90,10 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
             collection = Mock()
             collection.find.return_value.limit.return_value.__iter__ = lambda _: stalled()
             scope = functions("services/wa_service.py", ["reconcile_pending_whatsapp_revocations"],
-                              db=SimpleNamespace(whatsapp_connections=collection))
+                              db=SimpleNamespace(whatsapp_connections=collection),
+                              mongo_retry_allowed=lambda: True,
+                              mark_mongo_unavailable=Mock(),
+                              ConnectionFailure=TimeoutError)
             return await scope["reconcile_pending_whatsapp_revocations"]()
         await self.assert_nonblocking(invoke)
 
