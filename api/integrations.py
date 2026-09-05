@@ -28,10 +28,27 @@ async def get_integrations_status(request: Request, user: CurrentUser):
             raise HTTPException(status_code=404, detail="Organization not found")
         
         # Fetch integration status
+        google_connected = False
+        if org_data.get("google_id"):
+            # Cross-check: verify the connection actually exists and is active
+            active_conn = db.google_connections.find_one(
+                {"org_id": org_id, "status": "active"},
+                {"_id": 1}
+            )
+            if active_conn:
+                google_connected = True
+            else:
+                # Auto-heal: clear stale google_id from org document
+                db.organizations.update_one(
+                    {"org_id": org_id},
+                    {"$set": {"google_id": None}}
+                )
+                logger.warning(f"Auto-healed stale google_id for org {org_id}")
+
         integration_status = {
             "instagram": bool(org_data.get("ig_id")),
             "whatsapp": bool(org_data.get("wa_id")),
-            "google": bool(org_data.get("google_id"))
+            "google": google_connected
         }
 
         return integration_status
