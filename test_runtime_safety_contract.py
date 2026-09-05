@@ -228,9 +228,57 @@ def test_mongo_release_boundaries() -> None:
 
     main_source = _source("main.py")
     handler = ast.get_source_segment(main_source, _function("main.py", "mongo_unavailable_handler"))
-    assert 'status_code=503' in handler
-    assert '"database_unavailable"' in handler
+    response = ast.get_source_segment(main_source, _function("main.py", "_mongo_unavailable_response"))
+    circuit = ast.get_source_segment(
+        main_source,
+        _function("main.py", "reject_database_requests_while_mongo_recovers"),
+    )
+    assert "mark_mongo_unavailable()" in handler
+    assert 'status_code=503' in response
+    assert '"database_unavailable"' in response
     assert "str(exc)" not in handler
+    assert 'path == "/webhook" or path.startswith("/api/")' in circuit
+    assert 'request.method != "OPTIONS"' in circuit
+    assert "not mongo_retry_allowed()" in circuit
+
+
+def test_mongo_outage_circuit_recovers_after_cooldown() -> None:
+    tree = ast.parse(_source("database/__init__.py"))
+    wanted_assignments = {"MONGO_OUTAGE_COOLDOWN_SECONDS", "_mongo_unavailable_until"}
+    nodes = [
+        node for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id in wanted_assignments for target in node.targets)
+        )
+        or isinstance(node, ast.FunctionDef)
+        and node.name in {"mark_mongo_unavailable", "mark_mongo_available", "mongo_retry_allowed"}
+    ]
+    clock = SimpleNamespace(now=100.0)
+    namespace = {"monotonic": lambda: clock.now}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "database", "exec"), namespace)
+
+    assert namespace["mongo_retry_allowed"]()
+    namespace["mark_mongo_unavailable"]()
+    assert not namespace["mongo_retry_allowed"]()
+    clock.now += namespace["MONGO_OUTAGE_COOLDOWN_SECONDS"]
+    assert namespace["mongo_retry_allowed"]()
+    namespace["mark_mongo_unavailable"]()
+    namespace["mark_mongo_available"]()
+    assert namespace["mongo_retry_allowed"]()
+
+
+def test_scheduler_defers_all_jobs_while_mongo_circuit_is_open() -> None:
+    source = _source("core/scheduler.py")
+    run_job = ast.get_source_segment(source, _function("core/scheduler.py", "_run_mongo_job"))
+    add_job = ast.get_source_segment(source, _function("core/scheduler.py", "_add_mongo_job"))
+    start = ast.get_source_segment(source, _function("core/scheduler.py", "start_scheduler"))
+    assert "if not mongo_retry_allowed()" in run_job
+    assert "except PyMongoError" in run_job
+    assert "mark_mongo_unavailable()" in run_job
+    assert "scheduler.add_job(" in add_job
+    assert "scheduler.add_job(" not in start
+    assert start.count("_add_mongo_job(") == 18
 
 
 def test_readiness_fails_closed_on_mongo_timeout() -> None:
@@ -254,6 +302,8 @@ def test_readiness_fails_closed_on_mongo_timeout() -> None:
         "asyncio": asyncio,
         "os": SimpleNamespace(getenv=lambda *_: "revision"),
         "get_async_mongo_client": lambda: SimpleNamespace(admin=Admin()),
+        "mark_mongo_available": lambda: None,
+        "mark_mongo_unavailable": lambda: None,
         "JSONResponse": Response,
         "ConnectionFailure": OSError,
         "PyMongoError": OSError,
@@ -319,6 +369,38 @@ def test_webhook_sync_database_operations_leave_the_event_loop() -> None:
     } <= threaded
 
 
+def test_duplicate_whatsapp_status_returns_the_existing_message() -> None:
+    node = copy.deepcopy(_function("services/wa_service.py", "update_whatsapp_message_status"))
+    node.decorator_list = []
+    node.returns = None
+    for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
+        arg.annotation = None
+
+    existing = {"message_id": "mid", "platform": "whatsapp", "status": "read"}
+
+    class Collection:
+        def find_one_and_update(self, *_args, **_kwargs):
+            return None
+
+        def find_one(self, *_args, **_kwargs):
+            return existing
+
+    class Logger:
+        def __getattr__(self, _):
+            return lambda *args, **kwargs: None
+
+    namespace = {
+        "asyncio": asyncio,
+        "db": {"messages_org": Collection()},
+        "ReturnDocument": SimpleNamespace(AFTER="after"),
+        "ConnectionFailure": OSError,
+        "logger": Logger(),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "status", "exec"), namespace)
+    result = asyncio.run(namespace["update_whatsapp_message_status"]("org", "mid", "read"))
+    assert result == existing
+
+
 if __name__ == "__main__":
     test_rate_keys_separate_bearer_identities_behind_one_proxy()
     test_control_frames_are_bounded_and_typed()
@@ -326,7 +408,10 @@ if __name__ == "__main__":
     test_cleanup_is_idempotent_across_every_client_registry()
     test_noncritical_scans_do_not_gate_lifespan_startup()
     test_mongo_release_boundaries()
+    test_mongo_outage_circuit_recovers_after_cooldown()
+    test_scheduler_defers_all_jobs_while_mongo_circuit_is_open()
     test_readiness_fails_closed_on_mongo_timeout()
     test_whatsapp_critical_sync_operations_leave_the_event_loop()
     test_webhook_sync_database_operations_leave_the_event_loop()
+    test_duplicate_whatsapp_status_returns_the_existing_message()
     print("Runtime safety contracts passed.")

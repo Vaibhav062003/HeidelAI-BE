@@ -2,13 +2,14 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # === Internal Modules ===
-from database import get_mongo_db
+from database import get_mongo_db, mark_mongo_unavailable, mongo_retry_allowed
 from core.services import services
 from services.platforms import instagram_service, whatsapp_service
 from services.common_service import close_conversation
 from services.scheduler_service import clean_expired_archives
 from services.followup_service import process_scheduled_messages as drain_scheduled_followups
 from services.ai_policy_service import resume_expired_ai_pauses
+from pymongo.errors import PyMongoError
 # from services.websocket_service import broadcast_on_stats_update
 from loguru import logger
 
@@ -23,7 +24,31 @@ messaging_services = {
 }
 
 async def process_scheduled_messages():
-    await drain_scheduled_followups(messaging_services)
+    try:
+        await drain_scheduled_followups(messaging_services)
+    except PyMongoError as exc:
+        mark_mongo_unavailable()
+        logger.warning("Scheduled follow-up polling deferred: MongoDB unavailable ({})", type(exc).__name__)
+
+
+async def _run_mongo_job(job):
+    if not mongo_retry_allowed():
+        return
+    try:
+        await job()
+    except PyMongoError as exc:
+        mark_mongo_unavailable()
+        logger.warning("{} deferred: MongoDB unavailable ({})", job.__name__, type(exc).__name__)
+
+
+def _add_mongo_job(scheduler, job, trigger, **kwargs):
+    return scheduler.add_job(
+        _run_mongo_job,
+        trigger,
+        args=(job,),
+        name=job.__name__,
+        **kwargs,
+    )
 
 async def process_inactivity_for_org(org_id: str):
     
@@ -140,8 +165,9 @@ def start_scheduler():
     from services.shopify_service import process_shopify_reminders, process_shopify_syncs
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
-    scheduler.add_job(
+    _add_mongo_job(scheduler, process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
+    _add_mongo_job(
+        scheduler,
         process_scheduled_messages,
         "interval",
         seconds=30,
@@ -149,24 +175,24 @@ def start_scheduler():
         max_instances=1,
         coalesce=True,
     )
-    scheduler.add_job(update_ai_status, "interval", minutes=1, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, update_ai_status, "interval", minutes=1, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
     # OOS: send pending dealer messages when business hours start (check every 15 min)
-    scheduler.add_job(process_pending_oos_sends, "interval", minutes=15)
-    scheduler.add_job(process_pending_oos_reply_steps, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(process_pending_sales_offer_audits, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(reconcile_stale_tally_jobs, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(process_tally_payment_reminders, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(check_tally_contact_sync_health, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(process_shopify_reminders, "interval", seconds=30, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
-    scheduler.add_job(process_shopify_syncs, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(process_pending_pricing_escalations, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(reconcile_active_product_sheets, "interval", minutes=15, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, process_pending_oos_sends, "interval", minutes=15)
+    _add_mongo_job(scheduler, process_pending_oos_reply_steps, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, process_pending_sales_offer_audits, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, reconcile_stale_tally_jobs, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, process_tally_payment_reminders, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, check_tally_contact_sync_health, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, process_shopify_reminders, "interval", seconds=30, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, process_shopify_syncs, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, process_pending_pricing_escalations, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, reconcile_active_product_sheets, "interval", minutes=15, max_instances=1, coalesce=True)
     # OOS: expire stale requests and escalate (check every hour)
-    scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
-    scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(process_pending_member_device_revocations, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
-    scheduler.add_job(cleanup_expired_tally_pdfs, "cron", hour=3, minute=45, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, process_expired_oos_requests, "interval", hours=1)
+    _add_mongo_job(scheduler, process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, process_pending_member_device_revocations, "interval", minutes=1, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
+    _add_mongo_job(scheduler, cleanup_expired_tally_pdfs, "cron", hour=3, minute=45, max_instances=1, coalesce=True)
     scheduler.start()
     _scheduler = scheduler
     logger.success("APScheduler started (interval = 6 hours).")

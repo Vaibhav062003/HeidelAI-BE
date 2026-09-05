@@ -1,6 +1,7 @@
 from pinecone import Pinecone
 from pymongo import MongoClient
 from motor.motor_asyncio import AsyncIOMotorClient
+from time import monotonic
 from config.settings import MONGODB_URI, MONGODB_CLUSTER, PINECONE_API_KEY, PINECONE_INDEX_NAME
 
 _client = None
@@ -10,6 +11,27 @@ _pinecone_index = None
 
 _async_client = None
 _async_db = None
+
+MONGO_OUTAGE_COOLDOWN_SECONDS = 15
+_mongo_unavailable_until = 0.0
+
+
+def mark_mongo_unavailable() -> None:
+    global _mongo_unavailable_until
+    _mongo_unavailable_until = max(
+        _mongo_unavailable_until,
+        monotonic() + MONGO_OUTAGE_COOLDOWN_SECONDS,
+    )
+
+
+def mark_mongo_available() -> None:
+    global _mongo_unavailable_until
+    _mongo_unavailable_until = 0.0
+
+
+def mongo_retry_allowed() -> bool:
+    return monotonic() >= _mongo_unavailable_until
+
 
 def get_async_mongo_client():
     global _async_client

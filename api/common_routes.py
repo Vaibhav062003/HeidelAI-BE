@@ -4,7 +4,7 @@ import re
 import requests
 import httpx
 from typing import Optional
-from database import get_async_mongo_client, get_mongo_db
+from database import get_async_mongo_client, get_mongo_db, mark_mongo_available, mark_mongo_unavailable
 from config.settings import APP_ID
 from config.settings import ACCESS_TOKEN
 from services.cloudinary_service import upload_media_to_cloudinary
@@ -108,6 +108,7 @@ async def readiness_check(request: Request):
             timeout=3,
         )
     except (asyncio.TimeoutError, PyMongoError):
+        mark_mongo_unavailable()
         return JSONResponse(
             status_code=503,
             content={
@@ -116,6 +117,7 @@ async def readiness_check(request: Request):
                 "dependency": "mongodb",
             },
         )
+    mark_mongo_available()
     return {"status": "ready", "revision": revision}
 
 @router.get("/favicon.ico", include_in_schema=False)

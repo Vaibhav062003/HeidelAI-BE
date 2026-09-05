@@ -15,7 +15,7 @@ from pymongo.errors import ConnectionFailure, DuplicateKeyError
 
 # Internal modules
 from core.managers import manager
-from database import get_mongo_db, get_mongo_client
+from database import get_mongo_db, get_mongo_client, mark_mongo_unavailable, mongo_retry_allowed
 from core.services import services
 from config.settings import IG_VERSION, VERSION, WA_VERSION, APP_ID
 from schemas.models import InteractiveListMessage, InteractiveReplyButtonMessage, InteractiveUrlButtonMessage, MessageRole
@@ -1754,19 +1754,26 @@ async def update_whatsapp_message_status(
         elif status in {"sent", "delivered", "read"}:
             update["$unset"] = {"delivery_error": ""}
 
-        result = messages_collection.find_one_and_update(
+        result = await asyncio.to_thread(
+            messages_collection.find_one_and_update,
             status_filter,
             update,
-            return_document=ReturnDocument.AFTER
+            return_document=ReturnDocument.AFTER,
         )
         
         if result:
             logger.success(f"WhatsApp message {message_id} status updated to {status}")
             return result
-        return None
+        return await asyncio.to_thread(
+            messages_collection.find_one,
+            {"message_id": message_id, "platform": "whatsapp"},
+        )
     
+    except ConnectionFailure:
+        raise
     except Exception as e:
         logger.error(f"Error updating WhatsApp message status: {e}")
+        return None
 
 async def archive_whatsapp_data(org_id: str, phone_id: str, expire_days=30):
     """Archive only the conversations owned by one WhatsApp phone number."""
@@ -2001,6 +2008,8 @@ async def finalize_whatsapp_revocation(org_id: str, phone_id: str) -> dict:
 
 
 async def reconcile_pending_whatsapp_revocations(limit: int = 10) -> int:
+    if not mongo_retry_allowed():
+        return 0
     # Materialize the synchronous cursor in a thread, including server selection.
     try:
         pending = await asyncio.to_thread(lambda: list(db.whatsapp_connections.find({
@@ -2020,6 +2029,10 @@ async def reconcile_pending_whatsapp_revocations(limit: int = 10) -> int:
                 for row in pending
             ))
         return len(pending)
+    except ConnectionFailure as exc:
+        mark_mongo_unavailable()
+        logger.error("Pending WhatsApp revocation reconciliation failed ({})", type(exc).__name__)
+        return 0
     except Exception as exc:
         logger.error("Pending WhatsApp revocation reconciliation failed ({})", type(exc).__name__)
         return 0
