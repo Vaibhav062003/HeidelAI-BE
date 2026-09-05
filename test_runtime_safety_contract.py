@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import copy
 from collections import defaultdict
 import hashlib
 import json
@@ -219,25 +220,103 @@ def test_noncritical_scans_do_not_gate_lifespan_startup() -> None:
         assert operation not in lifespan
 
 
-def test_mongo_outages_fail_fast_for_sync_and_async_clients() -> None:
-    source = ast.parse(_source("database/__init__.py"))
-    options = next(
-        node for node in source.body
-        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "MONGO_CLIENT_OPTIONS" for target in node.targets)
-    ).value
-    values = {
-        key.value: value.value
-        for key, value in zip(options.keys, options.values)
-        if isinstance(key, ast.Constant) and isinstance(value, ast.Constant)
-    }
-    assert values == {
-        "serverSelectionTimeoutMS": 5_000,
-        "connectTimeoutMS": 5_000,
-        "waitQueueTimeoutMS": 5_000,
-    }
+def test_mongo_release_boundaries() -> None:
     client_source = (ROOT / "database/__init__.py").read_text()
-    assert "AsyncIOMotorClient(MONGODB_URI, **MONGO_CLIENT_OPTIONS)" in client_source
-    assert "MongoClient(MONGODB_URI, **MONGO_CLIENT_OPTIONS)" in client_source
+    assert "MONGO_CLIENT_OPTIONS" not in client_source
+    assert "AsyncIOMotorClient(MONGODB_URI)" in client_source
+    assert "MongoClient(MONGODB_URI)" in client_source
+
+    main_source = _source("main.py")
+    handler = ast.get_source_segment(main_source, _function("main.py", "mongo_unavailable_handler"))
+    assert 'status_code=503' in handler
+    assert '"database_unavailable"' in handler
+    assert "str(exc)" not in handler
+
+
+def test_readiness_fails_closed_on_mongo_timeout() -> None:
+    node = copy.deepcopy(_function("api/common_routes.py", "readiness_check"))
+    node.decorator_list = []
+    node.returns = None
+    for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
+        arg.annotation = None
+
+    class Response:
+        def __init__(self, *, status_code, content):
+            self.status_code = status_code
+            self.content = content
+
+    class Admin:
+        async def command(self, name):
+            assert name == "ping"
+            raise asyncio.TimeoutError
+
+    namespace = {
+        "asyncio": asyncio,
+        "os": SimpleNamespace(getenv=lambda *_: "revision"),
+        "get_async_mongo_client": lambda: SimpleNamespace(admin=Admin()),
+        "JSONResponse": Response,
+        "ConnectionFailure": OSError,
+        "PyMongoError": OSError,
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "ready", "exec"), namespace)
+    response = asyncio.run(namespace["readiness_check"](None))
+    assert response.status_code == 503
+    assert response.content == {
+        "status": "not_ready",
+        "revision": "revision",
+        "dependency": "mongodb",
+    }
+
+
+def test_whatsapp_critical_sync_operations_leave_the_event_loop() -> None:
+    node = _function("services/wa_service.py", "send_whatsapp_message")
+    threaded = {
+        ast.get_source_segment(_source("services/wa_service.py"), call.args[0])
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and ast.get_source_segment(_source("services/wa_service.py"), call.func) == "asyncio.to_thread"
+        and call.args
+    }
+    assert {
+        "require_feature",
+        "resolve_outbound_whatsapp_connection",
+        "claim_reply_manifest",
+        "claim_reply",
+        "start_provider",
+        "record_acceptance",
+        "complete_reply",
+    } <= threaded
+
+
+def test_webhook_sync_database_operations_leave_the_event_loop() -> None:
+    source = _source("api/webhook_routes.py")
+    node = _function("api/webhook_routes.py", "handle_webhook")
+    sync_methods = {
+        "aggregate", "delete_one", "find", "find_one", "find_one_and_update",
+        "insert_one", "list_collection_names", "replace_one", "update_many", "update_one",
+    }
+    direct = [
+        call for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in sync_methods
+    ]
+    assert not direct
+
+    threaded = {
+        ast.get_source_segment(source, call.args[0])
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and ast.get_source_segment(source, call.func) == "asyncio.to_thread"
+        and call.args
+    }
+    assert {
+        "resolve_active_whatsapp_connection",
+        "claim_instagram_webhook_message",
+        "claim_instagram_webhook_downstream",
+        "complete_instagram_webhook_message",
+        "release_instagram_webhook_downstream",
+    } <= threaded
 
 
 if __name__ == "__main__":
@@ -246,5 +325,8 @@ if __name__ == "__main__":
     test_websocket_identifiers_and_legacy_auth_are_bounded()
     test_cleanup_is_idempotent_across_every_client_registry()
     test_noncritical_scans_do_not_gate_lifespan_startup()
-    test_mongo_outages_fail_fast_for_sync_and_async_clients()
+    test_mongo_release_boundaries()
+    test_readiness_fails_closed_on_mongo_timeout()
+    test_whatsapp_critical_sync_operations_leave_the_event_loop()
+    test_webhook_sync_database_operations_leave_the_event_loop()
     print("Runtime safety contracts passed.")

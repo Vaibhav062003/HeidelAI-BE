@@ -56,7 +56,8 @@ def test_connection_and_webhook_contracts():
     assert 'error.get("code") == 190' in routes
     assert 'requested_phone_id = str(req.phone_number_id or "").strip()' in routes
     assert '(value.get("metadata") or {}).get("phone_number_id")' in webhook
-    assert "active_whatsapp_connection_candidates(whatsapp_business_id)" in webhook
+    assert "active_whatsapp_connection_candidates," in webhook
+    assert "await asyncio.to_thread(" in webhook
     assert "status_code=503" in webhook
     assert 'connection.get("wa_bot_flow_id")' in webhook
     assert 'business_phone_id=business_phone_id' in webhook

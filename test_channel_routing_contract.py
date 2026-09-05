@@ -31,9 +31,10 @@ def test_channel_routing_is_tenant_scoped() -> None:
     resolver = strings(function_node("services/wa_service.py", "resolve_outbound_whatsapp_connection"))
     assert {"org_id", "wa_id", "phone_id", "is_active"} <= resolver
     for name in ("send_whatsapp_message", "send_whatsapp_template_message", "send_wa_media_message"):
-        assert "resolve_outbound_whatsapp_connection" in calls(
-            function_node("services/wa_service.py", name)
-        ), name
+        node = function_node("services/wa_service.py", name)
+        assert "resolve_outbound_whatsapp_connection" in {
+            item.id for item in ast.walk(node) if isinstance(item, ast.Name)
+        }, name
 
     auth = strings(function_node("api/wa_routes.py", "whatsapp_auth_exchange"))
     assert "is_active" in auth
