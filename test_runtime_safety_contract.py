@@ -206,17 +206,17 @@ def test_cleanup_is_idempotent_across_every_client_registry() -> None:
     assert not manager.active_connections and not manager2.active_connections
 
 
-def test_noncritical_scans_do_not_gate_lifespan_startup() -> None:
+def test_database_bootstrap_gates_lifespan_startup() -> None:
     source = _source("core/lifespan.py")
     lifespan = ast.get_source_segment(source, _function("core/lifespan.py", "lifespan"))
-    background = ast.get_source_segment(source, _function("core/lifespan.py", "_run_noncritical_startup"))
-    assert "bootstrap_task = asyncio.create_task(_run_noncritical_startup())" in lifespan
-    assert lifespan.index("bootstrap_task =") < lifespan.index("yield")
+    startup = ast.get_source_segment(source, _function("core/lifespan.py", "_run_startup"))
+    assert lifespan.index("await _wait_for_mongo()") < lifespan.index("await _run_startup()") < lifespan.index("yield")
+    assert lifespan.index("monitor_task = asyncio.create_task(_monitor_mongo())") < lifespan.index("yield")
     for operation in (
         "ensure_bulk_job_indexes", "ensure_shopify_indexes", "startup_intent_worker",
         "recover_stale_bulk_jobs", "load_prompts_into_cache", "repair_legacy_shopify_connections",
     ):
-        assert operation in background
+        assert operation in startup
         assert operation not in lifespan
 
 
@@ -225,6 +225,9 @@ def test_mongo_release_boundaries() -> None:
     assert "MONGO_CLIENT_OPTIONS" not in client_source
     assert "AsyncIOMotorClient(MONGODB_URI)" in client_source
     assert "MongoClient(MONGODB_URI)" in client_source
+    assert "serverSelectionTimeoutMS=MONGO_PROBE_TIMEOUT_MS" in client_source
+    assert "connectTimeoutMS=MONGO_PROBE_TIMEOUT_MS" in client_source
+    assert "maxPoolSize=1" in client_source
 
     main_source = _source("main.py")
     handler = ast.get_source_segment(main_source, _function("main.py", "mongo_unavailable_handler"))
@@ -235,6 +238,7 @@ def test_mongo_release_boundaries() -> None:
     )
     assert "mark_mongo_unavailable()" in handler
     assert 'status_code=503' in response
+    assert '"Retry-After": "10"' in response
     assert '"database_unavailable"' in response
     assert "str(exc)" not in handler
     assert 'path == "/webhook" or path.startswith("/api/")' in circuit
@@ -242,9 +246,9 @@ def test_mongo_release_boundaries() -> None:
     assert "not mongo_retry_allowed()" in circuit
 
 
-def test_mongo_outage_circuit_recovers_after_cooldown() -> None:
+def test_mongo_outage_state_recovers_only_when_marked_available() -> None:
     tree = ast.parse(_source("database/__init__.py"))
-    wanted_assignments = {"MONGO_OUTAGE_COOLDOWN_SECONDS", "_mongo_unavailable_until"}
+    wanted_assignments = {"_mongo_available"}
     nodes = [
         node for node in tree.body
         if (
@@ -254,18 +258,59 @@ def test_mongo_outage_circuit_recovers_after_cooldown() -> None:
         or isinstance(node, ast.FunctionDef)
         and node.name in {"mark_mongo_unavailable", "mark_mongo_available", "mongo_retry_allowed"}
     ]
-    clock = SimpleNamespace(now=100.0)
-    namespace = {"monotonic": lambda: clock.now}
+    namespace = {}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "database", "exec"), namespace)
 
+    assert not namespace["mongo_retry_allowed"]()
+    namespace["mark_mongo_available"]()
     assert namespace["mongo_retry_allowed"]()
     namespace["mark_mongo_unavailable"]()
     assert not namespace["mongo_retry_allowed"]()
-    clock.now += namespace["MONGO_OUTAGE_COOLDOWN_SECONDS"]
-    assert namespace["mongo_retry_allowed"]()
-    namespace["mark_mongo_unavailable"]()
     namespace["mark_mongo_available"]()
     assert namespace["mongo_retry_allowed"]()
+
+
+def test_mongo_startup_uses_one_short_probe_with_backoff() -> None:
+    node = copy.deepcopy(_function("core/lifespan.py", "_wait_for_mongo"))
+    node.returns = None
+    clock = SimpleNamespace(now=0.0)
+    delays = []
+    attempts = []
+    state = []
+
+    class MongoError(Exception):
+        pass
+
+    async def to_thread(function):
+        return function()
+
+    async def sleep(delay):
+        delays.append(delay)
+        clock.now += delay
+
+    def probe():
+        attempts.append(True)
+        if len(attempts) < 3:
+            raise MongoError
+
+    namespace = {
+        "asyncio": SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: clock.now),
+            to_thread=to_thread,
+            sleep=sleep,
+        ),
+        "MONGO_BOOT_TIMEOUT_SECONDS": 90,
+        "PyMongoError": MongoError,
+        "probe_mongo": probe,
+        "mark_mongo_available": lambda: state.append("ready"),
+        "mark_mongo_unavailable": lambda: state.append("unavailable"),
+        "logger": SimpleNamespace(warning=lambda *_: None),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "lifespan", "exec"), namespace)
+    asyncio.run(namespace["_wait_for_mongo"]())
+    assert len(attempts) == 3
+    assert delays == [2, 4]
+    assert state == ["unavailable", "unavailable", "ready"]
 
 
 def test_scheduler_defers_all_jobs_while_mongo_circuit_is_open() -> None:
@@ -293,20 +338,10 @@ def test_readiness_fails_closed_on_mongo_timeout() -> None:
             self.status_code = status_code
             self.content = content
 
-    class Admin:
-        async def command(self, name):
-            assert name == "ping"
-            raise asyncio.TimeoutError
-
     namespace = {
-        "asyncio": asyncio,
         "os": SimpleNamespace(getenv=lambda *_: "revision"),
-        "get_async_mongo_client": lambda: SimpleNamespace(admin=Admin()),
-        "mark_mongo_available": lambda: None,
-        "mark_mongo_unavailable": lambda: None,
+        "mongo_retry_allowed": lambda: False,
         "JSONResponse": Response,
-        "ConnectionFailure": OSError,
-        "PyMongoError": OSError,
     }
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "ready", "exec"), namespace)
     response = asyncio.run(namespace["readiness_check"](None))
@@ -406,9 +441,10 @@ if __name__ == "__main__":
     test_control_frames_are_bounded_and_typed()
     test_websocket_identifiers_and_legacy_auth_are_bounded()
     test_cleanup_is_idempotent_across_every_client_registry()
-    test_noncritical_scans_do_not_gate_lifespan_startup()
+    test_database_bootstrap_gates_lifespan_startup()
     test_mongo_release_boundaries()
-    test_mongo_outage_circuit_recovers_after_cooldown()
+    test_mongo_outage_state_recovers_only_when_marked_available()
+    test_mongo_startup_uses_one_short_probe_with_backoff()
     test_scheduler_defers_all_jobs_while_mongo_circuit_is_open()
     test_readiness_fails_closed_on_mongo_timeout()
     test_whatsapp_critical_sync_operations_leave_the_event_loop()

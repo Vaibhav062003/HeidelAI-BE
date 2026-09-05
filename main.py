@@ -83,6 +83,7 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 def _mongo_unavailable_response() -> JSONResponse:
     return JSONResponse(
         status_code=503,
+        headers={"Retry-After": "10"},
         content={
             "error": "database_unavailable",
             "detail": "Service temporarily unavailable.",
