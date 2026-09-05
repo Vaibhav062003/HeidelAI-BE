@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
+import sys
 from types import SimpleNamespace
+from types import ModuleType
+from unittest.mock import Mock, patch
 
 from scripts.migrate_multi_whatsapp import (
     bounded_report,
@@ -8,6 +11,7 @@ from scripts.migrate_multi_whatsapp import (
     claim_org_lease,
     conversation_mapping_plan,
     merge_conversation_documents,
+    migrate,
     organization_waba_errors,
     renew_org_lease,
 )
@@ -241,6 +245,32 @@ def test_cli_report_is_bounded_without_losing_counts():
     assert output["output_truncated"] is True
 
 
+def test_targeted_run_finalizes_prepared_organization_independently():
+    db = SimpleNamespace(
+        whatsapp_connections=Mock(),
+        system_migrations=Mock(),
+        organizations=Mock(),
+    )
+    db.whatsapp_connections.distinct.return_value = ["org-1", "org-2"]
+    db.system_migrations.find.return_value = [{"org_id": "org-1"}]
+    db.system_migrations.find_one.side_effect = lambda query: (
+        {"status": "data_complete"} if query.get("_id") == "multi_whatsapp_v2:org-1" else None
+    )
+    database = ModuleType("database")
+    database.get_mongo_db = lambda: db
+    with patch.dict(sys.modules, {"database": database}), patch(
+        "scripts.migrate_multi_whatsapp._cross_org_ownership_errors", return_value=[]
+    ), patch("scripts.migrate_multi_whatsapp._create_and_verify_indexes") as verify:
+        report = migrate(apply=True, org_id="org-1")
+
+    verify.assert_called_once_with(db, ["org-1"])
+    db.organizations.update_one.assert_called_once_with(
+        {"org_id": "org-1"}, {"$set": {"whatsapp_connection_schema_version": 2}},
+    )
+    assert report["verified_indexes"] is True
+    assert report["applied"] is True
+
+
 if __name__ == "__main__":
     test_plan_deduplicates_reconnects_and_assigns_two_slots()
     test_plan_backfills_legacy_identifier_aliases()
@@ -255,4 +285,5 @@ if __name__ == "__main__":
     test_preflight_rejects_waba_owners()
     test_org_lease_fences_overlap_and_can_be_renewed_and_checkpointed()
     test_cli_report_is_bounded_without_losing_counts()
+    test_targeted_run_finalizes_prepared_organization_independently()
     print("Multi-number WhatsApp migration tests passed.")
