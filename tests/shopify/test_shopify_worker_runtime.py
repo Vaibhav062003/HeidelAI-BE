@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib.util
+import re
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,9 @@ def load_service():
     class DuplicateKeyError(Exception):
         pass
 
+    class PyMongoError(Exception):
+        pass
+
     class MessageRole:
         AGENT = "agent"
 
@@ -66,7 +70,11 @@ def load_service():
     _module("fastapi", HTTPException=HTTPException)
     _module("loguru", logger=_Logger())
     pymongo = _module("pymongo", ReturnDocument=types.SimpleNamespace(AFTER="after"), UpdateOne=object)
-    pymongo.errors = _module("pymongo.errors", DuplicateKeyError=DuplicateKeyError)
+    pymongo.errors = _module(
+        "pymongo.errors",
+        DuplicateKeyError=DuplicateKeyError,
+        PyMongoError=PyMongoError,
+    )
     config = _module("config")
     config.settings = _module(
         "config.settings",
@@ -75,7 +83,12 @@ def load_service():
         SHOPIFY_PUBLIC_BASE_URL="https://example.test",
         WA_VERSION="v24.0",
     )
-    _module("database", get_async_mongo_db=lambda: FakeDB(), get_mongo_db=lambda: FakeDB())
+    _module(
+        "database",
+        get_async_mongo_db=lambda: FakeDB(),
+        get_mongo_db=lambda: FakeDB(),
+        mark_mongo_unavailable=lambda: None,
+    )
     schemas = _module("schemas")
     schemas.models = _module("schemas.models", MessageRole=MessageRole)
     _module(
@@ -150,6 +163,14 @@ def apply_update(document: dict, update: dict) -> None:
         document.pop(key, None)
     for key, value in update.get("$inc", {}).items():
         document[key] = document.get(key, 0) + value
+    for key, value in update.get("$push", {}).items():
+        target = document.setdefault(key, [])
+        if isinstance(value, dict) and "$each" in value:
+            target.extend(copy.deepcopy(value["$each"]))
+            if value.get("$slice") is not None:
+                document[key] = target[value["$slice"]:]
+        else:
+            target.append(copy.deepcopy(value))
 
 
 class FakeCursor:
@@ -283,6 +304,13 @@ class SyncFakeCollection:
                 return {key: copy.deepcopy(value) for key, value in document.items() if key in include or key == "_id"}
         return None
 
+    def update_one(self, query, update):
+        for document in self.documents:
+            if matches(document, query):
+                apply_update(document, update)
+                return types.SimpleNamespace(matched_count=1, modified_count=1)
+        return types.SimpleNamespace(matched_count=0, modified_count=0)
+
 
 class SyncFakeDB:
     def __init__(self, **collections):
@@ -351,6 +379,22 @@ async def test_concurrent_workers_claim_once(service):
 
     await asyncio.gather(run_worker(service, database, send), run_worker(service, database, send))
     assert attempts == 1, f"expected one provider attempt, got {attempts}"
+
+
+async def test_database_outage_defers_worker_ticks(service):
+    class OfflineCollection:
+        async def update_one(self, *_args, **_kwargs):
+            raise service.PyMongoError("offline")
+
+        async def update_many(self, *_args, **_kwargs):
+            raise service.PyMongoError("offline")
+
+    service.db = FakeDB(
+        shopify_connections=OfflineCollection(),
+        shopify_worker_heartbeats=OfflineCollection(),
+    )
+    await service.process_shopify_syncs()
+    await service.process_shopify_reminders()
 
 
 async def test_expired_claim_recovery(service):
@@ -731,6 +775,124 @@ async def test_order_event_sends_approved_template_once(service):
     assert [item["text"] for item in posts[0]["template"]["components"][0]["parameters"]] == ["Customer", "#1001", "Board x 2"]
 
 
+async def test_immediate_meta_rejection_is_visible_and_retried(service):
+    job = {
+        "_id": "order-job", "org_id": "org", "order_provider_id": "order-1",
+        "event": "received", "event_at": NOW, "status": "sending", "claim_token": "claim",
+        "attempt_count": 1,
+    }
+    notifications = FakeCollection([job])
+    service.db = FakeDB(
+        shopify_order_notifications=notifications,
+        shopify_orders=FakeCollection([{
+            "org_id": "org", "provider_id": "order-1", "record_status": "active",
+            "phone": "+14155550100", "customer_name": "Customer", "order_number": "#1001",
+            "products": [{"name": "Board", "quantity": 1}],
+        }]),
+        shopify_connections=FakeCollection([{
+            "org_id": "org", "status": "connected", "order_notifications_enabled": True,
+            "order_templates": {"received": {"name": "order_received", "language": "en", "status": "APPROVED"}},
+        }]),
+        whatsapp_connections=FakeCollection([{"_id": "wa", "org_id": "org", "wa_id": "waba", "phone_id": "phone", "is_active": True}]),
+    )
+    messages = SyncFakeCollection()
+    service.sync_db = SyncFakeDB(messages_org=messages)
+    service._is_whatsapp_suppressed = lambda *_args, **_kwargs: _false()
+    service._selected_whatsapp_connection = lambda *_args, **_kwargs: _value({"wa_id": "waba", "phone_id": "phone", "access_token": "token"})
+    service._commerce_event = async_noop
+
+    async def create_conversation(**kwargs):
+        assert kwargs["business_phone_id"] == "phone"
+        return "whatsapp_phone_14155550100"
+
+    async def store_message(**kwargs):
+        messages.documents.append({
+            "message_id": kwargs["message_id"], "status": kwargs["status"],
+            "delivery_error": kwargs["delivery_error"], "ai_metadata": kwargs["bot_context"],
+        })
+
+    service.create_or_update_whatsapp_conversation = create_conversation
+    service.store_whatsapp_message = store_message
+
+    class Response:
+        status_code = 429
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"error": {"code": 130429, "message": "Rate limit reached", "error_data": {"details": "Try again later"}}}
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    service.httpx.AsyncClient = Client
+    await service._send_order_notification(job.copy(), "claim")
+    stored = notifications.documents[0]
+    assert stored["status"] == "retryable", stored
+    assert stored["auto_retry_count"] == 1
+    assert stored["provider_error"]["code"] == 130429
+    assert stored["provider_error"]["retry_state"] == "scheduled"
+    assert "provider_started_at" not in stored
+    assert messages.documents[0]["status"] == "failed", messages.documents[0]
+    assert messages.documents[0]["delivery_error"]["retry_state"] == "scheduled"
+
+
+async def test_async_meta_failure_keeps_terminal_reason(service):
+    notifications = FakeCollection([{
+        "_id": "job", "org_id": "org", "order_provider_id": "order-1", "event": "received",
+        "status": "sent", "provider_message_id": "wamid.failed", "auto_retry_count": 3,
+        "send_whatsapp_id": "waba", "send_phone_id": "phone", "attempt_count": 4,
+    }])
+    service.db = FakeDB(
+        shopify_order_notifications=notifications,
+        shopify_orders=FakeCollection([{
+            "org_id": "org", "provider_id": "order-1", "phone": "+14155550100",
+            "customer_name": "Customer", "order_number": "#1001", "products": [{"name": "Board"}],
+        }]),
+    )
+    messages = SyncFakeCollection([{"_id": "message", "message_id": "wamid.failed", "status": "sent"}])
+    service.sync_db = SyncFakeDB(messages_org=messages)
+    service._commerce_event = async_noop
+    error = service.normalize_whatsapp_delivery_error(
+        {"errors": [{"code": 131026, "title": "Message undeliverable", "error_data": {"details": "Recipient unavailable"}}]},
+        stage="delivery",
+    )
+    returned = await service.update_shopify_reminder_delivery("org", "wamid.failed", "failed", error)
+    stored = notifications.documents[0]
+    assert returned["code"] == 131026 and returned["retry_state"] == "terminal"
+    assert stored["status"] == "failed"
+    assert stored["inbox_sync_status"] == "complete", stored
+    assert "provider_message_id" not in stored
+    assert messages.documents[0]["status"] == "failed", messages.documents[0]
+    assert messages.documents[0]["delivery_error"]["details"] == "Recipient unavailable"
+
+
+async def test_late_failure_does_not_regress_delivered_notification(service):
+    notifications = FakeCollection([{
+        "_id": "job", "org_id": "org", "order_provider_id": "order-1", "event": "received",
+        "status": "sent", "provider_message_id": "wamid.delivered", "delivery_status": "delivered",
+        "delivery_rank": 2,
+    }])
+    service.db = FakeDB(shopify_order_notifications=notifications)
+    result = await service.update_shopify_reminder_delivery(
+        "org", "wamid.delivered", "failed",
+        service.normalize_whatsapp_delivery_error({"errors": [{"code": 131026}]}, stage="delivery"),
+    )
+    assert result is None
+    assert notifications.documents[0]["delivery_status"] == "delivered"
+    assert notifications.documents[0]["provider_message_id"] == "wamid.delivered"
+
+
 def test_delays_and_product_summary(service):
     assert {5, 10, 15}.issubset(service.ALLOWED_DELAYS)
     default = getattr(service, "DEFAULT_REMINDER_DELAY_MINUTES", 30)
@@ -740,10 +902,32 @@ def test_delays_and_product_summary(service):
         "orders/create": "received", "fulfillments/create": "shipped",
         "orders/fulfilled": "fulfilled", "orders/cancelled": "cancelled",
     }
-    assert service._template_compatible({
+    compliant_template = {
         "status": "APPROVED", "category": "UTILITY",
-        "components": [{"type": "BODY", "text": "Hi {{1}}, order {{2}} for {{3}}"}],
+        "components": [
+            {"type": "BODY", "text": "Hi {{1}}, order {{2}} for {{3}} is ready."},
+            {"type": "FOOTER", "text": service.SHOPIFY_TEMPLATE_FOOTER},
+        ],
+    }
+    assert service._template_compatible(compliant_template, "order")
+    assert not service._template_compatible({**compliant_template, "components": compliant_template["components"][:1]}, "order")
+    assert not service._template_compatible({
+        **compliant_template,
+        "components": [
+            {"type": "BODY", "text": "{{1}} order {{2}} for {{3}}"},
+            compliant_template["components"][1],
+        ],
     }, "order")
+    for event in ("abandoned_cart", "received", "shipped", "fulfilled", "cancelled"):
+        payload = service._default_template_payload(event)
+        assert payload["name"].endswith("_v3")
+        assert payload["category"] == ("MARKETING" if event == "abandoned_cart" else "UTILITY")
+        assert [component["type"] for component in payload["components"]] == ["BODY", "FOOTER"]
+        assert payload["components"][1]["text"] == service.SHOPIFY_TEMPLATE_FOOTER
+        assert not re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", payload["components"][0]["text"])
+        examples = payload["components"][0]["example"]["body_text"][0]
+        assert len(examples) == 3 and all(examples)
+        assert examples[2].startswith("https://") if event == "abandoned_cart" else examples[1].startswith("#")
     summary = service._product_summary([
         {"name": "Board", "quantity": 6},
         {"name": "Wax", "quantity": 1},
@@ -760,6 +944,7 @@ async def main():
     test_delays_and_product_summary(load_service())
     await test_hanging_checkout_does_not_block_next(load_service())
     await test_concurrent_workers_claim_once(load_service())
+    await test_database_outage_defers_worker_ticks(load_service())
     await test_expired_claim_recovery(load_service())
     await test_checkout_update_and_order_races(load_service())
     await test_refresh_shape_change_does_not_restart_elapsed_timer(load_service())
@@ -770,6 +955,9 @@ async def main():
     await test_provider_fence_timeout_is_unknown_and_not_retried(load_service())
     await test_acceptance_precedes_inbox_and_reconciles_once(load_service())
     await test_order_event_sends_approved_template_once(load_service())
+    await test_immediate_meta_rejection_is_visible_and_retried(load_service())
+    await test_async_meta_failure_keeps_terminal_reason(load_service())
+    await test_late_failure_does_not_regress_delivered_notification(load_service())
     print("SHOPIFY_WORKER_RUNTIME_OK")
 
 

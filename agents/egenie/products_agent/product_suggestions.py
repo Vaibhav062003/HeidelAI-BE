@@ -1,16 +1,15 @@
 import os
 from pinecone import Pinecone
 # from sentence_transformers import SentenceTransformer
-from pymongo import MongoClient
 import aiohttp
 from fastapi import HTTPException
 from typing import List
-from config.settings import KOYEB2, MONGODB_URI
+from config.settings import KOYEB2
+from database import get_mongo_db
 from loguru import logger
 
 
-mongo_client = MongoClient(MONGODB_URI)
-db = mongo_client['Cluster0']
+db = get_mongo_db()
 
 async def get_query_vector(query: str) -> List[float]:
     """

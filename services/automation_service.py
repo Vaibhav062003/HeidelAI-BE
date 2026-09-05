@@ -8,6 +8,7 @@ from pydantic import TypeAdapter
 # Internal Modules
 from database import get_mongo_db
 from schemas.models import WhatsAppInteractiveMessage
+from services.automation_keywords import message_contains_keyword
 from services.utils import get_first_name, inject_variables, serialize_mongo
 from services.wa_service import send_interactive_whatsapp_message, send_whatsapp_message
 from core.services import services
@@ -879,19 +880,16 @@ async def execute_whatsapp_flow(
     if welcome_message or start_node_id:
         msg_lower = message_content.strip().lower() if message_content else ""
 
-        # "Contains" matching: fires if ANY keyword is found within the message,
-        # OR if the entire message is found within any keyword.
-        # This supports single words ("hi"), phrases ("I am interested in X"),
-        # and full sentences with commas ("Hello, I am interested in Custom PC Built.").
+        # Match complete keywords or phrases, not fragments inside unrelated words.
         is_keyword_match = (
             message_type == "text"
             and trigger_event == "message_received"
             and msg_lower
-            and any(kw in msg_lower or msg_lower in kw for kw in trigger_keywords)
+            and any(message_contains_keyword(msg_lower, kw) for kw in trigger_keywords)
         )
 
         if is_keyword_match:
-            matched = [kw for kw in trigger_keywords if kw in msg_lower or msg_lower in kw]
+            matched = [kw for kw in trigger_keywords if message_contains_keyword(msg_lower, kw)]
             logger.info(f"[{org_id}] Keyword match found: message='{msg_lower}' matched={matched}")
 
         if not is_keyword_match:

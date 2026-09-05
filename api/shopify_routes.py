@@ -21,12 +21,31 @@ from services.shopify_service import (
     process_webhook,
     request_sync,
     retry_checkout_reminder,
+    retry_shopify_notification,
     update_settings,
 )
 
 
 router = APIRouter(tags=["Shopify commerce"])
 MAX_WEBHOOK_BYTES = 2_000_000
+
+
+@router.post("/api/shopify/storefront/cart")
+async def shopify_storefront_cart(request: Request):
+    from services.shopify_storefront_cart import capture_cart
+
+    # A cross-origin HTML form cannot set this header. The storefront uses a
+    # same-origin JSON fetch through Shopify's authenticated proxy.
+    if request.headers.get("x-heidel-cart") != "1":
+        raise HTTPException(403, "Use the storefront cart integration")
+    if len(request.url.query) > 4096:
+        raise HTTPException(413, "Cart query is too large")
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > 16_384:
+            raise HTTPException(413, "Cart payload is too large")
+    return await capture_cart(request.url.query, bytes(raw))
 
 
 class OAuthStartPayload(BaseModel):
@@ -70,6 +89,11 @@ class TemplateCreatePayload(BaseModel):
 
 class CheckoutRetryPayload(BaseModel):
     provider_id: str = Field(min_length=1, max_length=512)
+
+
+class ShopifyNotificationRetryPayload(BaseModel):
+    conversation_id: str = Field(min_length=1, max_length=240)
+    message_id: str = Field(min_length=1, max_length=512)
 
 
 @router.get("/api/integrations/shopify")
@@ -193,6 +217,16 @@ async def shopify_records(
 async def shopify_checkout_retry(payload: CheckoutRetryPayload, user: CurrentUser):
     await admin_required(user)
     return await retry_checkout_reminder(user.org_id, payload.provider_id)
+
+
+@router.post("/api/commerce/shopify/notifications/retry", status_code=202)
+async def shopify_notification_retry(payload: ShopifyNotificationRetryPayload, user: CurrentUser):
+    await require_conversation_access(
+        user.org_id, payload.conversation_id, user.user_id, user.role,
+    )
+    return await retry_shopify_notification(
+        user.org_id, payload.conversation_id, payload.message_id,
+    )
 
 
 @router.get("/api/conversations/{conversation_id}/shopify-activity")

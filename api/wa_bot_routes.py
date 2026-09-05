@@ -42,6 +42,10 @@ class WaBotFlowBody(BaseModel):
         return self.model_dump()
 
 
+class WaBotPublishBody(BaseModel):
+    phone_ids: list[str] = Field(default_factory=list)
+
+
 # ─── CREATE ───────────────────────────────────────────────────────────────────
 
 @router.post("", status_code=201)
@@ -179,7 +183,7 @@ async def delete_flow(flow_id: str, user: CurrentUser):
 # ─── PUBLISH ──────────────────────────────────────────────────────────────────
 
 @router.post("/{flow_id}/publish")
-async def publish_flow(flow_id: str, user: CurrentUser):
+async def publish_flow(flow_id: str, user: CurrentUser, payload: WaBotPublishBody = WaBotPublishBody()):
     """
     Set status → "active".
 
@@ -201,6 +205,7 @@ async def publish_flow(flow_id: str, user: CurrentUser):
             flow = await publish_wa_bot_flow(
                 org_id=org_id,
                 flow_id=flow_id,
+                phone_ids=payload.phone_ids,
                 updated_by=user.user_id,
             )
         finally:
@@ -212,6 +217,8 @@ async def publish_flow(flow_id: str, user: CurrentUser):
 
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"publish wa_bot_flow {flow_id} error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to publish WaBot flow: {e}")

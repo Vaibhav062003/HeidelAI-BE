@@ -55,7 +55,8 @@ def test_quote_routes_are_authenticated_and_store_private_pricing():
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert {"logo_url", "seller", "payment_details", "org_name"} <= settings_strings
-    assert {"pdf_design", "sections", "columns"} <= settings_strings
+    assert {"pdf_design", "branding_defaults", "sections", "columns"} <= settings_strings
+    assert "labels" in field_names
 
     update_quote = next(function for function in route_functions if function.name == "update_quote")
     update_strings = {

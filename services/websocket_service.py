@@ -1,11 +1,62 @@
 import asyncio
+import json
+import re
 from fastapi.encoders import jsonable_encoder
+from core.managers import manager, manager2
 from core.services import services
 from fastapi import WebSocket, WebSocketDisconnect
 from database import get_mongo_db, get_async_mongo_db
 from loguru import logger
 
 db = get_mongo_db()
+
+MAX_WEBSOCKET_CONTROL_FRAME_BYTES = 16 * 1024
+MAX_WEBSOCKET_EVENT_TYPE_LENGTH = 64
+MAX_WEBSOCKET_IDENTIFIER_LENGTH = 128
+
+
+class InvalidWebSocketControlFrame(ValueError):
+    def __init__(self, reason: str, close_code: int = 1003):
+        super().__init__(reason)
+        self.close_code = close_code
+
+
+def decode_websocket_control_frame(raw_data: str) -> dict:
+    if len(raw_data) > MAX_WEBSOCKET_CONTROL_FRAME_BYTES or len(raw_data.encode("utf-8")) > MAX_WEBSOCKET_CONTROL_FRAME_BYTES:
+        raise InvalidWebSocketControlFrame("Control frame is too large", close_code=1009)
+    try:
+        data = json.loads(raw_data)
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise InvalidWebSocketControlFrame("Control frame must be valid JSON") from error
+    if not isinstance(data, dict):
+        raise InvalidWebSocketControlFrame("Control frame must be a JSON object")
+    event_type = data.get("type")
+    if not isinstance(event_type, str) or not event_type or len(event_type) > MAX_WEBSOCKET_EVENT_TYPE_LENGTH:
+        raise InvalidWebSocketControlFrame("Control frame has an invalid type")
+    return data
+
+
+async def receive_websocket_control_frame(websocket: WebSocket) -> dict:
+    return decode_websocket_control_frame(await websocket.receive_text())
+
+
+def validate_websocket_identifier(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_WEBSOCKET_IDENTIFIER_LENGTH
+        or re.fullmatch(r"[A-Za-z0-9_.:-]+", value) is None
+    ):
+        raise ValueError("Invalid websocket identifier")
+    return value
+
+
+def websocket_client_id_in_use(client_id: str) -> bool:
+    return (
+        client_id in services.active_clients
+        or client_id in manager.active_connections
+        or client_id in manager2.active_connections
+    )
 
 
 def _payload_conversation_id(payload: dict) -> str | None:
@@ -15,28 +66,37 @@ def _payload_conversation_id(payload: dict) -> str | None:
     return None
 
 
-async def _eligible_conversation_clients(client_ids, conversation_id: str | None):
+async def _eligible_conversation_clients(client_ids, conversation_id: str | None, conversation: dict | None = None):
     if not conversation_id:
         return set(client_ids)
-    from services.work_team_service import can_user_access_conversation, list_work_teams
+    from services.work_team_service import can_user_access_conversation, is_admin, list_work_teams
     allowed_clients = set()
     clients_by_org = {}
-    for client_id in client_ids:
+    for client_id in list(client_ids):
         org_id = services.client_metadata.get(client_id, {}).get("org_id")
         if org_id:
             clients_by_org.setdefault(org_id, []).append(client_id)
-    async_db = get_async_mongo_db()
     for org_id, org_client_ids in clients_by_org.items():
-        conversation = await async_db[f"conversations_{org_id}"].find_one(
-            {"conversation_id": conversation_id}
-        )
-        if not conversation:
+        admin_clients = {
+            client_id for client_id in org_client_ids
+            if is_admin(services.client_metadata.get(client_id, {}).get("role") or "org:member")
+        }
+        allowed_clients.update(admin_clients)
+        member_clients = [client_id for client_id in org_client_ids if client_id not in admin_clients]
+        if not member_clients:
+            continue
+        org_conversation = conversation
+        if not org_conversation:
+            org_conversation = await get_async_mongo_db()[f"conversations_{org_id}"].find_one(
+                {"conversation_id": conversation_id}
+            )
+        if not org_conversation:
             continue
         teams = await list_work_teams(org_id)
-        for client_id in org_client_ids:
+        for client_id in member_clients:
             meta = services.client_metadata.get(client_id, {})
             if can_user_access_conversation(
-                meta.get("user_id") or "", meta.get("role") or "org:member", conversation, teams
+                meta.get("user_id") or "", meta.get("role") or "org:member", org_conversation, teams
             ):
                 allowed_clients.add(client_id)
     return allowed_clients
@@ -56,13 +116,20 @@ async def latest_unread_whatsapp_message_id(org_id: str, conversation_id: str) -
     )
     return message.get("message_id") if message else None
 
+def _discard_client(index, client_id: str) -> None:
+    for key, members in list(index.items()):
+        members.discard(client_id)
+        if not members:
+            index.pop(key, None)
+
+
 async def cleanup_client(client_id: str):
     """
     Clean up all references to a disconnected client.
     """
     logger.info(f"Disconnecting client {client_id}")
 
-    meta = services.client_metadata.get(client_id)
+    meta = services.client_metadata.get(client_id) or {}
     agent_name = meta.get("agent_name") if meta else None
 
     convo_key = services.client_convo_map.get(client_id)
@@ -71,43 +138,42 @@ async def cleanup_client(client_id: str):
         logger.info(f"Cleaning up presence data for conversation {convo_key}")
         leave_conversation_presence(org_id_for_convo, conversation_id, client_id)
 
-        await broadcast_org_ws(
-            org_id=org_id_for_convo,
-            event_type="leave_conversation",
-            payload={
-                "conversation_id": conversation_id,
-                "client_id": client_id,
-                "agent_name": agent_name,
-            },
-            exclude_client_id=client_id,
-        )
+        try:
+            await broadcast_org_ws(
+                org_id=org_id_for_convo,
+                event_type="leave_conversation",
+                payload={
+                    "conversation_id": conversation_id,
+                    "client_id": client_id,
+                    "agent_name": agent_name,
+                },
+                exclude_client_id=client_id,
+            )
+        except Exception as error:
+            logger.warning(f"Could not broadcast disconnect presence: {type(error).__name__}")
 
-    if not meta:
-        return
-    ig_ids = meta.get("ig_ids") or ([meta.get("ig_id")] if meta.get("ig_id") else [])
-    wa_ids = meta.get("wa_ids") or ([meta.get("wa_id")] if meta.get("wa_id") else [])
-    user_id = meta.get("user_id")
-    org_id = meta.get("org_id")
+    for index in (
+        services.agent_clients,
+        services.org_clients,
+        services.instagram_clients,
+        services.whatsapp_clients,
+        services.instagram_connections_map,
+        services.whatsapp_connections_map,
+    ):
+        _discard_client(index, client_id)
 
-    if user_id and client_id in services.agent_clients.get(user_id, set()):
-        services.agent_clients[user_id].remove(client_id)
-        if not services.agent_clients[user_id]:
-            del services.agent_clients[user_id]
-    if org_id and client_id in services.org_clients.get(org_id, set()):
-        services.org_clients[org_id].remove(client_id)
-        if not services.org_clients[org_id]:
-            del services.org_clients[org_id]
-    for ig_id in ig_ids:
-        services.instagram_clients[ig_id].discard(client_id)
-        if not services.instagram_clients[ig_id]:
-            del services.instagram_clients[ig_id]
-    for wa_id in wa_ids:
-        services.whatsapp_clients[wa_id].discard(client_id)
-        if not services.whatsapp_clients[wa_id]:
-            del services.whatsapp_clients[wa_id]
+    # Repair stale presence even if its reverse mapping or metadata was lost.
+    for org_id, conversations in list(services.org_convo_viewers.items()):
+        _discard_client(conversations, client_id)
+        if not conversations:
+            services.org_convo_viewers.pop(org_id, None)
 
+    services.client_convo_map.pop(client_id, None)
     services.active_clients.pop(client_id, None)
     services.client_metadata.pop(client_id, None)
+    services.connected_clients.pop(client_id, None)
+    manager.disconnect(client_id)
+    manager2.disconnect(client_id)
     logger.success(f"Cleaned up client {client_id}")
 
 async def handle_typing_event(client_id: str, data: dict):
@@ -115,7 +181,7 @@ async def handle_typing_event(client_id: str, data: dict):
     Broadcast typing indicators to all users under the same IG or WA account,
     excluding the sender.
     """
-    logger.info(f"[Typing Event] Client {client_id} sending typing: {data}")
+    logger.info(f"Typing event received from client {client_id}")
     
     meta = services.client_metadata.get(client_id)
     if not meta:
@@ -165,6 +231,7 @@ async def handle_typing_event(client_id: str, data: dict):
             asyncio.create_task(read_message_and_typing_indicator(
                 whatsapp_id=wa_id,
                 message_id=message_id,
+                conversation_id=conversation_id,
             ))
 
 async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: str, payload: dict, exclude_client_id: str = None):
@@ -192,6 +259,7 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
         client_ids = await _eligible_conversation_clients(
             client_ids,
             _payload_conversation_id(payload),
+            payload.get("conversation") if isinstance(payload.get("conversation"), dict) else None,
         )
     except Exception as error:
         logger.error(f"WebSocket access filtering failed: {type(error).__name__}")
@@ -224,18 +292,12 @@ async def broadcast_main_ws(platform_id: str, platform_type: str, event_type: st
         except WebSocketDisconnect:
             logger.error(f"Client {client_id} disconnected, marking as disconnected")
             disconnected_clients.append(client_id)
-        except Exception as e:
-            logger.error(f"Failed to send to {client_id}: {e}, marking as disconnected")
+        except Exception:
+            logger.error(f"Failed to send to {client_id}, marking as disconnected")
             disconnected_clients.append(client_id)
 
-    # Cleanup
     for client_id in disconnected_clients:
-        services.active_clients.pop(client_id, None)
-        services.client_metadata.pop(client_id, None)
-        target_map[platform_id].discard(client_id)
-
-    if not target_map[platform_id]:
-        del target_map[platform_id]
+        await cleanup_client(client_id)
 
 async def start_heartbeat(client_id: str, websocket: WebSocket):
     """
@@ -252,6 +314,10 @@ async def start_heartbeat(client_id: str, websocket: WebSocket):
                     await websocket.send_json({"type": "ping", "data": {}})
                 except Exception:
                     logger.error(f"Start Heartbeat: Failed to ping {client_id}")
+                    try:
+                        await websocket.close(code=1011, reason="Heartbeat failed")
+                    except Exception:
+                        pass
                     break
             else:
                 break
@@ -269,7 +335,7 @@ async def handle_unread_event(org_id: str, client_id: str, data: dict):
     agent_name = meta.get("agent_name")
 
     if not conversation_id or not event_type:
-        logger.error(f"Invalid unread event data from {client_id}: {data}")
+        logger.error(f"Invalid unread event from {client_id}")
         return
 
     from services.work_team_service import require_conversation_access
@@ -368,33 +434,40 @@ async def broadcast_org_ws(org_id: str, event_type: str, payload: dict, exclude_
         if cid == exclude_client_id:
             continue
         ws = services.active_clients.get(cid)
-        if ws:
-            try:
-                await ws.send_json({"type": event_type, "data": payload})
-            except Exception as e:
-                logger.error(f"Failed to send {event_type} to {cid}, marking as disconnected")
-            except WebSocketDisconnect:
-                logger.error(f"Client {cid} disconnected, marking as disconnected")
-                disconnected_clients.append(cid)
+        if not ws:
+            disconnected_clients.append(cid)
+            continue
+        try:
+            await ws.send_json({"type": event_type, "data": payload})
+        except WebSocketDisconnect:
+            logger.error(f"Client {cid} disconnected, marking as disconnected")
+            disconnected_clients.append(cid)
+        except Exception:
+            logger.error(f"Failed to send {event_type} to {cid}, marking as disconnected")
+            disconnected_clients.append(cid)
 
     for client_id in disconnected_clients:
-        services.org_clients[org_id].discard(client_id)
-        services.active_clients.pop(client_id, None)
-        services.client_metadata.pop(client_id, None)
+        await cleanup_client(client_id)
 
 
 async def broadcast_org_admin_ws(org_id: str, event_type: str, payload: dict):
     """Broadcast an organization event only to its administrators."""
     safe_payload = jsonable_encoder(payload)
+    disconnected_clients = []
     for client_id in list(services.org_clients.get(org_id, set())):
         if services.client_metadata.get(client_id, {}).get("role") not in {"admin", "org:admin"}:
             continue
         websocket = services.active_clients.get(client_id)
-        if websocket:
-            try:
-                await websocket.send_json({"type": event_type, "data": safe_payload})
-            except Exception:
-                logger.error(f"Failed to send {event_type} to an organization administrator")
+        if not websocket:
+            disconnected_clients.append(client_id)
+            continue
+        try:
+            await websocket.send_json({"type": event_type, "data": safe_payload})
+        except Exception:
+            logger.error(f"Failed to send {event_type} to an organization administrator")
+            disconnected_clients.append(client_id)
+    for client_id in disconnected_clients:
+        await cleanup_client(client_id)
 
 async def broadcast_on_stats_update(
     org_id: str, 
@@ -477,7 +550,7 @@ async def broadcast_team_message(org_id: str, conversation_id: str, participants
     """
     Broadcast an internal message to all online participants in a team chat.
     """
-    logger.info(f"📡 Broadcasting team message to participants: {participants}")
+    logger.info(f"📡 Broadcasting team message to {len(participants)} participants")
     
     if not participants:
         logger.warning(f"⚠️ No participants found for broadcasting in conversation {conversation_id}")
@@ -500,10 +573,12 @@ async def broadcast_team_message(org_id: str, conversation_id: str, participants
                             }
                         })
                         logger.success(f"Sent team message to agent {user_id} (client {client_id})")
-                    except Exception as e:
-                        logger.error(f"Failed to send team message to {client_id}: {e}")
+                    except Exception:
+                        logger.error(f"Failed to send team message to {client_id}")
+                        await cleanup_client(client_id)
                 else:
                     logger.warning(f"WebSocket not found for active client {client_id}")
+                    await cleanup_client(client_id)
         else:
             pass
 
@@ -529,10 +604,12 @@ async def broadcast_ai_escalation(org_id: str, payload: dict):
                     "data": safe_payload
                 })
                 logger.success(f"Sent escalation alert to terminal {client_id}")
-            except Exception as e:
-                logger.error(f"Failed to send escalation to {client_id}: {e}")
+            except Exception:
+                logger.error(f"Failed to send escalation to {client_id}")
+                await cleanup_client(client_id)
         else:
             logger.warning(f"WebSocket not found for active client {client_id}")
+            await cleanup_client(client_id)
 
 async def send_to_user(user_id: str, payload: dict, org_id: str | None = None):
     """
@@ -555,5 +632,8 @@ async def send_to_user(user_id: str, payload: dict, org_id: str | None = None):
             if ws:
                 try:
                     await ws.send_json(safe_payload)
-                except Exception as e:
-                    logger.error(f"Failed to send websocket message to user {user_id}: {e}")
+                except Exception:
+                    logger.error(f"Failed to send websocket message to user {user_id}")
+                    await cleanup_client(client_id)
+            else:
+                await cleanup_client(client_id)

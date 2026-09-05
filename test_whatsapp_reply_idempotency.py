@@ -167,6 +167,8 @@ assert second_retry["action"] == "claimed" and start_provider(multipart, second_
 lifespan = Path("core/lifespan.py").read_text()
 service = Path("services/wa_service.py").read_text()
 webhook = Path("api/webhook_routes.py").read_text()
+common_routes = Path("api/common_routes.py").read_text()
+decision_service = Path("services/pricing_decision_service.py").read_text()
 assert "ensure_whatsapp_outbound_indexes" in lifespan
 assert 'create_index("expires_at", expireAfterSeconds=0)' in service
 assert '"delivery_state": "accepted_pending_sync"' in service
@@ -177,12 +179,12 @@ assert "_is_definitive_meta_rejection" in service
 assert "await close_meta_http_client()" in lifespan
 assert "finally:\n        # Shutdown must also run" in lifespan
 rejection = service[service.index("if response.status_code != 200:"):service.index("response_data = response.json()")]
-assert "if i == 0" not in rejection and "release_claim(" in rejection
-assert rejection.index("mark_unknown(") < rejection.index("release_claim(")
+assert "if i == 0" not in rejection and "release_claim," in rejection
+assert rejection.index("mark_unknown,") < rejection.index("release_claim,")
 assert 'services.processed_message_ids.pop(temp_id.removeprefix("ai:"), None)' in rejection
 assert 'if mode == "ai":' in rejection and '"delivery_error"' in rejection
 request_error = service[service.index("except httpx.RequestError:"):service.index("if response.status_code != 200:")]
-assert "processed_message_ids.pop" not in request_error and "mark_unknown(" in request_error
+assert "processed_message_ids.pop" not in request_error and "mark_unknown," in request_error
 accepted = service[service.index("response_data = response.json()"):service.index("if part_operation:", service.index("response_data = response.json()"))]
 assert accepted.index("if not message_id:") < accepted.index("Meta accepted outbound request")
 assert "if first_meta_accepted_ms is None:" in accepted
@@ -211,5 +213,8 @@ assert pending_marker.index("finally:") < pending_marker.index("processed_messag
 assert "Sales action delivery is still being finalized" in webhook
 assert "Instagram delivery is still being synchronized" in webhook
 assert 'delivery_failure_required = error.category == "delivery_error"' in webhook
+assert 'platform in {"whatsapp", "instagram"} and mode == "reply" and not temp_id' in common_routes
+assert 'provider_state in {' in common_routes
+assert '"temp_id": temp_id' in decision_service
 
 print("WhatsApp reply idempotency behavior passed.")

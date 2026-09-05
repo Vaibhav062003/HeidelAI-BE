@@ -22,7 +22,7 @@ from config.settings import (
     FIREBASE_SERVICE_ACCOUNT_B64,
     PUSH_TOKEN_ENCRYPTION_KEY,
 )
-from database import get_mongo_db
+from database import get_mongo_db, wait_for_mongo_available
 
 
 db = get_mongo_db()
@@ -300,13 +300,17 @@ def process_member_device_revocation(revocation_id: str) -> None:
 
 
 async def process_pending_member_device_revocations(limit: int = 50) -> None:
-    pending = await asyncio.to_thread(
-        lambda: list(
-            revocations.find({"status": "pending"}, {"revocation_id": 1})
-            .sort("created_at", 1)
-            .limit(limit)
+    try:
+        pending = await asyncio.to_thread(
+            lambda: list(
+                revocations.find({"status": "pending"}, {"revocation_id": 1})
+                .sort("created_at", 1)
+                .limit(limit)
+            )
         )
-    )
+    except Exception as exc:
+        logger.warning(f"Push device revocation scan deferred: {type(exc).__name__}")
+        return
     for revocation in pending:
         try:
             await asyncio.to_thread(process_member_device_revocation, revocation["revocation_id"])
@@ -657,6 +661,7 @@ async def _immediate_push_worker(queue: asyncio.Queue[str]) -> None:
     while True:
         event_id = await queue.get()
         try:
+            await wait_for_mongo_available()
             await process_push_event(event_id)
         except asyncio.CancelledError:
             raise
@@ -714,20 +719,24 @@ async def stop_push_notification_workers() -> None:
 
 async def process_pending_push_notifications(limit: int = 25) -> None:
     now = datetime.now(timezone.utc)
-    pending = await asyncio.to_thread(
-        lambda: list(
-            events.find(
-                {
-                    "expires_at": {"$gt": now},
-                    "$or": [
-                        {"status": "pending", "next_attempt_at": {"$lte": now}},
-                        {"status": "sending", "claimed_at": {"$lt": now - timedelta(minutes=5)}},
-                    ],
-                },
-                {"event_id": 1},
-            ).sort("next_attempt_at", 1).limit(limit)
+    try:
+        pending = await asyncio.to_thread(
+            lambda: list(
+                events.find(
+                    {
+                        "expires_at": {"$gt": now},
+                        "$or": [
+                            {"status": "pending", "next_attempt_at": {"$lte": now}},
+                            {"status": "sending", "claimed_at": {"$lt": now - timedelta(minutes=5)}},
+                        ],
+                    },
+                    {"event_id": 1},
+                ).sort("next_attempt_at", 1).limit(limit)
+            )
         )
-    )
+    except Exception as exc:
+        logger.warning(f"Android push scan deferred: {type(exc).__name__}")
+        return
     for event in pending:
         try:
             await process_push_event(event["event_id"])

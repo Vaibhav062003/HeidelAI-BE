@@ -192,8 +192,10 @@ async def _exercise():
     }
     assert _core_reply(await _call(module)) == {"final_response": "A safe customer reply", "usage": {}}
     saved_context = records[-1][1]
-    assert saved_context["customer_text"] == "private customer text"
-    assert saved_context["metadata"]["catalogue_context"] == (
+    assert saved_context["customer_text"] == (
+        "private customer text\n\nWas looking at: Asus Zephyrus G14 (Rs.67,381)."
+    )
+    assert saved_context["metadata"]["context"] == (
         "Was looking at: Asus Zephyrus G14 (Rs.67,381)."
     )
 

@@ -6,8 +6,16 @@ on:
     branches:
       - dev
 
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
 jobs:
+  checks:
+    uses: ./.github/workflows/backend-checks.yml
+
   deploy-dev:
+    needs: checks
     runs-on: ubuntu-latest
 
     steps:
@@ -29,8 +37,10 @@ jobs:
         with:
           context: .
           push: true
-          # Using ':dev' tag to keep it separate from production images
-          tags: ${{ secrets.DOCKER_USERNAME }}/heidelai-dev:test
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/heidelai-dev:test
+            ${{ secrets.DOCKER_USERNAME }}/heidelai-dev:sha-${{ github.sha }}
           cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/backend:buildcache
           cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/backend:buildcache,mode=max
 
@@ -40,6 +50,21 @@ jobs:
         with:
           api_token: ${{ secrets.KOYEB_TOKEN }}
 
-      - name: Redeploy Koyeb Instance
-        # Replace 'heidelai-backend-dev' with your actual DEV service name
-        run: koyeb service redeploy heidelai-dev/heidelai-dev
+      - name: Deploy exact image to Koyeb
+        env:
+          IMAGE: ${{ secrets.DOCKER_USERNAME }}/heidelai-dev:sha-${{ github.sha }}
+        run: koyeb service update heidelai-dev/heidelai-dev --docker "$IMAGE" --checks 8000:http:/health --checks-grace-period 8000=180 --wait --wait-timeout 15m
+
+      - name: Verify API readiness
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --output readiness.json https://heidelai-dev.koyeb.app/ready \
+              && jq -e --arg revision "$EXPECTED_REVISION" '.status == "ready" and .revision == $revision' readiness.json; then
+              exit 0
+            fi
+            echo "Waiting for revision $EXPECTED_REVISION (attempt $attempt/30)"
+            sleep 10
+          done
+          exit 1
