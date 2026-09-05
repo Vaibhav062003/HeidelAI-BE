@@ -55,9 +55,9 @@ jobs:
           IMAGE: ${{ secrets.DOCKER_USERNAME }}/heidelai-dev:sha-${{ github.sha }}
         run: koyeb service update heidelai-dev/heidelai-dev --docker "$IMAGE" --wait --wait-timeout 15m
 
-      - name: Verify API health
+      - name: Verify API readiness
         env:
           EXPECTED_REVISION: ${{ github.sha }}
         run: |
-          curl --fail --retry 30 --retry-delay 10 --retry-all-errors --output health.json https://heidelai-dev.koyeb.app/health
-          jq -e --arg revision "$EXPECTED_REVISION" '.status == "ok" and .revision == $revision' health.json
+          curl --fail --retry 30 --retry-delay 10 --retry-all-errors --output readiness.json https://heidelai-dev.koyeb.app/ready
+          jq -e --arg revision "$EXPECTED_REVISION" '.status == "ready" and .revision == $revision' readiness.json

@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from core.limiter import limiter
 from slowapi.errors import RateLimitExceeded                       
 from slowapi.middleware import SlowAPIMiddleware                    
+from pymongo.errors import ConnectionFailure
 
 # === Internal Modules ===
 from api import router
@@ -77,6 +78,19 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
             "detail": "Too many requests, please slow down.",
         }
     )            
+
+async def mongo_unavailable_handler(request: Request, exc: Exception):
+    logger.error(f"MongoDB unavailable for {request.method} {request.url.path}: {type(exc).__name__}")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "database_unavailable",
+            "detail": "Service temporarily unavailable.",
+        },
+    )
+
+
+app.add_exception_handler(ConnectionFailure, mongo_unavailable_handler)
 
 app.include_router(router)
 
