@@ -133,12 +133,17 @@ def test_deployment_starts_the_api_without_running_migrations():
 
 def test_migration_is_dry_run_bounded_and_cli_only():
     migration = source("scripts/migrate_multi_whatsapp.py")
+    workflow = (ROOT / ".github/workflows/migrate-whatsapp-main.yml").read_text(encoding="utf-8")
     assert "def migrate(\n    apply: bool = False" in migration
     assert 'parser.add_argument("--org-id"' in migration
     assert 'parser.add_argument("--org-batch-size"' in migration
     assert "claim_org_lease" in migration and "checkpoint_org" in migration
     assert "organization_waba_unique" not in migration
     assert "migrate_multi_whatsapp" not in source("core/lifespan.py")
+    assert "workflow_dispatch:" in workflow
+    assert '[[ "$CONFIRMATION" == "APPLY" ]]' in workflow
+    assert workflow.index("- name: Dry run") < workflow.index("- name: Apply")
+    assert "--org-id \"$ORG_ID\" --apply" in workflow
 
 
 def test_number_scoped_query_and_flow_binding_contracts():
