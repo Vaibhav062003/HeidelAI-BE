@@ -1120,12 +1120,15 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
 
         now = datetime.now(timezone.utc)
 
-        conversation =  conversation_collection.find_one({"conversation_id": conversation_id})
+        conversation = await asyncio.to_thread(
+            conversation_collection.find_one, {"conversation_id": conversation_id},
+        )
 
         if not conversation:
             return {"message": "Conversation not found. Nothing to close."}
 
-        result = conversation_collection.find_one_and_update(
+        result = await asyncio.to_thread(
+            conversation_collection.find_one_and_update,
             {"conversation_id": conversation_id},
             {
                 "$set": {
@@ -1142,7 +1145,8 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
             last_index = len(conversation["assignment_history"]) - 1
             update_path = f"assignment_history.{last_index}.assigned_until"
 
-            result = conversation_collection.find_one_and_update(
+            result = await asyncio.to_thread(
+                conversation_collection.find_one_and_update,
                 {"conversation_id": conversation_id},
                 {"$set": {update_path: now}},
                 return_document=ReturnDocument.AFTER

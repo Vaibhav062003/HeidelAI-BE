@@ -34,14 +34,38 @@ from services.push_notification_service import (
 
 async def _run_noncritical_startup() -> None:
     jobs = (
-        ("bulk job recovery", asyncio.to_thread(recover_stale_bulk_jobs)),
-        ("prompt cache loading", asyncio.to_thread(load_prompts_into_cache)),
-        ("Shopify legacy repair", repair_legacy_shopify_connections()),
+        ("bulk job indexes", lambda: asyncio.to_thread(ensure_bulk_job_indexes)),
+        ("WhatsApp call indexes", lambda: asyncio.to_thread(ensure_whatsapp_call_indexes)),
+        ("WhatsApp outbound indexes", lambda: asyncio.to_thread(ensure_whatsapp_outbound_indexes)),
+        ("push notification indexes", lambda: asyncio.to_thread(ensure_push_notification_indexes)),
+        ("transfer notification indexes", lambda: asyncio.to_thread(ensure_transfer_notification_indexes)),
+        ("follow-up indexes", ensure_followup_indexes),
+        ("Shopify indexes", ensure_shopify_indexes),
+        ("WhatsApp follow-up worker", startup_scheduler),
+        ("Google Sheets worker", startup_google_scheduler),
+        ("OOS indexes", ensure_oos_indexes),
+        ("pricing indexes", ensure_pricing_indexes),
+        ("sales offer indexes", ensure_sales_offer_indexes),
+        ("Tally indexes", ensure_tally_indexes),
+        ("stock indexes", ensure_stock_indexes),
+        ("entitlement indexes", lambda: asyncio.to_thread(ensure_entitlement_indexes)),
+        ("push notification workers", start_push_notification_workers),
+        ("intent worker", startup_intent_worker),
+        ("bulk job recovery", lambda: asyncio.to_thread(recover_stale_bulk_jobs)),
+        ("prompt cache loading", lambda: asyncio.to_thread(load_prompts_into_cache)),
+        ("Shopify legacy repair", repair_legacy_shopify_connections),
     )
-    results = await asyncio.gather(*(job for _, job in jobs), return_exceptions=True)
-    for (name, _), result in zip(jobs, results):
-        if isinstance(result, Exception):
-            logger.error(f"Non-critical startup job failed ({name}): {type(result).__name__}")
+    for name, job in jobs:
+        try:
+            await job()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"Deferred startup job failed ({name}): {type(exc).__name__}")
+    try:
+        start_scheduler()
+    except Exception as exc:
+        logger.error(f"Deferred startup job failed (APScheduler): {type(exc).__name__}")
 
 
 @asynccontextmanager
@@ -50,39 +74,21 @@ async def lifespan(app: FastAPI):
     Lifespan event for the FastAPI application.
     """
     # Startup
-    await asyncio.to_thread(ensure_bulk_job_indexes)
-    await asyncio.to_thread(ensure_whatsapp_call_indexes)
-    await asyncio.to_thread(ensure_whatsapp_outbound_indexes)
     revocation_task = asyncio.create_task(run_whatsapp_revocation_reconciler())
-    await asyncio.to_thread(ensure_push_notification_indexes)
-    await asyncio.to_thread(ensure_transfer_notification_indexes)
     load_agents()
-    await ensure_followup_indexes()
-    await ensure_shopify_indexes()
     bootstrap_task = asyncio.create_task(_run_noncritical_startup())
-    start_scheduler()
-    await startup_scheduler()
-    await startup_google_scheduler()
-    await ensure_oos_indexes()
-    await ensure_pricing_indexes()
-    await ensure_sales_offer_indexes()
-    await ensure_tally_indexes()
-    await ensure_stock_indexes()
-    await asyncio.to_thread(ensure_entitlement_indexes)
-    await start_push_notification_workers()
-    await startup_intent_worker()
     try:
         yield
     finally:
         # Shutdown must also run when the application exits exceptionally.
         stop_scheduler()
+        if not bootstrap_task.done():
+            bootstrap_task.cancel()
+        await asyncio.gather(bootstrap_task, return_exceptions=True)
         await stop_push_notification_workers()
         await shutdown_intent_worker()
         await shutdown_scheduler()
         await shutdown_google_scheduler()
-        if not bootstrap_task.done():
-            bootstrap_task.cancel()
-        await asyncio.gather(bootstrap_task, return_exceptions=True)
         if not revocation_task.done():
             revocation_task.cancel()
         await asyncio.gather(revocation_task, return_exceptions=True)

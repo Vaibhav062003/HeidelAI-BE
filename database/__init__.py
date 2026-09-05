@@ -11,10 +11,16 @@ _pinecone_index = None
 _async_client = None
 _async_db = None
 
+MONGO_CLIENT_OPTIONS = {
+    "serverSelectionTimeoutMS": 5_000,
+    "connectTimeoutMS": 5_000,
+    "waitQueueTimeoutMS": 5_000,
+}
+
 def get_async_mongo_client():
     global _async_client
     if _async_client is None:
-        _async_client = AsyncIOMotorClient(MONGODB_URI)
+        _async_client = AsyncIOMotorClient(MONGODB_URI, **MONGO_CLIENT_OPTIONS)
     return _async_client
 
 def get_async_mongo_db():
@@ -27,7 +33,7 @@ def get_async_mongo_db():
 def get_mongo_client():
     global _client
     if _client is None:
-        _client = MongoClient(MONGODB_URI)
+        _client = MongoClient(MONGODB_URI, **MONGO_CLIENT_OPTIONS)
     return _client
 
 def get_mongo_db():
