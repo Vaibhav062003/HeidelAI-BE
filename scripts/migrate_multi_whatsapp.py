@@ -800,10 +800,17 @@ def migrate(
         })
         for value in all_org_ids
     )
-    if all_data_complete:
-        _create_and_verify_indexes(db, all_org_ids)
+    target_data_complete = bool(org_id and all_selected_ids and db.system_migrations.find_one({
+        "_id": _org_checkpoint_id(all_selected_ids[0]),
+        "status": {"$in": ["data_complete", "complete"]},
+    }))
+    ready_org_ids = all_org_ids if all_data_complete else []
+    if target_data_complete and not ready_org_ids:
+        ready_org_ids = all_selected_ids
+    if ready_org_ids:
+        _create_and_verify_indexes(db, ready_org_ids)
         now = datetime.now(timezone.utc)
-        for value in all_org_ids:
+        for value in ready_org_ids:
             db.organizations.update_one(
                 {"org_id": value}, {"$set": {"whatsapp_connection_schema_version": 2}},
             )
@@ -811,13 +818,14 @@ def migrate(
                 {"_id": _org_checkpoint_id(value)},
                 {"$set": {"status": "complete", "completed_at": now}},
             )
-        db.system_migrations.update_one(
-            {"_id": MIGRATION_ID}, {"$set": {"status": "complete", "completed_at": now}}, upsert=True,
-        )
+        if all_data_complete:
+            db.system_migrations.update_one(
+                {"_id": MIGRATION_ID}, {"$set": {"status": "complete", "completed_at": now}}, upsert=True,
+            )
         report["verified_indexes"] = True
     else:
         report["has_more"] = True
-    report["applied"] = bool(report["organizations"])
+    report["applied"] = bool(report["organizations"] or ready_org_ids)
     return report
 
 
