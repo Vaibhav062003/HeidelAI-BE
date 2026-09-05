@@ -209,11 +209,35 @@ def test_noncritical_scans_do_not_gate_lifespan_startup() -> None:
     source = _source("core/lifespan.py")
     lifespan = ast.get_source_segment(source, _function("core/lifespan.py", "lifespan"))
     background = ast.get_source_segment(source, _function("core/lifespan.py", "_run_noncritical_startup"))
-    assert "await ensure_shopify_indexes()" in lifespan
     assert "bootstrap_task = asyncio.create_task(_run_noncritical_startup())" in lifespan
-    for operation in ("recover_stale_bulk_jobs", "load_prompts_into_cache", "repair_legacy_shopify_connections"):
+    assert lifespan.index("bootstrap_task =") < lifespan.index("yield")
+    for operation in (
+        "ensure_bulk_job_indexes", "ensure_shopify_indexes", "startup_intent_worker",
+        "recover_stale_bulk_jobs", "load_prompts_into_cache", "repair_legacy_shopify_connections",
+    ):
         assert operation in background
         assert operation not in lifespan
+
+
+def test_mongo_outages_fail_fast_for_sync_and_async_clients() -> None:
+    source = ast.parse(_source("database/__init__.py"))
+    options = next(
+        node for node in source.body
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "MONGO_CLIENT_OPTIONS" for target in node.targets)
+    ).value
+    values = {
+        key.value: value.value
+        for key, value in zip(options.keys, options.values)
+        if isinstance(key, ast.Constant) and isinstance(value, ast.Constant)
+    }
+    assert values == {
+        "serverSelectionTimeoutMS": 5_000,
+        "connectTimeoutMS": 5_000,
+        "waitQueueTimeoutMS": 5_000,
+    }
+    client_source = (ROOT / "database/__init__.py").read_text()
+    assert "AsyncIOMotorClient(MONGODB_URI, **MONGO_CLIENT_OPTIONS)" in client_source
+    assert "MongoClient(MONGODB_URI, **MONGO_CLIENT_OPTIONS)" in client_source
 
 
 if __name__ == "__main__":
@@ -222,4 +246,5 @@ if __name__ == "__main__":
     test_websocket_identifiers_and_legacy_auth_are_bounded()
     test_cleanup_is_idempotent_across_every_client_registry()
     test_noncritical_scans_do_not_gate_lifespan_startup()
+    test_mongo_outages_fail_fast_for_sync_and_async_clients()
     print("Runtime safety contracts passed.")
