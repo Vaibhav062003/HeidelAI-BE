@@ -59,5 +59,12 @@ jobs:
         env:
           EXPECTED_REVISION: ${{ github.sha }}
         run: |
-          curl --fail --retry 30 --retry-delay 10 --retry-all-errors --output readiness.json https://heidelai-dev.koyeb.app/ready
-          jq -e --arg revision "$EXPECTED_REVISION" '.status == "ready" and .revision == $revision' readiness.json
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --output readiness.json https://heidelai-dev.koyeb.app/ready \
+              && jq -e --arg revision "$EXPECTED_REVISION" '.status == "ready" and .revision == $revision' readiness.json; then
+              exit 0
+            fi
+            echo "Waiting for revision $EXPECTED_REVISION (attempt $attempt/30)"
+            sleep 10
+          done
+          exit 1
