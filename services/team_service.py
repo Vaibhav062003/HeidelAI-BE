@@ -12,8 +12,6 @@ WebSocket broadcasting (broadcast_team_message) is unchanged.
 """
 
 import asyncio
-import base64
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 
@@ -26,57 +24,6 @@ from services.utils import serialize_mongo
 
 
 db = get_mongo_db()
-ESCALATION_RETENTION = timedelta(days=90)
-_escalation_indexes_ready: set[str] = set()
-
-
-def _canonical_escalation_status(status: str) -> str:
-    return "reviewed" if status == "reviewed" else "pending_human_review"
-
-
-async def ensure_escalation_indexes(org_id: str) -> None:
-    """Create the indexes required by durable writes and cursor discovery."""
-    if not org_id or org_id in _escalation_indexes_ready:
-        return
-    collection = get_async_mongo_db()[f"escalations_{org_id}"]
-    indexes = (
-        (("id",), {"unique": True}),
-        (([("status", 1), ("timestamp", -1), ("id", -1)],), {}),
-        (([("conversation_id", 1), ("status", 1), ("timestamp", -1)],), {}),
-        (("expires_at",), {"expireAfterSeconds": 0}),
-    )
-    complete = True
-    for args, kwargs in indexes:
-        try:
-            await collection.create_index(*args, **kwargs)
-        except Exception as exc:
-            complete = False
-            logger.error(f"[team_service] Escalation index unavailable for org={org_id}: {exc}")
-    if complete:
-        _escalation_indexes_ready.add(org_id)
-
-
-def _encode_escalation_cursor(timestamp: datetime, escalation_id: str) -> str:
-    payload = json.dumps(
-        {"timestamp": timestamp.astimezone(timezone.utc).isoformat(), "id": escalation_id},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-
-
-def _decode_escalation_cursor(cursor: str) -> tuple[datetime, str]:
-    try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
-        timestamp = datetime.fromisoformat(str(payload["timestamp"]).replace("Z", "+00:00"))
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        escalation_id = str(payload["id"])
-        if not escalation_id:
-            raise ValueError("missing escalation id")
-        return timestamp.astimezone(timezone.utc), escalation_id
-    except Exception as exc:
-        raise ValueError("Invalid escalation cursor") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +95,6 @@ async def fetch_ai_escalations(org_id: str) -> List[Dict]:
     Discovery endpoint for agents to find new escalations in their org.
     Reads from: escalations_{   org_id} (without org_ prefix)
     """
-    await ensure_escalation_indexes(org_id)
     async_db = get_async_mongo_db()
     collection = async_db[f"escalations_{org_id}"]
 
@@ -175,52 +121,6 @@ async def fetch_ai_escalations(org_id: str) -> List[Dict]:
     return raw_docs
 
 
-async def fetch_ai_escalations_v2(
-    org_id: str,
-    *,
-    status: str = "pending",
-    cursor: Optional[str] = None,
-    limit: int = 50,
-) -> Dict:
-    """Cursor-paginated escalation discovery with explicit lifecycle status."""
-    await ensure_escalation_indexes(org_id)
-    canonical_status = _canonical_escalation_status(status)
-    query: Dict = {
-        "status": {"$in": ["pending_human_review", "reviewed"]}
-        if status == "all" else canonical_status
-    }
-    if cursor:
-        timestamp, escalation_id = _decode_escalation_cursor(cursor)
-        query["$or"] = [
-            {"timestamp": {"$lt": timestamp}},
-            {"timestamp": timestamp, "id": {"$lt": escalation_id}},
-        ]
-    bounded_limit = max(1, min(int(limit), 100))
-    collection = get_async_mongo_db()[f"escalations_{org_id}"]
-    docs = await (
-        collection.find(query, {"_id": 0})
-        .sort([("timestamp", -1), ("id", -1)])
-        .limit(bounded_limit + 1)
-        .to_list(length=bounded_limit + 1)
-    )
-    has_more = len(docs) > bounded_limit
-    items = docs[:bounded_limit]
-    next_cursor = None
-    if has_more and items:
-        last_timestamp = items[-1].get("timestamp")
-        if isinstance(last_timestamp, datetime):
-            next_cursor = _encode_escalation_cursor(last_timestamp, str(items[-1].get("id") or ""))
-    for doc in items:
-        for field in ("timestamp", "created_at", "updated_at", "reviewed_at", "expires_at"):
-            if isinstance(doc.get(field), datetime):
-                doc[field] = serialize_mongo(doc[field])
-    return {
-        "items": items,
-        "next_cursor": next_cursor,
-        "status": "all" if status == "all" else "pending" if canonical_status == "pending_human_review" else "reviewed",
-    }
-
-
 # ---------------------------------------------------------------------------
 # Update Escalation Status
 # ---------------------------------------------------------------------------
@@ -228,42 +128,28 @@ async def fetch_ai_escalations_v2(
 async def update_escalation_status(
     org_id: str,
     escalation_id: str,
-    status: str,
-    reviewer_id: Optional[str] = None,
+    status: str
 ) -> bool:
     """
     Update the status of an AI escalation (e.g., from pending to reviewed).
     Targets the new collection: escalations_{org_id}
     """
-    await ensure_escalation_indexes(org_id)
     async_db = get_async_mongo_db()
     collection = async_db[f"escalations_{org_id}"]
-    canonical_status = _canonical_escalation_status(status)
-    now = datetime.now(timezone.utc)
-    update: Dict = {
-        "$set": {
-            "status": canonical_status,
-            "updated_at": now,
-        }
-    }
-    if canonical_status == "reviewed":
-        update["$set"].update({
-            "reviewed_at": now,
-            "reviewed_by": reviewer_id,
-            "expires_at": now + ESCALATION_RETENTION,
-        })
-    else:
-        update["$unset"] = {"reviewed_at": "", "reviewed_by": "", "expires_at": ""}
+
     result = await collection.update_one(
         {"id": escalation_id},
-        update,
+        {"$set": {
+            "status": status,
+            "updated_at": datetime.now(timezone.utc)
+        }}
     )
 
     if result.matched_count == 0:
         logger.warning(f"[team_service] No escalation found to update status: {escalation_id}")
         return False
 
-    logger.info(f"[team_service] Updated escalation status to '{canonical_status}' for {escalation_id} in org {org_id}")
+    logger.info(f"[team_service] Updated escalation status to '{status}' for {escalation_id} in org {org_id}")
     return True
 
 
@@ -276,9 +162,9 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
     Save a new AI escalation to MongoDB and broadcast to online agents.
     Used by the internal API and AI tools.
     """
+    from services.websocket_service import broadcast_ai_escalation
     import uuid
 
-    await ensure_escalation_indexes(org_id)
     async_db = get_async_mongo_db()
     collection = async_db[f"escalations_{org_id}"]
     metadata = data.get("metadata") or {}
@@ -297,36 +183,23 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
             return existing
 
     # Prepare document
-    now = datetime.now(timezone.utc)
-    canonical_status = _canonical_escalation_status(data.get("status", "pending_human_review"))
     escalation_doc = {
         "org_id": org_id,
         "id": data.get("id") or str(uuid.uuid4()),
-        "type": data.get("type"),
-        "schema_version": data.get("schema_version"),
         "user_name": data.get("user_name"),
         "customer_number": data.get("customer_number"),
         "customer_text": data.get("customer_text"),
         "inferred_intent": data.get("inferred_intent"),
         "priority": data.get("priority", "high"),
         "kind": data.get("kind", "actionable"),
-        "status": canonical_status,
-        "timestamp": now,
-        "created_at": now,
+        "status": data.get("status", "pending_human_review"),
+        "timestamp": datetime.now(timezone.utc),
+        "created_at": datetime.now(timezone.utc),
         "role": data.get("role", "ai_agent"),
         "sender_name": data.get("sender_name", "AI Assistant"),
-        "conversation_id": data.get("conversation_id") or metadata.get("conversation_id"),
-        "channel": data.get("channel") or metadata.get("channel"),
-        "context": data.get("context"),
         "is_ai_escalation": True,
         "metadata": metadata
     }
-    if canonical_status == "reviewed":
-        escalation_doc.update({
-            "reviewed_at": now,
-            "reviewed_by": data.get("reviewed_by"),
-            "expires_at": now + ESCALATION_RETENTION,
-        })
 
     # Mongo's native unique _id makes concurrent retries safe without a new index.
     dedupe_id = data.get("dedupe_id")
@@ -347,13 +220,10 @@ async def create_ai_escalation(org_id: str, data: Dict) -> Dict:
     # Broadcast via WebSocket
     # Prepare broadcast payload (format timestamps as ISO string)
     broadcast_payload = escalation_doc.copy()
-    for field in ("timestamp", "created_at", "reviewed_at", "expires_at"):
-        if isinstance(broadcast_payload.get(field), datetime):
-            broadcast_payload[field] = serialize_mongo(broadcast_payload[field])
+    broadcast_payload["timestamp"] = serialize_mongo(broadcast_payload["timestamp"])
+    broadcast_payload["created_at"] = serialize_mongo(broadcast_payload["created_at"])
     
     try:
-        from services.websocket_service import broadcast_ai_escalation
-
         await asyncio.wait_for(
             broadcast_ai_escalation(org_id, broadcast_payload),
             timeout=1,

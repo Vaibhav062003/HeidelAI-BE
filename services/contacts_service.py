@@ -16,7 +16,6 @@ from database import get_mongo_db
 from loguru import logger
 from services.websocket_service import broadcast_on_stats_update
 from services.utils import name_search_prefixes, normalize_phone
-from services.whatsapp_connection_service import whatsapp_conversation_scope
 
 db = get_mongo_db()
 
@@ -85,8 +84,6 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
     elif platform == "whatsapp":
         update_doc["$set"]["phone_number"] = contact_data.get("phone_number")
         update_doc["$set"]["whatsapp_id"] = contact_data.get("whatsapp_id")
-        if contact_data.get("conversation_id"):
-            update_doc["$addToSet"] = {"conversation_ids": contact_data["conversation_id"]}
 
     # Clean up $set to avoid overwriting with None if fields are missing in contact_data
     for key in list(update_doc["$set"].keys()):
@@ -379,7 +376,7 @@ async def get_labels_from_org_metadata(org_id: str):
     else:
         return []
 
-async def get_unread_counts_by_labels(org_id: str, business_phone_id: str | None = None):
+async def get_unread_counts_by_labels(org_id: str):
     """
     Get labels from org metadata and calculate unread conversation count for each label.
     Returns a dictionary: { "label_name": unread_count, ... }
@@ -398,30 +395,15 @@ async def get_unread_counts_by_labels(org_id: str, business_phone_id: str | None
         
         conv_col = async_db[f"conversations_{org_id}"]
         
-        conversation_match = {"unread_count": {"$gt": 0}}
-        if business_phone_id:
-            active = {"org_id": org_id, "is_active": {"$ne": False}}
-            primary = await async_db.whatsapp_connections.find_one(
-                {**active, "slot": 1}, {"phone_id": 1}
-            ) or await async_db.whatsapp_connections.find_one(
-                active, {"phone_id": 1}, sort=[("connected_at", 1)]
-            )
-            conversation_match.update(whatsapp_conversation_scope(
-                business_phone_id,
-                include_legacy=bool(primary and str(primary.get("phone_id") or "") == str(business_phone_id)),
-            ))
         pipeline = [
             # Only conversations with unread messages
-            {"$match": conversation_match},
+            {"$match": {"unread_count": {"$gt": 0}}},
             # Join with contacts to get labels
             {
                 "$lookup": {
                     "from": f"contacts_{org_id}",
-                    "let": {"conversation_id": "$conversation_id"},
-                    "pipeline": [{"$match": {"$expr": {"$or": [
-                        {"$eq": ["$conversation_id", "$$conversation_id"]},
-                        {"$in": ["$$conversation_id", {"$ifNull": ["$conversation_ids", []]}]},
-                    ]}}}],
+                    "localField": "conversation_id",
+                    "foreignField": "conversation_id",
                     "as": "contact"
                 }
             },

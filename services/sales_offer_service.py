@@ -31,9 +31,6 @@ def _outbox_collection(org_id: str):
     return get_async_mongo_db()[f"sales_offer_outbox_{org_id}"]
 
 
-_VERIFIED_OUTCOME_ORDER = {"superseded": -1, "open": 0, "accepted": 1, "billed": 2, "paid": 3}
-
-
 async def ensure_sales_offer_indexes() -> None:
     db = get_async_mongo_db()
     organizations = await db.organizations.find({}, {"org_id": 1}).to_list(length=None)
@@ -64,58 +61,6 @@ async def _broadcast_offer(org_id: str, offer: dict, action: str = "updated") ->
         "offer_id": str(offer.get("_id") or ""),
         "action": action,
     })
-
-
-async def record_verified_offer_outcome(
-    org_id: str, conversation_id: str, quote_id: str, quote_revision: int,
-    status: str, event_key: str,
-) -> dict | None:
-    """Advance the exact formal quote from a verified Tally event."""
-    if status not in {"billed", "paid"} or not quote_id or not event_key:
-        return None
-    collection = _collection(org_id)
-    query = {
-        "org_id": org_id,
-        "conversation_id": conversation_id,
-        "quote_id": quote_id,
-        "quote_revision": int(quote_revision),
-        "source_type": "formal_quote",
-        "delivery_status": {"$ne": "failed"},
-    }
-    offer = await collection.find_one(query, sort=[("created_at", -1)])
-    if not offer or event_key in (offer.get("outcome_event_keys") or []):
-        return offer
-    current = str(offer.get("status") or "open")
-    if current not in _VERIFIED_OUTCOME_ORDER or _VERIFIED_OUTCOME_ORDER[current] >= _VERIFIED_OUTCOME_ORDER[status]:
-        return offer
-
-    now = datetime.now(timezone.utc)
-    result = await collection.update_one(
-        {"_id": offer["_id"], "status": current, "outcome_event_keys": {"$ne": event_key}},
-        {
-            "$set": {
-                "status": status,
-                "outcome_source": "tally_verified",
-                f"{status}_at": now,
-                "updated_at": now,
-            },
-            "$addToSet": {"outcome_event_keys": event_key},
-            "$push": {"outcome_history": {
-                "from": current,
-                "to": status,
-                "changed_at": now,
-                "changed_by": "tally",
-                "changed_by_name": "Tally verification",
-                "event_key": event_key,
-            }},
-        },
-    )
-    if not result.modified_count:
-        return await collection.find_one({"_id": offer["_id"]})
-    updated = await collection.find_one({"_id": offer["_id"]})
-    if updated:
-        await _broadcast_offer(org_id, updated, "outcome")
-    return updated
 
 
 async def _supersede_older_formal_quotes(org_id: str, current: dict) -> None:

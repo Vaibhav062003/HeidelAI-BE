@@ -31,11 +31,7 @@ def test_quote_design_defaults_are_persisted_and_validated():
     design = _function(tree, "_default_quote_sections")
     assert design
     assert 'pdf_design: Optional[QuoteDesign]' in source
-    assert 'branding_defaults: Optional[QuoteBrandingDefaults]' in source
     assert '"pdf_design": (settings or {}).get("pdf_design") or QuoteDesign().model_dump()' in source
-    assert '"branding_defaults": (settings or {}).get("branding_defaults") or QuoteBrandingDefaults().model_dump()' in source
-    assert 'labels: QuoteTextLabels' in source
-    assert 'ConfigDict(str_strip_whitespace=True)' in source
     assert 'At least one quote' in source and 'cannot contain duplicates' in source
 
 

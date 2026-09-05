@@ -4,7 +4,7 @@ from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 from pymongo import ReturnDocument
 
 from auth.auth_utils import admin_required
@@ -64,16 +64,12 @@ class QuotePublicOptions(BaseModel):
 
 
 class QuoteComponentCategory(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
     id: str = Field(..., min_length=1, max_length=80)
     label: str = Field(..., min_length=1, max_length=40)
     enabled: bool = True
 
 
 class QuoteSectionLayout(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
     id: Literal[
         "customer", "metadata", "build", "items", "totals", "seller",
         "payment", "notes", "terms",
@@ -83,8 +79,6 @@ class QuoteSectionLayout(BaseModel):
 
 
 class QuoteColumnLayout(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
     id: Literal["category", "description", "sku", "quantity", "rate", "gst", "total"]
     label: str = Field(min_length=1, max_length=30)
     enabled: bool = True
@@ -93,48 +87,30 @@ class QuoteColumnLayout(BaseModel):
 def _default_quote_sections() -> list[QuoteSectionLayout]:
     return [QuoteSectionLayout(id=id, label=label) for id, label in (
         ("customer", "Customer"), ("metadata", "Quote details"), ("build", "Build summary"),
-        ("items", "Items"), ("totals", "Totals"), ("seller", "Seller details"),
-        ("payment", "Payment details"), ("notes", "Build and delivery notes"),
-        ("terms", "Terms and conditions"),
+        ("items", "Items"), ("totals", "Totals"), ("seller", "Seller"),
+        ("payment", "Payment"), ("notes", "Notes"), ("terms", "Terms"),
     )]
 
 
 def _default_quote_columns() -> list[QuoteColumnLayout]:
     return [QuoteColumnLayout(id=id, label=label, enabled=enabled) for id, label, enabled in (
-        ("category", "Component", True), ("description", "Specification", True),
+        ("category", "Category", True), ("description", "Description", True),
         ("sku", "SKU", True), ("quantity", "Qty", True), ("rate", "Rate", False),
         ("gst", "GST", True), ("total", "Total", False),
     )]
 
 
-class QuoteTextLabels(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    issued: str = Field(default="Issued", min_length=1, max_length=30)
-    paymentDue: str = Field(default="Payment due", min_length=1, max_length=30)
-    validUntil: str = Field(default="Valid until", min_length=1, max_length=30)
-    components: str = Field(default="Components", min_length=1, max_length=30)
-    totalInvestment: str = Field(default="Total investment", min_length=1, max_length=40)
-    taxIncluded: str = Field(default="Inclusive of applicable GST", min_length=1, max_length=60)
-    subtotal: str = Field(default="Subtotal", min_length=1, max_length=30)
-    gst: str = Field(default="GST", min_length=1, max_length=30)
-    shipping: str = Field(default="Shipping", min_length=1, max_length=30)
-    discount: str = Field(default="Discount", min_length=1, max_length=30)
-
-
 class QuoteDesign(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    name: str = Field(default="Signature", min_length=1, max_length=40)
-    headerColor: str = Field(default="#344B5F", pattern=r"^#[0-9A-Fa-f]{6}$")
-    accentColor: str = Field(default="#F36B3D", pattern=r"^#[0-9A-Fa-f]{6}$")
-    pageColor: str = Field(default="#FBFBF8", pattern=r"^#[0-9A-Fa-f]{6}$")
-    textColor: str = Field(default="#2A241D", pattern=r"^#[0-9A-Fa-f]{6}$")
+    name: str = Field(default="Custom", min_length=1, max_length=40)
+    headerColor: str = Field(default="#111315", pattern=r"^#[0-9A-Fa-f]{6}$")
+    accentColor: str = Field(default="#F7AD0A", pattern=r"^#[0-9A-Fa-f]{6}$")
+    pageColor: str = Field(default="#FBFAF7", pattern=r"^#[0-9A-Fa-f]{6}$")
+    textColor: str = Field(default="#0E1113", pattern=r"^#[0-9A-Fa-f]{6}$")
     typography: Literal["modern", "editorial"] = "modern"
     fontScale: float = Field(default=1, ge=0.9, le=1.15)
     density: Literal["compact", "comfortable"] = "compact"
-    headerStyle: Literal["solid", "light"] = "light"
-    tableStyle: Literal["striped", "ruled"] = "ruled"
+    headerStyle: Literal["solid", "light"] = "solid"
+    tableStyle: Literal["striped", "ruled"] = "striped"
     totalStyle: Literal["filled", "outline"] = "filled"
     showCustomerBlock: bool = True
     showMetadata: bool = True
@@ -143,7 +119,6 @@ class QuoteDesign(BaseModel):
     showNotes: bool = True
     showTerms: bool = True
     showPageNumbers: bool = True
-    labels: QuoteTextLabels = Field(default_factory=QuoteTextLabels)
     sections: list[QuoteSectionLayout] = Field(default_factory=_default_quote_sections, min_length=1, max_length=9)
     columns: list[QuoteColumnLayout] = Field(default_factory=_default_quote_columns, min_length=1, max_length=7)
 
@@ -159,35 +134,21 @@ class QuoteDesign(BaseModel):
 
 
 class QuoteBranding(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
     document_title: str = Field(default="Quotation", min_length=1, max_length=60)
     build_title: str = Field(default="Performance Workstation", max_length=80)
     build_label: str = Field(default="Custom PC", max_length=30)
     build_promise: str = Field(default="Manufacturer warranty / GST invoice", max_length=100)
     theme: Literal["slate", "emerald", "blue", "burgundy"] = "slate"
     cover_image_url: str = Field(default="", max_length=2048)
-    footer_text: str = Field(default="Thank you for the opportunity to build this with you.", max_length=240)
-    component_categories: list[QuoteComponentCategory] = Field(default_factory=list, max_length=20)
-    design: Optional[QuoteDesign] = None
-
-
-class QuoteBrandingDefaults(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    document_title: str = Field(default="Quotation", min_length=1, max_length=60)
-    build_title: str = Field(default="Performance Workstation", min_length=1, max_length=80)
-    build_label: str = Field(default="Custom PC", min_length=1, max_length=30)
-    build_promise: str = Field(default="Manufacturer warranty / GST invoice", max_length=100)
     footer_text: str = Field(default="Thank you for your business.", max_length=240)
     component_categories: list[QuoteComponentCategory] = Field(default_factory=list, max_length=20)
+    design: Optional[QuoteDesign] = None
 
 
 class QuoteSettingsPayload(BaseModel):
     logo_url: Optional[str] = Field(default=None, min_length=1, max_length=2048)
     seller: Optional[QuoteParty] = None
     pdf_design: Optional[QuoteDesign] = None
-    branding_defaults: Optional[QuoteBrandingDefaults] = None
 
 
 class QuotePayload(BaseModel):
@@ -293,7 +254,6 @@ async def get_quote_settings(request: Request, user: CurrentUser):
                 "payment_details": seller.get("payment_details", ""),
             },
             "pdf_design": (settings or {}).get("pdf_design") or QuoteDesign().model_dump(),
-            "branding_defaults": (settings or {}).get("branding_defaults") or QuoteBrandingDefaults().model_dump(),
             "can_edit": user.role in {"admin", "org:admin"},
         }
     }
@@ -314,10 +274,8 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
         updates["seller"] = payload.seller.model_dump()
     if payload.pdf_design is not None:
         updates["pdf_design"] = payload.pdf_design.model_dump()
-    if payload.branding_defaults is not None:
-        updates["branding_defaults"] = payload.branding_defaults.model_dump()
     if not updates:
-        raise HTTPException(status_code=422, detail="Add a logo, seller profile or PDF default to update")
+        raise HTTPException(status_code=422, detail="Add a logo, seller profile or PDF design to update")
     settings = await _settings_collection(user.org_id).find_one_and_update(
         {"_id": "branding"},
         {"$set": {
@@ -333,7 +291,6 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
         "logo_url": settings.get("logo_url", ""),
         "seller": settings.get("seller", {}),
         "pdf_design": settings.get("pdf_design") or QuoteDesign().model_dump(),
-        "branding_defaults": settings.get("branding_defaults") or QuoteBrandingDefaults().model_dump(),
         "can_edit": True,
     }}
 

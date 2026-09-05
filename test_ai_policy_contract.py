@@ -22,13 +22,9 @@ def test_ai_policy_contract() -> None:
     assert "MAX_PAUSE_MINUTES = 24 * 60" in policy
     assert 'conversation_id.startswith(("whatsapp_", "instagram_"))' in policy
     assert 'db[f"conversations_{org_id}"]' in policy
-    assert '"number_disabled"' in policy
-    assert '"ai_disabled_whatsapp_phone_ids"' in policy
-    assert '"whatsapp_enabled_phone_ids"' in policy
 
     put_policy = function_node("api/ai_routes.py", "put_ai_policy")
     assert any(isinstance(node, ast.Name) and node.id == "admin_required" for node in ast.walk(put_policy))
-    assert "whatsapp_enabled_phone_ids" in (ROOT / "api/ai_routes.py").read_text()
 
     scheduler = function_node("core/scheduler.py", "update_ai_status")
     names = {node.id for node in ast.walk(scheduler) if isinstance(node, ast.Name)}

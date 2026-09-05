@@ -1,4 +1,3 @@
-import asyncio
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # === Internal Modules ===
@@ -34,11 +33,11 @@ async def process_inactivity_for_org(org_id: str):
     conv_col = db[f"conversations_{org_id}"]
     now = datetime.now(timezone.utc)
 
-    convs = await asyncio.to_thread(lambda: list(conv_col.find({
+    convs = list(conv_col.find({
         "status": "open",
         "last_sender": "agent",
         "next_action_at": {"$lte": now}
-    })))
+    }))
 
     if not convs:
         return 
@@ -50,13 +49,14 @@ async def process_inactivity_for_org(org_id: str):
         conv_id = conv["conversation_id"]
 
         if stage == 0:
-            await asyncio.to_thread(
-                conv_col.update_one,
+            conv_col.update_one(
                 {"conversation_id": conv_id},
-                {"$set": {
-                    "reminder_stage": 1,
-                    "next_action_at": now + timedelta(hours=6),
-                }},
+                {
+                    "$set": {
+                        "reminder_stage": 1,
+                        "next_action_at": now + timedelta(hours=6)
+                    }
+                }
             )
             logger.info(f"[ORG {org_id[:6]}...] Stage 0 → 1 for {conv_id}")
             continue
@@ -76,13 +76,14 @@ async def process_inactivity_for_org(org_id: str):
 
         elif stage == 1:
             # Second 12h inactivity follow-up
-            await asyncio.to_thread(
-                conv_col.update_one,
+            conv_col.update_one(
                 {"conversation_id": conv_id},
-                {"$set": {
-                    "reminder_stage": 2,
-                    "next_action_at": now + timedelta(hours=6),
-                }},
+                {
+                    "$set": {
+                        "reminder_stage": 2,
+                        "next_action_at": now + timedelta(hours=6)
+                    }
+                }
             )
             logger.info(f"[ORG {org_id[:6]}...] Stage 1 → 2 for {conv_id}")
             continue
@@ -114,7 +115,7 @@ async def process_time_based_tasks():
 
     logger.info("Processing inactivity follow-ups and closures...")
     # Process inactivity follow-ups & closures for all orgs
-    orgs = await asyncio.to_thread(lambda: list(db.organizations.find({}, {"org_id": 1})))
+    orgs = db.organizations.find({}, {"org_id": 1})
     for org in orgs:
         org_id = org["org_id"]
         await process_inactivity_for_org(org_id)
@@ -134,7 +135,6 @@ def start_scheduler():
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests, process_pending_oos_reply_steps
     from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
     from services.pricing_service import process_pending_pricing_escalations
-    from services.product_sheet_sync import reconcile_active_product_sheets
     from services.sales_offer_service import process_pending_sales_offer_audits
     from services.tally_service import check_tally_contact_sync_health, cleanup_expired_tally_pdfs, process_tally_payment_reminders, reconcile_stale_tally_jobs
     from services.shopify_service import process_shopify_reminders, process_shopify_syncs
@@ -160,7 +160,6 @@ def start_scheduler():
     scheduler.add_job(process_shopify_reminders, "interval", seconds=30, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
     scheduler.add_job(process_shopify_syncs, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_pricing_escalations, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(reconcile_active_product_sheets, "interval", minutes=15, max_instances=1, coalesce=True)
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
     scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)

@@ -54,9 +54,6 @@ def structured_offer_snapshot(context: Optional[dict]) -> Optional[dict]:
     raw_items = offer.get("items")
     if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= 50:
         raise ValueError("A chat offer must contain between 1 and 50 products")
-    show_product_prices = offer.get("show_product_prices", True)
-    if not isinstance(show_product_prices, bool):
-        raise ValueError("Chat-offer price visibility must be true or false")
 
     items = []
     grand_total = Decimal("0")
@@ -67,25 +64,10 @@ def structured_offer_snapshot(context: Optional[dict]) -> Optional[dict]:
         description = str(raw.get("description") or "").strip()
         if not description or len(description) > 240:
             raise ValueError("Every chat-offer item needs a product name")
-        if (
-            len(description.splitlines()) != 1
-            or re.search(r"[\x00-\x1f\x7f\u20a0-\u20cf$€£¥]", description)
-            or _CURRENCY_PRICE_RE.search(description)
-            or _BARE_PRICE_RE.search(description)
-            or re.search(r"\b(?:price|rate|offer|total|can\s+do)\b[^\d]{0,12}\d", description, re.I)
-            or re.search(
-                r"\b(?:at|for|only)\s+\d[\d,]*(?:\.\d{1,2})?\s*(?:k|thousand|lakh|lac)?\b",
-                description,
-                re.I,
-            )
-        ):
-            raise ValueError("Chat-offer product names must not contain price text")
-        if "gst_rate" not in raw or raw.get("gst_rate") is None:
-            raise ValueError("Every chat-offer item must explicitly provide its GST rate")
         try:
             quantity = Decimal(str(raw.get("quantity", 1)))
             unit_price = Decimal(str(raw.get("unit_price")))
-            gst_rate = Decimal(str(raw.get("gst_rate")))
+            gst_rate = Decimal(str(raw.get("gst_rate", 18)))
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise ValueError("Chat-offer quantities, prices and GST must be numbers") from exc
         if not all(isfinite(float(value)) for value in (quantity, unit_price, gst_rate)):
@@ -93,9 +75,7 @@ def structured_offer_snapshot(context: Optional[dict]) -> Optional[dict]:
         if quantity <= 0 or quantity > 1000 or unit_price <= 0 or unit_price > 999_999_999 or gst_rate < 0 or gst_rate > 100:
             raise ValueError("Chat-offer values are outside the supported range")
 
-        gst_inclusive = raw.get("gst_inclusive")
-        if not isinstance(gst_inclusive, bool):
-            raise ValueError("Every chat-offer item must explicitly say whether GST is included")
+        gst_inclusive = raw.get("gst_inclusive") is True
         entered_total = quantity * unit_price
         line_total = entered_total if gst_inclusive else entered_total * (Decimal("1") + gst_rate / Decimal("100"))
         line_total = line_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -103,11 +83,6 @@ def structured_offer_snapshot(context: Optional[dict]) -> Optional[dict]:
         tax_modes.add("included" if gst_inclusive else "extra")
         items.append({
             "description": description,
-            **{
-                key: str(raw.get(key) or "").strip()
-                for key in ("sku", "tally_master_id", "tally_guid", "tally_alter_id")
-                if str(raw.get(key) or "").strip()
-            },
             "quantity": float(quantity),
             "unit_price": float(unit_price),
             "gst_rate": float(gst_rate),
@@ -120,18 +95,7 @@ def structured_offer_snapshot(context: Optional[dict]) -> Optional[dict]:
         "amounts": [item["line_total"] for item in items],
         "total_amount": float(grand_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
         "tax_basis": next(iter(tax_modes)) if len(tax_modes) == 1 else "mixed",
-        "show_product_prices": show_product_prices,
     }
-
-
-def render_structured_offer_message(offer: dict) -> str:
-    rows = []
-    for index, item in enumerate(offer["items"], 1):
-        if offer["show_product_prices"]:
-            rows.append(f"{index}. {item['description']} — ₹{item['line_total']:,.2f}")
-        else:
-            rows.append(f"{index}. {item['description']} × {item['quantity']:g}")
-    return "\n".join(["Price offer", "", *rows, "", f"Total: ₹{offer['total_amount']:,.2f}"])
 
 
 def report_query(

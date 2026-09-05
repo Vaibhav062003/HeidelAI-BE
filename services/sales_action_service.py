@@ -11,10 +11,7 @@ from loguru import logger
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from config.settings import PRICING_FLOOR_MAX_AGE_MINUTES
 from database import get_async_mongo_db
-from services.pricing_decision_service import get_pricing_settings
-from services.pricing_policy import PriceSnapshot, QuoteCandidate, decide_pricing_v1
 from services.pricing_service import _floor_tax_basis, floor_snapshot
 from services.quote_service import build_quote_document
 from services.sales_case_service import sales_action_job_id, set_sales_action_state
@@ -99,8 +96,8 @@ async def _product(org_id: str, selected_id: str) -> dict[str, Any] | None:
         str(selected.get(field)).strip() for field in fields
         if selected and selected.get(field)
     )}
-    live = await db[f"products_{org_id}"].find(query(identifiers)).limit(2).to_list(length=2)
-    return live[0] if len(live) == 1 else None
+    live = await db[f"products_{org_id}"].find_one(query(identifiers))
+    return live or selected
 
 
 async def _checked_product(case: dict[str, Any]) -> tuple[dict[str, Any], int, float]:
@@ -142,130 +139,11 @@ async def _checked_product(case: dict[str, Any]) -> tuple[dict[str, Any], int, f
     return product, quantity, floor
 
 
-async def _sales_action_quote_price(
-    case: dict[str, Any],
-    product: dict[str, Any],
-    quantity: int,
-    legacy_floor: float,
-    source_message_id: str,
-) -> float:
-    """Audit shadow decisions and enforce the exact target policy only in review."""
-    try:
-        pricing_mode = str(
-            (await get_pricing_settings(str(case["org_id"]))).get("mode") or "off"
-        )
-    except Exception as exc:
-        raise SalesActionBlocked(
-            "I need to verify the active pricing policy before I send this quote.",
-            escalate=True,
-        ) from exc
-    if pricing_mode == "off":
-        return legacy_floor
-
-    now = datetime.now(timezone.utc)
-    decision_data: dict[str, Any]
-    target_price: float | None = None
-    try:
-        snapshot = PriceSnapshot.from_product(product)
-        candidate_amount = snapshot.target_selling_price or snapshot.approved_floor_price or legacy_floor
-        candidate = QuoteCandidate(
-            amount=candidate_amount,
-            sku=snapshot.sku,
-            currency=snapshot.currency,
-            gst_inclusive=snapshot.selling_gst_inclusive,
-            gst_rate=snapshot.gst_rate,
-            quantity=quantity,
-            structured=True,
-            exact_product_match=True,
-            actor="ai",
-        )
-        decision = decide_pricing_v1(
-            snapshot,
-            candidate,
-            now=now,
-            max_age=timedelta(minutes=PRICING_FLOOR_MAX_AGE_MINUTES),
-        )
-        target_price = (
-            float(snapshot.target_selling_price)
-            if snapshot.target_selling_price is not None
-            else None
-        )
-        decision_data = {
-            "action": decision.action,
-            "reasons": list(decision.reasons),
-            "quote_inr_gst_inclusive": (
-                str(decision.quote_inr_gst_inclusive)
-                if decision.quote_inr_gst_inclusive is not None else None
-            ),
-            "floor_inr_gst_inclusive": (
-                str(decision.floor_inr_gst_inclusive)
-                if decision.floor_inr_gst_inclusive is not None else None
-            ),
-            "target_inr_gst_inclusive": (
-                str(decision.target_inr_gst_inclusive)
-                if decision.target_inr_gst_inclusive is not None else None
-            ),
-            "price_version": decision.price_version,
-        }
-    except (TypeError, ValueError) as exc:
-        decision_data = {
-            "action": "review_required",
-            "reasons": ["invalid_pricing_snapshot"],
-            "detail": str(exc),
-            "price_version": product.get("price_version"),
-        }
-
-    audit_id = str(uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"{case['org_id']}:{case['case_id']}:{source_message_id}:sales_action_pricing",
-    ))
-    audit = {
-        "_id": audit_id,
-        "schema_version": "sales_action_pricing_decision.v1",
-        "org_id": str(case["org_id"]),
-        "conversation_id": str(case["conversation_id"]),
-        "case_id": str(case["case_id"]),
-        "source_message_id": source_message_id,
-        "mode": pricing_mode,
-        "source": "sales_action_create_quote",
-        "quantity": quantity,
-        "sku": _sku(product),
-        "legacy_floor_price": legacy_floor,
-        **decision_data,
-        "created_at": now,
-        "expires_at": now + timedelta(days=30),
-    }
-    try:
-        await get_async_mongo_db()[f"pricing_decisions_{case['org_id']}"].update_one(
-            {"_id": audit_id}, {"$setOnInsert": audit}, upsert=True,
-        )
-    except Exception as exc:
-        if pricing_mode == "review":
-            raise SalesActionBlocked(
-                "I verified the price but could not save its pricing audit. Please ask the sales team to review it.",
-                escalate=True,
-            ) from exc
-        logger.error(f"Could not persist shadow sales-action pricing audit: {exc}")
-
-    if pricing_mode == "shadow":
-        return legacy_floor
-    if decision_data["action"] != "auto_send" or target_price is None:
-        reasons = ", ".join(decision_data.get("reasons") or ["pricing_review_required"])
-        raise SalesActionBlocked(
-            f"I need the sales team to review this quote before I send it ({reasons}).",
-            escalate=True,
-        )
-    return target_price
-
-
 async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[str, Any]:
     from services.entitlement_service import require_feature
 
     require_feature(str(case["org_id"]), "OFFERS")
     product, quantity, unit_price = await _checked_product(case)
-    unit_price = await _sales_action_quote_price(
-        case, product, quantity, unit_price, source_message_id,
-    )
     db = get_async_mongo_db()
     settings = await db[f"quote_settings_{case['org_id']}"].find_one({"_id": "branding"}) or {}
     seller = dict(settings.get("seller") or {})

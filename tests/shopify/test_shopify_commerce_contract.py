@@ -32,8 +32,6 @@ def pure_namespace():
         "_provider_reports_block", "_eligibility_status",
         "_provider_time", "_provider_sort_key", "_reminder_due", "_sync_retry_at",
         "_recovery_activity_time", "_checkout_changed_for_send",
-        "_safe_meta_error_text", "normalize_whatsapp_delivery_error", "_meta_configuration_error",
-        "_provider_retry_at", "_message_delivery_error",
         "_product_summary", "_default_template_payload", "_meta_template_error",
         "_template_compatible", "_checkout_status_clause", "verify_callback_hmac", "_iso_utc",
     }
@@ -48,10 +46,6 @@ def pure_namespace():
         "OPT_IN_COMMANDS": {"start", "subscribe"},
         "OVERDUE_GRACE_SECONDS": 90,
         "DEFAULT_TEMPLATE_LANGUAGE": "en_US",
-        "SHOPIFY_TEMPLATE_FOOTER": "Powered by Heidelai.com - AI Sales Agent",
-        "META_TRANSIENT_ERROR_CODES": {1, 2, 4, 17, 32, 613, 130429, 131000, 131016, 131056},
-        "META_CONFIGURATION_ERROR_CODES": {10, 100, 190, 200, 299, 131005, 131008, 131009},
-        "INBOX_RETRY_MINUTES": (1, 5, 15),
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVICE_PATH), "exec"), namespace)
     return namespace
@@ -120,14 +114,6 @@ def main():
     assert ns["_checkout_changed_for_send"](unchanged, {**unchanged, "products": [{"name": "B"}]})
     assert ns["_sync_retry_at"](1, provider_time) == provider_time + timedelta(minutes=1)
     assert ns["_sync_retry_at"](20, provider_time) == provider_time + timedelta(minutes=30)
-    transient = ns["normalize_whatsapp_delivery_error"](
-        {"error": {"code": 130429, "message": "Rate limit for +91 99999 99999", "error_data": {"details": "Try again"}}},
-        stage="submission", http_status=429,
-    )
-    assert transient["retryable"] and transient["code"] == 130429 and "99999" not in transient["title"]
-    assert ns["_provider_retry_at"]({}, transient, provider_time) == provider_time + timedelta(minutes=1)
-    terminal = ns["normalize_whatsapp_delivery_error"]({"errors": [{"code": 132001, "title": "Template missing"}]}, stage="delivery")
-    assert not terminal["retryable"] and ns["_meta_configuration_error"](terminal)
     assert ns["_iso_utc"](datetime(2026, 8, 28, 13, 2, 14)) == "2026-08-28T13:02:14+00:00"
     assert ns["_checkout_status_clause"]("overdue", provider_time)["reminder_due_at"]["$lte"] == provider_time - timedelta(seconds=90)
     assert ns["_checkout_status_clause"]("accepted", provider_time)["$or"][1]["delivery_status"] == "accepted"
@@ -141,7 +127,7 @@ def main():
         assert sorted(re.findall(r"{{\s*(\d+)\s*}}", body)) == ["1", "2", "3"]
         assert payload["category"] == ("MARKETING" if event == "abandoned_cart" else "UTILITY")
         if event != "abandoned_cart":
-            assert len(re.sub(r"{{\s*\d+\s*}}", "", body)) >= 80
+            assert len(re.sub(r"{{\s*\d+\s*}}", "", body)) >= 150
 
     class MetaResponse:
         status_code = 400
@@ -158,10 +144,9 @@ def main():
         "detail": "Meta rejected the Shopify template: English (US) is required",
     }
     assert len(ns["_meta_template_error"](type("LongResponse", (), {"status_code": 400, "json": lambda _self: {"error": {"error_user_msg": "x" * 400}}})())["detail"]) < 340
-    footer = {"type": "FOOTER", "text": "Powered by Heidelai.com - AI Sales Agent"}
-    assert ns["_template_compatible"]({"status": "APPROVED", "category": "MARKETING", "components": [{"type": "BODY", "text": "Hi {{1}}: {{2}} {{3}}. Thank you."}, footer]})
-    assert not ns["_template_compatible"]({"status": "APPROVED", "category": "UTILITY", "components": [{"type": "BODY", "text": "{{1}} {{2}} {{3}}"}, footer]})
-    assert not ns["_template_compatible"]({"status": "APPROVED", "category": "MARKETING", "components": [{"type": "HEADER", "text": "{{1}}"}, {"type": "BODY", "text": "Hi {{1}} {{2}} {{3}}"}, footer]})
+    assert ns["_template_compatible"]({"status": "APPROVED", "category": "MARKETING", "components": [{"type": "BODY", "text": "Hi {{1}}: {{2}} {{3}}"}]})
+    assert not ns["_template_compatible"]({"status": "APPROVED", "category": "UTILITY", "components": [{"type": "BODY", "text": "{{1}} {{2}} {{3}}"}]})
+    assert not ns["_template_compatible"]({"status": "APPROVED", "category": "MARKETING", "components": [{"type": "HEADER", "text": "{{1}}"}, {"type": "BODY", "text": "{{1}} {{2}} {{3}}"}]})
 
     params = {"shop": "demo.myshopify.com", "code": "abc", "state": "xyz", "timestamp": "1"}
     canonical = "&".join(f"{key}={value}" for key, value in sorted(params.items()))
@@ -175,7 +160,6 @@ def main():
         "/api/integrations/shopify/sync", "/api/webhooks/shopify",
         "/api/commerce/shopify/summary", "/api/commerce/shopify/records",
         "/api/commerce/shopify/checkouts/retry",
-        "/api/commerce/shopify/notifications/retry",
         "/api/conversations/{conversation_id}/shopify-activity",
     ):
         assert endpoint in ROUTES

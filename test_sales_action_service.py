@@ -71,20 +71,10 @@ class DB:
 
 class ProductCollection:
     def __init__(self, document):
-        self.documents = document if isinstance(document, list) else [document]
+        self.document = document
 
     async def find_one(self, query):
-        return self.documents[0] if self.documents else None
-
-    def find(self, query):
-        return self
-
-    def limit(self, length):
-        self.length = length
-        return self
-
-    async def to_list(self, length):
-        return self.documents[:length]
+        return self.document
 
 
 class ProductDB:
@@ -100,23 +90,6 @@ class ProductDB:
         return self.collections[name]
 
 
-class PricingAuditCollection:
-    def __init__(self):
-        self.docs = {}
-
-    async def update_one(self, query, update, upsert=False):
-        if upsert and query["_id"] not in self.docs:
-            self.docs[query["_id"]] = dict(update["$setOnInsert"])
-
-
-class PricingAuditDB:
-    def __init__(self):
-        self.audit = PricingAuditCollection()
-
-    def __getitem__(self, _name):
-        return self.audit
-
-
 def test_stock_count_requires_a_real_number():
     assert actions._stock_count({"stock": 4}) == 4
     assert actions._stock_count({"stock": "1,000"}) == 1000
@@ -130,16 +103,6 @@ def test_v5_selection_resolves_to_the_live_sheet_product(monkeypatch):
     assert product["source"] == "google_sheet"
 
 
-def test_ambiguous_live_product_match_is_not_exact(monkeypatch):
-    database = ProductDB()
-    database.collections["products_catalogue"] = ProductCollection([
-        {"unique_identifier": "ABC", "stock": 4},
-        {"unique_identifier": "ABC", "stock": 2},
-    ])
-    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
-    assert asyncio.run(actions._product("catalogue", "P1")) is None
-
-
 def test_billing_intent_is_explicit_and_handles_hinglish():
     assert actions.is_invoice_draft_intent("please bill")
     assert actions.is_invoice_draft_intent("bill karo")
@@ -149,68 +112,6 @@ def test_billing_intent_is_explicit_and_handles_hinglish():
     assert not actions.is_invoice_draft_intent("bill mat bhejo")
     assert not actions.is_invoice_draft_intent("old bill bhejo")
     assert not actions.is_invoice_draft_intent("bill kitna hoga?")
-
-
-def test_sales_action_pricing_modes_are_off_shadow_and_review(monkeypatch):
-    now = actions.datetime.now(actions.timezone.utc)
-    product = {
-        "unique_identifier": "SKU-1",
-        "approved_floor_price": 70_000,
-        "target_selling_price": 75_000,
-        "currency": "INR",
-        "gst_rate": 18,
-        "selling_gst_inclusive": True,
-        "stock_available": 5,
-        "price_source_sheet_id": "sheet-1",
-        "price_verified_at": now,
-        "price_version": "v1",
-    }
-    case = {
-        "org_id": "org",
-        "case_id": "case-1",
-        "conversation_id": "whatsapp_1",
-    }
-    database = PricingAuditDB()
-    monkeypatch.setattr(actions, "get_async_mongo_db", lambda: database)
-
-    async def settings(mode):
-        return {"mode": mode}
-
-    monkeypatch.setattr(actions, "get_pricing_settings", lambda _org_id: settings("off"))
-    off_price = asyncio.run(actions._sales_action_quote_price(
-        case, product, 2, 70_000, "message-off",
-    ))
-    assert off_price == 70_000
-    assert database.audit.docs == {}
-
-    monkeypatch.setattr(actions, "get_pricing_settings", lambda _org_id: settings("shadow"))
-    shadow_price = asyncio.run(actions._sales_action_quote_price(
-        case, product, 2, 70_000, "message-shadow",
-    ))
-    assert shadow_price == 70_000
-    shadow_audit = next(iter(database.audit.docs.values()))
-    assert shadow_audit["mode"] == "shadow"
-    assert shadow_audit["action"] == "review_required"
-    assert "quantity_not_single" in shadow_audit["reasons"]
-
-    monkeypatch.setattr(actions, "get_pricing_settings", lambda _org_id: settings("review"))
-    try:
-        asyncio.run(actions._sales_action_quote_price(
-            case, product, 2, 70_000, "message-review-block",
-        ))
-    except actions.SalesActionBlocked as exc:
-        assert "quantity_not_single" in exc.customer_message
-    else:
-        raise AssertionError("Review mode accepted a multi-quantity automatic quote")
-
-    target_price = asyncio.run(actions._sales_action_quote_price(
-        case, product, 1, 70_000, "message-review-allow",
-    ))
-    assert target_price == 75_000
-    allowed = [doc for doc in database.audit.docs.values() if doc["source_message_id"] == "message-review-allow"]
-    assert len(allowed) == 1
-    assert allowed[0]["action"] == "auto_send"
-    assert allowed[0]["reasons"] == ["verified_exact_target"]
 
 
 def test_invoice_action_creates_review_only_tally_draft(monkeypatch):

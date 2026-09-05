@@ -10,7 +10,6 @@ from html import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException
-from loguru import logger
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -51,8 +50,6 @@ INVALID_XML10_REFERENCES = re.compile(
     re.IGNORECASE,
 )
 SNAPSHOT_KEYS = {"ledgers", "stock_items", "units", "invoices", "credit_notes", "outstandings", "profit_loss"}
-TALLY_OUTCOME_MAX_ATTEMPTS = 5
-TALLY_OUTCOME_CLAIM_TIMEOUT = timedelta(minutes=5)
 
 
 def _money(value) -> Decimal:
@@ -894,109 +891,6 @@ async def _sync_tally_escalation(org_id: str, job: dict) -> None:
         )
 
 
-async def _record_tally_outcomes(
-    org_id: str, conversation_id: str, quote_id: str, quote_revision: int,
-    event_key: str, status: str,
-) -> None:
-    now = datetime.now(timezone.utc)
-    outbox_id = f"{org_id}:{event_key}"
-    await db.tally_outcome_outbox.update_one(
-        {"_id": outbox_id},
-        {"$setOnInsert": {
-            "org_id": org_id,
-            "conversation_id": conversation_id,
-            "quote_id": quote_id,
-            "quote_revision": int(quote_revision),
-            "event_key": event_key,
-            "outcome_status": status,
-            "status": "pending",
-            "attempts": 0,
-            "next_attempt_at": now,
-            "created_at": now,
-            "expires_at": now + timedelta(days=30),
-        }},
-        upsert=True,
-    )
-    await _process_tally_outcome(outbox_id)
-
-
-async def _process_tally_outcome(outbox_id: str) -> bool:
-    now = datetime.now(timezone.utc)
-    claim_id = uuid.uuid4().hex
-    job = await db.tally_outcome_outbox.find_one_and_update(
-        {
-            "_id": outbox_id,
-            "attempts": {"$lt": TALLY_OUTCOME_MAX_ATTEMPTS},
-            "$or": [
-                {"status": {"$in": ["pending", "failed"]}, "next_attempt_at": {"$lte": now}},
-                {"status": "processing", "claimed_at": {"$lt": now - TALLY_OUTCOME_CLAIM_TIMEOUT}},
-            ],
-        },
-        {"$set": {"status": "processing", "claim_id": claim_id, "claimed_at": now}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not job:
-        return False
-
-    errors = []
-    try:
-        from services.sales_offer_service import record_verified_offer_outcome
-
-        await record_verified_offer_outcome(
-            job["org_id"], job["conversation_id"], job["quote_id"],
-            int(job["quote_revision"]), job["outcome_status"], job["event_key"],
-        )
-    except Exception as exc:
-        errors.append(f"offer:{type(exc).__name__}")
-    try:
-        from services.sales_learning_service import record_verified_tally_outcome
-
-        await record_verified_tally_outcome(
-            job["org_id"], job["conversation_id"], job["event_key"], job["outcome_status"],
-        )
-    except Exception as exc:
-        errors.append(f"learning:{type(exc).__name__}")
-
-    completed_at = datetime.now(timezone.utc)
-    if not errors:
-        await db.tally_outcome_outbox.update_one(
-            {"_id": outbox_id, "claim_id": claim_id},
-            {"$set": {"status": "completed", "completed_at": completed_at}, "$unset": {"claim_id": "", "claimed_at": "", "last_error": ""}},
-        )
-        return True
-
-    attempts = int(job.get("attempts") or 0) + 1
-    await db.tally_outcome_outbox.update_one(
-        {"_id": outbox_id, "claim_id": claim_id},
-        {
-            "$set": {
-                "status": "dead" if attempts >= TALLY_OUTCOME_MAX_ATTEMPTS else "failed",
-                "attempts": attempts,
-                "last_error": ",".join(errors),
-                "next_attempt_at": completed_at + timedelta(seconds=min(900, 30 * (2 ** (attempts - 1)))),
-            },
-            "$unset": {"claim_id": "", "claimed_at": ""},
-        },
-    )
-    logger.warning(f"Deferred verified Tally outcome {outbox_id}: {','.join(errors)}")
-    return False
-
-
-async def process_pending_tally_outcomes() -> int:
-    now = datetime.now(timezone.utc)
-    jobs = await db.tally_outcome_outbox.find({
-        "attempts": {"$lt": TALLY_OUTCOME_MAX_ATTEMPTS},
-        "$or": [
-            {"status": {"$in": ["pending", "failed"]}, "next_attempt_at": {"$lte": now}},
-            {"status": "processing", "claimed_at": {"$lt": now - TALLY_OUTCOME_CLAIM_TIMEOUT}},
-        ],
-    }, {"_id": 1}).limit(50).to_list(length=50)
-    completed = 0
-    for job in jobs:
-        completed += int(await _process_tally_outcome(str(job["_id"])))
-    return completed
-
-
 def _customer_mapping(party: dict, link: dict) -> dict:
     return {
         "party_master_id": party["master_id"],
@@ -1664,13 +1558,11 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
     invoice_origins = {}
     async for job in db.tally_bill_jobs.find(
         {"org_id": org_id, "status": "completed", "master_id": {"$type": "string", "$ne": ""}},
-        {"master_id": 1, "conversation_id": 1, "customer.phone": 1, "quote_id": 1, "quote_revision": 1},
+        {"master_id": 1, "conversation_id": 1, "customer.phone": 1},
     ).sort("created_at", -1):
         invoice_origins.setdefault(job["master_id"], {
             "conversation_id": job.get("conversation_id") or "",
             "phone": (job.get("customer") or {}).get("phone") or str(job.get("conversation_id") or "").removeprefix("whatsapp_"),
-            "quote_id": job.get("quote_id") or "",
-            "quote_revision": int(job.get("quote_revision") or 1),
         })
     outstanding = {
         (row["party_ledger"].casefold(), row["bill_reference"].casefold()): row
@@ -1699,9 +1591,7 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
         pdf = previous.get("pdf") or {}
         if (pdf.get("public_id") or pdf.get("url")) and str(pdf.get("alter_id")) == str(invoice.get("alter_id")):
             invoice["pdf"] = pdf
-        previous_contact = previous.get("billing_contact") or {}
-        origin = invoice_origins.get(invoice.get("master_id")) or {}
-        billing_contact = {**origin, **previous_contact}
+        billing_contact = previous.get("billing_contact") or invoice_origins.get(invoice.get("master_id"))
         if billing_contact:
             invoice["billing_contact"] = billing_contact
     parsed["invoices"] = _merge_deleted_transactions(transactions, previous_rows, now)
@@ -1752,16 +1642,13 @@ async def _store_tally_snapshot(org_id: str, responses: list[dict]) -> dict:
         }}
     )
     await reconcile_default_payment_reminders(org_id)
+    from services.sales_learning_service import record_verified_tally_outcome
     for invoice in parsed["invoices"]:
         contact = invoice.get("billing_contact") or {}
         if invoice.get("payment_status") == "paid" and contact.get("conversation_id"):
-            await _record_tally_outcomes(
-                org_id,
-                str(contact["conversation_id"]),
-                str(contact.get("quote_id") or ""),
-                int(contact.get("quote_revision") or 1),
-                f"tally-paid:{invoice.get('invoice_id')}",
-                "paid",
+            await record_verified_tally_outcome(
+                org_id, str(contact["conversation_id"]),
+                f"tally-paid:{invoice.get('invoice_id')}", "paid",
             )
     return {"counts": counts, "contact_counts": contact_counts, "last_sync_at": now}
 
@@ -2926,8 +2813,6 @@ async def ensure_tally_indexes() -> None:
     await db.tally_profit_loss_reports.create_index([("org_id", 1), ("from_date", 1), ("to_date", 1)], unique=True)
     await db.tally_invoice_drafts.create_index("draft_id", unique=True)
     await db.tally_invoice_drafts.create_index([("org_id", 1), ("conversation_id", 1), ("created_at", -1)])
-    await db.tally_outcome_outbox.create_index([("status", 1), ("next_attempt_at", 1)])
-    await db.tally_outcome_outbox.create_index("expires_at", expireAfterSeconds=0)
 
 
 async def get_integration(org_id: str) -> dict:
@@ -3244,13 +3129,10 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
             if status == "completed":
                 await _remember_customer_mapping(integration["org_id"], existing)
                 await queue_tally_sync(integration["org_id"], force=True)
-                await _record_tally_outcomes(
-                    integration["org_id"],
-                    str(existing.get("conversation_id") or ""),
-                    str(existing.get("quote_id") or ""),
-                    int(existing.get("quote_revision") or 1),
-                    f"tally-billed:{existing['job_id']}",
-                    "billed",
+                from services.sales_learning_service import record_verified_tally_outcome
+                await record_verified_tally_outcome(
+                    integration["org_id"], str(existing.get("conversation_id") or ""),
+                    f"tally-billed:{existing['job_id']}", "billed",
                 )
             if existing.get("draft_id"):
                 await db.tally_invoice_drafts.update_one(
@@ -3270,13 +3152,10 @@ async def finish_job(integration: dict, job_id: str, claim_id: str | None, resul
     if status == "completed":
         await _remember_customer_mapping(integration["org_id"], updated)
         await queue_tally_sync(integration["org_id"], force=True)
-        await _record_tally_outcomes(
-            integration["org_id"],
-            str(updated.get("conversation_id") or ""),
-            str(updated.get("quote_id") or ""),
-            int(updated.get("quote_revision") or 1),
-            f"tally-billed:{updated['job_id']}",
-            "billed",
+        from services.sales_learning_service import record_verified_tally_outcome
+        await record_verified_tally_outcome(
+            integration["org_id"], str(updated.get("conversation_id") or ""),
+            f"tally-billed:{updated['job_id']}", "billed",
         )
     if updated.get("draft_id"):
         await db.tally_invoice_drafts.update_one(
@@ -3308,5 +3187,4 @@ async def reconcile_stale_tally_jobs() -> int:
             "updated_at": now,
         }, "$unset": {"claim_id": "", "claimed_at": ""}},
     )
-    outcomes = await process_pending_tally_outcomes()
-    return result.modified_count + commands.modified_count + outcomes
+    return result.modified_count + commands.modified_count

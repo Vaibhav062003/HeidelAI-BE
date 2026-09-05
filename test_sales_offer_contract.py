@@ -9,7 +9,6 @@ from services.sales_offer_policy import (
     next_delivery_status,
     offer_prices,
     quote_revision_snapshot,
-    render_structured_offer_message,
     report_query,
     structured_offer_snapshot,
     tax_basis,
@@ -40,38 +39,6 @@ class SalesOfferContractTest(unittest.TestCase):
             structured_offer_snapshot({"offer": {"items": []}})
         with self.assertRaises(ValueError):
             structured_offer_snapshot({"offer": {"items": [{"description": "RTX 5060", "unit_price": "NaN"}]}})
-        with self.assertRaisesRegex(ValueError, "explicitly say whether GST is included"):
-            structured_offer_snapshot({"offer": {"items": [{
-                "description": "RTX 5060", "unit_price": 45_000, "gst_rate": 18,
-                "gst_inclusive": "true",
-            }]}})
-        with self.assertRaisesRegex(ValueError, "explicitly provide its GST rate"):
-            structured_offer_snapshot({"offer": {"items": [{
-                "description": "RTX 5060", "unit_price": 45_000, "gst_inclusive": True,
-            }]}})
-        for injected_name in (
-            "GPU\nSpecial price ₹50", "GPU special price 50", "GPU special $50",
-            "GPU only 50k", "GPU for 50k",
-        ):
-            with self.assertRaisesRegex(ValueError, "must not contain price text"):
-                structured_offer_snapshot({"offer": {"items": [{
-                    "description": injected_name, "unit_price": 100,
-                    "gst_rate": 18, "gst_inclusive": True,
-                }]}})
-
-        identified = structured_offer_snapshot({"offer": {"items": [{
-            "description": "RTX 5060", "sku": "GPU-5060", "tally_master_id": "42",
-            "tally_guid": "guid-42", "tally_alter_id": "9", "unit_price": 45_000,
-            "gst_rate": 18, "gst_inclusive": False,
-        }]}})
-        self.assertEqual(
-            {key: identified["items"][0][key] for key in ("sku", "tally_master_id", "tally_guid", "tally_alter_id")},
-            {"sku": "GPU-5060", "tally_master_id": "42", "tally_guid": "guid-42", "tally_alter_id": "9"},
-        )
-        self.assertEqual(
-            render_structured_offer_message(identified),
-            "Price offer\n\n1. RTX 5060 — ₹53,100.00\n\nTotal: ₹53,100.00",
-        )
 
     def test_scope_money_and_delivery_rules(self):
         member = report_query(
@@ -193,50 +160,6 @@ class SalesOfferContractTest(unittest.TestCase):
             if isinstance(node, ast.Set)
         )
         self.assertEqual(allowed, {"whatsapp", "instagram"})
-
-    def test_manual_outcome_route_has_a_strict_cas_state_machine(self):
-        tree = ast.parse(Path("api/sales_offer_routes.py").read_text())
-        transitions = next(
-            ast.literal_eval(node.value)
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "_OUTCOME_TRANSITIONS" for target in node.targets)
-        )
-        self.assertEqual(transitions["open"], {"accepted", "lost", "expired"})
-        self.assertEqual(transitions["accepted"], {"billed", "lost"})
-        self.assertEqual(transitions["billed"], {"paid"})
-        update = next(
-            node for node in tree.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "update_offer_outcome"
-        )
-        source = ast.unparse(update)
-        self.assertIn("find_one_and_update(version_query", source)
-        self.assertIn("operator_manual", source)
-        self.assertIn("A reason is required", source)
-
-    def test_tally_updates_offer_and_learning_independently(self):
-        tree = ast.parse(Path("services/tally_service.py").read_text())
-        helper = next(
-            node for node in tree.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_record_tally_outcomes"
-        )
-        source = ast.unparse(helper)
-        self.assertIn("tally_outcome_outbox.update_one", source)
-        processor = next(
-            node for node in tree.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_tally_outcome"
-        )
-        processor_source = ast.unparse(processor)
-        self.assertIn("record_verified_offer_outcome", processor_source)
-        self.assertIn("record_verified_tally_outcome", processor_source)
-        self.assertIn("quote_revision", processor_source)
-        self.assertIn("process_pending_tally_outcomes", Path("services/tally_service.py").read_text())
-
-    def test_verified_tally_outcome_matches_exact_quote_revision(self):
-        source = Path("services/sales_offer_service.py").read_text()
-        self.assertIn('"quote_revision": int(quote_revision)', source)
-        tally = Path("services/tally_service.py").read_text()
-        self.assertIn('"quote_revision": int(job.get("quote_revision") or 1)', tally)
 
 
 if __name__ == "__main__":

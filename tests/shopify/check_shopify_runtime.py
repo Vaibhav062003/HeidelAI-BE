@@ -20,8 +20,7 @@ api_init = (ROOT / "api/__init__.py").read_text()
 lifespan = (ROOT / "core/lifespan.py").read_text()
 scheduler = (ROOT / "core/scheduler.py").read_text()
 assert "shopify_routes.router" in api_init
-assert '("Shopify indexes", ensure_shopify_indexes)' in lifespan
-assert '("Shopify legacy repair", repair_legacy_shopify_connections)' in lifespan
+assert "ensure_shopify_runtime_ready" in lifespan
 assert "stop_scheduler" in lifespan
 assert "process_shopify_reminders" in scheduler and "process_shopify_syncs" in scheduler
 assert "next_run_time=datetime.now(timezone.utc)" in scheduler
