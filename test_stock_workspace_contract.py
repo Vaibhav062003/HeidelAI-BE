@@ -2,7 +2,6 @@ import ast
 import re
 from pathlib import Path
 from typing import Any
-from services.stock_gst import normalize_category, normalize_gst_inclusive, normalize_gst_rate, DEFAULT_GST_RATE
 
 
 source = Path("services/stock_service.py").read_text(encoding="utf-8")
@@ -13,9 +12,7 @@ def function(name: str):
     return next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
 
 
-namespace = {"Any": Any, "re": re, "normalize_category": normalize_category,
-             "normalize_gst_inclusive": normalize_gst_inclusive, "normalize_gst_rate": normalize_gst_rate,
-             "DEFAULT_GST_RATE": DEFAULT_GST_RATE}
+namespace = {"Any": Any, "re": re}
 helpers = [function(name) for name in ("normalize_sku", "_sheet_sku", "_number", "_sheet_quantity", "_version", "_row", "_public")]
 exec(compile(ast.fix_missing_locations(ast.Module(body=helpers, type_ignores=[])), "<stock>", "exec"), namespace)
 
@@ -62,8 +59,7 @@ assert "source_values" in sheet_source
 assert "Primary Sheet changed since the last sync" in sheet_source
 
 sheet_routes = Path("api/product_sheets_routes.py").read_text(encoding="utf-8")
-assert "unlink_product_sheet_source" in sheet_routes
-assert 'f"source_rows.{removed_sheet_id}"' in sheet_source and 'f"source_values.{removed_sheet_id}"' in sheet_source
+assert '"$unset": {' in sheet_routes and 'f"source_rows.{sheet_id}"' in sheet_routes and 'f"source_values.{sheet_id}"' in sheet_routes
 
 pricing_source = Path("services/pricing_service.py").read_text(encoding="utf-8")
 assert '"event_type": "buyer_product_interest"' in pricing_source

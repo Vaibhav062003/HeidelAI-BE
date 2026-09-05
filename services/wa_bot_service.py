@@ -40,70 +40,6 @@ def _col(org_id: str):
     """Per-org WaBot flows collection — separate from automation_flows_{org_id}."""
     return db[f"wa_bot_flows_{org_id}"]
 
-
-def _normalized_phone_ids(phone_ids: List[str]) -> List[str]:
-    return list(dict.fromkeys(
-        value for value in (str(phone_id or "").strip() for phone_id in phone_ids) if value
-    ))
-
-
-async def _validate_publish_phone_ids(org_id: str, phone_ids: List[str]) -> List[str]:
-    normalized = _normalized_phone_ids(phone_ids)
-    if not normalized:
-        connections = await db.whatsapp_connections.find(
-            {"org_id": org_id, "is_active": {"$ne": False}},
-            {"phone_id": 1, "slot": 1, "_id": 0},
-        ).to_list(length=2)
-        if len(connections) != 1 or not connections[0].get("phone_id"):
-            raise ValueError("Select at least one active WhatsApp phone number")
-        normalized = [str(connections[0]["phone_id"])]
-
-    connections = await db.whatsapp_connections.find(
-        {
-            "org_id": org_id,
-            "phone_id": {"$in": normalized},
-            "is_active": {"$ne": False},
-        },
-        {"phone_id": 1, "_id": 0},
-    ).to_list(length=len(normalized))
-    found = {str(connection.get("phone_id") or "") for connection in connections}
-    missing = [phone_id for phone_id in normalized if phone_id not in found]
-    if missing:
-        raise ValueError(f"Unknown or inactive WhatsApp phone IDs: {', '.join(missing)}")
-    return normalized
-
-
-async def _clear_flow_bindings(org_id: str, flow_id: str) -> None:
-    await db.whatsapp_connections.update_many(
-        {"org_id": org_id, "wa_bot_flow_id": flow_id},
-        {"$unset": {"wa_bot_flow_id": ""}},
-    )
-
-
-async def _bind_flow_to_phone_ids(org_id: str, flow_id: str, phone_ids: List[str]) -> None:
-    previous = await db.whatsapp_connections.find(
-        {"org_id": org_id, "phone_id": {"$in": phone_ids}, "wa_bot_flow_id": {"$ne": flow_id}},
-        {"wa_bot_flow_id": 1, "_id": 0},
-    ).to_list(length=len(phone_ids))
-    replaced_flow_ids = {
-        str(item.get("wa_bot_flow_id")) for item in previous if item.get("wa_bot_flow_id")
-    }
-    await _clear_flow_bindings(org_id, flow_id)
-    await db.whatsapp_connections.update_many(
-        {"org_id": org_id, "phone_id": {"$in": phone_ids}, "is_active": {"$ne": False}},
-        {"$set": {"wa_bot_flow_id": flow_id}},
-    )
-    now = datetime.now(timezone.utc)
-    for replaced_flow_id in replaced_flow_ids:
-        remaining = await db.whatsapp_connections.count_documents({
-            "org_id": org_id, "wa_bot_flow_id": replaced_flow_id, "is_active": {"$ne": False},
-        })
-        if remaining == 0:
-            await _col(org_id).update_one(
-                {"flow_id": replaced_flow_id, "org_id": org_id},
-                {"$set": {"status": "draft", "published_at": None, "updated_at": now}},
-            )
-
 # ─── CREATE ───────────────────────────────────────────────────────────────────
 
 async def create_wa_bot_flow(
@@ -285,7 +221,6 @@ async def delete_wa_bot_flow(org_id: str, flow_id: str) -> bool:
         result = await col.delete_one({"flow_id": flow_id, "org_id": org_id})
         deleted = result.deleted_count > 0
         if deleted:
-            await _clear_flow_bindings(org_id, flow_id)
             logger.info(f"Deleted wa_bot_flow {flow_id} for org {org_id}")
         return deleted
 
@@ -299,7 +234,6 @@ async def delete_wa_bot_flow(org_id: str, flow_id: str) -> bool:
 async def publish_wa_bot_flow(
     org_id: str,
     flow_id: str,
-    phone_ids: List[str],
     updated_by: Optional[str] = None,
 ) -> Optional[Dict]:
     """
@@ -320,11 +254,7 @@ async def publish_wa_bot_flow(
         col = _col(org_id)
         now = datetime.now(timezone.utc)
 
-        existing = await col.find_one({"flow_id": flow_id, "org_id": org_id})
-        if not existing:
-            return None
-        normalized_phone_ids = await _validate_publish_phone_ids(org_id, phone_ids)
-        await _bind_flow_to_phone_ids(org_id, flow_id, normalized_phone_ids)
+        # We will draft other flows after confirming this flow exists
 
         result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
@@ -340,10 +270,19 @@ async def publish_wa_bot_flow(
         )
 
         if not result:
-            await _clear_flow_bindings(org_id, flow_id)
             return None
 
-        logger.info(f"Published wa_bot_flow {flow_id} for org {org_id}")
+        # Ensure only 1 active flow per organization by setting all others to draft
+        await col.update_many(
+            {"org_id": org_id, "flow_id": {"$ne": flow_id}},
+            {"$set": {
+                "status": "draft",
+                "published_at": None,
+                "updated_at": now,
+            }}
+        )
+
+        logger.info(f"Published wa_bot_flow {flow_id} for org {org_id} and unpublished all others.")
         return serialize_mongo(result)
 
     except Exception as e:
@@ -379,7 +318,6 @@ async def unpublish_wa_bot_flow(
         if not result:
             return None
 
-        await _clear_flow_bindings(org_id, flow_id)
         logger.info(f"Unpublished wa_bot_flow {flow_id} for org {org_id}")
         return serialize_mongo(result)
 
@@ -416,7 +354,7 @@ async def duplicate_wa_bot_flow(
         skip_keys = {
             "_id", "flow_id", "org_id", "created_at", "updated_at",
             "created_by", "updated_by", "published_at", "trigger_count",
-            "last_run", "phone_ids", "wa_bot_flow_id",
+            "last_run",
         }
         content = {k: v for k, v in source.items() if k not in skip_keys}
 

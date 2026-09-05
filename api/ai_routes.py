@@ -62,7 +62,6 @@ class AIPolicyRequest(BaseModel):
     enabled: bool
     pause_minutes: int = Field(default=60, ge=5, le=1440)
     quote_followup_prompt_enabled: Optional[bool] = None
-    whatsapp_enabled_phone_ids: Optional[list[str]] = Field(default=None, max_length=50)
 
 
 class ConversationAIStateRequest(BaseModel):
@@ -92,7 +91,6 @@ async def put_ai_policy(request: Request, payload: AIPolicyRequest, user: Curren
         payload.enabled,
         payload.pause_minutes,
         payload.quote_followup_prompt_enabled,
-        payload.whatsapp_enabled_phone_ids,
     )
 
 

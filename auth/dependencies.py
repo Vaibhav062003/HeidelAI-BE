@@ -1,5 +1,5 @@
 from typing import Annotated
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 
@@ -10,8 +10,8 @@ from .models import CurrentUserModel
 security = HTTPBearer()
 
 
-async def authenticate_credentials(
-    credentials: HTTPAuthorizationCredentials,
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> CurrentUserModel:
     token = credentials.credentials
     try:
@@ -24,15 +24,6 @@ async def authenticate_credentials(
         )
     except (JWTError, KeyError, TypeError):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-
-async def get_current_user(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> CurrentUserModel:
-    user = await authenticate_credentials(credentials)
-    request.state.rate_limit_identity = f"auth:{user.org_id}:{user.user_id}"
-    return user
 
 
 CurrentUser = Annotated[CurrentUserModel, Depends(get_current_user)]

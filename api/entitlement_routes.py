@@ -1,6 +1,5 @@
 import json
 import os
-import asyncio
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
@@ -39,7 +38,7 @@ async def put_entitlement(
         raise HTTPException(status_code=422, detail="Invalid entitlement JSON") from exc
     if payload.get("account_id") != account_id or not x_idempotency_key:
         raise HTTPException(status_code=422, detail="Entitlement account or idempotency key is invalid")
-    return await asyncio.to_thread(apply_entitlement, account_id, payload)
+    return apply_entitlement(account_id, payload)
 
 
 @router.post("/entitlements/usage")
@@ -70,9 +69,7 @@ async def post_entitlement_usage(
         if account_id not in seen:
             seen.add(account_id)
             normalized.append(account_id)
-    return await asyncio.to_thread(lambda: {"accounts": [
-        {"account_id": account_id, **access_snapshot(account_id, months)} for account_id in normalized
-    ]})
+    return {"accounts": [{"account_id": account_id, **access_snapshot(account_id, months)} for account_id in normalized]}
 
 
 @router.post("/entitlements/{account_id}/usage-events")
@@ -99,22 +96,22 @@ async def post_entitlement_usage_event(
         raise HTTPException(status_code=422, detail="Usage event values are invalid")
     event_key = event_key.strip()
     if action == "consume":
-        return await asyncio.to_thread(consume_quota, account_id, "AI", "monthly_messages", quantity, event_key)
+        return consume_quota(account_id, "AI", "monthly_messages", quantity, event_key)
     if action == "reserve":
-        return await asyncio.to_thread(reserve_quota, account_id, "AI", "monthly_messages", quantity, event_key)
+        return reserve_quota(account_id, "AI", "monthly_messages", quantity, event_key)
     if action == "commit":
         part_key = payload.get("part_key")
         if not isinstance(part_key, str) or not part_key.strip() or len(part_key) > 200:
             raise HTTPException(status_code=422, detail="Usage commit part_key is invalid")
-        return {"committed": await asyncio.to_thread(commit_quota, account_id, "monthly_messages", event_key, part_key.strip())}
+        return {"committed": commit_quota(account_id, "monthly_messages", event_key, part_key.strip())}
     if action == "release":
-        return {"released": await asyncio.to_thread(release_quota, account_id, "monthly_messages", event_key)}
+        return {"released": release_quota(account_id, "monthly_messages", event_key)}
     try:
-        return await asyncio.to_thread(record_ai_usage, account_id, event_key, payload.get("channel"), quantity, **numbers)
+        return record_ai_usage(account_id, event_key, payload.get("channel"), quantity, **numbers)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/api/features/access")
-def get_feature_access(user: CurrentUser):
+async def get_feature_access(user: CurrentUser):
     return access_snapshot(user.org_id)

@@ -705,7 +705,7 @@ async def _detect_header_row(
     Detect the header row in a Google Sheet tab by scanning the first 20 rows.
     Returns (header_list, header_row_number_1_indexed, col_offset).
 
-    - header_list: header strings, retaining internal blanks to preserve column positions
+    - header_list: list of non-empty header strings
     - header_row_number: 1-indexed row number in the sheet (e.g., 3 means row 3)
     - col_offset: 0-indexed column where headers start (e.g., 1 means columns start at B)
 
@@ -713,7 +713,7 @@ async def _detect_header_row(
     don't start at A1.
     """
     import urllib.parse
-    encoded_tab = urllib.parse.quote("'" + tab_name.replace("'", "''") + "'", safe="")
+    encoded_tab = urllib.parse.quote(tab_name, safe="")
     url = (
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}"
         f"/values/{encoded_tab}!A1:ZZ20"
@@ -722,11 +722,6 @@ async def _detect_header_row(
         resp = await client.get(
             url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
         )
-        if resp.status_code == 401:
-            access_token = await _force_token_refresh(org_id)
-            resp = await client.get(
-                url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15
-            )
         if resp.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Google Sheets API error: {resp.json().get('error', {}).get('message', 'Unknown')}")
 
@@ -744,7 +739,7 @@ async def _detect_header_row(
                 if cell and str(cell).strip():
                     break
                 col_offset += 1
-            headers = [str(cell).strip() if cell is not None else "" for cell in row[col_offset:]]
+            headers = [str(cell).strip() for cell in row[col_offset:] if cell and str(cell).strip()]
             return (headers, row_idx + 1, col_offset)
 
     # Fallback: first row with any data

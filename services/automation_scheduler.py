@@ -390,10 +390,12 @@ async def _execute_job(job: dict) -> None:
 
         customer_name = conversation.get("customer_name", "")
 
-        wa_id = conversation.get("whatsapp_id")
-        recipient_id = conversation.get("customer_id")
-        if not wa_id or not recipient_id:
-            raise Exception(f"Conversation {conversation_id} has no bound WhatsApp sender or customer")
+        # Step 2: Get wa_id from organizations collection
+        org = await asyncio.to_thread(lambda: db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}))
+        if not org or not org.get("wa_id"):
+            raise Exception(f"No wa_id found for org {org_id}")
+
+        wa_id = org["wa_id"]
 
         # Step 3: Send the message (handles both plain text and templates)
         from services.wa_service import send_whatsapp_message, send_whatsapp_template_message
@@ -417,12 +419,11 @@ async def _execute_job(job: dict) -> None:
             }
 
             result = await send_whatsapp_template_message(
-                recipient_id=recipient_id,
+                recipient_id=conversation_id.split("_")[-1], # extract phone from whatsapp_91...
                 template=template_dict,
                 wa_id=wa_id,
                 org_id=org_id,
                 mode="reply",
-                conversation_id=conversation_id,
             )
         else:
             # --- PLAIN TEXT PATH ---

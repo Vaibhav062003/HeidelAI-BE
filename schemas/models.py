@@ -41,31 +41,6 @@ class PlatformDisconnectRequest(BaseModel):
     user_id: str
 
 
-class WhatsappDisconnectRequest(BaseModel):
-    connection_id: Optional[str] = Field(default=None, max_length=128)
-    phone_id: Optional[str] = Field(default=None, max_length=128)
-    phone_number_id: Optional[str] = Field(default=None, max_length=128)
-    user_id: Optional[str] = Field(default=None, max_length=128)
-
-    @model_validator(mode="after")
-    def require_connection_selector(self):
-        if not any((self.connection_id, self.phone_id, self.phone_number_id, self.user_id)):
-            raise ValueError("connection_id, phone_id, phone_number_id, or user_id is required")
-        return self
-
-
-class WhatsappConnectionLabelRequest(BaseModel):
-    label: str = Field(..., min_length=1, max_length=24)
-
-    @field_validator("label")
-    @classmethod
-    def validate_label(cls, value: str) -> str:
-        value = value.strip()
-        if not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
-            raise ValueError("Label must contain printable characters")
-        return value
-
-
 class WhatsappAuthRequest(BaseModel):
     code: str
     redirect_uri: Optional[str] = None
@@ -76,7 +51,6 @@ class WhatsappAuthRequest(BaseModel):
     catalog_ids: Optional[List[str]] = None
     dataset_ids: Optional[List[str]] = None
     instagram_account_ids: Optional[List[str]] = None
-    label: Optional[str] = Field(default=None, max_length=24)
 
 class ChatbotPromptUpdate(BaseModel):
     chatbot_prompt: str = Field(..., min_length=10, max_length=5000)
@@ -126,19 +100,7 @@ class SendReactionRequest(BaseModel):
 class Product(BaseModel):
     product_name: str
     description: Optional[str] = None
-    # ``price`` is retained for legacy display. Safety decisions use only the
-    # provenance-bearing canonical fields below.
-    price: Optional[float] = None
-    cost_price: Optional[float] = Field(default=None, gt=0)
-    approved_floor_price: Optional[float] = Field(default=None, gt=0)
-    target_selling_price: Optional[float] = Field(default=None, gt=0)
-    mrp: Optional[float] = Field(default=None, gt=0)
-    currency: Literal["INR"] = "INR"
-    selling_gst_inclusive: Optional[bool] = None
-    cost_gst_inclusive: Optional[bool] = None
-    price_source_sheet_id: Optional[str] = None
-    price_verified_at: Optional[datetime] = None
-    price_version: Optional[str] = None
+    price: float = None
     stock: Optional[int] = None
     gst_inclusive: bool = False
     gst_rate: float = Field(default=18, ge=0, le=100)
@@ -148,7 +110,6 @@ class Product(BaseModel):
     search_text: Optional[str] = None
     source: Optional[str] = None  # "manual" | "csv_upload" | "google_sheet"
     source_sheet_id: Optional[str] = None
-    source_sheet_ids: List[str] = Field(default_factory=list)
     updated_at: Optional[datetime] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
@@ -174,9 +135,6 @@ class ProductSheetConnection(BaseModel):
     column_mapping: Dict[str, str]  # {product_field: sheet_column_name}
     product_type: str = "laptop"  # "laptop" | "component"
     last_synced_at: Optional[datetime] = None
-    next_reconcile_at: Optional[datetime] = None
-    reconcile_lease_id: Optional[str] = None
-    reconcile_lease_until: Optional[datetime] = None
     last_sync_count: int = 0
     sync_errors: List[str] = Field(default_factory=list)
     status: str = "active"  # "active" | "syncing" | "error"
@@ -354,5 +312,4 @@ class BulkMessageRequest(BaseModel):
     )
     recipients: List[BulkRecipient] = Field(..., min_length=1)  # At least one recipient required
     components: Optional[List[Dict[str, Any]]] = None  # Same for all recipients (header, body, etc.)
-    phone_number_id: Optional[str] = Field(default=None, max_length=128)
     delay_seconds: float = Field(default=8.0, ge=8.0)  # Seconds to wait between each batch of sends (applied per batch, not per recipient)

@@ -129,13 +129,13 @@ class EntitlementContractTest(unittest.TestCase):
         secret = "s" * 32
         request_id = "d8c03f2c-eef8-4d8b-8dd1-a9b63ad5890c"
         body, headers = signed_json({"org_id": "org_customer", "user_input": "hello"}, "/api/v2/chat", secret, request_id)
-        canonical = f"POST\n/api/v2/chat\n{headers['X-Timestamp']}\n{uuid.UUID(request_id).hex}\n".encode() + body
+        canonical = f"POST\n/api/v2/chat\n{headers['X-Timestamp']}\n{request_id}\n".encode() + body
         expected = base64.b64encode(hmac.new(secret.encode(), canonical, hashlib.sha256).digest()).decode()
         self.assertEqual(headers["X-Signature"], expected)
         self.assertEqual(body, b'{"org_id":"org_customer","user_input":"hello"}')
 
         _, provider_headers = signed_json({"org_id": "org_customer"}, "/api/v2/chat", secret, "wamid.provider-message")
-        self.assertEqual(provider_headers["X-Request-Id"], uuid.uuid5(uuid.NAMESPACE_URL, "heidelai:/api/v2/chat:wamid.provider-message").hex)
+        self.assertEqual(provider_headers["X-Request-Id"], str(uuid.uuid5(uuid.NAMESPACE_URL, "heidelai:/api/v2/chat:wamid.provider-message")))
 
 
 if __name__ == "__main__":
