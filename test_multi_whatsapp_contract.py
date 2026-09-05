@@ -45,6 +45,7 @@ def test_connection_and_webhook_contracts():
     assert "except OperationFailure as exc:" in legacy_indexes
     assert "if exc.code not in {85, 86}:" in legacy_indexes
     assert auth_source.count("await _fence_whatsapp_reconnect_cleanup") == 2
+    assert auth_source.index("len(active_connections) >= limit") < auth_source.index("token_url")
     assert auth_source.index("await _fence_whatsapp_reconnect_cleanup") < auth_source.index("token_url")
     assert '@router.get("/connections/{phone_id}/details")' in routes
     details_source = routes[routes.index("async def _get_whatsapp_details"):routes.index('@router.get("/{whatsapp_id}/analytics/conversations")')]
@@ -87,6 +88,8 @@ def test_connection_and_webhook_contracts():
     assert '"last_webhook_at": received_at' in store_source
     assert 'len(value) > 24' in connection_service
     assert 'MAX_WHATSAPP_CONNECTIONS = 50' in connection_service
+    assert 'os.getenv("WHATSAPP_ORG_NUMBER_LIMITS", "")' in connection_service
+    assert 'WHATSAPP_ORG_NUMBER_LIMITS.get(str(org_id), 1)' in connection_service
 
 
 def test_scoped_archive_and_cleanup_contracts():
@@ -170,11 +173,20 @@ def test_number_scoped_query_and_flow_binding_contracts():
 
 def test_primary_phone_scope_keeps_legacy_conversations_visible():
     from services.whatsapp_connection_service import (
+        MAX_WHATSAPP_CONNECTIONS,
+        _parse_org_number_limits,
         choose_connection_slot,
         public_historical_connections,
         public_connections,
+        validate_active_connection_slots,
         whatsapp_conversation_scope,
     )
+
+    limits = _parse_org_number_limits(
+        "org_default=2, org_large=50, org_duplicate=2, org_duplicate=3, "
+        "org_bad=0, org_float=2.5, malformed, invalid-org=4,"
+    )
+    assert limits == {"org_default": 2, "org_large": MAX_WHATSAPP_CONNECTIONS}
 
     assert whatsapp_conversation_scope("primary", include_legacy=True) == {
         "platform": "whatsapp",
@@ -221,6 +233,19 @@ def test_primary_phone_scope_keeps_legacy_conversations_visible():
         waba_id="waba-two",
         limit=50,
     )[0] == 2
+    grandfathered = [
+        {"phone_id": "one", "wa_id": "waba", "slot": 1},
+        {"phone_id": "two", "wa_id": "waba", "slot": 2},
+    ]
+    assert validate_active_connection_slots(grandfathered) == grandfathered
+    assert choose_connection_slot(
+        grandfathered, phone_number_id="two", waba_id="waba", limit=1,
+    ) == (2, grandfathered[1])
+    try:
+        choose_connection_slot(grandfathered, phone_number_id="three", waba_id="waba", limit=1)
+        raise AssertionError("a lowered entitlement must block additional numbers")
+    except ValueError as exc:
+        assert "at most 1 WhatsApp number" in str(exc)
     routes = source("api/wa_routes.py")
     assert "Fetched WhatsApp connection: {connection}" not in routes
     assert 'logger.success(f"Fetched WhatsApp connection: {connection}")' not in routes

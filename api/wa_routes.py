@@ -643,13 +643,29 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
         if not requested_phone_id:
             raise HTTPException(status_code=422, detail="phone_number_id is required")
 
-        active_connection_count = db.whatsapp_connections.count_documents({
-            "org_id": org_id, "is_active": {"$ne": False},
-        })
+        active_connections = list(db.whatsapp_connections.find({
+            "org_id": org_id,
+            "is_active": {"$ne": False},
+        }))
         if not _whatsapp_schema_ready(org_id):
-            if active_connection_count:
+            if active_connections:
                 raise HTTPException(status_code=503, detail="WhatsApp number upgrade is still being finalized. Try again shortly.")
             await asyncio.to_thread(_initialize_whatsapp_schema, org_id)
+
+        limit = whatsapp_connection_limit(org_id)
+        try:
+            validate_active_connection_slots(active_connections)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=f"WhatsApp connection data needs repair: {exc}") from exc
+        requested_connection_is_active = any(
+            str(row.get("phone_id") or row.get("phone_number_id") or "") == requested_phone_id
+            for row in active_connections
+        )
+        if not requested_connection_is_active and len(active_connections) >= limit:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This organization can connect at most {limit} WhatsApp number{'s' if limit != 1 else ''}",
+            )
 
         await _fence_whatsapp_reconnect_cleanup(org_id, requested_phone_id, whatsapp_business_id)
 
@@ -732,7 +748,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "is_active": {"$ne": False},
         }))
         try:
-            validate_active_connection_slots(active_connections, limit=whatsapp_connection_limit(org_id))
+            validate_active_connection_slots(active_connections)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=f"WhatsApp connection data needs repair: {exc}") from exc
         historical_connection = db.whatsapp_connections.find_one({
@@ -740,7 +756,6 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "$or": [{"phone_id": phone_id}, {"phone_number_id": phone_id}],
             "is_active": False,
         })
-        limit = whatsapp_connection_limit(org_id)
         try:
             slot, existing_connection = choose_connection_slot(
                 active_connections,
@@ -908,6 +923,7 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
                 {"$set": {"wa_id": str(whatsapp_business_id)}},
             )
         
+        display_limit = max(limit, len(active_connections))
         return {
             "status": "success",
             "org_id": org_id,
@@ -915,9 +931,9 @@ async def whatsapp_auth_exchange(request: Request, req: WhatsappAuthRequest, use
             "name": phones_data.get("verified_name", "WhatsApp Business"),
             "phone": phone,
             "connection": public_connection(saved_connection),
-            "multi_number_enabled": limit > 1,
-            "max_connections": limit,
-            "max_numbers": limit,
+            "multi_number_enabled": display_limit > 1,
+            "max_connections": display_limit,
+            "max_numbers": display_limit,
             "business_info": {
                 "account_type": "WhatsApp Business",
                 "status": "Active"
@@ -1005,15 +1021,16 @@ def list_whatsapp_connections(request: Request, user: CurrentUser):
         ):
             connections = [{**connection, "slot": 1}]
     try:
-        connections = validate_active_connection_slots(connections, limit=limit)
+        connections = validate_active_connection_slots(connections)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=f"WhatsApp connection data needs repair: {exc}") from exc
+    display_limit = max(limit, len(connections))
     return {
         "connections": public_connections(connections),
         "historical_connections": public_historical_connections(historical),
-        "multi_number_enabled": limit > 1,
-        "max_connections": limit,
-        "max_numbers": limit,
+        "multi_number_enabled": display_limit > 1,
+        "max_connections": display_limit,
+        "max_numbers": display_limit,
         "schema_ready": schema_ready,
         "can_add": schema_ready and len(connections) < limit,
     }
@@ -1085,7 +1102,7 @@ async def make_whatsapp_connection_primary(request: Request, phone_id: str, user
         "is_active": {"$ne": False},
     }).sort([("slot", 1), ("connected_at", 1)]))
     try:
-        active = validate_active_connection_slots(active, limit=whatsapp_connection_limit(user.org_id))
+        active = validate_active_connection_slots(active)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=f"WhatsApp connection data needs repair: {exc}") from exc
     current = next((row for row in active if row.get("slot") == 1), active[0] if active else None)
