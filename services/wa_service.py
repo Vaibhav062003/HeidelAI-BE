@@ -251,18 +251,22 @@ async def create_or_update_whatsapp_conversation(
     conversations_collection = db[conversations_collection_name]
     
     # Check if conversation already exists
-    existing_conversation = conversations_collection.find_one({
+    existing_conversation = await asyncio.to_thread(conversations_collection.find_one, {
         "platform": "whatsapp",
         "customer_id": customer_phone_no,
         **({"business_phone_id": str(business_phone_id)} if business_phone_id else {}),
     })
     if not existing_conversation and business_phone_id:
-        primary = resolve_active_whatsapp_connection(
-            business_phone_id, str(recipient_id or ""), org_id, allow_single_fallback=False,
+        primary = await asyncio.to_thread(
+            resolve_active_whatsapp_connection,
+            business_phone_id,
+            str(recipient_id or ""),
+            org_id,
+            allow_single_fallback=False,
         )
         primary_phone_id = str((primary or {}).get("phone_id") or (primary or {}).get("phone_number_id") or "")
         if primary_phone_id == str(business_phone_id) and (primary or {}).get("slot") == 1:
-            existing_conversation = conversations_collection.find_one({
+            existing_conversation = await asyncio.to_thread(conversations_collection.find_one, {
                 "platform": "whatsapp",
                 "customer_id": customer_phone_no,
                 "$or": [
@@ -292,7 +296,8 @@ async def create_or_update_whatsapp_conversation(
     # Check if the contact's name was locked by a VCF upload.
     # If locked, we must use the VCF name regardless of what Meta sends.
     contacts_col = db[f"contacts_{org_id}"]
-    contact_doc = contacts_col.find_one(
+    contact_doc = await asyncio.to_thread(
+        contacts_col.find_one,
         {"phone_number": customer_phone_no},
         {"name_locked_by_vcf": 1, "full_name": 1, "_id": 0}
     )
@@ -391,14 +396,16 @@ async def create_or_update_whatsapp_conversation(
     if idempotency_key:
         update_filter["applied_outbound_message_ids"] = {"$ne": idempotency_key}
     try:
-        updated_conversation = conversations_collection.find_one_and_update(
+        updated_conversation = await asyncio.to_thread(
+            conversations_collection.find_one_and_update,
             update_filter,
             mongo_update,
             upsert=True,
             return_document=ReturnDocument.AFTER
         )
     except DuplicateKeyError:
-        if idempotency_key and conversations_collection.find_one(
+        if idempotency_key and await asyncio.to_thread(
+            conversations_collection.find_one,
             {"conversation_id": conversation_id, "applied_outbound_message_ids": idempotency_key},
             {"_id": 1},
         ):
@@ -512,29 +519,55 @@ async def store_whatsapp_message(
     
     # Store message in WhatsApp-specific collection
     try:
-        messages_collection.insert_one(message)
+        await asyncio.to_thread(messages_collection.insert_one, message)
     except DuplicateKeyError:
-        existing = messages_collection.find_one({"message_id": message_id})
+        existing = await asyncio.to_thread(messages_collection.find_one, {"message_id": message_id})
         immutable_fields = ("platform", "conversation_id", "content", "type", "sender_id", "role", "mode")
         if existing and all(existing.get(field) == message.get(field) for field in immutable_fields):
-            if notify_push and role == MessageRole.CUSTOMER and mode != "private":
-                await schedule_customer_message_push(
-                    org_id=org_id,
-                    platform="whatsapp",
-                    message_id=message_id,
-                    conversation_id=conversation_id,
-                    sender_name=sender_name,
-                    content=content,
-                    message_type=type,
-                )
-            return str(existing.get("id") or existing["message_id"])
-        raise
+            message["timestamp"] = existing.get("timestamp") or message["timestamp"]
+            message_id = str(existing.get("id") or existing["message_id"])
+        else:
+            raise
 
     logger.success(f"Whatsapp message stored: {message_id}")
 
+    broadcast_message = {
+        "id": message_id,
+        "platform": "whatsapp",
+        "conversation_id": conversation_id,
+        "content": content,
+        "sender_id": customer_phone_no,
+        "role": role,
+        "timestamp": message["timestamp"].isoformat(),
+        "status": status,
+        "sender_name": sender_name,
+        "type": type,
+        "temp_id": temp_id,
+        "payload": payload,
+        "mode": mode,
+        "context_type": context_type,
+        "context": context,
+        "ai_metadata": bot_context if bot_context else None,
+        "business_phone_id": str(business_phone_id) if business_phone_id else None,
+        "delivery_error": delivery_error,
+    }
+
+    await broadcast_main_ws(
+        platform_id=recipient_id,
+        platform_type="whatsapp",
+        event_type="new_message",
+        payload={"message": broadcast_message}
+    )
+
+    if recipient_id in services.whatsapp_connections_map:
+         await broadcast_whatsapp_message(recipient_id, "new_message", {
+             "message": broadcast_message
+         })
+
     if business_phone_id and role == MessageRole.CUSTOMER:
         received_at = datetime.now(timezone.utc)
-        db.whatsapp_connections.update_one(
+        await asyncio.to_thread(
+            db.whatsapp_connections.update_one,
             {
                 "org_id": org_id,
                 "$or": [
@@ -565,15 +598,19 @@ async def store_whatsapp_message(
         )
     
     # Keep only latest 500 messages per conversation
-    messages_count = messages_collection.count_documents({"conversation_id": conversation_id})
+    messages_count = await asyncio.to_thread(
+        messages_collection.count_documents,
+        {"conversation_id": conversation_id},
+    )
     if messages_count > 500:
         # Find and delete oldest message
-        oldest_message = messages_collection.find_one(
+        oldest_message = await asyncio.to_thread(
+            messages_collection.find_one,
             {"conversation_id": conversation_id},
             sort=[("timestamp", 1)]  # 1 for ascending order
         )
         if oldest_message:
-            messages_collection.delete_one({"_id": oldest_message["_id"]})
+            await asyncio.to_thread(messages_collection.delete_one, {"_id": oldest_message["_id"]})
 
     # Update message counter and unread count for the conversation
     # conversation = conversations_collection.find_one_and_update(
@@ -583,42 +620,6 @@ async def store_whatsapp_message(
     # )
 
     logger.success(f"Whatsapp conversation updated: {conversation_id}")
-    
-    # Format message for WebSocket broadcast
-    broadcast_message = {
-        "id": message_id,
-        "platform": "whatsapp",
-        "conversation_id": conversation_id,
-        "content": content,
-        "sender_id": customer_phone_no,
-        "role": role,
-        "timestamp": message["timestamp"].isoformat(),
-        "status": status,
-        "sender_name": sender_name,
-        "type": type,
-        "temp_id": temp_id,
-        "payload": payload,
-        "mode": mode,
-        "context_type": context_type,
-        "context": context,
-        "ai_metadata": bot_context if bot_context else None,
-        "business_phone_id": str(business_phone_id) if business_phone_id else None,
-        "delivery_error": delivery_error,
-    }
-
-    await broadcast_main_ws(
-        platform_id=recipient_id,
-        platform_type="whatsapp",
-        event_type="new_message",
-        payload={"message": broadcast_message}
-    )
-    
-    # Broadcast to WhatsApp-specific WebSocket connections (legacy)
-    # This was causing double-broadcasts to clients already listening on main-ws
-    if recipient_id in services.whatsapp_connections_map:
-         await broadcast_whatsapp_message(recipient_id, "new_message", {
-             "message": broadcast_message
-         })
 
 
     # Check if counter >= 10 for conversational analytics
