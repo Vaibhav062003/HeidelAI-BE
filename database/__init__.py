@@ -1,7 +1,8 @@
+import asyncio
+
 from pinecone import Pinecone
 from pymongo import MongoClient
 from motor.motor_asyncio import AsyncIOMotorClient
-from time import monotonic
 from config.settings import MONGODB_URI, MONGODB_CLUSTER, PINECONE_API_KEY, PINECONE_INDEX_NAME
 
 _client = None
@@ -12,25 +13,41 @@ _pinecone_index = None
 _async_client = None
 _async_db = None
 
-MONGO_OUTAGE_COOLDOWN_SECONDS = 15
-_mongo_unavailable_until = 0.0
+_probe_client = None
+_mongo_available = False
+MONGO_PROBE_TIMEOUT_MS = 3_000
 
 
 def mark_mongo_unavailable() -> None:
-    global _mongo_unavailable_until
-    _mongo_unavailable_until = max(
-        _mongo_unavailable_until,
-        monotonic() + MONGO_OUTAGE_COOLDOWN_SECONDS,
-    )
+    global _mongo_available
+    _mongo_available = False
 
 
 def mark_mongo_available() -> None:
-    global _mongo_unavailable_until
-    _mongo_unavailable_until = 0.0
+    global _mongo_available
+    _mongo_available = True
 
 
 def mongo_retry_allowed() -> bool:
-    return monotonic() >= _mongo_unavailable_until
+    return _mongo_available
+
+
+async def wait_for_mongo_available() -> None:
+    while not mongo_retry_allowed():
+        await asyncio.sleep(1)
+
+
+def probe_mongo() -> None:
+    """Probe Atlas without changing normal application-client timeouts."""
+    global _probe_client
+    if _probe_client is None:
+        _probe_client = MongoClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=MONGO_PROBE_TIMEOUT_MS,
+            connectTimeoutMS=MONGO_PROBE_TIMEOUT_MS,
+            maxPoolSize=1,
+        )
+    _probe_client.admin.command("ping")
 
 
 def get_async_mongo_client():
@@ -64,3 +81,12 @@ def get_pinecone_db():
         pc = Pinecone(api_key=PINECONE_API_KEY)
         _pinecone_index = pc.Index(PINECONE_INDEX_NAME)
     return _pinecone_index
+
+
+def close_mongo_clients() -> None:
+    global _client, _db, _async_client, _async_db, _probe_client
+    for client in (_client, _async_client, _probe_client):
+        if client is not None:
+            client.close()
+    _client = _db = _async_client = _async_db = _probe_client = None
+    mark_mongo_unavailable()

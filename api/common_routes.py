@@ -4,7 +4,7 @@ import re
 import requests
 import httpx
 from typing import Optional
-from database import get_async_mongo_client, get_mongo_db, mark_mongo_available, mark_mongo_unavailable
+from database import get_mongo_db, mongo_retry_allowed
 from config.settings import APP_ID
 from config.settings import ACCESS_TOKEN
 from services.cloudinary_service import upload_media_to_cloudinary
@@ -69,7 +69,7 @@ from services.products_service import (
 
 from services.wa_service import send_whatsapp_reaction
 from loguru import logger
-from pymongo.errors import ConnectionFailure, PyMongoError
+from pymongo.errors import ConnectionFailure
 
 
 router = APIRouter(tags=["Common Routes"])
@@ -102,13 +102,7 @@ async def health_check_revision(request: Request):
 @limiter.exempt
 async def readiness_check(request: Request):
     revision = os.getenv("GIT_SHA", "unknown")
-    try:
-        await asyncio.wait_for(
-            get_async_mongo_client().admin.command("ping"),
-            timeout=3,
-        )
-    except (asyncio.TimeoutError, PyMongoError):
-        mark_mongo_unavailable()
+    if not mongo_retry_allowed():
         return JSONResponse(
             status_code=503,
             content={
@@ -117,7 +111,6 @@ async def readiness_check(request: Request):
                 "dependency": "mongodb",
             },
         )
-    mark_mongo_available()
     return {"status": "ready", "revision": revision}
 
 @router.get("/favicon.ico", include_in_schema=False)

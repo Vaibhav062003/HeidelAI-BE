@@ -2,7 +2,15 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import asyncio
 from loguru import logger
+from pymongo.errors import PyMongoError
 from core.scheduler import start_scheduler, stop_scheduler
+from database import (
+    close_mongo_clients,
+    mark_mongo_available,
+    mark_mongo_unavailable,
+    mongo_retry_allowed,
+    probe_mongo,
+)
 from services.ai_chatbot import load_agents, clear_agents, load_prompts_into_cache
 from services.wa_service import (
     close_meta_http_client,
@@ -32,7 +40,48 @@ from services.push_notification_service import (
 )
 
 
-async def _run_noncritical_startup() -> None:
+MONGO_BOOT_TIMEOUT_SECONDS = 90
+MONGO_MONITOR_INTERVAL_SECONDS = 10
+
+
+async def _wait_for_mongo() -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + MONGO_BOOT_TIMEOUT_SECONDS
+    delay = 2
+    while True:
+        try:
+            await asyncio.to_thread(probe_mongo)
+            mark_mongo_available()
+            return
+        except PyMongoError:
+            mark_mongo_unavailable()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise
+            logger.warning("MongoDB unavailable during startup; retrying in {}s", min(delay, int(remaining)))
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 15)
+
+
+async def _monitor_mongo() -> None:
+    while True:
+        was_available = mongo_retry_allowed()
+        try:
+            await asyncio.to_thread(probe_mongo)
+        except asyncio.CancelledError:
+            raise
+        except PyMongoError:
+            mark_mongo_unavailable()
+            if was_available:
+                logger.error("MongoDB became unavailable; database work is paused")
+        else:
+            mark_mongo_available()
+            if not was_available:
+                logger.success("MongoDB connectivity restored; database work resumed")
+        await asyncio.sleep(MONGO_MONITOR_INTERVAL_SECONDS)
+
+
+async def _run_startup() -> None:
     jobs = (
         ("bulk job indexes", lambda: asyncio.to_thread(ensure_bulk_job_indexes)),
         ("WhatsApp call indexes", lambda: asyncio.to_thread(ensure_whatsapp_call_indexes)),
@@ -56,16 +105,9 @@ async def _run_noncritical_startup() -> None:
         ("Shopify legacy repair", repair_legacy_shopify_connections),
     )
     for name, job in jobs:
-        try:
-            await job()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.error(f"Deferred startup job failed ({name}): {type(exc).__name__}")
-    try:
-        start_scheduler()
-    except Exception as exc:
-        logger.error(f"Deferred startup job failed (APScheduler): {type(exc).__name__}")
+        logger.info("Starting {}", name)
+        await job()
+    start_scheduler()
 
 
 @asynccontextmanager
@@ -73,25 +115,32 @@ async def lifespan(app: FastAPI):
     """
     Lifespan event for the FastAPI application.
     """
-    # Startup
-    revocation_task = asyncio.create_task(run_whatsapp_revocation_reconciler())
-    load_agents()
-    bootstrap_task = asyncio.create_task(_run_noncritical_startup())
+    revocation_task = None
+    monitor_task = None
     try:
+        await _wait_for_mongo()
+        load_agents()
+        await _run_startup()
+        await _wait_for_mongo()
+        revocation_task = asyncio.create_task(run_whatsapp_revocation_reconciler())
+        monitor_task = asyncio.create_task(_monitor_mongo())
         yield
     finally:
         # Shutdown must also run when the application exits exceptionally.
         stop_scheduler()
-        if not bootstrap_task.done():
-            bootstrap_task.cancel()
-        await asyncio.gather(bootstrap_task, return_exceptions=True)
         await stop_push_notification_workers()
         await shutdown_intent_worker()
         await shutdown_scheduler()
         await shutdown_google_scheduler()
-        if not revocation_task.done():
+        if monitor_task and not monitor_task.done():
+            monitor_task.cancel()
+        if revocation_task and not revocation_task.done():
             revocation_task.cancel()
-        await asyncio.gather(revocation_task, return_exceptions=True)
+        await asyncio.gather(
+            *(task for task in (monitor_task, revocation_task) if task),
+            return_exceptions=True,
+        )
         await close_agent_http_client()
         await close_meta_http_client()
         clear_agents()
+        close_mongo_clients()
