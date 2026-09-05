@@ -12,6 +12,7 @@ Key behaviors:
 """
 
 import re
+import hashlib
 import uuid as _uuid
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -59,7 +60,12 @@ async def process_google_sheet_trigger(
         return {"sent": 0, "skipped": 0, "errors": 1}
 
     # 1. Get WhatsApp connection early
-    wa_connection = await asyncio.to_thread(_get_wa_connection, org_id)
+    requested_phone_id = (
+        message_config.get("phone_number_id")
+        or message_config.get("business_phone_id")
+        or trigger_config.get("phone_number_id")
+    )
+    wa_connection = await asyncio.to_thread(_get_wa_connection, org_id, requested_phone_id)
     if not wa_connection:
         logger.error(f"[GoogleSheetAuto] No WhatsApp connection found for org {org_id}")
         return {"sent": 0, "skipped": 0, "errors": 1}
@@ -117,11 +123,19 @@ async def process_google_sheet_trigger(
     # 4. Build eligible recipients
     stats = {"sent": 0, "skipped": 0, "errors": 0}
     eligible: list = []
+    from services.wa_service import get_broadcast_suppressed_phone_keys, is_broadcast_suppressed
+
+    candidate_phones = [normalize_phone(str(row.get(column_name, ""))) for row in rows_to_process]
+    suppressed_phones = await asyncio.to_thread(get_broadcast_suppressed_phone_keys, org_id, candidate_phones)
 
     for row_dict in rows_to_process:
         phone_raw = normalize_phone(str(row_dict.get(column_name, "")))
             
         if not phone_raw:
+            continue
+
+        if phone_raw in suppressed_phones:
+            stats["skipped"] += 1
             continue
 
         if not await _try_claim_send(org_id, flow_id, phone_raw):
@@ -175,6 +189,30 @@ async def process_google_sheet_trigger(
     if not eligible:
         return stats
 
+    from fastapi import HTTPException
+    from services.entitlement_service import consume_quota_async, feature_access, release_quota_async
+
+    phones_key = hashlib.sha256("|".join(sorted(item["phone_number"] for item in eligible)).encode()).hexdigest()
+    automation_event = f"google-sheet:{flow_id}:{phones_key}"
+    broadcast_event = f"google-sheet-broadcast:{flow_id}:{phones_key}"
+    batch_limit = feature_access(org_id, "BROADCASTING")["limits"].get("max_batch_recipients")
+    try:
+        if batch_limit is not None and len(eligible) > batch_limit:
+            raise HTTPException(status_code=422, detail="Google Sheet send exceeds the broadcast batch limit")
+        automation_quota = await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", len(eligible), automation_event)
+        try:
+            await consume_quota_async(org_id, "BROADCASTING", "monthly_recipients", len(eligible), broadcast_event)
+        except Exception:
+            if not automation_quota.get("duplicate", False):
+                await release_quota_async(org_id, "monthly_runs", automation_event)
+            raise
+    except HTTPException as exc:
+        logger.warning(f"[GoogleSheetAuto] Flow {flow_id} blocked by entitlement: {exc.detail}")
+        for recipient in eligible:
+            await asyncio.to_thread(_mark_failed, org_id, flow_id, recipient["phone_number"], sheet_id)
+        stats["errors"] += len(eligible)
+        return stats
+
     # 5. Send via centralized wa_service functions (handles API call + storage + WebSocket broadcast)
     from services.wa_service import (
         send_whatsapp_message,
@@ -189,11 +227,15 @@ async def process_google_sheet_trigger(
             resolved_text = recipient["resolved_text"]
             customer_name = recipient.get("customer_name", phone)
 
+            if await asyncio.to_thread(is_broadcast_suppressed, org_id, phone):
+                await asyncio.to_thread(_mark_suppressed, org_id, flow_id, phone, sheet_id)
+                return {"sent": 0, "skipped": 1, "errors": 0}
+
             # Ensure conversation exists before sending — the centralized send functions
             # use find_one_and_update WITHOUT upsert, so new contacts from sheets would crash.
             # create_or_update_whatsapp_conversation uses upsert=True and handles name resolution.
             try:
-                await create_or_update_whatsapp_conversation(
+                conversation_id = await create_or_update_whatsapp_conversation(
                     org_id=org_id,
                     recipient_id=wa_id,
                     customer_phone_no=phone,
@@ -201,9 +243,13 @@ async def process_google_sheet_trigger(
                     last_message=resolved_text,
                     last_sender="agent",
                     mode="reply",
+                    business_phone_id=phone_id,
+                    business_phone=wa_connection.get("phone"),
                 )
             except Exception as e:
                 logger.warning(f"[GoogleSheetAuto] Conversation pre-create for {phone}: {e}")
+                await asyncio.to_thread(_mark_failed, org_id, flow_id, phone, sheet_id)
+                return {"sent": 0, "errors": 1}
 
             msg_id = ""
             send_ok = False
@@ -226,13 +272,14 @@ async def process_google_sheet_trigger(
                         mode="reply",
                         context_type=None,
                         context=None,
+                        conversation_id=conversation_id,
                     )
                     msg_id = result.get("message_id", "")
                     send_ok = True
                 else:
                     # Build message dict matching what send_whatsapp_message expects
                     message_dict = {
-                        "conversation_id": f"whatsapp_{phone}",
+                        "conversation_id": conversation_id,
                         "content": resolved_text,
                         "sender_id": wa_id,
                     }
@@ -335,6 +382,7 @@ async def process_google_sheet_trigger(
             stats["errors"] += 1
         elif res:
             stats["sent"] += res.get("sent", 0)
+            stats["skipped"] += res.get("skipped", 0)
             stats["errors"] += res.get("errors", 0)
 
     logger.info(f"[GoogleSheetAuto] Flow {flow_id}: sent={stats['sent']}, skipped={stats['skipped']}, errors={stats['errors']}")
@@ -743,13 +791,16 @@ async def _fetch_rows(
     return raw_rows
 
 
-def _get_wa_connection(org_id: str) -> Optional[dict]:
-    """Get active WhatsApp connection for an org."""
+def _get_wa_connection(org_id: str, phone_number_id: Optional[str] = None) -> Optional[dict]:
+    """Resolve an exact sender or the organization's primary sender."""
+    from services.wa_service import resolve_outbound_whatsapp_connection
+
+    if phone_number_id:
+        return resolve_outbound_whatsapp_connection(org_id, None, phone_number_id)
     org = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1})
     if not org or not org.get("wa_id"):
         return None
-    wa_id = org["wa_id"]
-    return db.whatsapp_connections.find_one({"wa_id": wa_id, "org_id": org_id})
+    return resolve_outbound_whatsapp_connection(org_id, org["wa_id"], phone_number_id)
 
 
 async def _try_claim_send(org_id: str, flow_id: str, phone: str) -> bool:
@@ -845,6 +896,16 @@ def _mark_failed(org_id: str, flow_id: str, phone: str, sheet_id: str):
                 "sheet_id": sheet_id,
             }
         },
+        upsert=True,
+    )
+
+
+def _mark_suppressed(org_id: str, flow_id: str, phone: str, sheet_id: str):
+    """Keep an opted-out recipient terminal for this automation flow."""
+    now = datetime.now(timezone.utc)
+    db[SENT_COLLECTION].update_one(
+        {"org_id": org_id, "flow_id": flow_id, "phone": phone},
+        {"$set": {"status": "suppressed", "updated_at": now, "sheet_id": sheet_id}},
         upsert=True,
     )
 

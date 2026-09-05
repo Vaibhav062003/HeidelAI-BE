@@ -24,10 +24,11 @@ wanted = {
     "_customer_snapshot", "_tally_escalation_payload", "build_sales_voucher_xml", "parse_invoice_command",
     "_node_text", "_decimal_text", "_tag", "_direct_text", "_parse_tally_xml", "_tally_date", "parse_snapshot_responses", "validate_snapshot_responses", "build_master_xml",
     "valid_gstin_format", "_normalized_phone", "_strict_party_matches", "parse_outstanding_response", "parse_profit_loss_response", "build_report_xml",
-    "_export_collection_xml", "build_snapshot_requests", "build_invoice_export_xml", "parse_invoice_export_response", "_pdf_document", "render_invoice_pdf",
+    "_export_collection_xml", "build_snapshot_requests", "_invoice_export_xml", "build_invoice_export_xml", "build_invoice_readback_xml",
+    "parse_tally_import_response", "parse_invoice_export_response", "validate_invoice_creation_readback", "_pdf_document", "render_invoice_pdf",
     "_financial_year_period", "_merge_deleted_transactions",
     "_pdf_expires_at", "_pdf_is_current", "_pdf_client_view",
-    "_exact_product_master_id", "_job_phase",
+    "_exact_product_master_id", "_job_phase", "_supports_invoice_readback",
     "_validate_tally_pdf",
 }
 nodes = [
@@ -59,7 +60,10 @@ job_phase = namespace["_job_phase"]
 export_collection_xml = namespace["_export_collection_xml"]
 build_snapshot_requests = namespace["build_snapshot_requests"]
 build_invoice_export_xml = namespace["build_invoice_export_xml"]
+build_invoice_readback_xml = namespace["build_invoice_readback_xml"]
+parse_tally_import_response = namespace["parse_tally_import_response"]
 parse_invoice_export_response = namespace["parse_invoice_export_response"]
+validate_invoice_creation_readback = namespace["validate_invoice_creation_readback"]
 render_invoice_pdf = namespace["render_invoice_pdf"]
 validate_tally_pdf = namespace["_validate_tally_pdf"]
 normalized_phone = namespace["_normalized_phone"]
@@ -67,6 +71,7 @@ strict_party_matches = namespace["_strict_party_matches"]
 merge_deleted_transactions = namespace["_merge_deleted_transactions"]
 pdf_is_current = namespace["_pdf_is_current"]
 pdf_client_view = namespace["_pdf_client_view"]
+supports_invoice_readback = namespace["_supports_invoice_readback"]
 
 
 class TallyContractTests(unittest.TestCase):
@@ -118,6 +123,8 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn("<BILLALLOCATIONS.LIST><NAME>Q-100</NAME><BILLTYPE>New Ref</BILLTYPE>", xml)
         self.assertEqual(xml.count("<BILLALLOCATIONS.LIST>"), 1)
         self.assertEqual(xml.count("REMOTEID="), 1)
+        self.assertIn("<VERSION>1</VERSION>", xml)
+        self.assertIn("<SVVCHIMPORTFORMAT>$$SysName:XML</SVVCHIMPORTFORMAT>", xml)
         self.assertNotIn("<VOUCHERNUMBER>", xml)
         self.assertIn("<REFERENCE>Q-100</REFERENCE>", xml)
         self.assertIn("<BASICBUYERADDRESS>Bill Road</BASICBUYERADDRESS>", xml)
@@ -127,6 +134,40 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn("<DISPATCHFROMADDRESS>Dock &amp; Yard</DISPATCHFROMADDRESS>", xml)
         self.assertIn("<DISPATCHFROMPLACE>Mumbai</DISPATCHFROMPLACE>", xml)
         self.assertNotIn("Buyer & Sons", xml)
+
+    def test_invoice_completion_requires_tally_import_ids_and_exact_readback(self):
+        template = build_invoice_readback_xml(self.settings, "2026-08-18")
+        self.assertIn("$MasterID = __HEIDELAI_MASTER_ID__", template)
+        self.assertIn("<SVCURRENTCOMPANY>Heidel &amp; Co</SVCURRENTCOMPANY>", template)
+        import_response = (
+            "<RESPONSE><CREATED>1</CREATED><ALTERED>0</ALTERED><ERRORS>0</ERRORS>"
+            "<LASTVCHID>99</LASTVCHID><VCHNUMBER>INV-99</VCHNUMBER></RESPONSE>"
+        )
+        self.assertEqual(parse_tally_import_response(import_response), {
+            "master_id": "99", "voucher_number": "INV-99", "created": 1, "altered": 0,
+        })
+        readback = (
+            "<ENVELOPE><VOUCHER><MASTERID>99</MASTERID><DATE>20260818</DATE>"
+            "<VOUCHERNUMBER>INV-99</VOUCHERNUMBER><REFERENCE>Q-100</REFERENCE>"
+            "<PARTYLEDGERNAME>Buyer &amp; Sons</PARTYLEDGERNAME><AMOUNT>-123</AMOUNT>"
+            "</VOUCHER></ENVELOPE>"
+        )
+        job = {"quote_number": "Q-100", "party_ledger": "Buyer & Sons", "amount": 123}
+        result = {
+            "tally_response": import_response, "master_id": "99", "voucher_number": "INV-99",
+            "responses": [{"key": "invoice", "xml": readback}],
+        }
+        confirmed = validate_invoice_creation_readback(job, result)
+        self.assertEqual(confirmed["master_id"], "99")
+        self.assertEqual(confirmed["voucher_number"], "INV-99")
+        with self.assertRaises(HTTPException):
+            validate_invoice_creation_readback({**job, "amount": 124}, result)
+        with self.assertRaises(HTTPException):
+            validate_invoice_creation_readback(job, {**result, "tally_response": import_response.replace("<CREATED>1", "<CREATED>0")})
+        with self.assertRaises(HTTPException):
+            parse_tally_import_response(import_response.replace("<CREATED>1", "<CREATED>one"))
+        with self.assertRaises(HTTPException):
+            parse_tally_import_response(import_response.replace("<RESPONSE>", "<RESPONSE><STATUS>0</STATUS>"))
 
     def test_mismatched_money_fails_before_connector(self):
         self.quote["public_grand_total"] = 124
@@ -138,6 +179,9 @@ class TallyContractTests(unittest.TestCase):
         self.assertNotEqual(connector_key_hash(raw), raw)
         self.assertEqual(connector_key_hash(raw), connector_key_hash(raw))
         self.assertNotIn("connector_key_hash", normalized_settings({"connector_key_hash": "never-return-this"}))
+        self.assertTrue(supports_invoice_readback({"connector_version": "8", "connector_capabilities": ["invoice_readback"]}))
+        self.assertFalse(supports_invoice_readback({"connector_version": "7", "connector_capabilities": ["invoice_readback"]}))
+        self.assertFalse(supports_invoice_readback({"connector_version": "8", "connector_capabilities": []}))
 
     def test_routes_keep_connector_separate_from_user_auth(self):
         source = pathlib.Path("api/tally_routes.py").read_text()
@@ -146,11 +190,14 @@ class TallyContractTests(unittest.TestCase):
         self.assertIn('alias="X-Tally-Claim-Id"', source)
         self.assertIn('await admin_required(user)', source)
         self.assertIn('/api/tally/operations', source)
-        self.assertIn('connector_version_number < 7', source)
+        self.assertIn('connector_version_number < 8', source)
+        self.assertIn('"invoice_readback" not in capabilities', source)
         self.assertIn('"credit_notes"', source)
         self.assertNotIn('"connector_key_hash": integration', source)
         self.assertIn('"response_meta": response_meta', service)
         self.assertNotIn('"responses": result.get("responses")', service)
+        self.assertIn('payload.get("idempotency_key")', service)
+        self.assertIn('{"$setOnInsert": draft}', service)
 
     def test_failure_escalation_connects_customer_and_tally_context(self):
         customer = customer_snapshot(self.quote)
@@ -337,8 +384,12 @@ class TallyContractTests(unittest.TestCase):
             claim.index("db.tally_bill_jobs.find_one_and_update"),
             claim.index('"job_type": "sync_snapshot"'),
         )
+        self.assertIn("if _supports_invoice_readback(integration):", claim)
         self.assertIn("Verify Tally Day Book before retrying this unconfirmed invoice", service)
         self.assertIn('"status": "pending", "request_xml": request_xml', service)
+        self.assertIn('"readback_request_xml": build_invoice_readback_xml', service)
+        self.assertIn('"invoice_readback"', service)
+        self.assertIn("validate_invoice_creation_readback", service)
 
     def test_master_xml_only_creates_or_alters_supported_masters(self):
         xml = build_master_xml("sales", {"name": "Computer Sales"})

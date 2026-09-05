@@ -1,5 +1,6 @@
 # === Third-party Modules ===
 from typing import Literal, Optional
+import uuid
 
 from pymongo.errors import PyMongoError
 from bson import ObjectId
@@ -18,6 +19,8 @@ from services.followup_service import (
     schedule_followup_message,
     transition_scheduled_followup,
 )
+from services.entitlement_service import commit_quota_async, record_ai_usage_async, release_quota_async, require_feature, reserve_quota_async
+from services.agent_service import send_to_agent
 from schemas.models import ChatbotPromptUpdate, ChatAnalysis
 from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required
@@ -58,11 +61,20 @@ class FollowUpStatusRequest(BaseModel):
 class AIPolicyRequest(BaseModel):
     enabled: bool
     pause_minutes: int = Field(default=60, ge=5, le=1440)
+    quote_followup_prompt_enabled: Optional[bool] = None
+    whatsapp_enabled_phone_ids: Optional[list[str]] = Field(default=None, max_length=50)
 
 
 class ConversationAIStateRequest(BaseModel):
     action: Literal["pause", "resume"]
     duration_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
+
+
+class PlaygroundChatRequest(BaseModel):
+    conversation_id: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=12_000)
+    persona: str = Field(default="fallback", max_length=100)
+    location: str = Field(default="india", max_length=100)
 
 
 @router.get("/policy")
@@ -75,7 +87,40 @@ async def get_ai_policy(request: Request, user: CurrentUser):
 @limiter.limit("30/minute")
 async def put_ai_policy(request: Request, payload: AIPolicyRequest, user: CurrentUser):
     await admin_required(user)
-    return await update_org_ai_policy(user.org_id, payload.enabled, payload.pause_minutes)
+    return await update_org_ai_policy(
+        user.org_id,
+        payload.enabled,
+        payload.pause_minutes,
+        payload.quote_followup_prompt_enabled,
+        payload.whatsapp_enabled_phone_ids,
+    )
+
+
+@router.post("/playground/chat")
+@limiter.limit("30/minute")
+async def playground_chat(request: Request, payload: PlaygroundChatRequest, user: CurrentUser):
+    require_feature(user.org_id, "AI")
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    event_key = f"playground:{user.user_id}:{request_id}"
+    await reserve_quota_async(user.org_id, "AI", "monthly_messages", 1, event_key)
+    try:
+        result = await send_to_agent(
+            conversation_id=payload.conversation_id,
+            user_input=payload.message,
+            persona=payload.persona,
+            location=payload.location,
+            customer_name=user.full_name or "User",
+            org_id=user.org_id,
+            source="ai_playground",
+            message_id=request_id,
+        )
+    except Exception:
+        await release_quota_async(user.org_id, "monthly_messages", event_key)
+        raise
+    await commit_quota_async(user.org_id, "monthly_messages", event_key, "0")
+    usage = result.get("usage") or {}
+    await record_ai_usage_async(user.org_id, event_key, "playground", 1, int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0)), int(usage.get("recorded_cost_microusd", 0)))
+    return {"response": result["final_response"]}
 
 
 @router.post("/conversations/{conversation_id}/state")
@@ -160,11 +205,12 @@ async def schedule_message(
     Schedule a follow-up using the customer's timeline or the fixed three-hour default.
     """
     try:
+        require_feature(user.org_id, "FOLLOW_UPS")
         body = payload or ScheduleFollowUpRequest()
         await require_conversation_access(user.org_id, conversation_id, user.user_id, user.role)
         if body.source == "quotation" and not body.quote_id:
             raise HTTPException(status_code=422, detail="A quote is required for quotation follow-ups.")
-        return await schedule_followup_message(
+        result = await schedule_followup_message(
             user.org_id,
             conversation_id,
             source=body.source,
@@ -173,6 +219,10 @@ async def schedule_message(
             requested_by_name=user.full_name,
             scheduled_for=body.scheduled_for,
         )
+        if body.source == "quotation" and result.get("requires_agent_time"):
+            policy = await get_org_ai_policy(user.org_id)
+            result["prompt_immediately"] = policy["quote_followup_prompt_enabled"]
+        return result
     except HTTPException as e:
         # Graceful return for API
         raise e
@@ -214,6 +264,7 @@ async def update_followup_status(
     payload: FollowUpStatusRequest,
     user: CurrentUser,
 ):
+    require_feature(user.org_id, "FOLLOW_UPS")
     existing = await get_async_mongo_db().scheduled_messages.find_one(
         {"_id": _followup_object_id(followup_id), "org_id": user.org_id},
         {"conversation_id": 1},
@@ -238,6 +289,7 @@ async def cancel_next_followup(
     followup_id: str,
     user: CurrentUser,
 ):
+    require_feature(user.org_id, "FOLLOW_UPS")
     existing = await get_async_mongo_db().scheduled_messages.find_one(
         {"_id": _followup_object_id(followup_id), "org_id": user.org_id},
         {"conversation_id": 1},
@@ -328,5 +380,8 @@ async def run_chat_analysis(request: Request, conversation_id: str, user: Curren
                 
         return cached_analysis
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        logger.error(f"Chat analysis failed for {conversation_id}: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="AI analysis is temporarily unavailable.")

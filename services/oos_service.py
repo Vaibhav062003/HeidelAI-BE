@@ -13,6 +13,7 @@ Handles:
 import asyncio
 import re
 import urllib.parse
+import uuid
 from datetime import datetime, timezone, timedelta, time as dt_time
 from typing import Optional, List, Dict
 
@@ -30,6 +31,14 @@ PENDING_SEND_BATCH = 100
 
 # Validate Google Sheet IDs (alphanumeric + hyphens/underscores)
 SHEET_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def canonical_brand(value: Optional[str]) -> str:
+    """Normalize brand casing, hyphens, and whitespace for consistent dealer matching."""
+    if not value:
+        return ""
+    key = " ".join(value.casefold().replace("-", " ").split())
+    return {"lianli": "lian li"}.get(key, key)
 
 
 def is_within_dealer_hours() -> bool:
@@ -72,42 +81,140 @@ async def fetch_dealer_directory(org_id: str, sheet_id: Optional[str] = None, ta
         return []
 
 
+def _format_brand(brand: str) -> str:
+    """Format brand dynamically: uppercase short acronyms (e.g. NZXT, MSI, HP, AMD, LG) or title-case word brands."""
+    if not brand:
+        return ""
+    b = brand.strip()
+    vowels = {"a", "e", "i", "o", "u"}
+    # Short acronym (<= 3 chars like HP/MSI/LG/AMD, or 4-char consonant acronym like NZXT)
+    is_consonant_acronym = len(b) <= 4 and not any(c in vowels for c in b.lower()) and " " not in b
+    if is_consonant_acronym or (len(b) <= 3 and " " not in b):
+        return b.upper()
+    return b.title()
+
+
+CONVERSATIONAL_PREFIXES = [
+    r"^(what|how)\s+about\s+",
+    r"^about\s+",
+    r"^do you have\s+",
+    r"^have you got\s+",
+    r"^is\s+(there\s+)?",
+    r"^are\s+(there\s+)?",
+    r"^can i get\s+",
+    r"^can you check\s+(about\s+)?",
+    r"^i need\s+",
+    r"^i want\s+",
+    r"^looking for\s+",
+    r"^price for\s+",
+    r"^cost of\s+",
+    r"^give me\s+",
+    r"^check\s+(about\s+)?",
+    r"^please check\s+(about\s+)?",
+]
+
+BUDGET_SUFFIXES = [
+    r",?\s*budget\s*(around|is|of)?\s*\d+.*$",
+    r",?\s*price\s*(around|is|of)?\s*\d+.*$",
+    r",?\s*under\s*\d+.*$",
+    r",?\s*around\s*\d+.*$",
+]
+
+
+def clean_product_query(raw_query: str) -> str:
+    """Strip conversational filler prefixes, punctuation, and budget mentions from customer queries."""
+    if not raw_query:
+        return ""
+    q = raw_query.strip()
+    for pat in CONVERSATIONAL_PREFIXES:
+        q = re.sub(pat, "", q, flags=re.IGNORECASE).strip()
+    for pat in BUDGET_SUFFIXES:
+        q = re.sub(pat, "", q, flags=re.IGNORECASE).strip()
+    q = q.rstrip("?!.,").strip()
+    return q
+
+
+def _format_product_title(text: str, brand: str = "") -> str:
+    """Format product words cleanly preserving brand and capitalizing model words."""
+    if not text:
+        return ""
+    if brand:
+        formatted_brand = _format_brand(brand)
+        pattern = re.compile(re.escape(brand), re.IGNORECASE)
+        if pattern.search(text):
+            remainder = pattern.sub("", text).strip()
+            vowels = {"a", "e", "i", "o", "u"}
+            rem_words = [
+                w.upper() if (len(w) <= 4 and not any(c in vowels for c in w.lower()) and not w.isdigit()) else w.capitalize()
+                for w in remainder.split()
+            ]
+            rem_str = " ".join(rem_words)
+            return f"{formatted_brand} {rem_str}".strip()
+
+    words = text.split()
+    formatted = []
+    vowels = {"a", "e", "i", "o", "u"}
+    for w in words:
+        if len(w) <= 4 and not any(c in vowels for c in w.lower()) and not w.isdigit():
+            formatted.append(w.upper())
+        else:
+            formatted.append(w.capitalize())
+    return " ".join(formatted)
+
+
+def format_dealer_sourcing_message(extracted_attrs: dict, raw_query: str = "") -> str:
+    """
+    Format a concise, redrafted sourcing message for dealers across any brand/org.
+    Excludes budget, raw customer query conversational noise, and internal labels.
+    Produces:
+        <Brand> <Model> <Category> in <Colour>
+
+        bhai price and availability?
+    """
+    raw_brand = (extracted_attrs.get("brand") or "").strip()
+    brand = _format_brand(raw_brand)
+    model = (extracted_attrs.get("model_name") or "").strip()
+    category = (extracted_attrs.get("category") or "").strip().title()
+    specs = extracted_attrs.get("specs") or {}
+
+    colour = specs.get("colour") or specs.get("color")
+
+    parts = [p for p in (brand, model, category) if p]
+
+    if len(parts) >= 2 or (len(parts) == 1 and not brand):
+        title = " ".join(parts)
+        if colour:
+            title += f" in {str(colour).strip().capitalize()}"
+    elif raw_query and raw_query.strip():
+        cleaned_raw = clean_product_query(raw_query)
+        if cleaned_raw:
+            title = _format_product_title(cleaned_raw, raw_brand)
+            if colour and colour.lower() not in title.lower():
+                title += f" in {str(colour).strip().capitalize()}"
+        else:
+            title = parts[0] if parts else "Product Inquiry"
+    elif parts:
+        title = parts[0]
+    else:
+        title = "Product Inquiry"
+
+    # Keep variant identity, but never forward budget/pricing or arbitrary customer text.
+    for key in ("cpu", "processor", "ram", "memory", "storage", "capacity", "gpu", "graphics", "size", "display", "screen_size", "refresh_rate"):
+        value = specs.get(key)
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            continue
+        value = str(value).strip()
+        if value and not re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", title, re.IGNORECASE):
+            title += f" / {value}"
+
+    return f"{title}\n\nbhai price and availability?"
+
+
 def generate_dealer_message(oos_doc: dict) -> str:
-    """Generate the formatted inquiry message to send to dealers."""
+    """Generate the concise sourcing message to send to dealers."""
     attrs = oos_doc.get("extracted_attributes", {})
-    parts = []
-    if attrs.get("category"):
-        parts.append(f"Category: {attrs['category'].strip().title()}")
-    if attrs.get("brand"):
-        parts.append(f"Brand: {attrs['brand'].strip().upper()}")
-    if attrs.get("model_name"):
-        parts.append(f"Model: {attrs['model_name'].strip()}")
-
-    specs = attrs.get("specs", {})
-    if specs:
-        for k, v in specs.items():
-            if v is None:
-                continue
-            label = k.replace("_", " ").title()
-            if label.lower() == "ram gb":
-                label, v = "RAM", f"{v}GB"
-            elif label.lower() == "storage gb":
-                label, v = "Storage", f"{v}GB"
-            elif label.lower() == "budget max":
-                label = "Max Budget"
-                try:
-                    v = f"Rs. {float(v):,.0f}"
-                except (ValueError, TypeError):
-                    v = f"Rs. {v}"
-            parts.append(f"{label}: {v}")
-
-    spec_summary = "\n".join(f"  - {p}" for p in parts)
     raw_query = oos_doc.get("raw_query_text", "")
-
-    message = f"Query: \"{raw_query}\""
-    if parts:
-        message += f"\nSpecifications:\n{spec_summary}"
-    return message
+    return format_dealer_sourcing_message(attrs, raw_query)
 
 
 async def send_oos_to_dealers(oos_doc: dict, org_id: str):
@@ -147,16 +254,33 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     all_dealers = await fetch_dealer_directory(org_id)
 
     # Filter by brand if known or detected in raw query
-    raw_query = (oos_doc.get("raw_query_text", "") or "").lower()
-    known_brands = ["lenovo", "asus", "dell", "msi", "hp", "apple", "mac", "macbook", "acer", "samsung", "gigabyte"]
+    raw_query_raw = oos_doc.get("raw_query_text", "") or ""
+    raw_query = raw_query_raw.lower()
+    normalized_raw_query = " ".join(raw_query.replace("-", " ").split())
+    compact_raw_query = normalized_raw_query.replace(" ", "")
+    known_brands = [
+        "lenovo", "asus", "dell", "msi", "hp", "apple", "mac", "macbook",
+        "acer", "samsung", "gigabyte", "lian li", "lianli", "nzxt"
+    ]
     detected_brand = None
     if brand:
-        detected_brand = brand.strip().lower()
+        detected_brand = canonical_brand(brand)
     else:
-        for kb in known_brands:
-            if kb in raw_query:
-                detected_brand = kb
+        # Dynamically check if any brand configured in this tenant's dealer directory matches the raw query
+        for d in all_dealers:
+            for b in (d.get("brands") or "").split(","):
+                cb = canonical_brand(b)
+                if cb and (cb in normalized_raw_query or b.lower().strip() in raw_query or cb.replace(" ", "") in compact_raw_query):
+                    detected_brand = cb
+                    break
+            if detected_brand:
                 break
+        if not detected_brand:
+            for kb in known_brands:
+                canonical_kb = canonical_brand(kb)
+                if canonical_kb in normalized_raw_query or kb in raw_query or canonical_kb.replace(" ", "") in compact_raw_query:
+                    detected_brand = canonical_kb
+                    break
 
     if detected_brand in ("mac", "macbook", "apple"):
         brand_search_terms = ["apple", "mac", "macbook"]
@@ -166,7 +290,11 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
     if detected_brand:
         target_dealers = []
         for d in all_dealers:
-            dealer_brands = [b.strip().lower() for b in d.get("brands", "").split(",")]
+            dealer_brands = [
+                canonical_brand(v)
+                for v in d.get("brands", "").split(",")
+                if v.strip()
+            ]
             if any(term in dealer_brands for term in brand_search_terms):
                 target_dealers.append(d)
         logger.info(f"[OOS] Filtered {len(all_dealers)} dealers down to {len(target_dealers)} dealers matching brand='{detected_brand}' (search terms={brand_search_terms})")
@@ -262,10 +390,17 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         }}
     )
 
-    # Resolve WhatsApp Business Account ID
+    # Reuse the sender bound to the source customer conversation.
     db = get_mongo_db()
-    wa_connection = await asyncio.to_thread(
-        db.whatsapp_connections.find_one, {"org_id": org_id}
+    source_conversation = await asyncio.to_thread(
+        db[f"conversations_{org_id}"].find_one,
+        {"conversation_id": oos_doc.get("conversation_id")},
+    )
+    from services.wa_service import create_or_update_whatsapp_conversation, resolve_outbound_whatsapp_connection
+    wa_connection = resolve_outbound_whatsapp_connection(
+        org_id,
+        (source_conversation or {}).get("whatsapp_id"),
+        (source_conversation or {}).get("business_phone_id"),
     )
     wa_id = (wa_connection or {}).get("wa_id")
     if not wa_id:
@@ -289,13 +424,26 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         async with sem:
             try:
                 logger.info(f"[OOS] Sending WhatsApp message to dealer '{dealer_name}' at +{dealer_phone}...")
+                dealer_conversation_id = await create_or_update_whatsapp_conversation(
+                    org_id=org_id,
+                    recipient_id=wa_id,
+                    customer_phone_no=dealer_phone,
+                    customer_name=dealer_name or dealer_phone,
+                    last_message=dealer_message,
+                    last_sender="ai",
+                    mode="ai",
+                    business_phone_id=wa_connection.get("phone_id"),
+                    business_phone=wa_connection.get("phone"),
+                )
+                idempotency_key = f"oos_{oos_doc.get('query_id', uuid.uuid4().hex)}_{dealer_phone}_{uuid.uuid4().hex[:6]}"
                 res = await send_whatsapp_message({
-                    "conversation_id": f"whatsapp_{dealer_phone}",
+                    "conversation_id": dealer_conversation_id,
                     "content": dealer_message,
                     "sender_id": wa_id,
                     "recipient_override": dealer_phone,
                     "customer_name": dealer_name,
-                }, org_id, "ai")
+                    "idempotency_key": idempotency_key,
+                }, org_id, "reply")
                 message_ids = res.get("message_ids", []) if res else []
                 logger.success(f"[OOS] WhatsApp successfully sent to dealer '{dealer_name}' at +{dealer_phone} (message_ids={message_ids})")
                 sent_dealers.append({
@@ -323,6 +471,17 @@ async def send_oos_to_dealers(oos_doc: dict, org_id: str):
         logger.success(f"[OOS] Contacted {len(sent_dealers)} dealers successfully. Query_id={oos_doc['query_id']} transitioned status to '{new_status}'")
     else:
         logger.error(f"[OOS] Failed to contact any dealers for query_id={oos_doc['query_id']}. Status set to 'send_failed'")
+
+
+def _is_pending_dealer_acknowledgement(content: str) -> bool:
+    """A narrow deferral, not a buyer question or an availability/price claim."""
+    return bool(re.fullmatch(
+        r"\s*(?:(?:ok(?:ay)?|sure)[,.!]?\s+)?"
+        r"(?:let me|i(?:'ll| will)|will)\s+(?:check|confirm)"
+        r"(?:\s+and\s+(?:confirm|let you know|update you))?"
+        r"(?:\s+(?:tomorrow|later|soon|shortly))?[.!]?\s*",
+        content or "", re.IGNORECASE,
+    ))
 
 
 async def handle_dealer_reply(
@@ -355,12 +514,15 @@ async def handle_dealer_reply(
     # Statuses where we expect dealer replies (only after message was actually sent)
     active_statuses = ["dealers_contacted", "partial_replies", "sending"]
 
-    from services.pricing_service import is_pricing_enabled, is_supplier_response
+    from services.pricing_service import is_supplier_response
 
     supplier_response = is_supplier_response(content)
+    pending_acknowledgement = False
     oos_doc = None
-    # Exact reply-to correlation establishes the supplier role; prose heuristics
-    # are only needed for the broader phone fallbacks.
+    # Reply-to correlation identifies the request, but the text still has to be
+    # a supplier answer. A dealer may also use this number as a customer and
+    # ask a question while quoting the request; that must continue to the
+    # conversational dealer/customer router instead of being stored as a quote.
     if replied_message_id:
         logger.info(f"[OOS] Attempting match by replied message_id: {replied_message_id}")
         oos_doc = await oos_col.find_one({
@@ -370,9 +532,21 @@ async def handle_dealer_reply(
         })
         if oos_doc:
             logger.success(f"[OOS] Match succeeded by message_id {replied_message_id} for query_id={oos_doc['query_id']}")
+            pending_acknowledgement = _is_pending_dealer_acknowledgement(content) and any(
+                row.get("dealer_phone") == dealer_phone and replied_message_id in (row.get("message_ids") or [])
+                for row in oos_doc.get("sent_dealers", [])
+            )
+            if not supplier_response and not pending_acknowledgement:
+                logger.info(
+                    f"[OOS] Reply to query_id={oos_doc['query_id']} is not a supplier answer; "
+                    "falling back to the chatbot agent"
+                )
+                return False
 
-    # Phone-only replies are safe only when exactly one active request matches.
-    allow_phone_fallback = not is_pricing_enabled(org_id) or supplier_response
+    # Without reply-to correlation, a supplier-shaped answer and one unique
+    # active request are both required. Otherwise normal customer questions
+    # from a registered dealer would be swallowed by the OOS workflow.
+    allow_phone_fallback = supplier_response
     if not oos_doc and allow_phone_fallback:
         logger.info(f"[OOS] Attempting unique match by dealer phone number: {dealer_phone}")
         matches = await oos_col.find(
@@ -409,10 +583,11 @@ async def handle_dealer_reply(
         "content": content,
         "source_message_id": source_message_id,
         "replied_at": datetime.now(timezone.utc),
+        "reply_kind": "pending_acknowledgement" if pending_acknowledgement else "supplier_response",
         "steps": {
-            "pricing": "pending",
+            "pricing": "done" if pending_acknowledgement else "pending",
             "sheet": "pending",
-            "escalation": "pending" if create_escalation else "done",
+            "escalation": "pending" if create_escalation and not pending_acknowledgement else "done",
         },
     }
 
@@ -427,7 +602,7 @@ async def handle_dealer_reply(
         },
         {
             "$push": {"dealer_replies": reply_entry},
-            "$set": {"status": "partial_replies"}
+            **({} if pending_acknowledgement else {"$set": {"status": "partial_replies"}}),
         }
     )
 
@@ -818,6 +993,6 @@ async def ensure_oos_indexes():
     await col.create_index([("org_id", 1), ("status", 1), ("sent_dealers.dealer_phone", 1)])
     await col.create_index([("org_id", 1), ("status", 1), ("sent_dealers.message_ids", 1)])
     await col.create_index([("org_id", 1), ("status", 1), ("target_dealers.phone", 1)])
-    await col.create_index([("conversation_id", 1), ("status", 1), ("extracted_attributes.brand", 1)])
+    await col.create_index([("org_id", 1), ("conversation_id", 1), ("status", 1), ("extracted_attributes.brand", 1)])
     await col.create_index([("status", 1), ("expires_at", 1)])
     logger.info("[OOS] Indexes ensured on oos_requests")

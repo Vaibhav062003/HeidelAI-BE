@@ -10,6 +10,15 @@ from loguru import logger
 
 db = get_mongo_db()
 
+
+def conversation_text(messages: list[dict]) -> str:
+    rows = []
+    for message in reversed(messages):
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            rows.append(f"{message.get('role') or 'unknown'}: {content.strip()}")
+    return "\n".join(rows)
+
 async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> ChatAnalysis:
     """
     Fetches the latest 40 messages for a given conversation_id,
@@ -48,12 +57,9 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
         except PyMongoError as e:
             raise RuntimeError(f"Database error fetching messages: {e}")
 
-        if not messages or len(messages) < 5:
+        text = conversation_text(messages)
+        if not text:
             return result_data
-
-        # Combine message content into a single string
-        messages.reverse()
-        conversation_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
 
         # Fetch existing tags and labels from org metadata
         available_tags = await contacts_service.get_tags_from_org_metadata(org_id)
@@ -61,8 +67,7 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
         # logger.info(f"Available tags: {available_tags}, Available labels: {available_labels}")
 
         # Call LLM to analyze (constrained to existing tags/labels)
-        analysis_result = await analyze_conversation(conversation_text, available_tags, available_labels)
-        logger.info(f"Analysis result: {analysis_result}")
+        analysis_result = await analyze_conversation(text, available_tags, available_labels)
 
         if analysis_result:
             timestamp = datetime.now(timezone.utc)
@@ -125,8 +130,8 @@ async def analyze_and_update_conversation(org_id: str, conversation_id: str) -> 
             return result_data
 
     except Exception as e:
-        logger.error(f"LLM analysis failed for {conversation_id}: {e}")
-        return None
+        logger.error(f"LLM analysis failed for {conversation_id}: {type(e).__name__}")
+        raise
 
 if __name__ == "__main__":
     pass

@@ -8,6 +8,7 @@ from pydantic import TypeAdapter
 # Internal Modules
 from database import get_mongo_db
 from schemas.models import WhatsAppInteractiveMessage
+from services.automation_keywords import message_contains_keyword
 from services.utils import get_first_name, inject_variables, serialize_mongo
 from services.wa_service import send_interactive_whatsapp_message, send_whatsapp_message
 from core.services import services
@@ -796,6 +797,7 @@ async def execute_whatsapp_flow(
     message_content: str,
     whatsapp_business_id: str,
     message_type: str,
+    source_message_id: str | None = None,
 ):
     logger.info(f"[{org_id}] Executing WhatsApp flow for conversation: {conversation_id} | Stage: {stage} | Type: {message_type}")
 
@@ -823,6 +825,18 @@ async def execute_whatsapp_flow(
 
     ctx = dict(org_id=org_id, whatsapp_business_id=whatsapp_business_id, conversation_id=conversation_id)
 
+    async def consume_run() -> bool:
+        from fastapi import HTTPException
+        from services.entitlement_service import consume_quota_async
+
+        key = source_message_id or f"{conversation_id}:{message_type}:{message_content}"
+        try:
+            await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", 1, f"wabot:{flow.get('flow_id')}:{key}")
+            return True
+        except HTTPException as exc:
+            logger.warning(f"[{org_id}] WhatsApp automation blocked: {exc.detail}")
+            return False
+
     # Interactive (button / list click)
     if message_type == "interactive":
         selection_id = message_content
@@ -830,6 +844,9 @@ async def execute_whatsapp_flow(
 
         if selection_id not in flow_nodes:
             logger.warning(f"[{org_id}] Node '{selection_id}' not found in flow, routing to AI...")
+            return False
+
+        if not await consume_run():
             return False
 
         if selection_id in welcome_message_ids:
@@ -863,23 +880,23 @@ async def execute_whatsapp_flow(
     if welcome_message or start_node_id:
         msg_lower = message_content.strip().lower() if message_content else ""
 
-        # "Contains" matching: fires if ANY keyword is found within the message,
-        # OR if the entire message is found within any keyword.
-        # This supports single words ("hi"), phrases ("I am interested in X"),
-        # and full sentences with commas ("Hello, I am interested in Custom PC Built.").
+        # Match complete keywords or phrases, not fragments inside unrelated words.
         is_keyword_match = (
             message_type == "text"
             and trigger_event == "message_received"
             and msg_lower
-            and any(kw in msg_lower or msg_lower in kw for kw in trigger_keywords)
+            and any(message_contains_keyword(msg_lower, kw) for kw in trigger_keywords)
         )
 
         if is_keyword_match:
-            matched = [kw for kw in trigger_keywords if kw in msg_lower or msg_lower in kw]
+            matched = [kw for kw in trigger_keywords if message_contains_keyword(msg_lower, kw)]
             logger.info(f"[{org_id}] Keyword match found: message='{msg_lower}' matched={matched}")
 
         if not is_keyword_match:
             logger.info(f"[{org_id}] Message '{msg_lower}' did not match flow trigger keywords {trigger_keywords}, routing to AI...")
+            return False
+
+        if not await consume_run():
             return False
 
         # Send optional introduction first

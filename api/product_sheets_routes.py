@@ -18,7 +18,13 @@ from api.google_sheets_routes import (
     _fetch_sheet_tabs,
     _fetch_columns_from_tab,
 )
-from services.product_sheet_sync import auto_suggest_mapping, auto_detect_product_type, sync_product_sheet
+from services.product_sheet_sync import (
+    auto_detect_product_type,
+    auto_suggest_mapping,
+    begin_product_sheet_disconnect,
+    sync_product_sheet,
+    unlink_product_sheet_source,
+)
 from schemas.models import (
     PreviewProductSheetRequest,
     ConnectProductSheetRequest,
@@ -152,6 +158,10 @@ async def connect_product_sheet(request: ConnectProductSheetRequest, user: Curre
         )
 
         now = datetime.now(timezone.utc)
+        has_primary = await asyncio.to_thread(
+            db.product_sheet_connections.find_one,
+            {"org_id": org_id, "status": "active", "is_primary": True},
+        )
         connection_doc = {
             "org_id": org_id,
             "sheet_id": request.sheet_id,
@@ -163,6 +173,7 @@ async def connect_product_sheet(request: ConnectProductSheetRequest, user: Curre
             "last_sync_count": 0,
             "sync_errors": [],
             "status": "active",
+            "is_primary": not bool(has_primary),
             "connected_at": now,
             "updated_at": now,
         }
@@ -237,6 +248,7 @@ async def list_product_sheet_connections(user: CurrentUser):
                     "last_sync_count": 1,
                     "sync_errors": 1,
                     "status": 1,
+                    "is_primary": 1,
                 }
             ).sort("connected_at", -1))
         )
@@ -255,6 +267,31 @@ async def list_product_sheet_connections(user: CurrentUser):
         raise HTTPException(status_code=500, detail=f"Failed to list product sheet connections: {str(e)}")
 
 
+@router.put("/connections/{sheet_id}/primary")
+async def set_primary_product_sheet(sheet_id: str, user: CurrentUser):
+    """Choose the only Sheet that inventory edits may write back to."""
+    if user.role not in {"admin", "org:admin"}:
+        raise HTTPException(status_code=403, detail="Only organization admins can change the primary stock sheet")
+    connection = await asyncio.to_thread(
+        db.product_sheet_connections.find_one,
+        {"org_id": user.org_id, "sheet_id": sheet_id, "status": "active"},
+    )
+    if not connection:
+        raise HTTPException(status_code=404, detail="Active product sheet connection not found")
+    now = datetime.now(timezone.utc)
+    await asyncio.to_thread(
+        db.product_sheet_connections.update_many,
+        {"org_id": user.org_id},
+        {"$set": {"is_primary": False, "updated_at": now}},
+    )
+    await asyncio.to_thread(
+        db.product_sheet_connections.update_one,
+        {"org_id": user.org_id, "sheet_id": sheet_id},
+        {"$set": {"is_primary": True, "updated_at": now}},
+    )
+    return {"status": "success", "sheet_id": sheet_id}
+
+
 # ─── DELETE /connections/{sheet_id} ────────────────────────────────────────────
 
 
@@ -264,40 +301,23 @@ async def disconnect_product_sheet(sheet_id: str, user: CurrentUser):
     try:
         org_id = user.org_id
 
-        # Verify connection exists
-        connection = await asyncio.to_thread(
-            db.product_sheet_connections.find_one,
-            {"org_id": org_id, "sheet_id": sheet_id}
-        )
-        if not connection:
+        # Wait for the active write claim to finish before removing price authority.
+        try:
+            await begin_product_sheet_disconnect(org_id, sheet_id)
+        except ValueError as exc:
             raise HTTPException(status_code=404, detail="Product sheet connection not found.")
+        except TimeoutError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-        # Delete the connection
+        # Unlink source-specific values and clear stale price authority before
+        # deleting orphaned products.
+        products_col = db[f"products_{org_id}"]
+        products_removed = await unlink_product_sheet_source(org_id, sheet_id)
+
         await asyncio.to_thread(
             db.product_sheet_connections.delete_one,
-            {"org_id": org_id, "sheet_id": sheet_id}
+            {"org_id": org_id, "sheet_id": sheet_id, "status": "disconnecting"},
         )
-
-        # 1. Unlink: Remove this sheet from all products' source arrays
-        products_col = db[f"products_{org_id}"]
-        await asyncio.to_thread(
-            lambda: products_col.update_many(
-                {"source_sheet_ids": sheet_id},
-                {"$pull": {"source_sheet_ids": sheet_id}}
-            )
-        )
-
-        # 2. Garbage Collect: Delete products that are now orphaned (no active sources)
-        delete_result = await asyncio.to_thread(
-            lambda: products_col.delete_many({"source_sheet_ids": {"$size": 0}})
-        )
-        
-        # 3. Clean up any legacy products that still use the scalar field
-        legacy_delete_result = await asyncio.to_thread(
-            lambda: products_col.delete_many({"source_sheet_id": sheet_id})
-        )
-        
-        products_removed = delete_result.deleted_count + legacy_delete_result.deleted_count
 
         # Update org metadata product count
         total_all_products = await asyncio.to_thread(

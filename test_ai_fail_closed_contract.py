@@ -74,11 +74,31 @@ class _Collection:
             raise self.document
         return self.document
 
+    def find(self, *_args, **_kwargs):
+        documents = self.document if isinstance(self.document, list) else ([self.document] if self.document else [])
+        return _Cursor(documents)
+
+    async def update_one(self, _query, update):
+        self.document.update(update.get("$set", {}))
+        return types.SimpleNamespace(matched_count=1)
+
+
+class _Cursor:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def sort(self, *_args, **_kwargs):
+        return self
+
+    async def to_list(self, *, length):
+        return self.documents[:length]
+
 
 class _DB:
-    def __init__(self, organization, conversation):
+    def __init__(self, organization, conversation, connection=None):
         self.organizations = _Collection(organization)
         self.conversation = _Collection(conversation)
+        self.whatsapp_connections = _Collection(connection if connection is not None else {"phone_id": "primary"})
 
     def __getitem__(self, _name):
         return self.conversation
@@ -95,11 +115,38 @@ def _load_agent_service():
     loguru.logger = _Logger()
     settings = types.ModuleType("config.settings")
     settings.X_INTERNAL_SECRET = "test-secret"
+    settings.INTERNAL_HMAC_SECRET = "s" * 32
     config = types.ModuleType("config")
     config.settings = settings
+    sales_cases = types.ModuleType("services.sales_case_service")
+    sales_learning = types.ModuleType("services.sales_learning_service")
+
+    async def get_active_sales_case(*_args, **_kwargs):
+        return None
+
+    async def get_sales_context(*_args, **_kwargs):
+        return {"version": 0, "stage": "new", "facts": {}}
+
+    async def apply_sales_decision(*_args, **_kwargs):
+        raise AssertionError("unexpected sales decision")
+
+    async def get_sales_guidance(*_args, **_kwargs):
+        return {"policy_version": "default", "cohort": "control", "recommended_moves": []}
+
+    async def record_customer_response(*_args, **_kwargs):
+        return None
+
+    sales_cases.get_active_sales_case = get_active_sales_case
+    sales_cases.get_sales_context = get_sales_context
+    sales_cases.apply_sales_decision = apply_sales_decision
+    sales_cases.sales_context = lambda _case: {"version": 0, "stage": "new", "facts": {}}
+    sales_learning.get_sales_guidance = get_sales_guidance
+    sales_learning.record_customer_response = record_customer_response
     sys.modules["loguru"] = loguru
     sys.modules["config"] = config
     sys.modules["config.settings"] = settings
+    sys.modules["services.sales_case_service"] = sales_cases
+    sys.modules["services.sales_learning_service"] = sales_learning
     spec = importlib.util.spec_from_file_location("agent_service_contract", ROOT / "services/agent_service.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -122,11 +169,14 @@ def _load_ai_policy_service():
         return None
 
     websocket.broadcast_org_ws = _broadcast
+    entitlement = types.ModuleType("services.entitlement_service")
+    entitlement.quota_status = lambda *_args, **_kwargs: {"remaining": None}
     sys.modules["fastapi"] = fastapi
     sys.modules["pymongo"] = pymongo
     sys.modules["database"] = database
     sys.modules["services.utils"] = utils
     sys.modules["services.websocket_service"] = websocket
+    sys.modules["services.entitlement_service"] = entitlement
     spec = importlib.util.spec_from_file_location("ai_policy_contract", ROOT / "services/ai_policy_service.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -150,7 +200,9 @@ def _failure_category(module, *, response=None, error=None):
 
 def test_provider_contract():
     module = _load_agent_service()
-    assert asyncio.run(_call(module)) == {"final_response": "Valid reply"}
+    valid = asyncio.run(_call(module))
+    assert valid["final_response"] == "Valid reply" and valid["usage"] == {}
+    assert valid["product_timings"]["math_ms"] >= 0
     assert _failure_category(module, response=_Response(status=500, payload={})) == "http_error"
     assert _failure_category(module, error=_TimeoutException("timeout")) == "timeout"
     assert _failure_category(module, response=_Response(malformed=True)) == "malformed_response"
@@ -163,10 +215,15 @@ def test_provider_contract():
 
 def test_all_clients_use_shared_guard():
     for path in ("services/agent_service.py", "services/pma_chatbot.py", "services/heidelai_bot.py"):
-        source = (ROOT / path).read_text()
+        source = (ROOT / path).read_text(encoding="utf-8")
         assert "validate_ai_reply" in source
         assert "AIProviderUnavailable" in source
         assert "technical difficulties" not in source
+    for path in ("services/agent_service.py", "services/pma_chatbot.py"):
+        source = (ROOT / path).read_text(encoding="utf-8")
+        assert "INTERNAL_HMAC_SECRET" in source
+        assert "signed_json" in source
+    assert "configuration_error" in (ROOT / "services/internal_request.py").read_text(encoding="utf-8")
 
 
 def test_effective_ai_state_fails_closed():
@@ -177,6 +234,20 @@ def test_effective_ai_state_fails_closed():
         ({"is_ai_enabled": False}, {"is_ai_enabled": True}, False),
         ({"is_ai_enabled": True}, {"is_ai_enabled": False}, False),
         ({"is_ai_enabled": True}, {"is_ai_enabled": True}, True),
+        ({"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["line-two"]}, {
+            "platform": "whatsapp",
+            "business_phone_id": "line-two",
+            "is_ai_enabled": True,
+        }, False),
+        ({"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["line-two"]}, {
+            "platform": "whatsapp",
+            "business_phone_id": "line-one",
+            "is_ai_enabled": True,
+        }, True),
+        ({"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["line-two"]}, {
+            "platform": "instagram",
+            "is_ai_enabled": True,
+        }, True),
         ({"is_ai_enabled": True}, {
             "is_ai_enabled": True,
             "auto_ai_disabled": True,
@@ -192,17 +263,41 @@ def test_effective_ai_state_fails_closed():
     for organization, conversation, expected in cases:
         module.db = _DB(organization, conversation)
         assert asyncio.run(module.is_effective_ai_enabled("org", "whatsapp_123456")) is expected
+    module.db = _DB(
+        {"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["line-two"]},
+        {"platform": "whatsapp", "business_phone_id": "line-two", "is_ai_enabled": True},
+    )
+    assert asyncio.run(module.ai_access_state("org", "whatsapp_line-two_customer")) == "number_disabled"
+
+
+def test_whatsapp_number_policy_defaults_and_updates():
+    module = _load_ai_policy_service()
+    connections = [
+        {"phone_id": "line-one", "slot": 1},
+        {"phone_id": "line-two", "slot": 2},
+    ]
+    module.db = _DB(
+        {"is_ai_enabled": True, "ai_disabled_whatsapp_phone_ids": ["historical-line"]},
+        {"is_ai_enabled": True},
+        connections,
+    )
+    policy = asyncio.run(module.get_org_ai_policy("org"))
+    assert policy["whatsapp_enabled_phone_ids"] == ["line-one", "line-two"]
+    updated = asyncio.run(module.update_org_ai_policy("org", True, 60, True, ["line-two"]))
+    assert updated["whatsapp_enabled_phone_ids"] == ["line-two"]
+    assert module.db.organizations.document["ai_disabled_whatsapp_phone_ids"] == ["historical-line", "line-one"]
 
 
 def test_channel_and_scheduler_contract():
-    webhook = (ROOT / "api/webhook_routes.py").read_text()
-    scheduler = (ROOT / "core/scheduler.py").read_text()
-    sender = (ROOT / "services/wa_service.py").read_text()
-    instagram = (ROOT / "services/ig_service.py").read_text()
-    reply_claim = (ROOT / "services/whatsapp_reply_idempotency.py").read_text()
+    webhook = (ROOT / "api/webhook_routes.py").read_text(encoding="utf-8")
+    scheduler = (ROOT / "core/scheduler.py").read_text(encoding="utf-8")
+    sender = (ROOT / "services/wa_service.py").read_text(encoding="utf-8")
+    instagram = (ROOT / "services/ig_service.py").read_text(encoding="utf-8")
+    reply_claim = (ROOT / "services/whatsapp_reply_idempotency.py").read_text(encoding="utf-8")
     assert webhook.count("except AIProviderUnavailable") >= 5
     assert webhook.count("is_effective_ai_enabled") >= 10
-    assert '"reason": "ai_provider_unavailable"' in webhook
+    assert '"reason": failure_kind' in webhook
+    assert '"delivery_verification"' in webhook
     assert "HOLDING_REPLY" not in webhook
     assert "HOLDING_REPLY" not in sender
     assert 'user_input="hi"' not in scheduler
@@ -219,9 +314,9 @@ def test_channel_and_scheduler_contract():
     assert "Instagram AI downstream claim was replaced" in webhook
     assert 'mode not in {"reply", "ai"}' in reply_claim
     assert "is_effective_ai_enabled" in sender
-    assert "len(joined_content) > 4096" in sender
-    assert "not joined_content.strip()" in sender
-    pending_resume = webhook.index("pending_ai_failure = messages_collection.find_one")
+    assert "any(len(content) > 4096 for content in contents)" in sender
+    assert "not all(content.strip() for content in contents)" in sender
+    pending_resume = webhook.index("stored_inbound_message = messages_collection.find_one")
     text_dispatch = webhook.index('if message_type == "text":', pending_resume)
     assert pending_resume < text_dispatch
     assert "is_effective_ai_enabled" in instagram
@@ -266,6 +361,7 @@ if __name__ == "__main__":
     test_provider_contract()
     test_all_clients_use_shared_guard()
     test_effective_ai_state_fails_closed()
+    test_whatsapp_number_policy_defaults_and_updates()
     test_channel_and_scheduler_contract()
     test_reply_validator()
     print("AI fail-closed contract: ok")

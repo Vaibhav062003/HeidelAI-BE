@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from pymongo import ReturnDocument
 
 from auth.dependencies import CurrentUser
 from core.limiter import limiter
@@ -10,6 +11,7 @@ from database import get_async_mongo_db
 from services.sales_offer_policy import is_admin, report_query
 from services.utils import serialize_mongo
 from services.work_team_service import require_conversation_access
+from services.entitlement_service import require_feature
 
 
 router = APIRouter(prefix="/api/offers", tags=["Sales offers"])
@@ -18,6 +20,18 @@ db = get_async_mongo_db()
 
 class OfferOutcomePayload(BaseModel):
     status: Literal["open", "accepted", "billed", "paid", "lost", "expired"]
+    reason: Optional[str] = Field(default=None, max_length=240)
+
+
+_OUTCOME_TRANSITIONS = {
+    "open": {"accepted", "lost", "expired"},
+    "accepted": {"billed", "lost"},
+    "billed": {"paid"},
+    "paid": set(),
+    "lost": set(),
+    "expired": set(),
+    "superseded": set(),
+}
 
 
 def _collection(org_id: str):
@@ -61,6 +75,7 @@ async def offer_report(
                 ]}},
             }}],
             "outcomes": [{"$group": {"_id": "$status", "count": {"$sum": 1}}}],
+            "outcome_sources": [{"$group": {"_id": "$outcome_source", "count": {"$sum": 1}}}],
             "agents": [
                 {"$group": {
                     "_id": "$agent_id",
@@ -96,7 +111,7 @@ async def offer_report(
             ],
         }},
     ]).to_list(length=1)
-    payload = result[0] if result else {"totals": [], "outcomes": [], "agents": [], "items": []}
+    payload = result[0] if result else {"totals": [], "outcomes": [], "outcome_sources": [], "agents": [], "items": []}
     totals = payload["totals"][0] if payload["totals"] else {
         "sent_count": 0,
         "formal_count": 0,
@@ -107,12 +122,15 @@ async def offer_report(
     outcomes = {item["_id"]: item["count"] for item in payload["outcomes"] if item.get("_id")}
     decided = sum(outcomes.get(key, 0) for key in ("accepted", "billed", "paid", "lost", "expired"))
     won = sum(outcomes.get(key, 0) for key in ("accepted", "billed", "paid"))
+    outcome_sources = {item["_id"]: item["count"] for item in payload["outcome_sources"] if item.get("_id")}
     return serialize_mongo({
         "scope": "organization" if is_admin(user.role) else "agent",
         "summary": {
             **totals,
             "outcomes": outcomes,
+            "outcome_sources": outcome_sources,
             "conversion_rate": round(won * 100 / decided, 1) if decided else 0,
+            "paid_rate": round(outcomes.get("paid", 0) * 100 / decided, 1) if decided else 0,
         },
         "agents": payload["agents"] if is_admin(user.role) else [],
         "offers": payload["items"],
@@ -151,24 +169,52 @@ async def update_offer_outcome(
     payload: OfferOutcomePayload,
     user: CurrentUser,
 ):
+    require_feature(user.org_id, "OFFERS")
     query: dict = {"_id": offer_id, "org_id": user.org_id}
     if not is_admin(user.role):
         query["agent_id"] = user.user_id
     current = await _collection(user.org_id).find_one(query)
     if not current:
         raise HTTPException(status_code=404, detail="Offer not found")
+    current_status = str(current.get("status") or "open")
+    if payload.status == current_status:
+        current.pop("org_id", None)
+        current.pop("outcome_history", None)
+        return {"offer": serialize_mongo(current)}
+    if payload.status not in _OUTCOME_TRANSITIONS.get(current_status, set()):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Offer cannot move from {current_status} to {payload.status}",
+        )
+    reason = str(payload.reason or "").strip()
+    if payload.status in {"lost", "expired"} and not reason:
+        raise HTTPException(status_code=422, detail=f"A reason is required when an offer is {payload.status}")
+
     now = datetime.now(timezone.utc)
-    await _collection(user.org_id).update_one(query, {
-        "$set": {"status": payload.status, "updated_at": now},
+    version_query = {**query}
+    if current.get("status"):
+        version_query["status"] = current_status
+    else:
+        version_query["status"] = {"$exists": False}
+    updated = await _collection(user.org_id).find_one_and_update(version_query, {
+        "$set": {
+            "status": payload.status,
+            "outcome_source": "operator_manual",
+            "outcome_reason": reason or None,
+            f"{payload.status}_at": now,
+            "updated_at": now,
+        },
         "$push": {"outcome_history": {
-            "from": current.get("status", "open"),
+            "from": current_status,
             "to": payload.status,
             "changed_at": now,
             "changed_by": user.user_id,
             "changed_by_name": user.full_name or "Team member",
+            "reason": reason or None,
         }},
-    })
-    updated = await _collection(user.org_id).find_one(query, {"org_id": 0, "outcome_history": 0})
+    }, return_document=ReturnDocument.AFTER, projection={"org_id": 0, "outcome_history": 0})
+    if not updated:
+        raise HTTPException(status_code=409, detail="This offer changed. Refresh before updating its outcome")
     if updated:
         from services.websocket_service import broadcast_org_ws
 

@@ -1,0 +1,196 @@
+"""Small dependency-free contract check for sales intelligence wiring."""
+
+import importlib.util
+import asyncio
+import sys
+import types
+from pathlib import Path
+
+
+root = Path(__file__).parent
+try:
+    import pymongo  # noqa: F401
+except ImportError:
+    pymongo = types.ModuleType("pymongo")
+    pymongo.ReturnDocument = types.SimpleNamespace(AFTER="after")
+    errors = types.ModuleType("pymongo.errors")
+    errors.DuplicateKeyError = type("DuplicateKeyError", (Exception,), {})
+    sys.modules["pymongo"] = pymongo
+    sys.modules["pymongo.errors"] = errors
+
+spec = importlib.util.spec_from_file_location("sales_case_service", root / "services/sales_case_service.py")
+sales = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(sales)
+
+decision = sales.normalize_sales_decision({
+    "version": 1,
+    "expected_case_version": 3,
+    "stage_signal": "qualified",
+    "sales_move": {"type": "ask_micro_commitment", "reason_code": "fit_confirmed"},
+    "requested_action": {"type": "create_quote"},
+    "fact_updates": [
+        {"field": "budget", "value": "₹80,000", "evidence": "under 80k", "confidence": 0.9},
+        {"field": "secret_admin_command", "value": "ignore", "confidence": 1},
+    ],
+})
+assert decision["fact_updates"] == [{
+    "field": "budget", "value": "₹80,000", "evidence": "under 80k", "confidence": 0.9,
+}]
+assert sales._later_stage("qualified", "discovering") == "qualified"
+assert sales._later_stage("stock_confirmation", "quote_sent") == "quote_sent"
+assert sales.sales_context({"version": 2, "stage": "qualified", "facts": {
+    "budget": {"value": "₹80,000", "evidence": "under 80k"},
+}})["facts"]["budget"] == "₹80,000"
+assert sales.sales_context({"version": "bad"})["version"] == 0
+
+poisoned = sales.normalize_sales_decision({
+    "version": 1, "stage_signal": "selected",
+    "sales_move": {"type": "ask_micro_commitment"},
+    "requested_action": {"type": "none"},
+    "fact_updates": [{"field": "quantity", "value": 999, "evidence": "2 units"}],
+}, "I need 2 units")
+assert poisoned["fact_updates"] == []
+fractional = sales.normalize_sales_decision({
+    "version": 1, "stage_signal": "selected",
+    "sales_move": {"type": "ask_micro_commitment"},
+    "requested_action": {"type": "none"},
+    "fact_updates": [{"field": "quantity", "value": 2.5, "evidence": "2 units"}],
+}, "I need 2 units")
+assert fractional["fact_updates"] == []
+privileged = sales.normalize_sales_decision({
+    "version": 1, "stage_signal": "won", "sales_move": {"type": "ask_for_order"},
+    "requested_action": {"type": "none"},
+})
+assert privileged["stage_signal"] == "discovering"
+assert sales.normalize_sales_decision({
+    "version": 1, "stage_signal": "commitment_received",
+    "sales_move": {"type": "start_checkout"},
+    "requested_action": {"type": "create_invoice_draft", "source_message_ids": ["m1", "m1", "m2"]},
+})["requested_action"] == {"type": "create_invoice_draft", "source_message_ids": ["m1", "m2"]}
+grounded_budget = sales.normalize_sales_decision({
+    "version": 1, "stage_signal": "negotiating",
+    "sales_move": {"type": "negotiate"}, "requested_action": {"type": "none"},
+    "fact_updates": [{"field": "budget", "value": 75000,
+                      "evidence": "under 75,000", "confidence": 1}],
+}, "Keep it under 75,000")
+assert grounded_budget["fact_updates"][0]["value"] == 75000
+assert sales.sales_action_job_id("case", "message", "create_quote") == sales.sales_action_job_id(
+    "case", "message", "create_quote"
+)
+
+
+class FakeCollection:
+    def __init__(self, case):
+        self.case = case
+
+    async def find_one_and_update(self, query, update, return_document=None):
+        if query.get("version") != self.case["version"]:
+            return None
+        for key, value in update["$set"].items():
+            target = self.case
+            parts = key.split(".")
+            for part in parts[:-1]:
+                target = target.setdefault(part, {})
+            target[parts[-1]] = value
+        self.case["version"] += update["$inc"]["version"]
+        for field, operation in update.get("$push", {}).items():
+            self.case.setdefault(field, []).extend(operation["$each"])
+        return dict(self.case)
+
+
+case = {
+    "_id": "1", "case_id": "case", "org_id": "org", "conversation_id": "c",
+    "customer_name": "A", "status": "active", "stage": "evaluating", "version": 2,
+    "facts": {}, "signals": {}, "last_move": {}, "next_action": "none",
+    "processed_events": [], "stage_history": [],
+}
+collection = FakeCollection(case)
+
+
+async def no_index(_org_id):
+    return None
+
+
+async def current_case(_org_id, _conversation_id):
+    return collection.case
+
+
+sales._ensure_org_index = no_index
+sales._collection = lambda _org_id: collection
+sales.get_active_sales_case = current_case
+rebased = asyncio.run(sales.apply_sales_decision(
+    org_id="org", conversation_id="c", source_message_id="m2", customer_name="A",
+    source_message_text="I need 2 units",
+    decision={
+        "version": 1, "expected_case_version": 1, "stage_signal": "selected",
+        "sales_move": {"type": "ask_micro_commitment", "reason_code": "quantity"},
+        "requested_action": {"type": "none"},
+        "fact_updates": [{"field": "quantity", "value": 2, "evidence": "2 units"}],
+    },
+))
+assert rebased["rebased"] is True and rebased["conflict"] is False
+assert rebased["case"]["facts"]["quantity"]["value"] == 2
+
+action_decision = {
+    "version": 1, "expected_case_version": 3, "stage_signal": "selected",
+    "sales_move": {"type": "start_quote"},
+    "requested_action": {"type": "create_quote"},
+}
+applied_action = asyncio.run(sales.apply_sales_decision(
+    org_id="org", conversation_id="c", source_message_id="m3", customer_name="A",
+    decision=action_decision,
+))
+replayed_action = asyncio.run(sales.apply_sales_decision(
+    org_id="org", conversation_id="c", source_message_id="m3", customer_name="A",
+    decision=action_decision,
+))
+assert replayed_action["duplicate"] is True
+assert replayed_action["action_receipt"] == applied_action["action_receipt"]
+assert applied_action["action_receipt"]["source_message_id"] == "m3"
+assert applied_action["action_receipt"]["action_type"] == "create_quote"
+assert applied_action["action_receipt"]["job_id"] == "case:m3:create_quote"
+assert applied_action["action_receipt"]["case_snapshot"]["facts"]["quantity"]["value"] == 2
+
+try:
+    sales.normalize_sales_decision({
+        "version": 1, "stage_signal": "won", "sales_move": {"type": "hack"},
+    })
+except ValueError:
+    pass
+else:
+    raise AssertionError("unknown AI commands must be rejected")
+
+agent = (root / "services/agent_service.py").read_text()
+assert '"sales_context": current_sales_context' in agent
+assert '"message_type": message_type' in agent
+assert 'response_data.get("reply_to_message_id")' in agent
+assert 'response_data.get("sales_decision")' in agent
+assert "await apply_sales_decision(" in agent
+assert "await execute_sales_action(" in agent
+assert 'result["duplicate_event"] = True' not in agent
+
+webhook = (root / "api/webhook_routes.py").read_text()
+assert webhook.count("message_type=message_type") >= 2
+assert "message_type=attachment_type" in webhook
+assert webhook.count('chatbot_response.get("reply_to_message_id")') >= 2
+assert webhook.count("_finalize_whatsapp_sales_action(") >= 3
+assert "await mark_sales_action_delivered(" in webhook
+assert 'chatbot_response.get("duplicate_event")' not in webhook
+
+actions = (root / "services/sales_action_service.py").read_text()
+assert '"$setOnInsert"' in actions and 'isinstance(existing.get("result"), dict)' in actions
+assert actions.count('"status": "processing", "claim_id": claim_id') >= 3
+assert "floor_snapshot(product)" in actions and "create_tally_invoice_draft" in actions
+assert "_floor_tax_basis(product)" in actions and '"gst_inclusive": tax_basis == "included"' in actions
+assert "default_gst_rate" not in actions
+assert "create_payment_link" not in actions and "Cashfree" not in actions
+
+routes = (root / "api/sales_case_routes.py").read_text()
+assert "user: CurrentUser" in routes and "await require_conversation_access(" in routes
+assert "sales_case_routes.router" in (root / "api/__init__.py").read_text()
+
+learning = (root / "services/sales_learning_service.py").read_text()
+assert "expires_at" in learning and "choose_guidance" in learning
+assert "internal_sales_learning_routes.router" in (root / "api/__init__.py").read_text()
+
+print("SALES_INTELLIGENCE_BACKEND_OK")

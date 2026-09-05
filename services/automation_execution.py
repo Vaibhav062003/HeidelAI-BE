@@ -2,6 +2,8 @@
 import uuid
 import asyncio
 import re
+import hashlib
+import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 
@@ -178,6 +180,12 @@ async def execute_automation_flow(
     context = FlowExecutionContext(org_id, flow_id, trigger_type, trigger_data)
     
     try:
+        from services.entitlement_service import consume_quota_async
+
+        source_id = next((trigger_data.get(key) for key in ("message_id", "comment_id", "event_id", "row_id") if trigger_data.get(key)), None)
+        if not source_id:
+            source_id = hashlib.sha256(json.dumps(trigger_data, sort_keys=True, default=str).encode()).hexdigest()
+        await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", 1, f"automation:{flow_id}:{trigger_type}:{source_id}")
         flows_collection = _automation_flows_collection(org_id)
         flow = flows_collection.find_one({"flow_id": flow_id, "org_id": org_id})
         

@@ -1,15 +1,14 @@
 import uuid
 from datetime import datetime
-from pymongo import ReturnDocument, DESCENDING
+from pymongo import ReturnDocument
 from fastapi import APIRouter, HTTPException, Depends, Response, Cookie, Request
 
 # internal modules
-from loguru import logger
 from core.limiter import limiter
 from database import get_mongo_db
-from services.payment_service import create_subscription
-from schemas.models import InitPaymentRequest, InitSignupRequest, InviteTeamMembersRequest, SelectPlanRequest, SetPasswordRequest, VerifyOtpRequest
+from schemas.models import InitSignupRequest, InviteTeamMembersRequest, SelectPlanRequest, SetPasswordRequest, VerifyOtpRequest
 from services.clerk_service import create_clerk_signup, create_organization, invite_users_to_organization, update_password_and_send_otp, verify_clerk_otp
+from services.commercial_mode import billing_enabled
 
 db = get_mongo_db()
 
@@ -33,8 +32,6 @@ async def init_signup(request: Request, data: InitSignupRequest, response: Respo
     """
     Initialize signup process. Returns session_id.
     """
-    logger.info(f"Incoming Request: {request.cookies}")
-
     first_name = data.first_name.strip()
     last_name = data.last_name.strip() if data.last_name else ""
     email = data.email
@@ -47,6 +44,9 @@ async def init_signup(request: Request, data: InitSignupRequest, response: Respo
     if existing_session:
         session_id = existing_session.get("session_id")
         next_step = existing_session.get("next_step")
+        if next_step in {"PHONE_NUMBER", "PAYMENT", "SCHEDULE_CALL"}:
+            next_step = "PLAN"
+            db.onboarding_sessions.update_one({"session_id": session_id}, {"$set": {"next_step": next_step, "updated_at": datetime.utcnow()}})
     else:
         session_id = str(uuid.uuid4())
         next_step = "PASSWORD" if provider == "email" else "PLAN"
@@ -84,8 +84,6 @@ async def set_password(request: Request, data: SetPasswordRequest, session_id: s
     """
     Check if the Signup session exists, set password for the signup session & trigger email OTP to the registered email by Clerk.
     """
-    logger.info(f"Incoming Request: {request.cookies}")
-
     # Fetch session from DB
     session = db.onboarding_sessions.find_one_and_update(
         {"session_id": session_id}, 
@@ -131,16 +129,17 @@ async def verify_otp(request: Request, data: VerifyOtpRequest, session_id: str =
 async def select_plan(request: Request, data: SelectPlanRequest, session_id: str = Depends(get_onboarding_session)):
     plan_id = data.plan_id
 
-    if plan_id == "free":
-        # Update session with free plan
+    if plan_id in {"trial", "free"}:
+        workspace_plan = "trial_pending" if billing_enabled() else "free"
+        max_allowed_members = 1 if billing_enabled() else None
         session = db.onboarding_sessions.find_one_and_update(
             {"session_id": session_id}, 
             {"$set": {
                 "status": "PLAN_SELECTED", 
-                "plan": "free", 
+                "plan": workspace_plan,
                 "next_step": "SUCCESS", 
                 "updated_at": datetime.utcnow(), 
-                "max_allowed_members": 2
+                "max_allowed_members": max_allowed_members
             }}, 
             return_document=ReturnDocument.AFTER
         )
@@ -148,7 +147,6 @@ async def select_plan(request: Request, data: SelectPlanRequest, session_id: str
             raise HTTPException(status_code=400, detail="Invalid Session")
 
         org_name = f"{session.get('first_name')}'s Organization"
-        max_allowed_members = 2
         owner = {
             "clerk_user_id": session.get("clerk_user_id"),
             "owner_email": session.get("email"),
@@ -162,7 +160,7 @@ async def select_plan(request: Request, data: SelectPlanRequest, session_id: str
             max_allowed_members=max_allowed_members,
             session_id=session_id,
             owner=owner,
-            plan="free"
+            plan=workspace_plan
         )
 
         if not organization:
@@ -170,214 +168,17 @@ async def select_plan(request: Request, data: SelectPlanRequest, session_id: str
         
         return {"success": True, "next_step": "SUCCESS", "org_id" : organization.get("id")}
     
-    elif plan_id in ["growth_monthly_inr_3499", "growth_yearly_inr_37789", "growth_yearly_usd_456", "growth_monthly_usd_46"]:
-        # Update session with paid plan
-        session = db.onboarding_sessions.find_one_and_update(
-            {"session_id": session_id}, 
-            {"$set": {
-                "status": "PLAN_SELECTED", 
-                "plan": plan_id, 
-                "next_step": "PHONE_NUMBER", 
-                "updated_at": datetime.utcnow(), 
-                "max_allowed_members": 4
-            }}, 
-            return_document=ReturnDocument.AFTER
-        )
-        if not session:
-            raise HTTPException(status_code=400, detail="Invalid Session")
-        
-        org_name = f"{session.get('first_name')}'s Organization"
-        max_allowed_members = 4
-        owner = {
-            "clerk_user_id": session.get("clerk_user_id"),
-            "owner_email": session.get("email"),
-            "owner_first_name": session.get("first_name"),
-            "owner_last_name": session.get("last_name"),
-            "owner_phone_number": session.get("phone_number"),
-        }
-
-        organization = await create_organization(
-            org_name=org_name,
-            max_allowed_members=max_allowed_members,
-            session_id=session_id,
-            owner=owner,
-            plan="growth_monthly" if "monthly" in plan_id else "growth_yearly"
-        )
-
-        if not organization:
-            raise HTTPException(status_code=500, detail="Failed to create organization")
-        
-        return {"success": True, "next_step": "PHONE_NUMBER", "org_id" : organization.get("id")}
-    
-    elif plan_id in ["enterprise"]:
-        # Update session with enterprise plan
-        session = db.onboarding_sessions.find_one_and_update(
-            {"session_id": session_id}, 
-            {"$set": {"status": "PLAN_SELECTED", "plan": plan_id, "next_step": "SCHEDULE_CALL", "updated_at": datetime.utcnow()}}, 
-            return_document=ReturnDocument.AFTER
-        )
-        if not session:
-            raise HTTPException(status_code=400, detail="Invalid Session")
-        
-        return {"success": True, "next_step": "SCHEDULE_CALL"}
-    
-    raise HTTPException(status_code=400, detail="Invalid Plan ID")
+    raise HTTPException(status_code=410, detail="Create a trial workspace, then choose a published plan in Plan & Billing.")
 
 @router.post("/init-payment")
 @limiter.limit("30/minute")
-async def init_payment(request: Request, data: InitPaymentRequest, session_id: str = Depends(get_onboarding_session)):
-    logger.info(f"Initiating payment for phone number: {data.phone_number}")
-    phone_number = data.phone_number
-
-    # Update session with phone number
-    session = db.onboarding_sessions.find_one_and_update(
-        {"session_id": session_id}, 
-        {"$set": {
-            "phone_number": phone_number, 
-            "status": "PHONE_NUMBER_ADDED", 
-            "next_step": "PAYMENT", 
-            "updated_at": datetime.utcnow()
-        }}, 
-        return_document=ReturnDocument.AFTER
-    )
-
-    if not session:
-        raise HTTPException(status_code=400, detail="Invalid Session")
-    
-    db.organizations.update_one(
-        {"session_id": session_id},
-        {"$set": {
-            "owner.phone_number": phone_number,
-            "updated_at": datetime.utcnow()
-        }}
-    )
-    
-    plan_id = session.get("plan")
-    customer_full_name = f"{session.get('first_name')} {session.get('last_name')}"
-    customer_email = session.get("email")
-    customer_phone = session.get("phone_number")
-    clerk_user_id = session.get("clerk_user_id")
-
-    subscription_data = await create_subscription(
-        plan_id=plan_id,
-        customer_full_name=customer_full_name,
-        customer_email=customer_email,
-        customer_phone=customer_phone,
-        session_id=session_id
-    )
-
-    subscription_session_id = subscription_data.get("subscription_session_id") # ID for frontend to initialise payment
-    cf_subscription_id = subscription_data.get("cf_subscription_id") # ID from Cashfree
-    subscription_id = subscription_data.get("subscription_id") # Our internal ID, matched on frontend payment status page
-
-    if not subscription_session_id:
-        raise HTTPException(status_code=500, detail="Failed to initiate payment session")
-
-    db.subscriptions.insert_one({
-        "session_id": session_id, # session id from onboarding_sessions collection
-        "cf_subscription_id": cf_subscription_id, # Cashfree ID
-        "subscription_id": subscription_id, # Our internal ID
-        "clerk_user_id": clerk_user_id, # clerk user id
-        "plan_id": plan_id,
-        "status": "INITIALIZED", # Waiting for user to pay on frontend
-        "created_at": datetime.utcnow()
-    })
-
-    # Update session with payment session ID
-    db.onboarding_sessions.find_one_and_update(
-        {"session_id": session_id}, 
-        {"$set": {
-            "subscription_session_id": subscription_session_id, 
-            "status": "PAYMENT_INITIATED", 
-            "next_step": "PAYMENT", 
-            "updated_at": datetime.utcnow(), 
-            "payment_data": subscription_data
-        }},
-    )
-
-    return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
+async def init_payment(request: Request, session_id: str = Depends(get_onboarding_session)):
+    raise HTTPException(status_code=410, detail="Legacy signup payments are closed. Use Plan & Billing for bank transfer or Cashfree.")
 
 @router.post("/init-payment/retry")
 @limiter.limit("30/minute")
-async def init_payment(request: Request, session_id: str = Depends(get_onboarding_session)):
-    logger.info(f"Retrying payment for session ID: {session_id}")
-
-    subscription_status = db.subscriptions.find_one(
-        {"session_id": session_id}, 
-        {"status": 1, "_id": 0},
-        sort=[("created_at", -1)],
-    )
-
-    if subscription_status and subscription_status.get("status") == "ACTIVE":
-        raise HTTPException(status_code=400, detail="Payment already completed for this session")
-
-    session = db.onboarding_sessions.find_one(
-        {"session_id": session_id}
-    )
-
-    if not session:
-        raise HTTPException(status_code=400, detail="Invalid Session")
-
-    if subscription_status and subscription_status.get("status") == "INITIALIZED":
-        logger.info(f"Previous payment attempt found with status INITIALIZED for session ID: {session_id}. Allowing retry.")
-        return {"subscription_session_id": session.get("subscription_session_id"), "next_step": "PAYMENT"}
-
-    # Update session with phone number
-
-    
-    plan_id = session.get("plan")
-    customer_full_name = f"{session.get('first_name')} {session.get('last_name')}"
-    customer_email = session.get("email")
-    customer_phone = session.get("phone_number")
-    clerk_user_id = session.get("clerk_user_id")
-
-    subscription_data = await create_subscription(
-        plan_id=plan_id,
-        customer_full_name=customer_full_name,
-        customer_email=customer_email,
-        customer_phone=customer_phone,
-        session_id=session_id
-    )
-
-    subscription_session_id = subscription_data.get("subscription_session_id") # ID for frontend to initialise payment
-    cf_subscription_id = subscription_data.get("cf_subscription_id") # ID from Cashfree
-    subscription_id = subscription_data.get("subscription_id") # Our internal ID, matched on frontend payment status page
-
-    if not subscription_session_id:
-        raise HTTPException(status_code=500, detail="Failed to initiate payment session")
-
-    db.subscriptions.find_one_and_update(
-        { "session_id": session_id },
-        {
-            "$set": {
-                "cf_subscription_id": cf_subscription_id, 
-                "subscription_id": subscription_id, 
-                "clerk_user_id": clerk_user_id,
-                "plan_id": plan_id,
-                "status": "INITIALIZED",
-                "updated_at": datetime.utcnow()
-            },
-            "$setOnInsert": {
-                "created_at": datetime.utcnow()
-            }
-        },
-        sort=[("created_at", DESCENDING)], 
-        upsert=True
-    )
-
-    # Update session with payment session ID
-    db.onboarding_sessions.find_one_and_update(
-        {"session_id": session_id}, 
-        {"$set": {
-            "subscription_session_id": subscription_session_id, 
-            "status": "PAYMENT_INITIATED", 
-            "next_step": "PAYMENT", 
-            "updated_at": datetime.utcnow(), 
-            "payment_data": subscription_data
-        }},
-    )
-
-    return {"subscription_session_id": subscription_session_id, "next_step": "PAYMENT"}
+async def retry_init_payment(request: Request, session_id: str = Depends(get_onboarding_session)):
+    raise HTTPException(status_code=410, detail="Legacy signup payments are closed. Use Plan & Billing for bank transfer or Cashfree.")
 
 @router.get("/subscription/status")
 @limiter.limit("60/minute")
@@ -411,10 +212,10 @@ async def invite_team_members(request: Request, data: InviteTeamMembersRequest, 
     )
     
     clerk_user_id = session.get("clerk_user_id")
-    max_allowed_members = session.get("max_allowed_members", 2)
+    max_allowed_members = session.get("max_allowed_members")
     org_id = organization.get("org_id")
 
-    if team_emails and len(team_emails) > max_allowed_members - 1:
+    if max_allowed_members is not None and team_emails and len(team_emails) > max_allowed_members - 1:
         team_emails = team_emails[:max_allowed_members - 1]  # Limit to max allowed members minus the owner
 
     # 2. Invite team members

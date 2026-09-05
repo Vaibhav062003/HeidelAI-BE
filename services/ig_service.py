@@ -64,6 +64,9 @@ def _claim_instagram_send(
     temp_id: Optional[str],
     kind: str,
     fingerprint: str,
+    content: Optional[str] = None,
+    authoritative_replay: bool = False,
+    sales_action_job_id: Optional[str] = None,
 ):
     if not temp_id:
         raise ValueError("temp_id is required for Instagram replies")
@@ -80,6 +83,8 @@ def _claim_instagram_send(
             {"$setOnInsert": {
                 "status": "sending",
                 "fingerprint": fingerprint,
+                "content": content,
+                "sales_action_job_id": sales_action_job_id,
                 "claim_token": claim_token,
                 "claimed_at": now,
                 "created_at": now,
@@ -92,13 +97,23 @@ def _claim_instagram_send(
         existing = collection.find_one({"_id": request_id})
     if not existing:
         return request_id, claim_token, None
-    if existing.get("fingerprint") != fingerprint:
+    if existing.get("fingerprint") != fingerprint and not authoritative_replay:
         return request_id, None, {
             "error": "temp_id was already used for a different Instagram message",
             "success": False,
         }
     if existing.get("result"):
-        return request_id, None, existing["result"]
+        result = dict(existing["result"])
+        if authoritative_replay:
+            result["_authoritative_content"] = existing.get("content")
+            result["sales_action_job_id"] = existing.get("sales_action_job_id")
+        return request_id, None, result
+    if authoritative_replay:
+        return request_id, None, {
+            "error": "The previous Instagram delivery could not be confirmed. Check the chat before sending again.",
+            "success": False,
+            "delivery_unknown": True,
+        }
     stale_before = now - timedelta(minutes=2)
     claimed_at = existing.get("claimed_at")
     if not claimed_at or claimed_at < stale_before:
@@ -132,14 +147,21 @@ def _finish_instagram_send(
     result: dict,
 ) -> None:
     if request_id and claim_token:
-        db[f"instagram_outbox_{org_id}"].update_one(
-            {"_id": request_id, "claim_token": claim_token},
-            {"$set": {
-                "status": "sent" if result.get("success") else "failed",
-                "result": result,
-                "updated_at": datetime.now(timezone.utc),
-            }},
-        )
+        try:
+            db[f"instagram_outbox_{org_id}"].update_one(
+                {"_id": request_id, "claim_token": claim_token},
+                {"$set": {
+                    "status": (
+                        "sent" if result.get("success")
+                        else "delivery_unknown" if result.get("delivery_unknown")
+                        else "failed"
+                    ),
+                    "result": result,
+                    "updated_at": datetime.now(timezone.utc),
+                }},
+            )
+        except Exception:
+            logger.exception("Could not persist Instagram outbound result")
 
 
 def _instagram_conversation_id(org_id: str, recipient_id: str) -> Optional[str]:
@@ -259,6 +281,8 @@ async def send_ig_message(
     context: Optional[dict] = None,
     is_auto_followup: bool = False,
     enforce_ai_state: bool = False,
+    ai_usage: Optional[dict] = None,
+    bot_context: Optional[dict] = None,
 ) -> dict:
     """
     Send a message to an Instagram user using the appropriate access token
@@ -270,7 +294,11 @@ async def send_ig_message(
         mode: The mode of the message (reply or private message)
         org_id: The organization ID
     """
-    request_id = claim_token = None
+    from services.entitlement_service import require_feature
+    require_feature(org_id, "CHANNELS")
+    request_id = claim_token = quota_event_key = None
+    quota_consumed = False
+    provider_started = False
     try:
         access_token = _instagram_access_token(org_id, instagram_id)
         
@@ -278,14 +306,19 @@ async def send_ig_message(
             conversation_id = conversation_id or _instagram_conversation_id(org_id, id)
             fingerprint = hashlib.sha256(f"{id}\0text\0{message_text}".encode()).hexdigest()
             request_id, claim_token, cached = _claim_instagram_send(
-                org_id, conversation_id or str(id), temp_id, "text", fingerprint
+                org_id, conversation_id or str(id), temp_id, "text", fingerprint,
+                content=message_text, authoritative_replay=enforce_ai_state,
+                sales_action_job_id=str(
+                    (bot_context or {}).get("sales_action_job_id") or ""
+                ) or None,
             )
             if cached:
                 if cached.get("success") and cached.get("message_id"):
+                    confirmed_text = cached.pop("_authoritative_content", None) or message_text
                     try:
                         await _record_confirmed_instagram_outbound(
                             org_id, conversation_id, instagram_id, id, sender_name,
-                            cached["message_id"], message_text, temp_id=temp_id,
+                            cached["message_id"], confirmed_text, temp_id=temp_id,
                             context_type=context_type, context=context,
                             is_auto_followup=is_auto_followup,
                         )
@@ -313,6 +346,7 @@ async def send_ig_message(
             # Send the message
             if enforce_ai_state:
                 from services.ai_policy_service import is_effective_ai_enabled
+                from services.entitlement_service import reserve_quota_async
 
                 if not await is_effective_ai_enabled(org_id, conversation_id):
                     db[f"instagram_outbox_{org_id}"].delete_one({
@@ -321,8 +355,26 @@ async def send_ig_message(
                         "status": "sending",
                     })
                     raise AIProviderUnavailable("ai_disabled", escalation_required=False)
+                quota_event_key = f"ai:{request_id or temp_id or conversation_id}"
+                try:
+                    await reserve_quota_async(org_id, "AI", "monthly_messages", 1, quota_event_key)
+                    quota_consumed = True
+                except HTTPException as exc:
+                    raise AIProviderUnavailable("quota_exhausted", escalation_required=False) from exc
             async with httpx.AsyncClient(timeout=30.0) as client:
+                provider_started = True
                 response = await client.post(url, headers=headers, json=data)
+            if (
+                400 <= response.status_code < 500
+                and response.status_code != 408
+                and quota_consumed
+                and quota_event_key
+            ):
+                from services.entitlement_service import release_quota_async
+
+                provider_started = False
+                await release_quota_async(org_id, "monthly_messages", quota_event_key)
+                quota_consumed = False
             response.raise_for_status()
             response_data = response.json()
             message_id = response_data.get("message_id") or response_data.get("messages", [{}])[0].get("id")
@@ -330,7 +382,27 @@ async def send_ig_message(
                 raise RuntimeError("Instagram did not return a message ID")
             logger.info(f"Instagram message response: {response.status_code}, {response.text}")
             result = {"message_id": message_id, "success": True, "status": "sent", "response": response_data}
+            if (bot_context or {}).get("sales_action_job_id"):
+                result["sales_action_job_id"] = bot_context["sales_action_job_id"]
             _finish_instagram_send(org_id, request_id, claim_token, result)
+            if enforce_ai_state:
+                try:
+                    from services.entitlement_service import commit_quota_async, record_ai_usage_async
+
+                    await commit_quota_async(org_id, "monthly_messages", quota_event_key, "0")
+
+                    usage = ai_usage if isinstance(ai_usage, dict) else {}
+                    await record_ai_usage_async(
+                        org_id,
+                        quota_event_key or f"ai:{message_id}",
+                        "instagram",
+                        1,
+                        int(usage.get("input_tokens", 0)),
+                        int(usage.get("output_tokens", 0)),
+                        int(usage.get("recorded_cost_microusd", 0)),
+                    )
+                except Exception as exc:
+                    logger.error(f"Could not record Instagram AI analytics for org={org_id}: {exc}")
             try:
                 await _record_confirmed_instagram_outbound(
                     org_id, conversation_id, instagram_id, id, sender_name,
@@ -383,9 +455,12 @@ async def send_ig_message(
         raise
     except Exception as e:
         logger.error(f"Error sending Instagram message: {e}")
-        # Return an error response that can be handled by the caller
         result = {"error": str(e), "success": False}
+        if provider_started:
+            result["delivery_unknown"] = True
         _finish_instagram_send(org_id, request_id, claim_token, result)
+        if provider_started and enforce_ai_state:
+            raise AIProviderUnavailable("delivery_unknown") from e
         return result
     
 async def send_ig_media_message(

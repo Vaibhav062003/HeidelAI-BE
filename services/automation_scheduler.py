@@ -372,6 +372,8 @@ async def _execute_job(job: dict) -> None:
     max_retries = job.get("max_retries", 3)
 
     try:
+        from services.entitlement_service import consume_quota_async
+        await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", 1, f"automation-schedule:{schedule_id}")
         # Step 1: Validate conversation still exists and is open
         conv_collection = db[f"conversations_{org_id}"]
         conversation = await asyncio.to_thread(lambda: conv_collection.find_one({"conversation_id": conversation_id}))
@@ -388,12 +390,10 @@ async def _execute_job(job: dict) -> None:
 
         customer_name = conversation.get("customer_name", "")
 
-        # Step 2: Get wa_id from organizations collection
-        org = await asyncio.to_thread(lambda: db.organizations.find_one({"org_id": org_id}, {"wa_id": 1}))
-        if not org or not org.get("wa_id"):
-            raise Exception(f"No wa_id found for org {org_id}")
-
-        wa_id = org["wa_id"]
+        wa_id = conversation.get("whatsapp_id")
+        recipient_id = conversation.get("customer_id")
+        if not wa_id or not recipient_id:
+            raise Exception(f"Conversation {conversation_id} has no bound WhatsApp sender or customer")
 
         # Step 3: Send the message (handles both plain text and templates)
         from services.wa_service import send_whatsapp_message, send_whatsapp_template_message
@@ -417,11 +417,12 @@ async def _execute_job(job: dict) -> None:
             }
 
             result = await send_whatsapp_template_message(
-                recipient_id=conversation_id.split("_")[-1], # extract phone from whatsapp_91...
+                recipient_id=recipient_id,
                 template=template_dict,
                 wa_id=wa_id,
                 org_id=org_id,
                 mode="reply",
+                conversation_id=conversation_id,
             )
         else:
             # --- PLAIN TEXT PATH ---

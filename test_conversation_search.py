@@ -1,4 +1,5 @@
 import ast
+import re
 from pathlib import Path
 
 
@@ -41,6 +42,27 @@ def test_phone_search_parts_are_country_agnostic():
     assert namespace["_lookup_scope"]({"$and": [{"platform": "whatsapp"}]}) == {
         "$and": [{"conversation.platform": "whatsapp"}]
     }
+
+    contact_search = next(node for node in service_tree.body if isinstance(node, ast.FunctionDef) and node.name == "_contact_search_condition")
+    namespace = {"re": re, "Dict": dict}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[contact_search], type_ignores=[])), "contact-search", "exec"), namespace)
+    assert namespace["_contact_search_condition"]("Patil", False, "", ["patil"]) == {
+        "$and": [{"$or": [
+            {field: {"$regex": "patil", "$options": "i"}}
+            for field in ("full_name", "username", "company", "tally.legal_name")
+        ]}]
+    }
+    phone_condition = namespace["_contact_search_condition"]("987654", True, "987654", [])
+    assert phone_condition["$or"][0]["phone_number"]["$regex"] == "987654$"
+
+    search_source = ast.unparse(next(
+        node for node in service_tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "search_conversations"
+    ))
+    assert 'contacts_{org_id}' in search_source
+    assert "contact_conversation_ids" in search_source
+    assert "conversation_access_condition" in search_source
+    assert "item['customer_name'] = contact_name" in search_source
 
     wa_source = Path("services/wa_service.py").read_text()
     assert '"phone_digits": phone_digits' in wa_source

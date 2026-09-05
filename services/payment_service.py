@@ -144,6 +144,10 @@ async def verify_cashfree_signature(request: Request):
 async def build_idempotency_key(event_type: str, data: dict) -> str:
     if data.get("cf_payment_id"):
         ref = data["cf_payment_id"]
+    elif data.get("link_id"):
+        ref = data["link_id"]
+    elif data.get("order", {}).get("cf_order_id"):
+        ref = data["order"]["cf_order_id"]
     elif data.get("authorization_details", {}).get("authorization_reference"):
         ref = data["authorization_details"]["authorization_reference"]
     elif data.get("cf_subscription_id"):

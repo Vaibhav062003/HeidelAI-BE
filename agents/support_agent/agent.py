@@ -1,10 +1,10 @@
 import os
 from typing import List, Optional
 from dotenv import load_dotenv
-from agno.models.azure import AzureOpenAI
-from config.settings import AZURE_MODEL
+from agno.models.moonshot import MoonShot
+from config.settings import MOONSHOT_API_KEY, MOONSHOT_ENDPOINT, MOONSHOT_DEPLOYMENT_NAME
 from pydantic import BaseModel, Field
-from agno.agent import Agent, RunResponse
+from agno.agent import Agent, RunOutput
 from loguru import logger
 import json
 
@@ -46,9 +46,13 @@ class ConversationSummary(BaseModel):
 
 # Agent that uses structured outputs for conversation analysis
 chat_analysis_agent = Agent(
-    model=AzureOpenAI(id=AZURE_MODEL),  
+    model=MoonShot(
+        id=MOONSHOT_DEPLOYMENT_NAME or "kimi-k2-thinking",
+        api_key=MOONSHOT_API_KEY,
+        base_url=MOONSHOT_ENDPOINT,
+    ),
     description="You are a customer service assistant. Summarize conversations and assign a priority level and relevant tags/labels.",
-    response_model=ConversationSummary,
+    output_schema=ConversationSummary,
     instructions=[
         "Summarize the chat in 2-5 bullet points, keeping it concise and relevant.",
         "Ensure the 'priority' field contains only one of the following values: 'low', 'medium', or 'high' - case sensitive.",
@@ -83,7 +87,7 @@ async def analyze_conversation(conversation: str, available_tags: list = None, a
         separators=(",", ":"),
     )
 
-    response: RunResponse = await chat_analysis_agent.arun(prompt)
+    response: RunOutput = await chat_analysis_agent.arun(prompt)
     if isinstance(response.content, ConversationSummary):
         return response.content
 

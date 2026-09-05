@@ -23,8 +23,16 @@ from . import transfer_routes
 from . import push_routes
 from . import quote_routes
 from . import sales_offer_routes
+from . import sales_case_routes
 from . import work_team_routes
 from . import tally_routes
+from . import stock_routes
+from . import entitlement_routes
+from . import billing_routes
+from . import internal_sales_learning_routes
+from . import shopify_routes
+from . import pricing_routes
+from . import product_request_routes
 
 router = APIRouter()
 
@@ -51,5 +59,13 @@ router.include_router(transfer_routes.router)
 router.include_router(push_routes.router)
 router.include_router(quote_routes.router)
 router.include_router(sales_offer_routes.router)
+router.include_router(sales_case_routes.router)
 router.include_router(work_team_routes.router)
 router.include_router(tally_routes.router)
+router.include_router(stock_routes.router)
+router.include_router(entitlement_routes.router)
+router.include_router(billing_routes.router)
+router.include_router(internal_sales_learning_routes.router)
+router.include_router(shopify_routes.router)
+router.include_router(pricing_routes.router)
+router.include_router(product_request_routes.router)

@@ -1,4 +1,5 @@
-agno==1.7.7
+agno==2.9.0
+agnoctl==0.1.3
 aiohappyeyeballs==2.6.1
 aiohttp==3.12.15
 aiosignal==1.4.0
@@ -8,6 +9,7 @@ APScheduler==3.11.0
 attrs==25.3.0
 cachetools==5.5.2
 certifi==2025.8.3
+cffi==2.1.1
 charset-normalizer==3.4.2
 click==8.2.1
 cloudinary==1.44.1
@@ -40,11 +42,13 @@ h11==0.16.0
 h2==4.2.0
 hpack==4.1.0
 httpcore==1.0.9
+httpcore2==2.12.0
 httptools==0.6.4
 httpx==0.28.1
+httpx2==2.12.0
 hyperframe==6.1.0
-idna==3.10
-jiter==0.12.0
+idna==3.19
+jiter==0.16.0
 jsonpatch==1.33
 jsonpointer==3.0.0
 langchain-core==0.3.72
@@ -61,7 +65,7 @@ mdurl==0.1.2
 motor==3.7.1
 multidict==6.6.3
 numpy==2.3.5
-openai==2.13.0
+openai==3.3.1
 openpyxl==3.1.5
 orjson==3.11.1
 ormsgpack==1.10.0
@@ -76,6 +80,7 @@ proto-plus==1.26.1
 protobuf==6.31.1
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
+pycparser==3.0
 pydantic==2.12.4
 pydantic-settings==2.10.1
 pydantic_core==2.41.5
@@ -108,6 +113,7 @@ supafunc==0.10.1
 tenacity==8.5.0
 tomli==2.2.1
 tqdm==4.67.1
+truststore==0.10.4
 typer==0.16.0
 typing-inspection==0.4.2
 typing_extensions==4.14.1
@@ -117,7 +123,6 @@ urllib3==2.5.0
 uvicorn==0.35.0
 watchfiles==1.1.0
 websockets==15.0.1
-win32_setctime==1.2.0
 wrapt==2.2.1
 xxhash==3.5.0
 yarl==1.20.1

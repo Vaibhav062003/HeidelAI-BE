@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # === Internal Modules ===
@@ -14,6 +15,7 @@ from loguru import logger
 
 
 db = get_mongo_db()
+_scheduler = None
 # mapping of platforms -> service instance
 messaging_services = {
     "instagram": instagram_service.InstagramService(),
@@ -32,11 +34,11 @@ async def process_inactivity_for_org(org_id: str):
     conv_col = db[f"conversations_{org_id}"]
     now = datetime.now(timezone.utc)
 
-    convs = list(conv_col.find({
+    convs = await asyncio.to_thread(lambda: list(conv_col.find({
         "status": "open",
         "last_sender": "agent",
         "next_action_at": {"$lte": now}
-    }))
+    })))
 
     if not convs:
         return 
@@ -48,14 +50,13 @@ async def process_inactivity_for_org(org_id: str):
         conv_id = conv["conversation_id"]
 
         if stage == 0:
-            conv_col.update_one(
+            await asyncio.to_thread(
+                conv_col.update_one,
                 {"conversation_id": conv_id},
-                {
-                    "$set": {
-                        "reminder_stage": 1,
-                        "next_action_at": now + timedelta(hours=6)
-                    }
-                }
+                {"$set": {
+                    "reminder_stage": 1,
+                    "next_action_at": now + timedelta(hours=6),
+                }},
             )
             logger.info(f"[ORG {org_id[:6]}...] Stage 0 → 1 for {conv_id}")
             continue
@@ -75,14 +76,13 @@ async def process_inactivity_for_org(org_id: str):
 
         elif stage == 1:
             # Second 12h inactivity follow-up
-            conv_col.update_one(
+            await asyncio.to_thread(
+                conv_col.update_one,
                 {"conversation_id": conv_id},
-                {
-                    "$set": {
-                        "reminder_stage": 2,
-                        "next_action_at": now + timedelta(hours=6)
-                    }
-                }
+                {"$set": {
+                    "reminder_stage": 2,
+                    "next_action_at": now + timedelta(hours=6),
+                }},
             )
             logger.info(f"[ORG {org_id[:6]}...] Stage 1 → 2 for {conv_id}")
             continue
@@ -114,7 +114,7 @@ async def process_time_based_tasks():
 
     logger.info("Processing inactivity follow-ups and closures...")
     # Process inactivity follow-ups & closures for all orgs
-    orgs = db.organizations.find({}, {"org_id": 1})
+    orgs = await asyncio.to_thread(lambda: list(db.organizations.find({}, {"org_id": 1})))
     for org in orgs:
         org_id = org["org_id"]
         await process_inactivity_for_org(org_id)
@@ -127,12 +127,17 @@ async def update_ai_status(org_type: str = "all"):
 
 
 def start_scheduler():
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        return _scheduler
     from services.cloudinary_service import cleanup_expired_audio_notes
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests, process_pending_oos_reply_steps
     from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
     from services.pricing_service import process_pending_pricing_escalations
+    from services.product_sheet_sync import reconcile_active_product_sheets
     from services.sales_offer_service import process_pending_sales_offer_audits
-    from services.tally_service import cleanup_expired_tally_pdfs, process_tally_payment_reminders, reconcile_stale_tally_jobs
+    from services.tally_service import check_tally_contact_sync_health, cleanup_expired_tally_pdfs, process_tally_payment_reminders, reconcile_stale_tally_jobs
+    from services.shopify_service import process_shopify_reminders, process_shopify_syncs
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
@@ -151,7 +156,11 @@ def start_scheduler():
     scheduler.add_job(process_pending_sales_offer_audits, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(reconcile_stale_tally_jobs, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_tally_payment_reminders, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(check_tally_contact_sync_health, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(process_shopify_reminders, "interval", seconds=30, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
+    scheduler.add_job(process_shopify_syncs, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_pricing_escalations, "interval", minutes=1, max_instances=1, coalesce=True)
+    scheduler.add_job(reconcile_active_product_sheets, "interval", minutes=15, max_instances=1, coalesce=True)
     # OOS: expire stale requests and escalate (check every hour)
     scheduler.add_job(process_expired_oos_requests, "interval", hours=1)
     scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
@@ -159,4 +168,13 @@ def start_scheduler():
     scheduler.add_job(cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
     scheduler.add_job(cleanup_expired_tally_pdfs, "cron", hour=3, minute=45, max_instances=1, coalesce=True)
     scheduler.start()
+    _scheduler = scheduler
     logger.success("APScheduler started (interval = 6 hours).")
+    return scheduler
+
+
+def stop_scheduler():
+    global _scheduler
+    if _scheduler and _scheduler.running:
+        _scheduler.shutdown(wait=False)
+    _scheduler = None

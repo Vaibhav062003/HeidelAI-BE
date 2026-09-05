@@ -25,6 +25,11 @@ temp.py
 tests/*
 !tests/contracts/
 !tests/contracts/test_team_routing_contract.py
+!tests/shopify/
+tests/shopify/*
+!tests/shopify/test_shopify_worker_runtime.py
+!tests/shopify/test_storefront_cart.py
+!tests/shopify/test_storefront_capture.cjs
 
 \export_mongo_conversations.py
 conversation_export.jsonl

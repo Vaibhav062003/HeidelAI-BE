@@ -94,10 +94,17 @@ PARIJAT_ACADEMY_ORG_WA_ID = os.getenv("PARIJAT_ACADEMY_ORG_WA_ID")
 LEE_DEALER_ORG_WA_ID = os.getenv("LEE_DEALER_ORG_WA_ID")
 KARAN_ORG_WA_ID = os.getenv("KARAN_ORG_WA_ID")
 X_INTERNAL_SECRET = os.getenv("X_INTERNAL_SECRET") # internal secret for making & validating API calls between different koyeb instances
+INTERNAL_HMAC_SECRET = os.getenv("INTERNAL_HMAC_SECRET") or X_INTERNAL_SECRET
+CRM_COMMERCIAL_BASE_URL = os.getenv("CRM_COMMERCIAL_BASE_URL")
 
 # Google OAuth 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+
+# Shopify OAuth and webhooks
+SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip()
+SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip()
+SHOPIFY_PUBLIC_BASE_URL = os.getenv("SHOPIFY_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 # Google Drive Webhook (push notifications for sheet changes)
 # GOOGLE_WEBHOOK_BASE_URL: Public HTTPS URL where Google sends notifications
@@ -112,6 +119,12 @@ os.environ["LANGCHAIN_PROJECT"] =os.getenv("LANGCHAIN_PROJECT")
 
 #Azure OpenAI
 AZURE_MODEL=os.getenv("AZURE_MODEL")
+
+#Moonshot / Kimi
+MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY")
+MOONSHOT_ENDPOINT = os.getenv("MOONSHOT_ENDPOINT")
+MOONSHOT_DEPLOYMENT_NAME = os.getenv("MOONSHOT_DEPLOYMENT_NAME", "Kimi-K2.6-f-s-a")
+MOONSHOT_DEPLOYMENT = MOONSHOT_DEPLOYMENT_NAME
 AZURE_OPENAI_ENDPOINT=os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_SUBSCRIPTION_KEY=os.getenv("AZURE_OPENAI_SUBSCRIPTION_KEY")
 AZURE_OPENAI_API_VERSION=os.getenv("AZURE_OPENAI_API_VERSION")
@@ -145,4 +158,15 @@ PRICING_INTELLIGENCE_ORG_IDS = {
     for org_id in os.getenv("PRICING_INTELLIGENCE_ORG_IDS", "").split(",")
     if org_id.strip()
 }
-PRICING_FLOOR_MAX_AGE_MINUTES = int(os.getenv("PRICING_FLOOR_MAX_AGE_MINUTES", "60"))
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer without making application import fail closed."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+PRICING_FLOOR_MAX_AGE_MINUTES = _positive_int_env("PRICING_FLOOR_MAX_AGE_MINUTES", 60)

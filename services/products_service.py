@@ -1,4 +1,5 @@
 import os
+import re
 import pandas as pd
 from io import BytesIO
 from bson import ObjectId
@@ -73,13 +74,34 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             colmap[c] = c
     return df.rename(columns=colmap)
 
-def get_products_for_org(org_id: str, limit: int = 100, skip: int = 0) -> List[Dict[str, Any]]:
+def _product_search(query: str) -> Dict[str, Any]:
+    if not query.strip():
+        return {}
+    pattern = {"$regex": re.escape(query.strip()), "$options": "i"}
+    return {"$or": [
+        {"search_text": pattern}, {"model_no": pattern}, {"unique_identifier": pattern},
+        {"product_name": pattern}, {"description": pattern},
+    ]}
+
+
+def get_products_for_org(
+    org_id: str, limit: int = 100, skip: int = 0, query: str = ""
+) -> List[Dict[str, Any]]:
     collection = _products_collection(org_id)
-    docs = list(collection.find({}, skip=skip, limit=limit))
+    docs = list(
+        collection.find(_product_search(query))
+        .sort([("product_name", 1), ("model_no", 1), ("_id", 1)])
+        .skip(skip)
+        .limit(limit)
+    )
 
     for d in docs:
         d["_id"] = str(d["_id"])
     return docs
+
+
+def count_products_for_org(org_id: str, query: str = "") -> int:
+    return _products_collection(org_id).count_documents(_product_search(query))
 
 def _row_to_product(row: pd.Series, extra_cols: List[str]) -> Tuple[Optional[Product], Optional[str]]:
     """

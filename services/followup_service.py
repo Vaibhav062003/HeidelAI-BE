@@ -140,7 +140,7 @@ async def schedule_followup_message(
             {"active_key": {"$exists": False}, "status": {"$in": ACTIVE_STATUSES}},
         ],
     })
-    if existing and source != "quotation":
+    if existing and source not in {"quotation", "payment"}:
         return {"message": "A follow-up is already active.", "followup": serialize_mongo(existing)}
     if existing and (existing.get("status") not in {"pending", "failed"} or existing.get("sequence_step", 1) != 1):
         return {"message": "A follow-up is already active.", "followup": serialize_mongo(existing)}
@@ -183,10 +183,11 @@ async def schedule_followup_message(
     timeline_text = None
     if ai_active:
         quote_context = ""
-        if quote and source == "quotation":
+        if quote and source in {"quotation", "payment"}:
             quote_context = (
                 f"Quotation {quote.get('quote_number', quote_id)} with a total of "
-                f"INR {quote.get('public_grand_total', 0):,.0f} was just shared."
+                f"INR {quote.get('public_grand_total', 0):,.0f} was just "
+                f"{'followed by a payment link' if source == 'payment' else 'shared'}."
             )
         try:
             generated = await get_followup_message(org_id, conversation_id, quote_context)
@@ -820,6 +821,13 @@ async def process_scheduled_messages(messaging_services: dict) -> None:
             return_document=ReturnDocument.AFTER,
         )
         if not claimed:
+            continue
+        from services.entitlement_service import feature_access
+        if feature_access(claimed["org_id"], "FOLLOW_UPS")["state"] != "active":
+            await collection.update_one(
+                {"_id": claimed["_id"], "claim_id": claim_id},
+                {"$set": {"status": "cancelled", "cancelled_at": claim_time, "error": "Follow-ups entitlement is not active", "updated_at": claim_time}, "$unset": {"active_key": "", "claim_id": "", "claimed_at": ""}},
+            )
             continue
         if not _is_customer_facing_followup(claimed):
             await collection.update_one(

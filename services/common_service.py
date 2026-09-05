@@ -22,6 +22,7 @@ from services.work_team_service import (
     require_conversation_access,
     team_queue_condition,
 )
+from services.whatsapp_connection_service import whatsapp_conversation_scope
 
 from database import get_mongo_db, get_async_mongo_db
 
@@ -30,6 +31,19 @@ from dateutil import parser
 
 
 db = get_mongo_db()
+
+
+async def _business_phone_scope(org_id: str, phone_id: str) -> Dict:
+    active = {"org_id": org_id, "is_active": {"$ne": False}}
+    connections = get_async_mongo_db().whatsapp_connections
+    primary = (
+        await connections.find_one({**active, "slot": 1}, {"phone_id": 1})
+        or await connections.find_one(active, {"phone_id": 1}, sort=[("connected_at", 1)])
+    )
+    return whatsapp_conversation_scope(
+        phone_id,
+        include_legacy=bool(primary and str(primary.get("phone_id") or "") == str(phone_id)),
+    )
 
 
 def validate_outbound_attachment(file) -> None:
@@ -105,14 +119,24 @@ def build_focus_group_condition(
     return {"$and": [*conditions, {"status": "open"}]}
 
 
-async def fetch_focus_counts(org_id: str, user_id: str, role: str) -> Dict[str, int]:
+async def fetch_focus_counts(
+    org_id: str,
+    user_id: str,
+    role: str,
+    business_phone_id: Optional[str] = None,
+) -> Dict[str, int]:
     async_db = get_async_mongo_db()
     collection = async_db[f"conversations_{org_id}"]
     now = datetime.now(timezone.utc)
     access = await conversation_access_condition(org_id, user_id, role)
+    phone_scope = await _business_phone_scope(org_id, business_phone_id) if business_phone_id else None
     facets = {
         group: [
-            {"$match": {"$and": [build_focus_group_condition(group, now), access]} if access else build_focus_group_condition(group, now)},
+            {"$match": {"$and": [
+                build_focus_group_condition(group, now),
+                *([access] if access else []),
+                *([phone_scope] if phone_scope else []),
+            ]}},
             {"$count": "count"},
         ]
         for group in FOCUS_GROUPS
@@ -145,6 +169,11 @@ async def ensure_conversation_search_indexes(org_id: str) -> None:
         await conversations.create_index("phone_search_suffixes")
         await conversations.create_index("customer_name_prefixes")
         await conversations.create_index([("last_message_timestamp", -1)])
+        await conversations.create_index([
+            ("last_assignment_action", 1),
+            ("last_transfer_to_agent_id", 1),
+            ("assigned_agent_id", 1),
+        ])
         await messages.create_index([("conversation_id", 1), ("timestamp", -1)])
         await messages.create_index(
             [("content", "text")],
@@ -162,6 +191,27 @@ def _search_snippet(value: object, query: str, limit: int = 160) -> str:
     start = max(0, match_at - limit // 3) if match_at >= 0 else 0
     end = min(len(text), start + limit)
     return f"{'…' if start else ''}{text[start:end]}{'…' if end < len(text) else ''}"
+
+
+def _contact_search_condition(
+    clean_query: str,
+    phone_query: bool,
+    digits: str,
+    name_terms: list[str],
+) -> Dict:
+    if phone_query:
+        suffix = f"{re.escape(digits)}$"
+        return {"$or": [
+            {"phone_number": {"$regex": suffix}},
+            {"conversation_id": {"$regex": suffix}},
+        ]}
+    return {"$and": [
+        {"$or": [
+            {field: {"$regex": re.escape(term), "$options": "i"}}
+            for field in ("full_name", "username", "company", "tally.legal_name")
+        ]}
+        for term in name_terms
+    ]} if name_terms else {"_id": {"$exists": False}}
 
 
 def _lookup_scope(value: object) -> object:
@@ -185,6 +235,20 @@ def _escalated_condition() -> Dict:
     }
 
 
+def _transferred_condition(current_user_id: Optional[str]) -> Dict:
+    if not current_user_id:
+        return {"_id": {"$exists": False}}
+    return {"$and": [
+        {"$or": [
+            {"assigned_agent.id": current_user_id},
+            {"assigned_agent_id": current_user_id},
+        ]},
+        {"last_assignment_action": "transferred"},
+        {"last_transfer_to_agent_id": current_user_id},
+        {"last_transfer_from_agent_id": {"$nin": [None, current_user_id, "system"]}},
+    ]}
+
+
 def _queue_filter_conditions(
     active_tab: str,
     current_user_id: Optional[str],
@@ -204,6 +268,8 @@ def _queue_filter_conditions(
                 "status": {"$in": ["pending", "in_progress", "needs_review"]},
             }}},
         ]})
+    elif active_tab == "transferred":
+        conditions.append(_transferred_condition(current_user_id))
     elif active_tab == "team" and team_id:
         conditions.append({"active_work": {"$elemMatch": {
                 "team_id": team_id,
@@ -295,6 +361,7 @@ async def search_conversations(
     assigned_agent_id: Optional[str] = None,
     current_user_role: str = "org:member",
     team_id: Optional[str] = None,
+    business_phone_id: Optional[str] = None,
 ) -> Dict:
     clean_query = query.strip()
     if len(clean_query) < 2:
@@ -310,6 +377,8 @@ async def search_conversations(
         conditions.append(access)
     if active_tab == "team" and team_id:
         await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
+    if business_phone_id:
+        conditions.append(await _business_phone_scope(org_id, business_phone_id))
 
     conditions.extend(_queue_filter_conditions(
         active_tab, current_user_id, attention, handling, status_filter, assigned_agent_id, team_id
@@ -328,9 +397,16 @@ async def search_conversations(
         requested_labels = [item.strip() for item in labels.split(",") if item.strip()]
         if requested_labels:
             label_regexes = [re.compile(f"^{re.escape(item)}$", re.IGNORECASE) for item in requested_labels]
-            matching_ids = await async_db[f"contacts_{org_id}"].distinct(
-                "conversation_id", {"labels": {"$in": label_regexes}}
-            )
+            contact_rows = await async_db[f"contacts_{org_id}"].find(
+                {"labels": {"$in": label_regexes}},
+                {"_id": 0, "conversation_id": 1, "conversation_ids": 1},
+            ).to_list(length=None)
+            matching_ids = list(dict.fromkeys(
+                conversation_id
+                for contact in contact_rows
+                for conversation_id in [contact.get("conversation_id"), *(contact.get("conversation_ids") or [])]
+                if conversation_id
+            ))
             if not matching_ids:
                 return {"conversations": [], "has_more": False}
             conditions.append({"conversation_id": {"$in": matching_ids}})
@@ -344,14 +420,42 @@ async def search_conversations(
     candidate_limit = skip + limit + 1
     digits, _ = phone_search_parts(clean_query)
     phone_query = len(digits) >= 6 and bool(re.fullmatch(r"[+\d\s().-]+", clean_query))
+    name_terms = [] if phone_query else re.findall(r"[^\W_]+", clean_query.casefold())
+    contact_rows = await async_db[f"contacts_{org_id}"].find(
+        _contact_search_condition(clean_query, phone_query, digits, name_terms),
+        {
+            "_id": 0,
+            "conversation_id": 1,
+            "conversation_ids": 1,
+            "full_name": 1,
+            "username": 1,
+            "company": 1,
+            "phone_number": 1,
+        },
+    ).limit(max(50, candidate_limit * 3)).to_list(length=max(50, candidate_limit * 3))
+    contacts_by_conversation = {
+        str(conversation_id): contact
+        for contact in contact_rows
+        for conversation_id in [contact.get("conversation_id"), *(contact.get("conversation_ids") or [])]
+        if conversation_id
+    }
+    contact_conversation_ids = list(contacts_by_conversation)
     results: Dict[str, tuple[Dict, Dict]] = {}
 
-    def add_result(doc: Dict, match_type: str, snippet: str, message: Optional[Dict] = None) -> None:
+    def add_result(
+        doc: Dict,
+        match_type: str,
+        snippet: str,
+        message: Optional[Dict] = None,
+        contact_name: Optional[str] = None,
+    ) -> None:
         conversation_id = doc.get("conversation_id")
         if not conversation_id or conversation_id in results:
             return
         item = serialize_mongo(doc)
         item["id"] = conversation_id
+        if contact_name:
+            item["customer_name"] = contact_name
         match = {
             "type": match_type,
             "snippet": snippet,
@@ -371,25 +475,54 @@ async def search_conversations(
             {"phone_search_suffixes": digits},
             {"conversation_id": {"$regex": f"^(?:whatsapp|dealer)_\\d*{re.escape(digits)}$"}},
         ]
+        if contact_conversation_ids:
+            phone_conditions.append({"conversation_id": {"$in": contact_conversation_ids}})
         direct_query = {"$and": [*conditions, {"$or": phone_conditions}]}
         direct_docs = await conversations.find(direct_query, projection).sort(
             "last_message_timestamp", -1
         ).limit(candidate_limit).to_list(length=candidate_limit)
         for doc in direct_docs:
-            add_result(doc, "phone", str(doc.get("customer_id") or doc.get("conversation_id") or ""))
+            contact = contacts_by_conversation.get(str(doc.get("conversation_id") or ""))
+            add_result(
+                doc,
+                "contact" if contact else "phone",
+                str((contact or {}).get("phone_number") or doc.get("customer_id") or doc.get("conversation_id") or ""),
+                contact_name=str((contact or {}).get("full_name") or (contact or {}).get("company") or "") or None,
+            )
     else:
-        name_terms = re.findall(r"[^\W_]+", clean_query.casefold())
         direct_docs = []
         if name_terms:
-            direct_query = {"$and": [*conditions, {
-                "customer_name_prefixes": {"$all": name_terms}
-            }]}
+            # ponytail: this legacy-only regex path can be removed after old rows have prefixes.
+            legacy_name_match = {"$and": [
+                {"$or": [
+                    {"customer_name_prefixes": {"$exists": False}},
+                    {"customer_name_prefixes": None},
+                    {"customer_name_prefixes": []},
+                ]},
+                *[
+                    {"customer_name": {"$regex": re.escape(term), "$options": "i"}}
+                    for term in name_terms
+                ],
+            ]}
+            name_matches: List[Dict] = [
+                {"customer_name_prefixes": {"$all": name_terms}},
+                legacy_name_match,
+            ]
+            if contact_conversation_ids:
+                name_matches.append({"conversation_id": {"$in": contact_conversation_ids}})
+            direct_query = {"$and": [*conditions, {"$or": name_matches}]}
             direct_docs = await conversations.find(direct_query, projection).sort(
                 "last_message_timestamp", -1
             ).limit(candidate_limit).to_list(length=candidate_limit)
         for doc in direct_docs:
-            name = str(doc.get("customer_name") or "")
-            add_result(doc, "name", _search_snippet(name, clean_query))
+            contact = contacts_by_conversation.get(str(doc.get("conversation_id") or ""))
+            name = str((contact or {}).get("full_name") or (contact or {}).get("company") or doc.get("customer_name") or "")
+            add_result(
+                doc,
+                "contact" if contact else "name",
+                _search_snippet(name, clean_query),
+                contact_name=name if contact else None,
+            )
 
         message_hits = await messages.aggregate([
             {"$match": {"$text": {"$search": clean_query}}},
@@ -469,6 +602,7 @@ async def fetch_conversations_new(
     include_meta: bool = False,
     current_user_role: str = "org:member",
     team_id: Optional[str] = None,
+    business_phone_id: Optional[str] = None,
 ) -> object:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -493,6 +627,8 @@ async def fetch_conversations_new(
     access = await conversation_access_condition(org_id, current_user_id or "", current_user_role)
     if access:
         base_conditions.append(access)
+    if business_phone_id:
+        base_conditions.append(await _business_phone_scope(org_id, business_phone_id))
     if active_tab == "team" and team_id:
         await team_queue_condition(org_id, team_id, current_user_id or "", current_user_role)
     base_conditions.extend(_queue_filter_conditions(
@@ -517,11 +653,19 @@ async def fetch_conversations_new(
             # Optimization: Use regex for case-insensitive exact matching
             regex_labels = [re.compile(f"^{re.escape(l)}$", re.IGNORECASE) for l in labels_list]
             
-            # Fetch unique conversation_ids from contacts who have any of these labels
-            matching_ids = await contact_col.distinct("conversation_id", {"labels": {"$in": regex_labels}})
+            contact_rows = await contact_col.find(
+                {"labels": {"$in": regex_labels}},
+                {"_id": 0, "conversation_id": 1, "conversation_ids": 1},
+            ).to_list(length=None)
+            matching_ids = list(dict.fromkeys(
+                conversation_id
+                for contact in contact_rows
+                for conversation_id in [contact.get("conversation_id"), *(contact.get("conversation_ids") or [])]
+                if conversation_id
+            ))
             
             if not matching_ids:
-                return {"conversations": [], "has_more": False, "total": 0, "counts": {"all": 0, "mine": 0, "unassigned": 0, "escalated": 0}} if include_meta else []
+                return {"conversations": [], "has_more": False, "total": 0, "counts": {"all": 0, "mine": 0, "transferred": 0, "team": 0, "unassigned": 0, "escalated": 0}} if include_meta else []
             
             base_conditions.append({"conversation_id": {"$in": matching_ids}})
 
@@ -612,12 +756,17 @@ async def fetch_conversations_new(
             ),
             "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
             "assignment_history": doc.get("assignment_history", []),
+            "last_assignment_action": doc.get("last_assignment_action"),
+            "last_transfer_to_agent_id": doc.get("last_transfer_to_agent_id"),
+            "last_transfer_from_agent_id": doc.get("last_transfer_from_agent_id"),
             "suggestions": doc.get("suggestions", []),
             "summary": doc.get("summary", []),
             "categories": doc.get("categories", []),
             "labels": doc.get("labels", []),
             "participants": doc.get("participants", []),
-            "unread": doc.get("unread", {})
+            "unread": doc.get("unread", {}),
+            "business_phone_id": doc.get("business_phone_id"),
+            "business_phone": doc.get("business_phone"),
         }
             
         result.append(conv_obj)
@@ -632,11 +781,14 @@ async def fetch_conversations_new(
     count_scope_parts = [{"type": {"$ne": "team"}}]
     if access:
         count_scope_parts.append(access)
+    if business_phone_id:
+        count_scope_parts.append(await _business_phone_scope(org_id, business_phone_id))
     count_scope = {"$and": count_scope_parts} if len(count_scope_parts) > 1 else count_scope_parts[0]
     team_conditions = _queue_filter_conditions("team", current_user_id, None, None, None, None, team_id)
     facets = {
         "all": [{"$match": count_scope}, {"$count": "value"}],
         "mine": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("mine", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
+        "transferred": [{"$match": {"$and": [count_scope, _transferred_condition(current_user_id)]}}, {"$count": "value"}],
         "team": [{"$match": {"$and": [count_scope, *team_conditions]}} if team_conditions else {"$match": {"_id": None}}, {"$count": "value"}],
         "unassigned": [{"$match": {"$and": [count_scope, *_queue_filter_conditions("unassigned", current_user_id, None, None, None, None)]}}, {"$count": "value"}],
         "escalated": [{"$match": {"$and": [count_scope, _escalated_condition()]}}, {"$count": "value"}],
@@ -968,12 +1120,15 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
 
         now = datetime.now(timezone.utc)
 
-        conversation =  conversation_collection.find_one({"conversation_id": conversation_id})
+        conversation = await asyncio.to_thread(
+            conversation_collection.find_one, {"conversation_id": conversation_id},
+        )
 
         if not conversation:
             return {"message": "Conversation not found. Nothing to close."}
 
-        result = conversation_collection.find_one_and_update(
+        result = await asyncio.to_thread(
+            conversation_collection.find_one_and_update,
             {"conversation_id": conversation_id},
             {
                 "$set": {
@@ -990,7 +1145,8 @@ async def close_conversation(org_id: str, conversation_id: str, reason: str):
             last_index = len(conversation["assignment_history"]) - 1
             update_path = f"assignment_history.{last_index}.assigned_until"
 
-            result = conversation_collection.find_one_and_update(
+            result = await asyncio.to_thread(
+                conversation_collection.find_one_and_update,
                 {"conversation_id": conversation_id},
                 {"$set": {update_path: now}},
                 return_document=ReturnDocument.AFTER
@@ -1200,7 +1356,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             raise HTTPException(status_code=409, detail="The WhatsApp number for this conversation is not connected")
 
         if file:
-            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name, media_kind, duration_ms)
+            res = await upload_and_send_wa_media_message(recipient_id, file, wa_id, org_id, content, temp_id, mode, context_type, context, sender_name, media_kind, duration_ms, conversation_id)
 
             if res.get("error"):
                 raise HTTPException(
@@ -1223,7 +1379,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
                         mode=mode,
                         context_type=context_type,
                         context=context,
-                        sender_name=sender_name
+                        sender_name=sender_name,
+                        conversation_id=conversation_id,
                     )
                 else:
                     raise ValueError("Not a template")

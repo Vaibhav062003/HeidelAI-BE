@@ -4,7 +4,7 @@ from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pymongo import ReturnDocument
 
 from auth.auth_utils import admin_required
@@ -12,9 +12,10 @@ from auth.dependencies import CurrentUser
 from core.limiter import limiter
 from database import get_async_mongo_db
 from services.cloudinary_service import upload_media_to_cloudinary
-from services.quote_math import quote_line_amounts
+from services.quote_service import build_quote_document
 from services.utils import serialize_mongo
 from services.work_team_service import require_conversation_access
+from services.entitlement_service import require_feature
 
 
 router = APIRouter(prefix="/api/quotes", tags=["Quotes"])
@@ -39,7 +40,7 @@ class QuoteParty(BaseModel):
 
 class QuoteItem(BaseModel):
     id: str = Field(..., min_length=1, max_length=80)
-    description: str = Field(..., min_length=1, max_length=240)
+    description: str = Field(..., min_length=1, max_length=750)
     category: str = Field(default="", max_length=40)
     sku: str = Field(default="", max_length=60)
     quantity: float = Field(default=1, gt=0, le=9999)
@@ -63,22 +64,77 @@ class QuotePublicOptions(BaseModel):
 
 
 class QuoteComponentCategory(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     id: str = Field(..., min_length=1, max_length=80)
     label: str = Field(..., min_length=1, max_length=40)
     enabled: bool = True
 
 
+class QuoteSectionLayout(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    id: Literal[
+        "customer", "metadata", "build", "items", "totals", "seller",
+        "payment", "notes", "terms",
+    ]
+    label: str = Field(min_length=1, max_length=40)
+    enabled: bool = True
+
+
+class QuoteColumnLayout(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    id: Literal["category", "description", "sku", "quantity", "rate", "gst", "total"]
+    label: str = Field(min_length=1, max_length=30)
+    enabled: bool = True
+
+
+def _default_quote_sections() -> list[QuoteSectionLayout]:
+    return [QuoteSectionLayout(id=id, label=label) for id, label in (
+        ("customer", "Customer"), ("metadata", "Quote details"), ("build", "Build summary"),
+        ("items", "Items"), ("totals", "Totals"), ("seller", "Seller details"),
+        ("payment", "Payment details"), ("notes", "Build and delivery notes"),
+        ("terms", "Terms and conditions"),
+    )]
+
+
+def _default_quote_columns() -> list[QuoteColumnLayout]:
+    return [QuoteColumnLayout(id=id, label=label, enabled=enabled) for id, label, enabled in (
+        ("category", "Component", True), ("description", "Specification", True),
+        ("sku", "SKU", True), ("quantity", "Qty", True), ("rate", "Rate", False),
+        ("gst", "GST", True), ("total", "Total", False),
+    )]
+
+
+class QuoteTextLabels(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    issued: str = Field(default="Issued", min_length=1, max_length=30)
+    paymentDue: str = Field(default="Payment due", min_length=1, max_length=30)
+    validUntil: str = Field(default="Valid until", min_length=1, max_length=30)
+    components: str = Field(default="Components", min_length=1, max_length=30)
+    totalInvestment: str = Field(default="Total investment", min_length=1, max_length=40)
+    taxIncluded: str = Field(default="Inclusive of applicable GST", min_length=1, max_length=60)
+    subtotal: str = Field(default="Subtotal", min_length=1, max_length=30)
+    gst: str = Field(default="GST", min_length=1, max_length=30)
+    shipping: str = Field(default="Shipping", min_length=1, max_length=30)
+    discount: str = Field(default="Discount", min_length=1, max_length=30)
+
+
 class QuoteDesign(BaseModel):
-    name: str = Field(default="Custom", min_length=1, max_length=40)
-    headerColor: str = Field(default="#111315", pattern=r"^#[0-9A-Fa-f]{6}$")
-    accentColor: str = Field(default="#F7AD0A", pattern=r"^#[0-9A-Fa-f]{6}$")
-    pageColor: str = Field(default="#FBFAF7", pattern=r"^#[0-9A-Fa-f]{6}$")
-    textColor: str = Field(default="#0E1113", pattern=r"^#[0-9A-Fa-f]{6}$")
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(default="Signature", min_length=1, max_length=40)
+    headerColor: str = Field(default="#344B5F", pattern=r"^#[0-9A-Fa-f]{6}$")
+    accentColor: str = Field(default="#F36B3D", pattern=r"^#[0-9A-Fa-f]{6}$")
+    pageColor: str = Field(default="#FBFBF8", pattern=r"^#[0-9A-Fa-f]{6}$")
+    textColor: str = Field(default="#2A241D", pattern=r"^#[0-9A-Fa-f]{6}$")
     typography: Literal["modern", "editorial"] = "modern"
     fontScale: float = Field(default=1, ge=0.9, le=1.15)
     density: Literal["compact", "comfortable"] = "compact"
-    headerStyle: Literal["solid", "light"] = "solid"
-    tableStyle: Literal["striped", "ruled"] = "striped"
+    headerStyle: Literal["solid", "light"] = "light"
+    tableStyle: Literal["striped", "ruled"] = "ruled"
     totalStyle: Literal["filled", "outline"] = "filled"
     showCustomerBlock: bool = True
     showMetadata: bool = True
@@ -87,23 +143,51 @@ class QuoteDesign(BaseModel):
     showNotes: bool = True
     showTerms: bool = True
     showPageNumbers: bool = True
+    labels: QuoteTextLabels = Field(default_factory=QuoteTextLabels)
+    sections: list[QuoteSectionLayout] = Field(default_factory=_default_quote_sections, min_length=1, max_length=9)
+    columns: list[QuoteColumnLayout] = Field(default_factory=_default_quote_columns, min_length=1, max_length=7)
+
+    @model_validator(mode="after")
+    def validate_layout(self):
+        for name, entries in (("sections", self.sections), ("columns", self.columns)):
+            ids = [entry.id for entry in entries]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"Quote {name} cannot contain duplicates")
+            if not any(entry.enabled for entry in entries):
+                raise ValueError(f"At least one quote {name[:-1]} must be visible")
+        return self
 
 
 class QuoteBranding(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     document_title: str = Field(default="Quotation", min_length=1, max_length=60)
     build_title: str = Field(default="Performance Workstation", max_length=80)
     build_label: str = Field(default="Custom PC", max_length=30)
     build_promise: str = Field(default="Manufacturer warranty / GST invoice", max_length=100)
     theme: Literal["slate", "emerald", "blue", "burgundy"] = "slate"
     cover_image_url: str = Field(default="", max_length=2048)
-    footer_text: str = Field(default="Thank you for your business.", max_length=240)
+    footer_text: str = Field(default="Thank you for the opportunity to build this with you.", max_length=240)
     component_categories: list[QuoteComponentCategory] = Field(default_factory=list, max_length=20)
     design: Optional[QuoteDesign] = None
+
+
+class QuoteBrandingDefaults(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    document_title: str = Field(default="Quotation", min_length=1, max_length=60)
+    build_title: str = Field(default="Performance Workstation", min_length=1, max_length=80)
+    build_label: str = Field(default="Custom PC", min_length=1, max_length=30)
+    build_promise: str = Field(default="Manufacturer warranty / GST invoice", max_length=100)
+    footer_text: str = Field(default="Thank you for your business.", max_length=240)
+    component_categories: list[QuoteComponentCategory] = Field(default_factory=list, max_length=20)
 
 
 class QuoteSettingsPayload(BaseModel):
     logo_url: Optional[str] = Field(default=None, min_length=1, max_length=2048)
     seller: Optional[QuoteParty] = None
+    pdf_design: Optional[QuoteDesign] = None
+    branding_defaults: Optional[QuoteBrandingDefaults] = None
 
 
 class QuotePayload(BaseModel):
@@ -132,38 +216,10 @@ def _settings_collection(org_id: str):
 
 
 def _document(payload: QuotePayload, user: CurrentUser) -> dict:
-    data = payload.model_dump(mode="json")
-    stored_items = []
-    subtotal = 0.0
-    gst_total = 0.0
-    for item in data["items"]:
-        unit_price = item.pop("unit_price")
-        base, gst, line_total = quote_line_amounts(
-            item["quantity"], unit_price, item["gst_rate"], item["gst_inclusive"]
-        )
-        subtotal += base
-        gst_total += gst
-        stored_items.append({
-            **item,
-            "private_unit_price": round(unit_price, 2),
-            "private_line_subtotal": base,
-            "public_line_total": line_total,
-        })
-    subtotal = round(subtotal, 2)
-    gst_total = round(gst_total, 2)
-    discount = min(data["discount"], subtotal + gst_total + data["shipping"])
-    return {
-        **data,
-        "org_id": user.org_id,
-        "items": stored_items,
-        "private_subtotal": subtotal,
-        "private_gst_total": gst_total,
-        "discount": round(discount, 2),
-        "public_grand_total": round(subtotal + gst_total + data["shipping"] - discount, 2),
-        "updated_at": datetime.now(timezone.utc),
-        "updated_by": user.user_id,
-        "updated_by_name": user.full_name or "Team member",
-    }
+    return build_quote_document(
+        payload.model_dump(mode="json"), org_id=user.org_id,
+        actor_id=user.user_id, actor_name=user.full_name or "Team member",
+    )
 
 
 async def _require_conversation(user: CurrentUser, conversation_id: str) -> None:
@@ -203,6 +259,7 @@ async def list_quotes(
 @router.post("", status_code=201)
 @limiter.limit("20/minute")
 async def create_quote(request: Request, payload: QuotePayload, user: CurrentUser):
+    require_feature(user.org_id, "OFFERS")
     await _require_conversation(user, payload.conversation_id)
     now = datetime.now(timezone.utc)
     document = {
@@ -235,6 +292,8 @@ async def get_quote_settings(request: Request, user: CurrentUser):
                 "address": seller.get("address", ""),
                 "payment_details": seller.get("payment_details", ""),
             },
+            "pdf_design": (settings or {}).get("pdf_design") or QuoteDesign().model_dump(),
+            "branding_defaults": (settings or {}).get("branding_defaults") or QuoteBrandingDefaults().model_dump(),
             "can_edit": user.role in {"admin", "org:admin"},
         }
     }
@@ -243,6 +302,7 @@ async def get_quote_settings(request: Request, user: CurrentUser):
 @router.put("/settings")
 @limiter.limit("10/minute")
 async def update_quote_settings(request: Request, payload: QuoteSettingsPayload, user: CurrentUser):
+    require_feature(user.org_id, "OFFERS")
     await admin_required(user)
     updates = {}
     if payload.logo_url is not None:
@@ -252,8 +312,12 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
         updates["logo_url"] = payload.logo_url
     if payload.seller is not None:
         updates["seller"] = payload.seller.model_dump()
+    if payload.pdf_design is not None:
+        updates["pdf_design"] = payload.pdf_design.model_dump()
+    if payload.branding_defaults is not None:
+        updates["branding_defaults"] = payload.branding_defaults.model_dump()
     if not updates:
-        raise HTTPException(status_code=422, detail="Add a logo or seller profile to update")
+        raise HTTPException(status_code=422, detail="Add a logo, seller profile or PDF default to update")
     settings = await _settings_collection(user.org_id).find_one_and_update(
         {"_id": "branding"},
         {"$set": {
@@ -265,12 +329,19 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
-    return {"settings": {"logo_url": settings.get("logo_url", ""), "seller": settings.get("seller", {}), "can_edit": True}}
+    return {"settings": {
+        "logo_url": settings.get("logo_url", ""),
+        "seller": settings.get("seller", {}),
+        "pdf_design": settings.get("pdf_design") or QuoteDesign().model_dump(),
+        "branding_defaults": settings.get("branding_defaults") or QuoteBrandingDefaults().model_dump(),
+        "can_edit": True,
+    }}
 
 
 @router.put("/{quote_id}")
 @limiter.limit("20/minute")
 async def update_quote(request: Request, quote_id: str, payload: QuotePayload, user: CurrentUser):
+    require_feature(user.org_id, "OFFERS")
     await _require_conversation(user, payload.conversation_id)
     collection = _collection(user.org_id)
     current = await collection.find_one({"org_id": user.org_id, "quote_id": quote_id})
@@ -322,6 +393,7 @@ async def get_quote_revisions(request: Request, quote_id: str, user: CurrentUser
 @router.post("/assets")
 @limiter.limit("20/minute")
 async def upload_quote_asset(request: Request, user: CurrentUser, file: UploadFile = File(...)):
+    require_feature(user.org_id, "OFFERS")
     allowed = {"image/jpeg": b"\xff\xd8\xff", "image/png": b"\x89PNG\r\n\x1a\n"}
     if file.content_type not in allowed or not file.size or file.size > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Use a JPG or PNG image up to 5 MB")

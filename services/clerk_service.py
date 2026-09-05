@@ -85,24 +85,25 @@ async def verify_clerk_otp(sign_up_id: str, code: str):
         return data.get("created_user_id")
     
     
-async def create_organization(org_name: str, session_id: str, owner: OwnerPayload, plan: Literal["free", "growth_monthly", "growth_yearly", "enterprise"], max_allowed_members: int = 2):
+async def create_organization(org_name: str, session_id: str, owner: OwnerPayload, plan: Literal["free", "trial_pending", "growth_monthly", "growth_yearly", "enterprise"], max_allowed_members: int | None = 2):
     """
     Create an organization in Clerk for the given user and also add the organization details in MongoDB.
     """
     logger.info(f"Creating organization '{org_name}' for user {owner['clerk_user_id']}")
     async with httpx.AsyncClient() as client:
         try:
+            clerk_payload = {
+                "name": org_name,
+                "created_by": owner["clerk_user_id"],
+            }
+            if max_allowed_members is not None:
+                clerk_payload["max_allowed_memberships"] = max_allowed_members
             response = await client.post(
                 f"{base_url}/organizations",
                 headers=clerk_headers(),
-                json={
-                    "name": org_name,
-                    "created_by": owner["clerk_user_id"],
-                    "max_allowed_memberships": max_allowed_members
-                    
-                }
+                json=clerk_payload,
             )
-            logger.info(f"Clerk create organization response: {response.json()}")
+            logger.info(f"Clerk create organization status: {response.status_code}")
             if response.status_code != 200:
                 raise Exception(f"Failed to create organization: {response.text}")
 
