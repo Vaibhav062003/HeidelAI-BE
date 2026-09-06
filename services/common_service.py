@@ -777,6 +777,7 @@ async def fetch_conversations_new(
                 else doc.get("auto_ai_disabled_until")
             ),
             "reply_window_ends_at": doc.get("reply_window_ends_at").isoformat() if isinstance(doc.get("reply_window_ends_at"), datetime) else None,
+            "free_entry_window_ends_at": doc.get("free_entry_window_ends_at").isoformat() if isinstance(doc.get("free_entry_window_ends_at"), datetime) else None,
             "assignment_history": doc.get("assignment_history", []),
             "last_assignment_action": doc.get("last_assignment_action"),
             "last_transfer_to_agent_id": doc.get("last_transfer_to_agent_id"),
