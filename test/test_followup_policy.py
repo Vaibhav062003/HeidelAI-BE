@@ -10,8 +10,6 @@ def test_followup_timing_and_reply_window_policy():
     assert not can_auto_send("whatsapp", now + timedelta(hours=3), None)
     assert can_auto_send("whatsapp", now + timedelta(hours=3), now + timedelta(hours=24))
     assert not can_auto_send("whatsapp", now + timedelta(hours=24), now + timedelta(hours=24))
-    assert can_auto_send("whatsapp", now + timedelta(hours=60), now + timedelta(hours=72))
-    assert not can_auto_send("whatsapp", now + timedelta(hours=72), now + timedelta(hours=72))
     assert not can_auto_send("email", now + timedelta(hours=1), now + timedelta(hours=24))
 
 

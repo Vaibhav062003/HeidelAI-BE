@@ -23,7 +23,7 @@ from services.cloudinary_service import upload_media_to_cloudinary
 from services.conversation_utils import reopen_conversation
 from services.followup_service import abort_scheduled_message
 from services.websocket_service import broadcast_main_ws
-from services.utils import name_search_prefixes, normalize_phone, phone_search_parts
+from services.utils import name_search_prefixes, normalize_phone, phone_search_parts, serialize_mongo
 from services.whatsapp_connection_service import MAX_WHATSAPP_CONNECTIONS, whatsapp_conversation_id
 from services.push_notification_service import schedule_customer_message_push
 from services.ai_reply_guard import AIProviderUnavailable
@@ -34,6 +34,58 @@ from schemas.models import WhatsAppInteractiveMessage
 
 MSG_SPLIT = "|MSG_SPLIT|"
 _meta_client: Optional[httpx.AsyncClient] = None
+
+
+def _utc_datetime(value) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    return None
+
+
+def ensure_whatsapp_reply_window_open(conversation: Optional[dict], mode: str, now: Optional[datetime] = None) -> None:
+    """Reject free-form WhatsApp sends outside Meta's 24-hour service window."""
+    if mode not in {"reply", "ai"}:
+        return
+    expires_at = _utc_datetime((conversation or {}).get("reply_window_ends_at"))
+    current_time = _utc_datetime(now) or datetime.now(timezone.utc)
+    if expires_at and current_time < expires_at:
+        return
+    free_entry_ends_at = _utc_datetime((conversation or {}).get("free_entry_window_ends_at"))
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "whatsapp_reply_window_closed",
+            "message": "The 24-hour WhatsApp reply window is closed. Send an approved template instead.",
+            "reply_window_ends_at": expires_at.isoformat() if expires_at else None,
+            "free_entry_window_ends_at": free_entry_ends_at.isoformat() if free_entry_ends_at else None,
+        },
+    )
+
+
+def whatsapp_free_entry_expiry(status_payload: Optional[dict]) -> Optional[datetime]:
+    """Read Meta's authoritative 72-hour referral-conversion expiry."""
+    payload = status_payload or {}
+    conversation = payload.get("conversation") or {}
+    origin = conversation.get("origin") or {}
+    pricing = payload.get("pricing") or {}
+    categories = {
+        str(origin.get("type") or "").lower(),
+        str(conversation.get("type") or "").lower(),
+        str(pricing.get("category") or "").lower(),
+    }
+    if "referral_conversion" not in categories:
+        return None
+    try:
+        return datetime.fromtimestamp(int(conversation["expiration_timestamp"]), timezone.utc)
+    except (KeyError, TypeError, ValueError, OSError):
+        logger.warning("Meta referral-conversion status omitted a valid expiration_timestamp")
+        return None
 
 
 def _meta_http_client() -> httpx.AsyncClient:
@@ -424,6 +476,8 @@ async def create_or_update_whatsapp_conversation(
         broadcast_conversation["started_at"] = broadcast_conversation["started_at"].isoformat()
     if broadcast_conversation.get("reply_window_ends_at"):
         broadcast_conversation["reply_window_ends_at"] = broadcast_conversation["reply_window_ends_at"].isoformat()
+    if broadcast_conversation.get("free_entry_window_ends_at"):
+        broadcast_conversation["free_entry_window_ends_at"] = broadcast_conversation["free_entry_window_ends_at"].isoformat()
     if "_id" in broadcast_conversation:
         broadcast_conversation["_id"] = str(broadcast_conversation["_id"])
     
@@ -801,6 +855,7 @@ async def send_whatsapp_message(
         )
         if not conversation:
             raise HTTPException(status_code=404, detail="WhatsApp conversation not found")
+        ensure_whatsapp_reply_window_open(conversation, mode)
         conversation_wa_id = str(conversation.get("whatsapp_id") or whatsapp_id)
         if str(whatsapp_id) != conversation_wa_id:
             raise HTTPException(status_code=409, detail="The selected sender does not own this conversation")
@@ -1244,7 +1299,7 @@ async def send_whatsapp_message(
                 final_conversation["_id"] = str(final_conversation["_id"])
             
             # Convert datetimes for JSON
-            for key in ["last_message_timestamp", "next_action_at", "started_at", "created_at", "reply_window_ends_at"]:
+            for key in ["last_message_timestamp", "next_action_at", "started_at", "created_at", "reply_window_ends_at", "free_entry_window_ends_at"]:
                 if final_conversation.get(key) and isinstance(final_conversation[key], datetime):
                     final_conversation[key] = final_conversation[key].isoformat()
 
@@ -1702,6 +1757,12 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
     Upload media to Cloudinary and send it as a media message
     """
     try:
+        conversation = await asyncio.to_thread(
+            db[f"conversations_{org_id}"].find_one,
+            {"conversation_id": conversation_id, "platform": "whatsapp"},
+        ) if conversation_id else None
+        ensure_whatsapp_reply_window_open(conversation, mode)
+
         # Upload media to Cloudinary
         result = await upload_media_to_cloudinary(
             file, platform="whatsapp", org_id=org_id, media_kind=media_kind
@@ -1724,6 +1785,8 @@ async def upload_and_send_wa_media_message(recipient_id: str, file: any, wa_id: 
         )
         
         return response
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in upload_and_send_wa_media_message: {e}")
         return {"error": str(e), "success": False}
@@ -1733,10 +1796,9 @@ async def update_whatsapp_message_status(
     message_id: str,
     status: str,
     delivery_error: Optional[dict] = None,
+    status_payload: Optional[dict] = None,
 ):
-    """
-    Update the status of a WhatsApp message in the database
-    """
+    """Update delivery status and Meta's separate referral pricing expiry."""
     try:
         messages_collection = db[f"messages_{org_id}"]
 
@@ -1762,13 +1824,32 @@ async def update_whatsapp_message_status(
             return_document=ReturnDocument.AFTER,
         )
         
-        if result:
-            logger.success(f"WhatsApp message {message_id} status updated to {status}")
-            return result
-        return await asyncio.to_thread(
-            messages_collection.find_one,
-            {"message_id": message_id, "platform": "whatsapp"},
-        )
+        if not result:
+            result = await asyncio.to_thread(
+                messages_collection.find_one,
+                {"message_id": message_id, "platform": "whatsapp"},
+            )
+        if not result:
+            return None
+
+        free_entry_ends_at = whatsapp_free_entry_expiry(status_payload) if status_payload else None
+        if free_entry_ends_at and result.get("conversation_id"):
+            conversation = await asyncio.to_thread(
+                db[f"conversations_{org_id}"].find_one_and_update,
+                {"conversation_id": result["conversation_id"], "platform": "whatsapp"},
+                {"$max": {"free_entry_window_ends_at": free_entry_ends_at}},
+                return_document=ReturnDocument.AFTER,
+            )
+            if conversation:
+                await broadcast_main_ws(
+                    platform_id=conversation.get("whatsapp_id"),
+                    platform_type="whatsapp",
+                    event_type="conversation_updated",
+                    payload={"conversation": serialize_mongo(conversation)},
+                )
+
+        logger.success(f"WhatsApp message {message_id} status updated to {status}")
+        return result
     
     except ConnectionFailure:
         raise
