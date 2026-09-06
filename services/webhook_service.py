@@ -42,8 +42,9 @@ def calculate_whatsapp_reply_window(message_payload):
     is_ad_referral = referral.get("source_type") == "ad"
     logger.info(f"Message timestamp (UTC): {message_time_utc}, Is ad referral: {is_ad_referral}")
     
-    # Define window length
-    window_hours = 72 if is_ad_referral else 24
+    # Ad referrals have a separate 72-hour pricing window after the business
+    # replies; they do not extend Meta's 24-hour free-form reply window.
+    window_hours = 24
     logger.info(f"Using a window of {window_hours} hours for expiry calculation.")
     
     # Calculate the exact expiry time

@@ -1018,6 +1018,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             message_id=message_id,
                             status=status_type,
                             delivery_error=delivery_error,
+                            status_payload=status,
                         )
 
                         delivery_task = (
@@ -1225,9 +1226,9 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             except ValueError as exc:
                                 logger.warning(
                                     f"Failed to calculate WhatsApp reply window due to invalid/missing timestamp; "
-                                    f"using default 24h window. Error: {exc}"
+                                    f"leaving the existing window unchanged. Error: {exc}"
                                 )
-                                reply_window_expiry_time_utc = datetime.now(timezone.utc) + timedelta(hours=24)
+                                reply_window_expiry_time_utc = None
                                 is_ad_referral = False
 
                             if message_context:
