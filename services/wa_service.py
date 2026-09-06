@@ -1832,7 +1832,7 @@ async def update_whatsapp_message_status(
         if not result:
             return None
 
-        free_entry_ends_at = whatsapp_free_entry_expiry(status_payload)
+        free_entry_ends_at = whatsapp_free_entry_expiry(status_payload) if status_payload else None
         if free_entry_ends_at and result.get("conversation_id"):
             conversation = await asyncio.to_thread(
                 db[f"conversations_{org_id}"].find_one_and_update,
