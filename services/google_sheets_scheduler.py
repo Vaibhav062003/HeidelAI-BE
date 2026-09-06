@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from config.settings import ENVIRONMENT, GOOGLE_API_KEY, GOOGLE_WEBHOOK_BASE_URL
-from database import get_mongo_db, wait_for_mongo_available
+from database import get_mongo_db
 from loguru import logger
 import uuid
 
@@ -94,7 +94,6 @@ async def _channel_renewal_loop() -> None:
     """Periodically renew watch channels that are nearing expiration."""
     logger.info("[Scheduler] Channel renewal loop started.")
     while True:
-        await wait_for_mongo_available()
         try:
             from services.google_drive_webhook import renew_expiring_channels
             renewed = await renew_expiring_channels()
@@ -187,7 +186,6 @@ async def _reconciliation_loop() -> None:
     await asyncio.sleep(300)
 
     while True:
-        await wait_for_mongo_available()
         try:
             await _poll_all_sheets()
         except Exception as e:

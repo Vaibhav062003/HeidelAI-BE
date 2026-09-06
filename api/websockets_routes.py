@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import suppress
 from core.managers import manager, manager2
-from database import get_mongo_db, mongo_retry_allowed
+from database import get_mongo_db
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.services import services
 from auth.dependencies import authenticate_credentials
@@ -34,20 +34,11 @@ def _active_account_ids(default_id, connections, field: str) -> set[str]:
     return ids
 
 
-async def _reject_if_mongo_unavailable(websocket: WebSocket) -> bool:
-    if mongo_retry_allowed():
-        return False
-    await websocket.accept()
-    await websocket.close(code=1013, reason="Service temporarily unavailable")
-    return True
-
 # Add a new WebSocket endpoint for Instagram
 @router.websocket("/ws2/instagram/{client_id}")
 async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
     """WebSocket endpoint that uses both client_id and instagram_id for Instagram-specific connections"""
 
-    if await _reject_if_mongo_unavailable(websocket):
-        return
     token = websocket.headers.get("sec-websocket-protocol")
     instagram_id = None
 
@@ -125,8 +116,6 @@ async def websocket_endpoint_instagram(websocket: WebSocket, client_id: str):
 async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, whatsapp_id: str):
     """WebSocket endpoint for WhatsApp-specific connections"""
 
-    if await _reject_if_mongo_unavailable(websocket):
-        return
     protocol = websocket.headers.get("sec-websocket-protocol")
 
     try:
@@ -195,8 +184,6 @@ async def websocket_endpoint_whatsapp(websocket: WebSocket, client_id: str, what
 
 @router.websocket("/cs/{client_id}")
 async def websocket_endpoint(websocket: WebSocket):
-    if await _reject_if_mongo_unavailable(websocket):
-        return
     # Retrieve the path parameter from websocket.path_params
     client_id = websocket.path_params["client_id"]
     token = websocket.headers.get("sec-websocket-protocol")
@@ -228,8 +215,6 @@ async def websocket_endpoint(websocket: WebSocket):
 #TODO: Implement a ping-pong mechanism to kill dead connections
 @router.websocket("/main-ws/{client_id}")
 async def main_ws(websocket: WebSocket, client_id: str):
-    if await _reject_if_mongo_unavailable(websocket):
-        return
     token = websocket.headers.get("sec-websocket-protocol")
 
     try:

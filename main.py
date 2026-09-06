@@ -10,13 +10,11 @@ from fastapi.responses import JSONResponse
 from core.limiter import limiter
 from slowapi.errors import RateLimitExceeded                       
 from slowapi.middleware import SlowAPIMiddleware                    
-from pymongo.errors import ConnectionFailure
 
 # === Internal Modules ===
 from api import router
 from core.lifespan import lifespan
 from config.settings import INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET
-from database import mark_mongo_unavailable, mongo_retry_allowed
 from services.utils import format_in_ist
 
 logger.remove()
@@ -79,34 +77,6 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
             "detail": "Too many requests, please slow down.",
         }
     )            
-
-def _mongo_unavailable_response() -> JSONResponse:
-    return JSONResponse(
-        status_code=503,
-        headers={"Retry-After": "10"},
-        content={
-            "error": "database_unavailable",
-            "detail": "Service temporarily unavailable.",
-        },
-    )
-
-
-async def mongo_unavailable_handler(request: Request, exc: Exception):
-    mark_mongo_unavailable()
-    logger.error(f"MongoDB unavailable for {request.method} {request.url.path}: {type(exc).__name__}")
-    return _mongo_unavailable_response()
-
-
-app.add_exception_handler(ConnectionFailure, mongo_unavailable_handler)
-
-
-@app.middleware("http")
-async def reject_database_requests_while_mongo_recovers(request: Request, call_next):
-    path = request.url.path
-    database_request = path == "/webhook" or path.startswith("/api/")
-    if request.method != "OPTIONS" and database_request and not mongo_retry_allowed():
-        return _mongo_unavailable_response()
-    return await call_next(request)
 
 app.include_router(router)
 

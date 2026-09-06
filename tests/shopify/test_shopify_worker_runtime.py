@@ -87,7 +87,6 @@ def load_service():
         "database",
         get_async_mongo_db=lambda: FakeDB(),
         get_mongo_db=lambda: FakeDB(),
-        mark_mongo_unavailable=lambda: None,
     )
     schemas = _module("schemas")
     schemas.models = _module("schemas.models", MessageRole=MessageRole)

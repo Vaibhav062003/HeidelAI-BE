@@ -21,7 +21,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from config.settings import SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, SHOPIFY_PUBLIC_BASE_URL, WA_VERSION
-from database import get_async_mongo_db, get_mongo_db, mark_mongo_unavailable
+from database import get_async_mongo_db, get_mongo_db
 from schemas.models import MessageRole
 from services.wa_service import create_or_update_whatsapp_conversation, store_whatsapp_message
 from services.websocket_service import broadcast_org_admin_ws, broadcast_org_ws
@@ -1191,7 +1191,6 @@ async def process_shopify_syncs() -> None:
         async for item in cursor:
             await sync_shopify_org(item["org_id"])
     except PyMongoError as exc:
-        mark_mongo_unavailable()
         logger.warning("Shopify sync polling deferred: MongoDB unavailable ({})", type(exc).__name__)
 
 
@@ -2213,7 +2212,6 @@ async def process_shopify_reminders() -> None:
             {"_id": "recovery"}, {"$set": {"last_completed_at": utcnow(), "claimed_count": len(claimed), "last_error_code": None}}, upsert=True,
         )
     except PyMongoError as exc:
-        mark_mongo_unavailable()
         logger.warning("Shopify reminder polling deferred: MongoDB unavailable ({})", type(exc).__name__)
     except Exception as exc:
         try:

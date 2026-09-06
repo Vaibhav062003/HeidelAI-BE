@@ -206,12 +206,14 @@ def test_cleanup_is_idempotent_across_every_client_registry() -> None:
     assert not manager.active_connections and not manager2.active_connections
 
 
-def test_database_bootstrap_gates_lifespan_startup() -> None:
+def test_database_bootstrap_has_no_global_mongo_gate() -> None:
     source = _source("core/lifespan.py")
     lifespan = ast.get_source_segment(source, _function("core/lifespan.py", "lifespan"))
     startup = ast.get_source_segment(source, _function("core/lifespan.py", "_run_startup"))
-    assert lifespan.index("await _wait_for_mongo()") < lifespan.index("await _run_startup()") < lifespan.index("yield")
-    assert lifespan.index("monitor_task = asyncio.create_task(_monitor_mongo())") < lifespan.index("yield")
+    assert lifespan.index("await _run_startup()") < lifespan.index("yield")
+    assert "probe_mongo" not in source
+    assert "_monitor_mongo" not in source
+    assert "_wait_for_mongo" not in source
     for operation in (
         "ensure_bulk_job_indexes", "ensure_shopify_indexes", "startup_intent_worker",
         "recover_stale_bulk_jobs", "load_prompts_into_cache", "repair_legacy_shopify_connections",
@@ -220,137 +222,36 @@ def test_database_bootstrap_gates_lifespan_startup() -> None:
         assert operation not in lifespan
 
 
-def test_mongo_release_boundaries() -> None:
+def test_mongo_runtime_uses_driver_defaults_without_a_circuit() -> None:
     client_source = (ROOT / "database/__init__.py").read_text()
-    assert "MONGO_CLIENT_OPTIONS" not in client_source
     assert "AsyncIOMotorClient(MONGODB_URI)" in client_source
     assert "MongoClient(MONGODB_URI)" in client_source
-    assert "serverSelectionTimeoutMS=MONGO_PROBE_TIMEOUT_MS" in client_source
-    assert "connectTimeoutMS=MONGO_PROBE_TIMEOUT_MS" in client_source
-    assert "maxPoolSize=1" in client_source
-
-    main_source = _source("main.py")
-    handler = ast.get_source_segment(main_source, _function("main.py", "mongo_unavailable_handler"))
-    response = ast.get_source_segment(main_source, _function("main.py", "_mongo_unavailable_response"))
-    circuit = ast.get_source_segment(
-        main_source,
-        _function("main.py", "reject_database_requests_while_mongo_recovers"),
-    )
-    assert "mark_mongo_unavailable()" in handler
-    assert 'status_code=503' in response
-    assert '"Retry-After": "10"' in response
-    assert '"database_unavailable"' in response
-    assert "str(exc)" not in handler
-    assert 'path == "/webhook" or path.startswith("/api/")' in circuit
-    assert 'request.method != "OPTIONS"' in circuit
-    assert "not mongo_retry_allowed()" in circuit
+    runtime_paths = [ROOT / "main.py"]
+    for directory in ("api", "core", "database", "services"):
+        runtime_paths.extend((ROOT / directory).rglob("*.py"))
+    runtime_source = "\n".join(path.read_text(encoding="utf-8") for path in runtime_paths)
+    for removed in (
+        "serverSelectionTimeoutMS", "connectTimeoutMS", "socketTimeoutMS", "maxTimeMS",
+        "probe_mongo", "mongo_retry_allowed", "wait_for_mongo_available",
+        "mark_mongo_available", "mark_mongo_unavailable",
+    ):
+        assert removed not in runtime_source
 
 
-def test_mongo_outage_state_recovers_only_when_marked_available() -> None:
-    tree = ast.parse(_source("database/__init__.py"))
-    wanted_assignments = {"_mongo_available"}
-    nodes = [
-        node for node in tree.body
-        if (
-            isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id in wanted_assignments for target in node.targets)
-        )
-        or isinstance(node, ast.FunctionDef)
-        and node.name in {"mark_mongo_unavailable", "mark_mongo_available", "mongo_retry_allowed"}
-    ]
-    namespace = {}
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), "database", "exec"), namespace)
-
-    assert not namespace["mongo_retry_allowed"]()
-    namespace["mark_mongo_available"]()
-    assert namespace["mongo_retry_allowed"]()
-    namespace["mark_mongo_unavailable"]()
-    assert not namespace["mongo_retry_allowed"]()
-    namespace["mark_mongo_available"]()
-    assert namespace["mongo_retry_allowed"]()
-
-
-def test_mongo_startup_uses_one_short_probe_with_backoff() -> None:
-    node = copy.deepcopy(_function("core/lifespan.py", "_wait_for_mongo"))
-    node.returns = None
-    clock = SimpleNamespace(now=0.0)
-    delays = []
-    attempts = []
-    state = []
-
-    class MongoError(Exception):
-        pass
-
-    async def to_thread(function):
-        return function()
-
-    async def sleep(delay):
-        delays.append(delay)
-        clock.now += delay
-
-    def probe():
-        attempts.append(True)
-        if len(attempts) < 3:
-            raise MongoError
-
-    namespace = {
-        "asyncio": SimpleNamespace(
-            get_running_loop=lambda: SimpleNamespace(time=lambda: clock.now),
-            to_thread=to_thread,
-            sleep=sleep,
-        ),
-        "MONGO_BOOT_TIMEOUT_SECONDS": 90,
-        "PyMongoError": MongoError,
-        "probe_mongo": probe,
-        "mark_mongo_available": lambda: state.append("ready"),
-        "mark_mongo_unavailable": lambda: state.append("unavailable"),
-        "logger": SimpleNamespace(warning=lambda *_: None),
-    }
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "lifespan", "exec"), namespace)
-    asyncio.run(namespace["_wait_for_mongo"]())
-    assert len(attempts) == 3
-    assert delays == [2, 4]
-    assert state == ["unavailable", "unavailable", "ready"]
-
-
-def test_scheduler_defers_all_jobs_while_mongo_circuit_is_open() -> None:
+def test_scheduler_runs_jobs_without_a_mongo_circuit() -> None:
     source = _source("core/scheduler.py")
-    run_job = ast.get_source_segment(source, _function("core/scheduler.py", "_run_mongo_job"))
-    add_job = ast.get_source_segment(source, _function("core/scheduler.py", "_add_mongo_job"))
     start = ast.get_source_segment(source, _function("core/scheduler.py", "start_scheduler"))
-    assert "if not mongo_retry_allowed()" in run_job
-    assert "except PyMongoError" in run_job
-    assert "mark_mongo_unavailable()" in run_job
-    assert "scheduler.add_job(" in add_job
-    assert "scheduler.add_job(" not in start
-    assert start.count("_add_mongo_job(") == 18
+    assert "_add_mongo_job" not in source
+    assert start.count("scheduler.add_job(") == 18
 
 
-def test_readiness_fails_closed_on_mongo_timeout() -> None:
-    node = copy.deepcopy(_function("api/common_routes.py", "readiness_check"))
-    node.decorator_list = []
-    node.returns = None
-    for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
-        arg.annotation = None
-
-    class Response:
-        def __init__(self, *, status_code, content):
-            self.status_code = status_code
-            self.content = content
-
-    namespace = {
-        "os": SimpleNamespace(getenv=lambda *_: "revision"),
-        "mongo_retry_allowed": lambda: False,
-        "JSONResponse": Response,
-    }
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "ready", "exec"), namespace)
-    response = asyncio.run(namespace["readiness_check"](None))
-    assert response.status_code == 503
-    assert response.content == {
-        "status": "not_ready",
-        "revision": "revision",
-        "dependency": "mongodb",
-    }
+def test_deployments_verify_liveness_and_exact_revision() -> None:
+    assert '@router.get("/ready")' not in _source("api/common_routes.py")
+    for workflow in ("deploy-dev.yml", "deploy-main.yml"):
+        source = (ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
+        assert "/health" in source
+        assert ".status == \"ok\" and .revision == $revision" in source
+        assert "/ready" not in source
 
 
 def test_whatsapp_critical_sync_operations_leave_the_event_loop() -> None:
@@ -441,12 +342,10 @@ if __name__ == "__main__":
     test_control_frames_are_bounded_and_typed()
     test_websocket_identifiers_and_legacy_auth_are_bounded()
     test_cleanup_is_idempotent_across_every_client_registry()
-    test_database_bootstrap_gates_lifespan_startup()
-    test_mongo_release_boundaries()
-    test_mongo_outage_state_recovers_only_when_marked_available()
-    test_mongo_startup_uses_one_short_probe_with_backoff()
-    test_scheduler_defers_all_jobs_while_mongo_circuit_is_open()
-    test_readiness_fails_closed_on_mongo_timeout()
+    test_database_bootstrap_has_no_global_mongo_gate()
+    test_mongo_runtime_uses_driver_defaults_without_a_circuit()
+    test_scheduler_runs_jobs_without_a_mongo_circuit()
+    test_deployments_verify_liveness_and_exact_revision()
     test_whatsapp_critical_sync_operations_leave_the_event_loop()
     test_webhook_sync_database_operations_leave_the_event_loop()
     test_duplicate_whatsapp_status_returns_the_existing_message()

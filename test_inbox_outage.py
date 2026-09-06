@@ -39,9 +39,8 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
             pass
         class InvalidFrame(Exception):
             pass
-        scope = functions("api/websockets_routes.py", ["main_ws", "_active_account_ids", "_reject_if_mongo_unavailable"],
+        scope = functions("api/websockets_routes.py", ["main_ws", "_active_account_ids"],
                           db=db, services=state, suppress=suppress,
-                          mongo_retry_allowed=lambda: True,
                           validate_websocket_identifier=Mock(),
                           HTTPAuthorizationCredentials=lambda **kw: SimpleNamespace(**kw),
                           authenticate_credentials=AsyncMock(return_value=SimpleNamespace(org_id="org", user_id="user", role="admin", full_name="Agent")),
@@ -50,15 +49,6 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
                           WebSocketDisconnect=Disconnect, get_org_presence_snapshot=Mock(return_value={}),
                           start_heartbeat=AsyncMock(), receive_websocket_control_frame=AsyncMock(side_effect=Disconnect))
         return scope, socket, state
-
-    async def test_websocket_rejects_before_database_access_during_outage(self):
-        db = Mock(side_effect=AssertionError("outage websocket accessed database"))
-        scope, socket, _ = self.websocket_scope(db)
-        scope["mongo_retry_allowed"] = lambda: False
-        await scope["main_ws"](socket, "client")
-        socket.accept.assert_awaited_once()
-        socket.close.assert_awaited_once_with(code=1013, reason="Service temporarily unavailable")
-        scope["authenticate_credentials"].assert_not_awaited()
 
     async def assert_nonblocking(self, invoke, **kwargs):
         """A real thread-blocking fake must not hold the event loop until it returns."""
@@ -101,8 +91,6 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
             collection.find.return_value.limit.return_value.__iter__ = lambda _: stalled()
             scope = functions("services/wa_service.py", ["reconcile_pending_whatsapp_revocations"],
                               db=SimpleNamespace(whatsapp_connections=collection),
-                              mongo_retry_allowed=lambda: True,
-                              mark_mongo_unavailable=Mock(),
                               ConnectionFailure=TimeoutError)
             return await scope["reconcile_pending_whatsapp_revocations"]()
         await self.assert_nonblocking(invoke)
@@ -184,7 +172,6 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
         scope = functions("services/intent_queue_worker.py",
                           ["startup_intent_worker", "shutdown_intent_worker", "_restock_polling_loop"],
                           _polling_task=None, _restock_task=None, POLL_INTERVAL_SECONDS=15,
-                          wait_for_mongo_available=AsyncMock(),
                           _ensure_indexes=Mock(), _recover_stuck_jobs=Mock())
         running = asyncio.Event()
         async def intent_loop():
@@ -209,7 +196,6 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
         scope = functions("services/intent_queue_worker.py",
                           ["startup_intent_worker", "shutdown_intent_worker", "_restock_polling_loop", "_polling_loop"],
                           _polling_task=None, _restock_task=None, POLL_INTERVAL_SECONDS=0.001,
-                          wait_for_mongo_available=AsyncMock(),
                           _ensure_indexes=Mock(), _recover_stuck_jobs=Mock())
         polled = asyncio.Event()
         blocked = asyncio.Event()
@@ -247,7 +233,6 @@ class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
             "services/intent_queue_worker.py",
             ["_restock_polling_loop"],
             POLL_INTERVAL_SECONDS=15,
-            wait_for_mongo_available=AsyncMock(),
         )
         scope["asyncio"] = SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError)
         product = SimpleNamespace(ensure_product_request_indexes=AsyncMock(side_effect=[RuntimeError("index"), None]),

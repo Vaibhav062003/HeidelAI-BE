@@ -22,7 +22,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict
 
-from database import get_mongo_db, wait_for_mongo_available
+from database import get_mongo_db
 from services.utils import serialize_mongo
 from pymongo import ReturnDocument
 from loguru import logger
@@ -293,7 +293,6 @@ async def _polling_loop() -> None:
     logger.info("Polling loop started.")
 
     while True:
-        await wait_for_mongo_available()
         try:
             await _process_due_jobs()
         except Exception as e:
