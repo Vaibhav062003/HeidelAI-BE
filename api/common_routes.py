@@ -4,7 +4,7 @@ import re
 import requests
 import httpx
 from typing import Optional
-from database import get_mongo_db, mongo_retry_allowed
+from database import get_mongo_db
 from config.settings import APP_ID
 from config.settings import ACCESS_TOKEN
 from services.cloudinary_service import upload_media_to_cloudinary
@@ -69,7 +69,6 @@ from services.products_service import (
 
 from services.wa_service import send_whatsapp_reaction
 from loguru import logger
-from pymongo.errors import ConnectionFailure
 
 
 router = APIRouter(tags=["Common Routes"])
@@ -97,21 +96,6 @@ async def health_check_head(request: Request, response: Response):
 async def health_check_revision(request: Request):
     return {"status": "ok", "revision": os.getenv("GIT_SHA", "unknown")}
 
-
-@router.get("/ready")
-@limiter.exempt
-async def readiness_check(request: Request):
-    revision = os.getenv("GIT_SHA", "unknown")
-    if not mongo_retry_allowed():
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "not_ready",
-                "revision": revision,
-                "dependency": "mongodb",
-            },
-        )
-    return {"status": "ready", "revision": revision}
 
 @router.get("/favicon.ico", include_in_schema=False)
 @limiter.limit("60/minute")
@@ -171,8 +155,6 @@ async def get_conversations(
         )
 
     except HTTPException:
-        raise
-    except ConnectionFailure:
         raise
     except Exception as e:
         logger.error(f"Error fetching conversations for {user.org_id}: {e}")

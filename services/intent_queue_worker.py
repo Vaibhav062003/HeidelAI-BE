@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 from pymongo import ReturnDocument
 
-from database import get_mongo_db, wait_for_mongo_available
+from database import get_mongo_db
 from agents.intent_agent.agent import extract_purchase_intent
 from services.intent_agent_tools import save_intent_to_sheet, schedule_intent_followup
 
@@ -100,7 +100,6 @@ def enqueue_intent_check(
 async def _polling_loop() -> None:
     logger.info("Intent polling loop started.")
     while True:
-        await wait_for_mongo_available()
         try:
             await _process_due_jobs()
         except asyncio.CancelledError:
@@ -113,7 +112,6 @@ async def _restock_polling_loop() -> None:
     from services.product_request_service import ensure_product_request_indexes, process_restock_outbox
     ready = False
     while True:
-        await wait_for_mongo_available()
         try:
             if not ready:
                 await ensure_product_request_indexes()
