@@ -54,13 +54,13 @@ jobs:
           IMAGE: ${{ secrets.DOCKER_USERNAME_PROD }}/backend:sha-${{ github.sha }}
         run: koyeb service update backend/backend --docker "$IMAGE" --checks 8000:http:/health --checks-grace-period 8000=180 --wait --wait-timeout 15m
 
-      - name: Verify API readiness
+      - name: Verify deployed revision
         env:
           EXPECTED_REVISION: ${{ github.sha }}
         run: |
           for attempt in {1..30}; do
-            if curl --fail --silent --show-error --output readiness.json https://api.heidelai.com/ready \
-              && jq -e --arg revision "$EXPECTED_REVISION" '.status == "ready" and .revision == $revision' readiness.json; then
+            if curl --fail --silent --show-error --output health.json https://api.heidelai.com/health \
+              && jq -e --arg revision "$EXPECTED_REVISION" '.status == "ok" and .revision == $revision' health.json; then
               exit 0
             fi
             echo "Waiting for revision $EXPECTED_REVISION (attempt $attempt/30)"
