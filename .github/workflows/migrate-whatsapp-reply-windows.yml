@@ -1,0 +1,59 @@
+name: Repair WhatsApp reply windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Koyeb environment to inspect or repair
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - production
+      apply:
+        description: Apply the repair after the dry run
+        required: true
+        default: false
+        type: boolean
+      confirmation:
+        description: Type APPLY when apply is enabled
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migrate-whatsapp-reply-windows-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    env:
+      KOYEB_SERVICE: ${{ inputs.target == 'production' && 'backend/backend' || 'heidelai-dev/heidelai-dev' }}
+    steps:
+      - name: Validate input
+        env:
+          APPLY: ${{ inputs.apply }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [[ "$APPLY" == "true" ]]; then
+            [[ "$CONFIRMATION" == "APPLY" ]]
+          fi
+
+      - uses: koyeb-community/koyeb-actions@v2
+        with:
+          api_token: ${{ inputs.target == 'production' && secrets.KOYEB_TOKEN_PROD || secrets.KOYEB_TOKEN }}
+
+      - name: Dry run
+        run: script --quiet --return --command 'koyeb services exec "$KOYEB_SERVICE" python -- -m scripts.migrate_whatsapp_reply_windows' /dev/null
+
+      - name: Apply
+        if: ${{ inputs.apply }}
+        run: script --quiet --return --command 'koyeb services exec "$KOYEB_SERVICE" python -- -m scripts.migrate_whatsapp_reply_windows --apply' /dev/null
+
+      - name: Verify idempotency
+        if: ${{ inputs.apply }}
+        run: script --quiet --return --command 'koyeb services exec "$KOYEB_SERVICE" python -- -m scripts.migrate_whatsapp_reply_windows' /dev/null
