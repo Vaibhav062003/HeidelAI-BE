@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from agno.models.moonshot import MoonShot
 from config.settings import MOONSHOT_API_KEY, MOONSHOT_ENDPOINT, MOONSHOT_DEPLOYMENT_NAME
 from pydantic import BaseModel, Field
-from agno.agent import Agent, RunResponse
+from agno.agent import Agent, RunOutput
 from loguru import logger
 
 load_dotenv()
@@ -222,7 +222,7 @@ async def extract_purchase_intent(conversation_text: str, current_datetime_iso: 
     )
 
     try:
-        response: RunResponse = await intent_extraction_agent.arun(prompt)
+        response: RunOutput = await intent_extraction_agent.arun(prompt)
         if isinstance(response.content, PurchaseIntentResult):
             return response.content
 

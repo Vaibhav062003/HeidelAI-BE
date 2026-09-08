@@ -1,4 +1,4 @@
-from agno.agent import Agent, RunResponse
+from agno.agent import Agent, RunOutput
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -91,7 +91,7 @@ def generate_followup_message(conversation: str) -> FollowUpAgentResponse:
     Returns:
         FollowUpAgentResponse: An object containing the follow-up message and delay.
     """
-    response: RunResponse = follow_up_agent.run(conversation)
+    response: RunOutput = follow_up_agent.run(conversation)
     if isinstance(response.content, FollowUpAgentResponse):
         return response.content
     else:
@@ -100,7 +100,7 @@ def generate_followup_message(conversation: str) -> FollowUpAgentResponse:
 
 @traceable(run_type="llm", name="follow-up-reply-analysis", metadata={"model": MOONSHOT_DEPLOYMENT})
 def analyze_followup_reply(customer_reply: str) -> FollowUpReplyAnalysis:
-    response: RunResponse = follow_up_reply_agent.run(customer_reply)
+    response: RunOutput = follow_up_reply_agent.run(customer_reply)
     if isinstance(response.content, FollowUpReplyAnalysis):
         return response.content
     raise ValueError("AI response is not in the expected format")
