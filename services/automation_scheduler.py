@@ -502,6 +502,11 @@ def _ensure_indexes() -> None:
     col.create_index([("org_id", 1), ("flow_id", 1)])
     col.create_index([("org_id", 1), ("conversation_id", 1)])
     col.create_index("schedule_id", unique=True)
+    
+    # 7-day TTL cleanup for completed and cancelled jobs
+    col.create_index("completed_at", expireAfterSeconds=7 * 24 * 60 * 60)
+    col.create_index("cancelled_at", expireAfterSeconds=7 * 24 * 60 * 60)
+    
     logger.info("automation_scheduled_followups indexes ensured.")
 
 

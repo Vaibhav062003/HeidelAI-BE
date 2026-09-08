@@ -330,6 +330,13 @@ async def _trigger_google_sheet_automations(org_id: str, sheet_id: str) -> None:
     except Exception as e:
         logger.error(f"[Scheduler] Error triggering google_sheet automations for sheet {sheet_id}: {e}")
 
+    # Doctor patient follow-up (client-specific, no-ops for other orgs)
+    try:
+        from services.doctor_followup_worker import process_doctor_followups
+        await process_doctor_followups(org_id, sheet_id)
+    except Exception as e:
+        logger.error(f"[Scheduler] Error processing doctor follow-ups for sheet {sheet_id}: {e}")
+
 
 # ─── MongoDB Indexes ──────────────────────────────────────────────────────────
 
