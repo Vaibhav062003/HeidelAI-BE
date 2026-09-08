@@ -30,6 +30,7 @@ from services.push_notification_service import (
     start_push_notification_workers,
     stop_push_notification_workers,
 )
+from services.doctor_followup_worker import startup_doctor_followup_worker, shutdown_doctor_followup_worker
 
 
 async def _run_startup() -> None:
@@ -51,6 +52,7 @@ async def _run_startup() -> None:
         ("entitlement indexes", lambda: asyncio.to_thread(ensure_entitlement_indexes)),
         ("push notification workers", start_push_notification_workers),
         ("intent worker", startup_intent_worker),
+        ("doctor followup worker", startup_doctor_followup_worker),
         ("bulk job recovery", lambda: asyncio.to_thread(recover_stale_bulk_jobs)),
         ("prompt cache loading", lambda: asyncio.to_thread(load_prompts_into_cache)),
         ("Shopify legacy repair", repair_legacy_shopify_connections),
@@ -79,6 +81,7 @@ async def lifespan(app: FastAPI):
         await shutdown_intent_worker()
         await shutdown_scheduler()
         await shutdown_google_scheduler()
+        await shutdown_doctor_followup_worker()
         if revocation_task:
             if not revocation_task.done():
                 revocation_task.cancel()

@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from agno.models.moonshot import MoonShot
 from config.settings import MOONSHOT_API_KEY, MOONSHOT_ENDPOINT, MOONSHOT_DEPLOYMENT_NAME
 from pydantic import BaseModel, Field
-from agno.agent import Agent, RunOutput
+from agno.agent import Agent, RunResponse
 from loguru import logger
 import json
 
@@ -87,7 +87,7 @@ async def analyze_conversation(conversation: str, available_tags: list = None, a
         separators=(",", ":"),
     )
 
-    response: RunOutput = await chat_analysis_agent.arun(prompt)
+    response: RunResponse = await chat_analysis_agent.arun(prompt)
     if isinstance(response.content, ConversationSummary):
         return response.content
 
