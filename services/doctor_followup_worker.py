@@ -30,7 +30,7 @@ db = get_mongo_db()
 # =============================================================================
 # CONSTANTS — Change DOCTOR_ORG_ID to enable for a client
 # =============================================================================
-DOCTOR_ORG_ID = "2zV2OOhodLocEnTybzR8t9MIYCE"
+DOCTOR_ORG_ID = "org_2zV2OOhodLocEnTybzR8t9MIYCE"
 
 SHEET_TAB_NAME = "1 - Master Tracker"
 
@@ -205,20 +205,19 @@ async def startup_doctor_followup_worker():
     _firing_task = asyncio.create_task(_firing_loop())
     logger.info("[DoctorFollowup] Background firing loop started.")
 
-    # Run a one-time catch-up scan
+    # Run a one-time catch-up scan for any connected sheet for this org
     conn = await asyncio.to_thread(
         lambda: db.google_sheets_connections.find_one({
             "org_id": DOCTOR_ORG_ID,
-            "tab_name": SHEET_TAB_NAME,
         })
     )
     if conn:
-        logger.info("[DoctorFollowup] Running startup catch-up scan...")
+        logger.info(f"[DoctorFollowup] Running startup catch-up scan for sheet {conn['sheet_id']}...")
         await process_doctor_followups(DOCTOR_ORG_ID, conn["sheet_id"])
     else:
         logger.warning(
-            f"[DoctorFollowup] No sheet connection found for org={DOCTOR_ORG_ID}, "
-            f"tab='{SHEET_TAB_NAME}'. Will process when a matching sheet is synced."
+            f"[DoctorFollowup] No sheet connection found for org={DOCTOR_ORG_ID}. "
+            f"Will process when a sheet is synced."
         )
 
 
@@ -336,16 +335,20 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
     if org_id != DOCTOR_ORG_ID:
         return
 
-    # Verify this is the correct sheet (the Master Tracker tab)
+    # Verify this is the correct sheet
     conn = await asyncio.to_thread(
         lambda: db.google_sheets_connections.find_one({
             "org_id": org_id,
             "sheet_id": sheet_id,
-            "tab_name": SHEET_TAB_NAME,
         })
     )
     if not conn:
+        logger.warning(f"[DoctorFollowup] Sheet {sheet_id} not found in connections for org {org_id}")
         return
+
+    actual_tab_name = conn.get("tab_name", "")
+    if actual_tab_name != SHEET_TAB_NAME:
+        logger.info(f"[DoctorFollowup] Processing sheet with tab '{actual_tab_name}' (expected '{SHEET_TAB_NAME}')")
 
     rows_col = db[f"google_sheet_rows_{org_id}"]
     tracking_col = db[TRACKING_COLLECTION]
