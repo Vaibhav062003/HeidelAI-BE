@@ -17,6 +17,7 @@ TO ENABLE FOR A CLIENT:
 
 import asyncio
 import re
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -25,7 +26,6 @@ from database import get_mongo_db
 from loguru import logger
 
 db = get_mongo_db()
-from services.automation_scheduler import schedule_followup, cancel_conversation_followups
 
 # =============================================================================
 # CONSTANTS — Change DOCTOR_ORG_ID to enable for a client
@@ -107,6 +107,69 @@ def _parse_sheet_date(date_str: str) -> Optional[datetime]:
     return None
 
 
+def _get_wa_connection(org_id: str) -> Optional[dict]:
+    """
+    Get WhatsApp Business connection for the org.
+    Returns dict with wa_id, phone_id, access_token, phone.
+    """
+    from services.wa_service import resolve_outbound_whatsapp_connection
+    org = db.organizations.find_one({"org_id": org_id}, {"wa_id": 1})
+    if not org or not org.get("wa_id"):
+        return None
+    return resolve_outbound_whatsapp_connection(org_id, org["wa_id"], None)
+
+
+# =============================================================================
+# DIRECT MESSAGE SENDER — bypasses scheduler, sends immediately or scheduled
+# =============================================================================
+
+async def _send_doctor_followup_message(
+    org_id: str,
+    phone: str,
+    patient_name: str,
+    message_text: str,
+    wa_connection: dict,
+) -> dict:
+    """
+    Send a WhatsApp message directly to a patient's number.
+    Creates a conversation if one doesn't exist (just like google_sheet_automation does).
+    """
+    from services.wa_service import (
+        send_whatsapp_message,
+        create_or_update_whatsapp_conversation,
+    )
+
+    wa_id = wa_connection["wa_id"]
+    phone_id = wa_connection.get("phone_id")
+    business_phone = wa_connection.get("phone")
+
+    # Step 1: Create or update conversation (upsert=True handles new contacts)
+    conversation_id = await create_or_update_whatsapp_conversation(
+        org_id=org_id,
+        recipient_id=wa_id,
+        customer_phone_no=phone,
+        customer_name=patient_name or phone,
+        last_message=message_text,
+        last_sender="agent",
+        mode="reply",
+        business_phone_id=phone_id,
+        business_phone=business_phone,
+    )
+
+    # Step 2: Send the message
+    result = await send_whatsapp_message(
+        message={
+            "conversation_id": conversation_id,
+            "content": message_text,
+            "sender_id": wa_id,
+        },
+        org_id=org_id,
+        mode="reply",
+    )
+
+    return result
+
+
 # =============================================================================
 # STARTUP — Create indexes + run initial catch-up scan
 # =============================================================================
@@ -114,21 +177,21 @@ def _parse_sheet_date(date_str: str) -> Optional[datetime]:
 def _ensure_indexes():
     """Create indexes for tracking and automatic TTL cleanup."""
     col = db[TRACKING_COLLECTION]
-    # Unique index to prevent duplicate tracking per row
     col.create_index(
         [("org_id", 1), ("sheet_id", 1), ("row_number", 1)],
         unique=True,
     )
-    # TTL index: delete records 7 days (604800 seconds) after the target appointment date
     col.create_index("target_date_utc", expireAfterSeconds=7 * 24 * 60 * 60)
 
 
 async def startup_doctor_followup_worker():
     """
     Called once at server boot from lifespan.py.
-    Creates indexes and runs an initial catch-up scan for any rows
-    that may have been added while the server was down.
+    Creates indexes, starts the background firing loop,
+    and runs an initial catch-up scan.
     """
+    global _firing_task
+
     if DOCTOR_ORG_ID == "REPLACE_WITH_CLIENT_ORG_ID":
         logger.info("[DoctorFollowup] Skipped — DOCTOR_ORG_ID not configured.")
         return
@@ -138,7 +201,11 @@ async def startup_doctor_followup_worker():
     except Exception as e:
         logger.error(f"[DoctorFollowup] Index creation failed: {e}")
 
-    # Find the sheet and run a one-time catch-up scan
+    # Start the background loop that fires scheduled messages
+    _firing_task = asyncio.create_task(_firing_loop())
+    logger.info("[DoctorFollowup] Background firing loop started.")
+
+    # Run a one-time catch-up scan
     conn = await asyncio.to_thread(
         lambda: db.google_sheets_connections.find_one({
             "org_id": DOCTOR_ORG_ID,
@@ -155,9 +222,100 @@ async def startup_doctor_followup_worker():
         )
 
 
+_firing_task: Optional[asyncio.Task] = None
+
+
 async def shutdown_doctor_followup_worker():
-    """Nothing to clean up — no background tasks or polling loops."""
-    logger.info("[DoctorFollowup] Shutdown complete (no background tasks to cancel).")
+    """Cancel the background firing loop."""
+    global _firing_task
+    if _firing_task and not _firing_task.done():
+        _firing_task.cancel()
+        try:
+            await _firing_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("[DoctorFollowup] Shutdown complete.")
+
+
+# =============================================================================
+# BACKGROUND LOOP — Fires scheduled messages when their time arrives
+# =============================================================================
+
+async def _firing_loop():
+    """
+    Lightweight loop that checks every 60 seconds for follow-ups ready to fire.
+    When fire_at <= now, sends the message directly via WhatsApp API.
+    """
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await _fire_ready_followups()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[DoctorFollowup] Firing loop error: {e}")
+            await asyncio.sleep(60)
+
+
+async def _fire_ready_followups():
+    """Find all tracking records with status=scheduled and fire_at <= now, and send them."""
+    tracking_col = db[TRACKING_COLLECTION]
+    now_utc = datetime.now(timezone.utc)
+
+    ready_jobs = await asyncio.to_thread(
+        lambda: list(tracking_col.find({
+            "org_id": DOCTOR_ORG_ID,
+            "status": "scheduled",
+            "fire_at_utc": {"$lte": now_utc},
+        }))
+    )
+
+    if not ready_jobs:
+        return
+
+    logger.info(f"[DoctorFollowup] Firing {len(ready_jobs)} ready follow-up(s)...")
+
+    # Get WhatsApp connection once for all sends
+    wa_connection = await asyncio.to_thread(_get_wa_connection, DOCTOR_ORG_ID)
+    if not wa_connection:
+        logger.error(f"[DoctorFollowup] No WhatsApp connection for org {DOCTOR_ORG_ID} — cannot send!")
+        return
+
+    for job in ready_jobs:
+        phone = job.get("patient_phone", "")
+        patient_name = job.get("patient_name", "")
+        message_text = job.get("message_text", "")
+        row_number = job.get("row_number", "?")
+
+        try:
+            result = await _send_doctor_followup_message(
+                org_id=DOCTOR_ORG_ID,
+                phone=phone,
+                patient_name=patient_name,
+                message_text=message_text,
+                wa_connection=wa_connection,
+            )
+            logger.success(
+                f"[DoctorFollowup] ✅ Sent to {phone} (row {row_number}). "
+                f"message_id={result.get('message_id', 'N/A')}"
+            )
+
+            # Mark as sent
+            await asyncio.to_thread(
+                lambda: tracking_col.update_one(
+                    {"_id": job["_id"]},
+                    {"$set": {"status": "sent", "sent_at": datetime.now(timezone.utc)}}
+                )
+            )
+        except Exception as e:
+            logger.error(f"[DoctorFollowup] Failed to send to {phone} (row {row_number}): {e}")
+            # Mark as failed so it doesn't retry forever
+            await asyncio.to_thread(
+                lambda: tracking_col.update_one(
+                    {"_id": job["_id"]},
+                    {"$set": {"status": "failed", "error": str(e)}}
+                )
+            )
 
 
 # =============================================================================
@@ -171,7 +329,8 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
       2. `startup_doctor_followup_worker()` in lifespan.py (one-time catch-up)
 
     Reads all synced rows from MongoDB, checks for follow-up dates,
-    and schedules/updates WhatsApp reminders.
+    and schedules follow-ups in our tracking collection.
+    The background _firing_loop() picks them up when it's time.
     """
     # Only process for the configured doctor client
     if org_id != DOCTOR_ORG_ID:
@@ -217,14 +376,8 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
         diagnosis = _find_column(row_data, DIAGNOSIS_KEYWORDS) or ""
         next_date_str = _find_column(row_data, FOLLOWUP_DATE_KEYWORDS) or ""
 
-        # Skip rows missing required data
+        # Skip rows missing required data (name + phone + followup date are required)
         if not patient_name or not raw_phone or not next_date_str:
-            if row_number <= 5:  # Log first few rows for debugging
-                logger.debug(
-                    f"[DoctorFollowup] Row {row_number} skipped — "
-                    f"name='{patient_name}', phone='{raw_phone}', "
-                    f"followup_date='{next_date_str}'"
-                )
             continue
 
         phone = _normalize_phone(raw_phone)
@@ -251,7 +404,7 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
             })
         )
 
-        # Same row, same date → already scheduled, skip
+        # Same row, same date → already scheduled/sent, skip
         if existing and existing.get("next_followup_date_str") == next_date_str:
             skipped_count += 1
             continue
@@ -261,86 +414,60 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
         fire_at_ist = day_before.replace(hour=10, minute=0, second=0, microsecond=0)
         fire_at_utc = fire_at_ist.astimezone(timezone.utc)
 
-        # If 10 AM yesterday already passed, use 5-min fallback (appointment is today/tomorrow)
+        # If fire time already passed, send within 2 minutes
         if fire_at_utc < now_utc:
-            fire_at_utc = now_utc + timedelta(minutes=5)
+            fire_at_utc = now_utc + timedelta(minutes=2)
 
-        delay_seconds = max(int((fire_at_utc - now_utc).total_seconds()), 60)
-
-        conversation_id = f"whatsapp_{phone}"
         message_text = (
             f"Hi {patient_name}, this is a reminder from Dr. Mhaske Hospital.\n"
             f"You have a follow-up visit scheduled for {next_date_str} regarding {diagnosis}.\n"
             f"Please visit the hospital as scheduled."
         )
 
-        # --- If date changed, cancel old follow-up first ---
-        if existing and existing.get("schedule_id"):
-            try:
-                await asyncio.to_thread(
-                    cancel_conversation_followups,
-                    org_id=org_id,
-                    conversation_id=conversation_id,
-                    reason="appointment_rescheduled",
-                    flow_id=FLOW_ID,
-                )
-                logger.info(f"[DoctorFollowup] Cancelled old follow-up for row {row_number} ({phone})")
-            except Exception as e:
-                logger.warning(f"[DoctorFollowup] Failed to cancel old follow-up for row {row_number}: {e}")
-
-        # --- Schedule new follow-up ---
-        try:
-            _ds = delay_seconds  # capture for lambda
-            _cid = conversation_id
-            _msg = message_text
-            schedule_id = await asyncio.to_thread(
-                schedule_followup,
-                org_id=org_id,
-                flow_id=FLOW_ID,
-                conversation_id=_cid,
-                delay_seconds=_ds,
-                message_config={"text": _msg},
-                max_retries=3,
-            )
-        except Exception as e:
-            logger.error(f"[DoctorFollowup] Failed to schedule for row {row_number}: {e}")
-            continue
-
-        if schedule_id:
-            fire_at_display = fire_at_utc.astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+        # --- If date changed, cancel old tracking (will be replaced by new upsert) ---
+        if existing:
             logger.info(
-                f"[DoctorFollowup] ✅ Scheduled {schedule_id} — "
-                f"row={row_number}, phone={phone}, fires_at={fire_at_display}"
+                f"[DoctorFollowup] Date changed for row {row_number}: "
+                f"'{existing.get('next_followup_date_str')}' → '{next_date_str}'"
             )
 
-            # Upsert tracking record
-            _td_utc = target_date.astimezone(timezone.utc)
-            _nds = next_date_str
-            _sid = schedule_id
-            _pn = patient_name
-            _ph = phone
-            _diag = diagnosis
-            _now = now_utc
-            await asyncio.to_thread(
-                lambda: tracking_col.update_one(
-                    {"org_id": org_id, "sheet_id": sheet_id, "row_number": _rn},
-                    {
-                        "$set": {
-                            "patient_name": _pn,
-                            "patient_phone": _ph,
-                            "diagnosis": _diag,
-                            "next_followup_date_str": _nds,
-                            "target_date_utc": _td_utc,
-                            "schedule_id": _sid,
-                            "status": "scheduled",
-                            "updated_at": _now,
-                        },
-                        "$setOnInsert": {"created_at": _now},
+        # --- Upsert tracking record with fire_at_utc ---
+        _td_utc = target_date.astimezone(timezone.utc)
+        _nds = next_date_str
+        _pn = patient_name
+        _ph = phone
+        _diag = diagnosis
+        _fat = fire_at_utc
+        _msg = message_text
+        _now = now_utc
+
+        await asyncio.to_thread(
+            lambda: tracking_col.update_one(
+                {"org_id": org_id, "sheet_id": sheet_id, "row_number": _rn},
+                {
+                    "$set": {
+                        "patient_name": _pn,
+                        "patient_phone": _ph,
+                        "diagnosis": _diag,
+                        "next_followup_date_str": _nds,
+                        "target_date_utc": _td_utc,
+                        "fire_at_utc": _fat,
+                        "message_text": _msg,
+                        "status": "scheduled",
+                        "updated_at": _now,
                     },
-                    upsert=True,
-                )
+                    "$setOnInsert": {"created_at": _now},
+                },
+                upsert=True,
             )
-            scheduled_count += 1
+        )
+
+        fire_at_display = fire_at_utc.astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+        logger.info(
+            f"[DoctorFollowup] 📋 Queued row={row_number}, phone={phone}, "
+            f"followup={next_date_str}, fires_at={fire_at_display}"
+        )
+        scheduled_count += 1
 
     logger.info(
         f"[DoctorFollowup] Done — scheduled={scheduled_count}, "
