@@ -22,7 +22,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from database import get_mongo_db
-from core.logger import logger
+from loguru import logger
 
 db = get_mongo_db()
 from services.automation_scheduler import schedule_followup, cancel_conversation_followups
