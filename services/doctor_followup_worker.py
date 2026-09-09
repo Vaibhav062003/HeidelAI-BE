@@ -8,7 +8,7 @@ HOW IT WORKS (Event-Driven — NO polling):
 2. Google webhook fires → existing sync engine updates `google_sheet_rows_{org_id}` in MongoDB.
 3. After sync, `_trigger_google_sheet_automations()` is called (in google_sheets_scheduler.py).
 4. We hook into that call via `process_doctor_followups(org_id, sheet_id)`.
-5. For each row with a "Next Follow-up Date", we schedule a WhatsApp reminder
+5. For each row with a follow-up date, we schedule a WhatsApp reminder
    1 day prior at 10:00 AM IST.
 
 TO ENABLE FOR A CLIENT:
@@ -34,11 +34,12 @@ DOCTOR_ORG_ID = "2zV2OOhodLocEnTybzR8t9MIYCE"
 
 SHEET_TAB_NAME = "1 - Master Tracker"
 
-# Column headers (must match the Google Sheet exactly)
-COL_PATIENT_NAME = "Patient Name"
-COL_MOBILE_NO = "Mobile No"
-COL_DIAGNOSIS = "Diagnosis"
-COL_NEXT_FOLLOWUP_DATE = "Next Follow-up Date"
+# Column header keywords — we match flexibly (case-insensitive, partial match)
+# so the system works regardless of minor header name variations in the sheet.
+PATIENT_NAME_KEYWORDS = ["patient name"]
+MOBILE_NO_KEYWORDS = ["mobile", "phone", "contact"]
+DIAGNOSIS_KEYWORDS = ["diagnosis"]
+FOLLOWUP_DATE_KEYWORDS = ["follow-up date", "followup date", "follow up date", "next follow"]
 
 TRACKING_COLLECTION = "doctor_followup_tracking"
 FLOW_ID = "__doctor_followup_reminder__"
@@ -48,6 +49,19 @@ IST = ZoneInfo("Asia/Kolkata")
 # =============================================================================
 # HELPERS
 # =============================================================================
+
+def _find_column(row_data: dict, keywords: list[str]) -> Optional[str]:
+    """
+    Find a column value by fuzzy-matching column headers against keywords.
+    Returns the value (str) of the first matching column, or None.
+    """
+    for header, value in row_data.items():
+        header_lower = header.strip().lower()
+        for kw in keywords:
+            if kw in header_lower:
+                return str(value).strip() if value else ""
+    return None
+
 
 def _normalize_phone(raw: str) -> str:
     """
@@ -73,7 +87,18 @@ def _parse_sheet_date(date_str: str) -> Optional[datetime]:
     if not date_str:
         return None
 
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%d/%m/%y"):
+    for fmt in (
+        "%d/%m/%Y",    # 25/12/2026
+        "%d-%m-%Y",    # 25-12-2026
+        "%d.%m.%Y",    # 09.09.2026  (dot-separated)
+        "%Y-%m-%d",    # 2026-12-25
+        "%d %b %Y",    # 25 Dec 2026
+        "%d %B %Y",    # 25 December 2026
+        "%d/%m/%y",    # 25/12/26
+        "%d-%m-%y",    # 25-12-26
+        "%d.%m.%y",    # 09.09.26
+        "%m/%d/%Y",    # 12/25/2026 (US format, fallback)
+    ):
         try:
             dt = datetime.strptime(date_str, fmt)
             return dt.replace(tzinfo=IST)
@@ -145,7 +170,7 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
       1. `_trigger_google_sheet_automations()` in google_sheets_scheduler.py (webhook-driven)
       2. `startup_doctor_followup_worker()` in lifespan.py (one-time catch-up)
 
-    Reads all synced rows from MongoDB, checks for 'Next Follow-up Date',
+    Reads all synced rows from MongoDB, checks for follow-up dates,
     and schedules/updates WhatsApp reminders.
     """
     # Only process for the configured doctor client
@@ -172,6 +197,13 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
         lambda: list(rows_col.find({"sheet_id": sheet_id}))
     )
 
+    logger.info(f"[DoctorFollowup] Processing {len(rows)} row(s) from sheet {sheet_id}")
+
+    # Log the column headers from the first row to help debug column name mismatches
+    if rows:
+        first_row_data = rows[0].get("row_data", {})
+        logger.info(f"[DoctorFollowup] Sheet column headers: {list(first_row_data.keys())}")
+
     scheduled_count = 0
     skipped_count = 0
 
@@ -179,23 +211,30 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
         row_number = row_doc["row_number"]
         row_data = row_doc.get("row_data", {})
 
-        # --- Extract required fields ---
-        patient_name = row_data.get(COL_PATIENT_NAME, "").strip()
-        raw_phone = row_data.get(COL_MOBILE_NO, "")
-        diagnosis = row_data.get(COL_DIAGNOSIS, "").strip()
-        next_date_str = row_data.get(COL_NEXT_FOLLOWUP_DATE, "").strip()
+        # --- Extract required fields using fuzzy column matching ---
+        patient_name = _find_column(row_data, PATIENT_NAME_KEYWORDS) or ""
+        raw_phone = _find_column(row_data, MOBILE_NO_KEYWORDS) or ""
+        diagnosis = _find_column(row_data, DIAGNOSIS_KEYWORDS) or ""
+        next_date_str = _find_column(row_data, FOLLOWUP_DATE_KEYWORDS) or ""
 
         # Skip rows missing required data
         if not patient_name or not raw_phone or not next_date_str:
+            if row_number <= 5:  # Log first few rows for debugging
+                logger.debug(
+                    f"[DoctorFollowup] Row {row_number} skipped — "
+                    f"name='{patient_name}', phone='{raw_phone}', "
+                    f"followup_date='{next_date_str}'"
+                )
             continue
 
         phone = _normalize_phone(raw_phone)
         if not phone:
+            logger.warning(f"[DoctorFollowup] Row {row_number} — unusable phone: '{raw_phone}'")
             continue
 
         target_date = _parse_sheet_date(next_date_str)
         if not target_date:
-            logger.warning(f"[DoctorFollowup] Unparseable date '{next_date_str}' in row {row_number}")
+            logger.warning(f"[DoctorFollowup] Row {row_number} — unparseable date: '{next_date_str}'")
             continue
 
         # Skip appointments that are firmly in the past
@@ -203,11 +242,12 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
             continue
 
         # --- Dedup check ---
+        _rn = row_number  # capture for lambda
         existing = await asyncio.to_thread(
             lambda: tracking_col.find_one({
                 "org_id": org_id,
                 "sheet_id": sheet_id,
-                "row_number": row_number,
+                "row_number": _rn,
             })
         )
 
@@ -250,13 +290,16 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
 
         # --- Schedule new follow-up ---
         try:
+            _ds = delay_seconds  # capture for lambda
+            _cid = conversation_id
+            _msg = message_text
             schedule_id = await asyncio.to_thread(
                 schedule_followup,
                 org_id=org_id,
                 flow_id=FLOW_ID,
-                conversation_id=conversation_id,
-                delay_seconds=delay_seconds,
-                message_config={"text": message_text},
+                conversation_id=_cid,
+                delay_seconds=_ds,
+                message_config={"text": _msg},
                 max_retries=3,
             )
         except Exception as e:
@@ -271,26 +314,35 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
             )
 
             # Upsert tracking record
+            _td_utc = target_date.astimezone(timezone.utc)
+            _nds = next_date_str
+            _sid = schedule_id
+            _pn = patient_name
+            _ph = phone
+            _diag = diagnosis
+            _now = now_utc
             await asyncio.to_thread(
                 lambda: tracking_col.update_one(
-                    {"org_id": org_id, "sheet_id": sheet_id, "row_number": row_number},
+                    {"org_id": org_id, "sheet_id": sheet_id, "row_number": _rn},
                     {
                         "$set": {
-                            "patient_name": patient_name,
-                            "patient_phone": phone,
-                            "diagnosis": diagnosis,
-                            "next_followup_date_str": next_date_str,
-                            "target_date_utc": target_date.astimezone(timezone.utc),
-                            "schedule_id": schedule_id,
+                            "patient_name": _pn,
+                            "patient_phone": _ph,
+                            "diagnosis": _diag,
+                            "next_followup_date_str": _nds,
+                            "target_date_utc": _td_utc,
+                            "schedule_id": _sid,
                             "status": "scheduled",
-                            "updated_at": now_utc,
+                            "updated_at": _now,
                         },
-                        "$setOnInsert": {"created_at": now_utc},
+                        "$setOnInsert": {"created_at": _now},
                     },
                     upsert=True,
                 )
             )
             scheduled_count += 1
 
-    if scheduled_count:
-        logger.info(f"[DoctorFollowup] Processed {scheduled_count} new/updated follow-up(s), skipped {skipped_count} unchanged.")
+    logger.info(
+        f"[DoctorFollowup] Done — scheduled={scheduled_count}, "
+        f"skipped_unchanged={skipped_count}, total_rows={len(rows)}"
+    )
