@@ -21,8 +21,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from core.database import db
+from database import get_mongo_db
 from core.logger import logger
+
+db = get_mongo_db()
 from services.automation_scheduler import schedule_followup, cancel_conversation_followups
 
 # =============================================================================
