@@ -39,7 +39,7 @@ SHEET_TAB_NAME = "1 - Master Tracker"
 PATIENT_NAME_KEYWORDS = ["patient name"]
 MOBILE_NO_KEYWORDS = ["mobile", "phone", "contact"]
 DIAGNOSIS_KEYWORDS = ["diagnosis"]
-FOLLOWUP_DATE_KEYWORDS = ["follow-up date", "followup date", "follow up date", "next follow"]
+FOLLOWUP_DATE_KEYWORDS = ["next follow-up date", "next followup date", "next follow up date", "next follow"]
 
 TRACKING_COLLECTION = "doctor_followup_tracking"
 FLOW_ID = "__doctor_followup_reminder__"
