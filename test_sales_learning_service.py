@@ -77,7 +77,8 @@ def test_negative_customer_reaction_records_a_complaint_for_the_sales_case():
         await record_reaction("org-1", "conversation-1", "event-1", "message-1", "👎🏽", "react", "whatsapp")
         await record_reaction("org-1", "conversation-1", "event-2", "message-1", "❤️", "react", "whatsapp")
 
-    with patch("services.sales_case_service.get_active_sales_case", AsyncMock(return_value=case)), \
+    with patch("services.sales_workflow_service.enabled", AsyncMock(return_value=False)), \
+            patch("services.sales_case_service.get_active_sales_case", AsyncMock(return_value=case)), \
             patch("services.sales_learning_service.record_sales_learning_event", recorder):
         asyncio.run(record_reactions())
 
@@ -95,7 +96,8 @@ def test_verified_tally_outcome_does_not_replace_action_owner():
         "action_source_message_id": "wamid.customer",
     }
     set_outcome = AsyncMock()
-    with patch("services.sales_case_service.get_active_sales_case", AsyncMock(return_value=case)), \
+    with patch("services.sales_workflow_service.enabled", AsyncMock(return_value=False)), \
+            patch("services.sales_case_service.get_active_sales_case", AsyncMock(return_value=case)), \
             patch("services.sales_case_service.set_verified_sales_outcome", set_outcome), \
             patch("services.sales_learning_service.record_sales_learning_event", AsyncMock(return_value=True)):
         asyncio.run(record_verified_tally_outcome(

@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 # === Load Environment Variables ===
 load_dotenv()
 
+CHATBOT_BASE_URL = (os.getenv("CHATBOT_BASE_URL", "").strip() or "https://backend-chatbot.koyeb.app").rstrip("/")
+
 IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
 IG_ID = os.getenv("IG_ID")
 IG_VERSION = os.getenv("IG_VERSION")

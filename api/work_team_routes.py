@@ -1,4 +1,5 @@
 from typing import Literal, Optional
+from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -34,6 +35,10 @@ class WorkPayload(BaseModel):
     quote_id: Optional[str] = None
     quote_revision: Optional[int] = None
     note: Optional[str] = Field(default=None, max_length=500)
+    case_id: Optional[str] = Field(default=None, max_length=100)
+    case_version: Optional[int] = Field(default=None, ge=0)
+    due_at: Optional[datetime] = None
+    referenced_message_ids: list[str] = Field(default_factory=list, max_length=20)
 
 
 class WorkUpdatePayload(BaseModel):
@@ -89,6 +94,12 @@ async def create_work(request: Request, conversation_id: str, payload: WorkPaylo
     work, created = await create_conversation_work(
         user.org_id, conversation_id, user.user_id, user.full_name or "Team member", user.role, payload.model_dump()
     )
+    if work.get("case_id"):
+        from services.sales_workflow_service import refresh_summary, event, _collection
+        case = await _collection(user.org_id).find_one({"case_id": work["case_id"]})
+        if case:
+            await event(case, "handoff", work["work_id"], user.user_id)
+        await refresh_summary(user.org_id, conversation_id)
     return {"work_item": work, "created": created}
 
 

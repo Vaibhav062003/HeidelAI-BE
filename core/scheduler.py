@@ -26,6 +26,8 @@ messaging_services = {
 async def process_scheduled_messages():
     try:
         await drain_scheduled_followups(messaging_services)
+        from services.sales_workflow_service import resume_completed_work
+        await resume_completed_work()
     except PyMongoError as exc:
         logger.warning("Scheduled follow-up polling deferred: MongoDB unavailable ({})", type(exc).__name__)
 

@@ -326,6 +326,9 @@ async def send_ig_message(
                         logger.exception("Retry could not reconcile a confirmed Instagram message")
                         cached["local_sync_pending"] = True
                 return cached
+            if (bot_context or {}).get("sales_action_job_id"):
+                from services.sales_workflow_service import validate_delivery
+                await validate_delivery(org_id, bot_context["sales_action_job_id"])
             # Build the API URL using the appropriate page_id
             url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
 

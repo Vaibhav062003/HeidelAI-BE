@@ -262,10 +262,24 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
     from services.entitlement_service import require_feature
 
     require_feature(str(case["org_id"]), "OFFERS")
-    product, quantity, unit_price = await _checked_product(case)
-    unit_price = await _sales_action_quote_price(
-        case, product, quantity, unit_price, source_message_id,
-    )
+    purchase = case.get("workflow_version") == 2
+    if purchase:
+        from services.sales_workflow_service import assess
+        preparation = await assess(case)
+        if not preparation["auto_send"]:
+            raise SalesActionBlocked("The purchase needs a fresh stock or pricing review.", escalate=True)
+        quote_items = [{"id": item["line_id"], "description": item["name"], "sku": item.get("sku", ""),
+                        "quantity": item["quantity"], "unit_price": item["unit_price"],
+                        "gst_rate": item["gst_rate"], "gst_inclusive": item["gst_inclusive"]}
+                       for item in preparation["items"]]
+        # Preserve the checked commercial facts with the existing action job.
+        await get_async_mongo_db()[f"sales_action_jobs_{case['org_id']}"].update_one(
+            {"_id": sales_action_job_id(case["case_id"], source_message_id, "create_quote")},
+            {"$set": {"purchase_version": case["version"], "commercial_snapshot": preparation}})
+        product, quantity, unit_price = {}, 1, 0
+    else:
+        product, quantity, unit_price = await _checked_product(case)
+        unit_price = await _sales_action_quote_price(case, product, quantity, unit_price, source_message_id)
     db = get_async_mongo_db()
     settings = await db[f"quote_settings_{case['org_id']}"].find_one({"_id": "branding"}) or {}
     seller = dict(settings.get("seller") or {})
@@ -283,9 +297,9 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
         {"customer_name": 1, "customer_phone_no": 1, "phone": 1, "email": 1},
     ) or {}
     now = datetime.now(timezone.utc)
-    tax_basis = _floor_tax_basis(product)
+    tax_basis = "included" if purchase else _floor_tax_basis(product)
     try:
-        gst_rate = float(str(product.get("gst_rate")).replace("%", "").strip())
+        gst_rate = 0 if purchase else float(str(product.get("gst_rate")).replace("%", "").strip())
     except (TypeError, ValueError):
         gst_rate = -1
     if tax_basis not in {"included", "extra"} or not 0 <= gst_rate <= 100:
@@ -307,7 +321,7 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
             "email": conversation.get("email") or "", "gstin": "", "address": "",
             "payment_details": "", "logo_url": "",
         },
-        "items": [{
+        "items": quote_items if purchase else [{
             "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{quote_id}:item")),
             "description": _name(product), "category": str(product.get("category") or ""),
             "sku": _sku(product), "quantity": quantity, "unit_price": unit_price,
@@ -337,6 +351,7 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
             actor_name="AI Sales Agent",
         ),
         "quote_id": quote_id, "source_message_id": source_message_id,
+        **({"case_id": case["case_id"], "purchase_version": case["version"], "supersedes_quote_id": case.get("quote_id")} if purchase else {}),
         "created_at": now, "created_by": "ai-sales",
         "created_by_name": "AI Sales Agent", "revision_number": 1,
         "revision_count": 0,
@@ -347,17 +362,16 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
     )
     quote = await db[f"quotes_{case['org_id']}"].find_one({"quote_id": quote_id}) or document
     quote_item = (quote.get("items") or [{}])[0]
+    item_text = "\n".join(f"• {item.get('description')} × {item.get('quantity')} — Rs.{float(item.get('private_unit_price') or 0):,.2f} each" for item in quote.get("items") or [])
     gst = float(quote.get("private_gst_total") or 0)
     return {
         "reply": (
             f"*Quotation {quote['quote_number']}*\n"
-            f"{quote_item.get('description') or _name(product)}\n"
-            f"Quantity: {quote_item.get('quantity') or quantity}\n"
-            f"Unit price: Rs.{float(quote_item.get('private_unit_price') or unit_price):,.2f}\n"
+            f"{item_text}\n"
             f"GST: Rs.{gst:,.2f}\n*Total: Rs.{float(quote['public_grand_total']):,.2f}*\n"
             f"Valid until: {quote['valid_until']}\n\nReply *proceed* when you are ready for billing."
         ),
-        "fields": {"quote_id": quote_id, "quote_number": quote["quote_number"]},
+        "fields": {"quote_id": quote_id, "quote_number": quote["quote_number"], **({"quoted_version": case["version"]} if purchase else {})},
         "ready_stage": "stock_confirmation", "delivered_stage": "quote_sent",
     }
 
@@ -375,13 +389,14 @@ async def _invoice_draft(
     case: dict[str, Any], customer_text: str, source_message_id: str,
 ) -> dict[str, Any]:
     source_ids = [str(value) for value in case.get("action_source_message_ids") or [] if value]
-    if not is_invoice_draft_intent(customer_text, has_source=bool(source_ids or case.get("quote_id"))):
+    if not (case.get("workflow_version") == 2 and case.get("quote_id") and customer_text.strip().casefold() == "proceed") and not is_invoice_draft_intent(customer_text, has_source=bool(source_ids or case.get("quote_id"))):
         raise SalesActionBlocked("Please confirm which quoted products you want me to send for billing.")
     from services.tally_service import create_tally_invoice_draft
     draft = await create_tally_invoice_draft(
         str(case["org_id"]), "ai-sales", "admin", str(case["conversation_id"]),
         {
-            "source": "messages", "source_message_ids": source_ids,
+            "source": "quote" if case.get("workflow_version") == 2 and case.get("quote_id") else "messages", "source_message_ids": source_ids,
+            "quote_id": case.get("quote_id"),
             "idempotency_key": sales_action_job_id(
                 str(case["case_id"]), source_message_id, "create_invoice_draft"
             ),
@@ -492,9 +507,23 @@ async def execute_sales_action(
     try:
         if action_type == "create_quote":
             result = await _create_quote(case, source_message_id)
+        elif action_type == "start_checkout" and case.get("workflow_version") == 2:
+            from services.sales_workflow_service import assess
+            preparation = await assess(case)
+            if not preparation["auto_send"] or not preparation.get("retail_link"):
+                raise SalesActionBlocked("A verified checkout is not ready. The sales team can help.", escalate=True)
+            await jobs.update_one({"_id": job_id}, {"$set": {"purchase_version": case["version"], "commercial_snapshot": preparation}})
+            result = {"reply": "You can complete your purchase here: " + preparation["retail_link"],
+                      "fields": {"quoted_version": case["version"]}, "ready_stage": "selected", "delivered_stage": "selected"}
         elif action_type == "request_stock_confirmation":
             result = await _stock_confirmation(case)
         elif action_type == "create_invoice_draft":
+            if case.get("workflow_version") == 2:
+                from services.sales_workflow_service import assess
+                preparation = await assess(case)
+                if not preparation["auto_send"]:
+                    raise SalesActionBlocked("The purchase needs review before billing.", escalate=True)
+                await jobs.update_one({"_id": job_id}, {"$set": {"purchase_version": case["version"], "commercial_snapshot": preparation}})
             result = await _invoice_draft(case, customer_text, source_message_id)
         elif action_type == "schedule_followup":
             result = await _schedule_followup(case)

@@ -191,6 +191,8 @@ class QuoteSettingsPayload(BaseModel):
 
 
 class QuotePayload(BaseModel):
+    case_id: Optional[str] = Field(default=None, max_length=100)
+    purchase_version: Optional[int] = Field(default=None, ge=0)
     conversation_id: str = Field(..., min_length=1, max_length=200)
     quote_number: str = Field(..., min_length=1, max_length=60)
     issued_on: date
@@ -217,7 +219,7 @@ def _settings_collection(org_id: str):
 
 def _document(payload: QuotePayload, user: CurrentUser) -> dict:
     return build_quote_document(
-        payload.model_dump(mode="json"), org_id=user.org_id,
+        {key: value for key, value in payload.model_dump(mode="json").items() if key not in {"case_id", "purchase_version"} or value is not None}, org_id=user.org_id,
         actor_id=user.user_id, actor_name=user.full_name or "Team member",
     )
 
@@ -261,6 +263,13 @@ async def list_quotes(
 async def create_quote(request: Request, payload: QuotePayload, user: CurrentUser):
     require_feature(user.org_id, "OFFERS")
     await _require_conversation(user, payload.conversation_id)
+    if payload.case_id:
+        from services.sales_workflow_service import require_enabled
+        from services.sales_case_service import get_active_sales_case
+        await require_enabled(user.org_id)
+        case = await get_active_sales_case(user.org_id, payload.conversation_id)
+        if not case or case["case_id"] != payload.case_id or case["version"] != payload.purchase_version:
+            raise HTTPException(409, "Purchase changed. Prepare the quote again")
     now = datetime.now(timezone.utc)
     document = {
         **_document(payload, user),
@@ -272,6 +281,15 @@ async def create_quote(request: Request, payload: QuotePayload, user: CurrentUse
         "revision_count": 0,
     }
     await _collection(user.org_id).insert_one(document)
+    if payload.case_id:
+        from services.sales_workflow_service import _collection as cases, publish, event
+        updated = await cases(user.org_id).find_one_and_update(
+            {"case_id": payload.case_id, "version": payload.purchase_version, "status": "active"},
+            {"$set": {"quote_id": document["quote_id"], "quoted_version": payload.purchase_version}}, return_document=ReturnDocument.AFTER)
+        if not updated:
+            raise HTTPException(409, "Purchase changed while saving. Reopen the purchase before sharing this quote")
+        await event(updated, "preparation", document["quote_id"], user.user_id)
+        await publish(updated)
     return {"quote": serialize_mongo(document)}
 
 
@@ -349,6 +367,8 @@ async def update_quote(request: Request, quote_id: str, payload: QuotePayload, u
         raise HTTPException(status_code=404, detail="Quote not found")
     if current.get("conversation_id") != payload.conversation_id:
         raise HTTPException(status_code=409, detail="A quote cannot be moved to another conversation")
+    if payload.case_id and payload.case_id != current.get("case_id"):
+        raise HTTPException(409, "A quote cannot be moved to another purchase")
     replacement = _document(payload, user)
     if _quote_content(current) == _quote_content(replacement):
         current.pop("revisions", None)

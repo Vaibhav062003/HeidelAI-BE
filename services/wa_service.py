@@ -1065,6 +1065,9 @@ async def send_whatsapp_message(
                         part_operation,
                     ):
                         raise HTTPException(status_code=409, detail="This reply is already being sent")
+                    if manifest_action_job_id:
+                        from services.sales_workflow_service import validate_delivery
+                        await validate_delivery(org_id, manifest_action_job_id)
                     provider_started = True
                     try:
                         provider_started_at = time.perf_counter()

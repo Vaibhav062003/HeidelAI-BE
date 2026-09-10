@@ -952,7 +952,7 @@ async def _process_tally_outcome(outbox_id: str) -> bool:
         from services.sales_learning_service import record_verified_tally_outcome
 
         await record_verified_tally_outcome(
-            job["org_id"], job["conversation_id"], job["event_key"], job["outcome_status"],
+            job["org_id"], job["conversation_id"], job["event_key"], job["outcome_status"], quote_id=job["quote_id"],
         )
     except Exception as exc:
         errors.append(f"learning:{type(exc).__name__}")

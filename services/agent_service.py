@@ -7,13 +7,9 @@ import httpx
 import uuid
 from typing import Dict, Optional
 from loguru import logger
-from config.settings import INTERNAL_HMAC_SECRET
+from config.settings import CHATBOT_BASE_URL, INTERNAL_HMAC_SECRET
 from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
 from services.internal_request import signed_json
-
-# Base URL for the chatbot API
-CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app"
-#CHATBOT_BASE_URL = "http://localhost:8001"  For local testing with self-signed certs, ensure to disable SSL verification in httpx client
 
 _HANDOFF_REASON = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 _HANDOFF_REASONS = {
@@ -174,6 +170,10 @@ async def send_to_agent(
         sales_context,
     )
     sales_event_id = message_id or f"agent_{uuid.uuid4()}"
+    from services.sales_workflow_service import automatic_purchase
+    purchase_reply = await automatic_purchase(org_id, conversation_id, sales_event_id, user_input)
+    if purchase_reply is not None:
+        return purchase_reply
 
     try:
         active_sales_case = await get_active_sales_case(org_id, conversation_id)

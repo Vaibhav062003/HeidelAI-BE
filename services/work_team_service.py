@@ -193,6 +193,11 @@ async def create_conversation_work(
     work_type = payload.get("type") or ("pricing" if team.get("type") == "sales" else team.get("type"))
     if work_type not in {"pricing", "billing", "support", "general"}:
         raise HTTPException(status_code=422, detail="Invalid work type")
+    if payload.get("case_id"):
+        from services.sales_case_service import get_active_sales_case
+        case = await get_active_sales_case(org_id, conversation_id)
+        if not case or case["case_id"] != payload["case_id"] or case["version"] != payload.get("case_version"):
+            raise HTTPException(409, "Purchase changed. Refresh before linking team work")
     quote_id = payload.get("quote_id")
     open_key = ":".join([conversation_id, team["team_id"], work_type])
     collection = get_async_mongo_db()[f"conversation_work_{org_id}"]
@@ -200,6 +205,8 @@ async def create_conversation_work(
     await collection.create_index("open_key", unique=True, sparse=True)
     existing = await collection.find_one({"open_key": open_key}, {"_id": 0})
     if existing:
+        if payload.get("case_id") and existing.get("case_id") != payload["case_id"]:
+            raise HTTPException(409, "Finish the existing team work before linking another purchase")
         existing = await _assign_open_work(
             org_id, conversation["_id"], collection, existing,
             assigned_agent_id, payload.get("assigned_agent_name"),
@@ -225,6 +232,8 @@ async def create_conversation_work(
         "assigned_agent_name": payload.get("assigned_agent_name") if assigned_agent_id else None,
         "status": "pending",
         "quote_id": quote_id,
+        "case_id": payload.get("case_id"), "case_version": payload.get("case_version"),
+        "due_at": payload.get("due_at"),
         "quote_revision": payload.get("quote_revision"),
         "note": (payload.get("note") or "").strip() or None,
         "referenced_message_ids": list(payload.get("referenced_message_ids") or []),
