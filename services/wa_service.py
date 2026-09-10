@@ -273,6 +273,7 @@ async def create_or_update_whatsapp_conversation(
     idempotency_key: Optional[str] = None,
     business_phone_id: Optional[str] = None,
     business_phone: Optional[str] = None,
+    record_activity: bool = True,
 ) -> str:
     """
     Create or update a conversation in the WhatsApp-specific conversations collection
@@ -371,6 +372,26 @@ async def create_or_update_whatsapp_conversation(
                 final_customer_name = stored_name
             elif stored_name and stored_name != customer_phone_no:
                 final_customer_name = stored_name
+
+    if not record_activity:
+        # Preparing an outbound recipient is not a message or customer activity.
+        await asyncio.to_thread(
+            conversations_collection.update_one,
+            {"conversation_id": conversation_id},
+            {"$setOnInsert": {
+                "platform": "whatsapp", "conversation_id": conversation_id,
+                "whatsapp_id": recipient_id, "customer_id": customer_phone_no,
+                "customer_name": final_customer_name, "phone_digits": phone_digits,
+                "phone_search_suffixes": phone_search_suffixes,
+                "customer_name_prefixes": name_search_prefixes(final_customer_name),
+                "business_phone_id": str(business_phone_id) if business_phone_id else None,
+                "business_phone": business_phone, "status": "open", "is_ai_enabled": True,
+                "started_at": now, "created_at": now, "closed_at": None,
+                "message_counter": 0, "unread_count": 0,
+            }},
+            upsert=True,
+        )
+        return conversation_id
 
     # Base fields that ALWAYS get updated
     update_set = {
@@ -795,7 +816,6 @@ async def send_whatsapp_message(
     """
     from services.entitlement_service import require_feature
     send_started_at = time.perf_counter()
-    await asyncio.to_thread(require_feature, org_id, "CHANNELS")
     whatsapp_id = message.get("sender_id")
     outbound_operation = None
     active_operation = None
@@ -805,6 +825,7 @@ async def send_whatsapp_message(
     quota_consumed = False
     had_replay = False
     manifest_action_job_id = None
+    all_message_ids = []
 
     async def mark_active_delivery_unknown() -> None:
         try:
@@ -845,6 +866,7 @@ async def send_whatsapp_message(
         raise HTTPException(status_code=422, detail="Missing 'sender_id'")
         
     try:
+        await asyncio.to_thread(require_feature, org_id, "CHANNELS")
         conversation_id = message["conversation_id"]
         conversation = await asyncio.to_thread(
             db[f"conversations_{org_id}"].find_one,
@@ -976,21 +998,7 @@ async def send_whatsapp_message(
             await reserve_quota_async(org_id, "AI", "monthly_messages", len(contents), quota_event_key)
             quota_consumed = True
 
-        # Ensure the conversation document exists in the database
-        if mode != "ai":
-            await create_or_update_whatsapp_conversation(
-                org_id=org_id,
-                recipient_id=whatsapp_business_id,
-                customer_phone_no=recipient_id,
-                customer_name=message.get("customer_name") or recipient_id,
-                last_message=contents[0],
-                last_sender="agent",
-                mode=mode,
-                is_auto_followup=is_auto_followup,
-            )
-
         last_stored_id = None
-        all_message_ids = []
         first_meta_accepted_ms = None
 
         # Send each content part as a separate bubble
@@ -1197,14 +1205,6 @@ async def send_whatsapp_message(
                 "last_message_is_private_note": mode == "private"
             }
 
-            # Update conversation for each part (last one will reflect the final state)
-            await asyncio.to_thread(
-                db[f"conversations_{org_id}"].find_one_and_update,
-                {"conversation_id": conversation_id},
-                {"$set": wa_conversation},
-                return_document=ReturnDocument.AFTER,
-            )
-
             # Store message in WhatsApp-specific collection
             stored_bot_context = dict(bot_context or {})
             if pricing_source_message_id:
@@ -1237,7 +1237,8 @@ async def send_whatsapp_message(
                         temp_id=temp_id,
                         context=context,
                         context_type=context_type,
-                        bot_context=stored_bot_context or None
+                        bot_context=stored_bot_context or None,
+                        business_phone_id=connection.get("phone_id"),
                     )
                 except Exception as exc:
                     stored_message = (
@@ -1252,6 +1253,25 @@ async def send_whatsapp_message(
                             raise AIProviderUnavailable("delivery_sync_failed") from exc
                         raise
                     last_stored_id = stored_message.get("id") or stored_message.get("message_id")
+
+            # Publish activity only after this accepted message is in history.
+            if mode != "ai" and i == 0:
+                await create_or_update_whatsapp_conversation(
+                    org_id=org_id, recipient_id=whatsapp_business_id,
+                    customer_phone_no=recipient_id,
+                    customer_name=message.get("customer_name") or recipient_id,
+                    last_message=last_message, last_sender="agent", mode=mode,
+                    is_auto_followup=is_auto_followup, extra_updates=wa_conversation,
+                    business_phone_id=connection.get("phone_id"),
+                    business_phone=connection.get("phone"),
+                )
+            else:
+                await asyncio.to_thread(
+                    db[f"conversations_{org_id}"].find_one_and_update,
+                    {"conversation_id": conversation_id},
+                    {"$set": wa_conversation},
+                    return_document=ReturnDocument.AFTER,
+                )
 
             if len(contents) > 1 and not await asyncio.to_thread(
                 complete_reply,
@@ -1385,6 +1405,7 @@ async def send_whatsapp_message(
         if provider_started:
             await mark_active_delivery_unknown()
             raise AIProviderUnavailable("delivery_unknown") from e
+        e.delivery_not_attempted = not all_message_ids
         try:
             await asyncio.to_thread(
                 release_claim,
@@ -1401,6 +1422,7 @@ async def send_whatsapp_message(
         if provider_started:
             await mark_active_delivery_unknown()
             raise AIProviderUnavailable("delivery_unknown") from e
+        e.delivery_not_attempted = not all_message_ids
         await asyncio.to_thread(
             release_claim,
             db.whatsapp_outbound_sends,
@@ -1420,15 +1442,18 @@ async def send_whatsapp_message(
             active_operation or outbound_operation,
         )
         logger.error(f"Error sending WhatsApp message: {e}")
-        raise HTTPException(
+        error = HTTPException(
             status_code=500, 
             detail=f"Failed to send message: {str(e)}"
         )
+        error.delivery_not_attempted = not all_message_ids
+        raise error from e
 
 async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_id: str, org_id: str, temp_id: Optional[str], mode: str, context_type: Optional[str], context: Optional[dict], sender_name: Optional[str] = "Agent", conversation_id: Optional[str] = None) -> dict:
     """
     Send a template message via WhatsApp Cloud API
     """
+    provider_started = False
     try:
         conversation = db[f"conversations_{org_id}"].find_one({"conversation_id": conversation_id}) if conversation_id else None
         connection = resolve_outbound_whatsapp_connection(
@@ -1476,9 +1501,11 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
             }
             
             async with httpx.AsyncClient() as client:
+                provider_started = True
                 response = await client.post(url, headers=headers, json=data)
             
             if response.status_code != 200:
+                provider_started = not _is_definitive_meta_rejection(response.status_code)
                 logger.error(f"WhatsApp API error: {response.text}")
                 raise HTTPException(
                     status_code=response.status_code,
@@ -1538,13 +1565,6 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
         if conversation and "_id" in conversation:
             conversation["_id"] = str(conversation["_id"])
 
-        await broadcast_main_ws(
-            platform_id=connection.get("wa_id"),
-            platform_type="whatsapp",
-            event_type="conversation_updated",
-            payload={"conversation": conversation}
-        )
-
         # Store message in WhatsApp-specific collection
         mid = await store_whatsapp_message(
             org_id=org_id,
@@ -1562,19 +1582,30 @@ async def send_whatsapp_template_message(recipient_id: str, template: dict, wa_i
             status="delivered" if mode == "private" else "sending",
             temp_id=temp_id,
             context=context,
-            context_type=context_type
+            context_type=context_type,
+            business_phone_id=connection.get("phone_id"),
         )
         
+        await broadcast_main_ws(
+            platform_id=connection.get("wa_id"),
+            platform_type="whatsapp",
+            event_type="conversation_updated",
+            payload={"conversation": conversation}
+        )
+
         return {"message": "Message sent", "message_id": mid}
     
     except HTTPException as e:
+        e.delivery_not_attempted = not provider_started
         raise e
     except Exception as e:
         logger.error(f"Error sending WhatsApp template message: {e}")
-        raise HTTPException(
+        error = HTTPException(
             status_code=500, 
             detail=f"Failed to send template message: {str(e)}"
         )
+        error.delivery_not_attempted = not provider_started
+        raise error from e
 
 async def send_wa_media_message(
         recipient_id: str, 
