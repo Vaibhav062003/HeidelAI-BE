@@ -24,7 +24,8 @@ class ProductRequestPolicyTest(unittest.TestCase):
 
     def test_grounding_rejects_invented_agent_private_and_missing_evidence(self):
         message = {"message_id": "m1", "role": "customer", "content": "Do you have the RTX 4060 Ti?"}
-        raw = {"source_message_id": "m1", "product_name": "RTX 4060 Ti", "evidence": message["content"], "confidence": "high"}
+        raw = {"source_message_id": "m1", "product_name": "RTX 4060 Ti", "evidence": message["content"], "confidence": "high",
+               "specificity": "specific_product", "product_reference_message_id": "m1", "product_mention": "RTX 4060 Ti"}
         self.assertIsNotNone(grounded_request(raw, [message]))
         self.assertIsNone(grounded_request({**raw, "evidence": "Please notify me"}, [message]))
         self.assertIsNone(grounded_request(raw, [{**message, "role": "agent"}]))
