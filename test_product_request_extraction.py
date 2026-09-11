@@ -81,6 +81,17 @@ class ExtractionTests(unittest.TestCase):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_missing_or_partial_extraction_preserves_specific_product_identity(self):
+        cpu = row(name="AMD Ryzen 5 5600", evidence="I want AMD Ryzen 5 5600 and Zotac RTX 5060")
+        for values in ([], [item()]):
+            original = deepcopy(cpu)
+            plan = plan_conversation([cpu], {"old": values}, "report", STAMP)
+            self.assertIn("review", plan)
+            self.assertNotIn("after", plan)
+            self.assertEqual(cpu, original)
+        unfamiliar = row(name="Unfamiliar Acme Edition")
+        self.assertIn("review", plan_conversation([unfamiliar], {"old": []}, "report", STAMP))
+
     def test_build_splits_into_products_and_preserves_original(self):
         original = row(status="fulfilled")
         saved = deepcopy(original)
@@ -168,8 +179,60 @@ class Context:
 
 
 class ApplyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_earlier_evidence_cannot_turn_valid_request_into_archive(self):
+        older = message()
+        followup = message("Any stock for this?", _id="m2", message_id="m2", timestamp=STAMP + timedelta(minutes=1))
+        original = row(name="Zotac RTX 5060", source_message_id="m2", evidence=followup["content"])
+        class DB:
+            product_requests = SimpleNamespace(find=lambda *a, **k: Cursor([original]))
+            def __getitem__(self, name):
+                if name.startswith("conversations_"):
+                    return SimpleNamespace(find_one=AsyncMock(return_value={"conversation_id": "chat", "platform": "whatsapp"}))
+                return SimpleNamespace(find_one=AsyncMock(return_value=followup), find=lambda *a, **k: Cursor([followup, older]))
+        raw = extraction()
+        self.assertIsNotNone(grounded_request(raw, [older, followup]))
+        output = SimpleNamespace(source_message_id="m1", model_dump=lambda: raw)
+        report = await make_report(DB(), "org", AsyncMock(return_value=SimpleNamespace(product_requests=[output])))
+        self.assertEqual(report["conversations"], [])
+        self.assertIn("source", report["review"][0]["reason"].lower())
+
+    async def test_original_customer_evidence_is_required_for_every_cached_row(self):
+        source = message("I want Zotac RTX 5060")
+        class DB:
+            rows = []
+            def __init__(self):
+                self.product_requests = SimpleNamespace(find=lambda *a, **k: Cursor(self.rows))
+            def __getitem__(self, name):
+                if name.startswith("conversations_"):
+                    return SimpleNamespace(find_one=AsyncMock(return_value={"conversation_id": "chat", "platform": "whatsapp"}))
+                return SimpleNamespace(find_one=AsyncMock(return_value=source), find=lambda *a, **k: Cursor([source]))
+        db = DB()
+        raw = extraction(evidence=source["content"])
+        output = SimpleNamespace(source_message_id="m1", model_dump=lambda: raw)
+        extract = AsyncMock(return_value=SimpleNamespace(product_requests=[output]))
+        db.rows = [row("a", evidence=source["content"]), row("b", evidence="Invented quote")]
+        report = await make_report(db, "org", extract)
+        self.assertEqual(report["conversations"], [])
+        self.assertEqual(len(report["review"]), 1)
+        self.assertEqual(extract.await_count, 1)
+        for change in ({"role": "agent"}, {"mode": "private"}):
+            original_source = deepcopy(source)
+            source.update(change)
+            db.rows = [row(evidence=source["content"])]
+            extract.reset_mock()
+            report = await make_report(db, "org", extract)
+            self.assertEqual(report["conversations"], [])
+            self.assertEqual(len(report["review"]), 1)
+            extract.assert_not_awaited()
+            source.clear()
+            source.update(original_source)
+
+    async def test_version_one_report_rejected_before_database_access(self):
+        with self.assertRaisesRegex(ValueError, "version.*regenerate"):
+            await apply_report(SimpleNamespace(), "org", {"version": 1, "org_id": "org", "report_id": "old", "conversations": []})
+
     async def test_dry_run_only_reads_and_failed_extraction_never_archives(self):
-        original = row()
+        original = row(evidence="I want Zotac RTX 5060")
         source = message("I want Zotac RTX 5060")
         class DB:
             product_requests = SimpleNamespace(find=lambda *a, **k: Cursor([original]))
@@ -181,6 +244,7 @@ class ApplyTests(unittest.IsolatedAsyncioTestCase):
         output = SimpleNamespace(source_message_id="m1", model_dump=lambda: raw)
         extract = AsyncMock(return_value=SimpleNamespace(product_requests=[output]))
         report = await make_report(DB(), "org", extract)
+        self.assertEqual(report["version"], 2)
         self.assertEqual(len(report["conversations"]), 1)
         self.assertEqual(report["review"], [])
         self.assertEqual(extract.await_count, 1)
@@ -197,7 +261,7 @@ class ApplyTests(unittest.IsolatedAsyncioTestCase):
         original = row()
         plan = plan_conversation([original], {"old": [item()]}, "report", STAMP)
         plan.update(conversation_id="chat", contexts=[], conversation={"conversation_id": "chat"})
-        report = {"version": 1, "org_id": "org", "report_id": "report", "conversations": [plan]}
+        report = {"version": 2, "org_id": "org", "report_id": "report", "conversations": [plan]}
         collection = SimpleNamespace(create_index=AsyncMock(), find=lambda *a, **k: Cursor([original]),
                                      replace_one=AsyncMock(), insert_one=AsyncMock())
         class DB:

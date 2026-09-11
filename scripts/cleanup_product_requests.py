@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from services.product_request_policy import as_utc, grounded_request, request_key
+from services.product_request_policy import as_utc, grounded_request, product_name, request_key
 
 MESSAGE_FIELDS = {field: 1 for field in ("_id", "message_id", "conversation_id", "role", "mode", "content", "timestamp")}
 CONVERSATION_FIELDS = {field: 1 for field in ("_id", "conversation_id", "platform", "customer_id", "business_phone_id", "is_dealer", "persona")}
@@ -40,6 +40,8 @@ def plan_conversation(rows, extracted, report_id, stamp):
         same_product = [item for item in values if request_key(row["org_id"], row["conversation_id"], item["product_name"]) == request_key(row["org_id"], row["conversation_id"], row["product_name"])]
         if same_product:
             values = same_product
+        elif product_name(row.get("product_name")) is not None:
+            return {"review": "Existing product has no exact extracted identity match; preserve it for review"}
         keys = {request_key(row["org_id"], row["conversation_id"], item["product_name"]) for item in values}
         targets[str(row["_id"])] = keys
         if protected(row) and (len(keys) != 1 or next(iter(keys)) != request_key(row["org_id"], row["conversation_id"], row["product_name"])):
@@ -105,7 +107,7 @@ def plan_conversation(rows, extracted, report_id, stamp):
 
 async def make_report(db, org, extract):
     report_id, stamp = str(uuid4()), datetime.now(timezone.utc)
-    report = {"version": 1, "report_id": report_id, "org_id": org, "created_at": stamp, "conversations": [], "review": []}
+    report = {"version": 2, "report_id": report_id, "org_id": org, "created_at": stamp, "conversations": [], "review": []}
     grouped = defaultdict(list)
     async for row in db.product_requests.find({"org_id": org, "archived_at": {"$exists": False}}).sort("_id", 1):
         grouped[row["conversation_id"]].append(row)
@@ -117,16 +119,24 @@ async def make_report(db, org, extract):
             continue
         for row in rows:
             source_id = str(row.get("source_message_id") or "")
-            if source_id not in contexts:
+            if source_id in contexts:
+                source = contexts[source_id]["messages"][-1]
+            else:
                 ids = [source_id]
                 if len(source_id) == 24:
                     from bson import ObjectId
                     if ObjectId.is_valid(source_id):
                         ids.append(ObjectId(source_id))
                 source = await db[f"messages_{org}"].find_one({"conversation_id": cid, "$or": [{"message_id": source_id}, {"_id": {"$in": ids}}]}, MESSAGE_FIELDS)
-                if not source or not isinstance(source.get("timestamp"), datetime):
-                    error = "Missing source message/timestamp; cannot safely re-extract"
-                    break
+            if not source or not isinstance(source.get("timestamp"), datetime):
+                error = "Missing source message/timestamp; cannot safely re-extract"
+                break
+            evidence = str(row.get("evidence") or "").strip()
+            if (source.get("role") != "customer" or source.get("mode") == "private"
+                    or not evidence or evidence not in str(source.get("content") or "")):
+                error = "Original customer evidence is missing or invalid; preserve the request for review"
+                break
+            if source_id not in contexts:
                 docs = await db[f"messages_{org}"].find({"conversation_id": cid, "timestamp": {"$lte": source["timestamp"]}}, MESSAGE_FIELDS).sort([("timestamp", -1), ("_id", -1)]).limit(30).to_list(30)
                 docs.reverse()
                 # Equal timestamps must not permit messages after the actual source as references.
@@ -142,7 +152,10 @@ async def make_report(db, org, extract):
                 if result is None:
                     error = "Extraction failed; no records may be archived"
                     break
-                raw = [item.model_dump() for item in result.product_requests if item.source_message_id == source_id]
+                raw = [item.model_dump() for item in result.product_requests]
+                if any(item.get("source_message_id") != source_id for item in raw):
+                    error = "Extraction cites another source message; preserve requests for review"
+                    break
                 if any(item.get("confidence") == "low" or item.get("specificity") == "ambiguous" for item in raw):
                     error = "Ambiguous extraction requires review"
                     break
@@ -168,8 +181,10 @@ def same_rows(actual, expected):
 
 
 async def apply_report(db, org, report):
-    if report.get("version") != 1 or report.get("org_id") != org or not report.get("report_id"):
-        raise ValueError("Report version/organization does not match")
+    if report.get("version") != 2:
+        raise ValueError("Unsupported cleanup report version; regenerate and review a version 2 report")
+    if report.get("org_id") != org or not report.get("report_id"):
+        raise ValueError("Report organization or identifier does not match")
     await db.product_requests.create_index("product_key", unique=True, sparse=True)
     applied = already_applied = 0
     for plan in report["conversations"]:
