@@ -235,7 +235,7 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
             result = await extract_purchase_intent(messages_str, ist_now)
             if result is not None:
                 from services.product_request_service import capture_product_requests
-                await capture_product_requests(job, [item.model_dump() for item in getattr(result, "product_requests", [])], docs[-10:])
+                await capture_product_requests(job, [item.model_dump() for item in getattr(result, "product_requests", [])], docs)
             
             # Branch 1: LLM returned None → transient error (network, malformed response).
             # Do NOT cancel existing follow-ups on transient failures (Bug #2 fix).

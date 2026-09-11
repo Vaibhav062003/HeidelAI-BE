@@ -11,7 +11,10 @@ from loguru import logger
 load_dotenv()
 
 class ProductRequestExtraction(BaseModel):
-    product_name: str = Field(max_length=240)
+    product_name: str = Field(max_length=240, description="Only a specific product name/model and stated variant; never a sentence, category, build or setup description")
+    specificity: Literal["specific_product", "generic", "ambiguous"] = "ambiguous"
+    product_reference_message_id: str = ""
+    product_mention: str = Field(default="", max_length=240, description="Exact product noun phrase quoted from the reference message, without surrounding request prose")
     source_message_id: str
     evidence: str = Field(max_length=2000, description="Exact verbatim quote from that customer message")
     confidence: Literal["low", "medium", "high"]
@@ -182,7 +185,31 @@ If the customer explicitly no longer wants a previously requested product or bou
 include that product with withdrawn=true. Do not withdraw other products by association.
 notification_requested=true ONLY if the customer explicitly asks to be notified when
 that product is available again; asking for price alone is NOT notification permission.
-Low confidence or ambiguous references belong in low confidence, never guessed matches.
+Only specific named products/models belong in this output, even if absent from the catalogue.
+These rules override R10's category fallback for product_requests ONLY. Omit generic
+categories, vague setups, ambiguous references and low-confidence guesses entirely.
+Set specificity=specific_product only for an identifiable named product/model. Digits,
+capacity, technology and a chipset alone are not product identity (DDR4 RAM, 16GB RAM,
+512GB NVMe SSD, MSI B550M without a motherboard model are insufficient).
+product_name must be a compact product noun phrase, with no request/question/explanation.
+product_mention is the EXACT corresponding product noun phrase in the reference message;
+product_reference_message_id identifies it. The name may normalize case/spacing only;
+never reorder, add or remove identity words, punctuation, brand, model or variant tokens.
+Use consistent names for repeats; retain all stated variant qualifiers.
+For a custom PC build the customer actually requests or asks about, return each
+identifiable component separately. Never return a build/setup label or the whole parts
+sentence. Do not invent models for generic RAM, storage, motherboard or other specs.
+An agent's suggested parts are not demand unless the customer explicitly requests or
+unambiguously asks about that build/product. A reference must precede or be in the
+customer evidence message; private messages may never supply product identity.
+A follow-up such as "Whats the avg fps ill get?" referring to one established requested
+build uses the same component names, with this recent question as customer evidence.
+If no unique product/build referent exists, return no product requests.
+Examples: "DDR4 setup with GPU", "PC build (DDR4 setup with GPU)", "For dd4 setup?"
+and a standalone "Whats the avg fps ill get?" -> product_requests=[].
+"I want AMD Ryzen 5 5600 and Zotac RTX 5060 with 16GB RAM and 512GB SSD" ->
+AMD Ryzen 5 5600 and Zotac RTX 5060 ONLY (two exact product mentions); no RAM/SSD record.
+"Apple AirPods Pro ka price?" -> Apple AirPods Pro (no digit requirement).
 This independent output does not change any purchase-date/follow-up rules above.
 Example: [m1] customer: "What's the price of iPhone 16 256GB?" -> has_intent=false,
 product_requests includes iPhone 16 256GB, source_message_id=m1, that exact evidence,
