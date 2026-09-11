@@ -96,6 +96,16 @@ interest statuses and corrections affecting reviewed products or outreach are
 reported for review, not automatically discarded. Work is scoped to saved
 requests and their source context; unrelated chat history is not backfilled.
 
+Reports now use version 2. Regenerate and review any existing version 1 report;
+application rejects it before accessing the database. Every saved row must have
+valid original evidence from a public customer message, including rows sharing
+a cached extraction. Output citing a different source message requires review.
+Existing specific or unfamiliar product names require an exact normalized match;
+missing/partial extraction cannot archive them or relabel them as another product.
+Only titles rejected by the existing prose/category validator can be corrected,
+split into components or archived automatically. Other protected-record and
+duplicate-identity checks still apply.
+
 Apply the exact reviewed report without another model call:
 
 ```sh
