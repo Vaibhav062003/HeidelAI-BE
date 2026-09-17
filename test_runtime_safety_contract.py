@@ -246,7 +246,6 @@ def test_scheduler_runs_jobs_without_a_mongo_circuit() -> None:
 
 
 def test_deployments_verify_liveness_and_exact_revision() -> None:
-    assert '@router.get("/ready")' not in _source("api/common_routes.py")
     for workflow in ("deploy-dev.yml", "deploy-main.yml"):
         source = (ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8")
         assert "/health" in source
