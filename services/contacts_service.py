@@ -14,6 +14,7 @@ from pymongo.errors import PyMongoError, BulkWriteError
 from core.services import services
 from database import get_mongo_db
 from loguru import logger
+from services.feature_flags import tally_enabled
 from services.websocket_service import broadcast_on_stats_update
 from services.utils import name_search_prefixes, normalize_phone
 from services.whatsapp_connection_service import whatsapp_conversation_scope
@@ -109,9 +110,11 @@ def _get_contacts_for_org(org_id: str):
 
         contacts_collection = db[collection_name]
 
-        projection = {"_id": 0}
+        include_tally = tally_enabled(org_id)
+        query = {} if include_tally else {"platform": {"$ne": "tally"}}
+        projection = {"_id": 0} if include_tally else {"_id": 0, "tally": 0}
 
-        cursor = contacts_collection.find({}, projection).batch_size(services.BATCH_SIZE)
+        cursor = contacts_collection.find(query, projection).batch_size(services.BATCH_SIZE)
 
         contacts = []
         for contact in cursor:
@@ -138,7 +141,8 @@ def _get_contacts_page(
     snapshot: str | None,
 ) -> dict:
     collection = db[f"contacts_{org_id}"]
-    query: dict = {}
+    include_tally = tally_enabled(org_id)
+    query: dict = {} if include_tally else {"platform": {"$ne": "tally"}}
     tags = [str(tag).strip()[:100] for tag in tags[:20] if str(tag).strip()]
 
     if tags:
@@ -153,7 +157,10 @@ def _get_contacts_page(
         search_query = {
             "$or": [
                 {field: {"$regex": re.escape(safe_search), "$options": "i"}}
-                for field in ("full_name", "phone_number", "email", "username", "company", "gstin", "tally.legal_name")
+                for field in (
+                    "full_name", "phone_number", "email", "username", "company", "gstin",
+                    *(("tally.legal_name",) if include_tally else ()),
+                )
             ]
         }
         if query:
@@ -176,8 +183,9 @@ def _get_contacts_page(
         "username": 1,
         "company": 1,
         "gstin": 1,
-        "tally": 1,
     }
+    if include_tally:
+        projection["tally"] = 1
     if snapshot:
         if not ObjectId.is_valid(snapshot):
             raise HTTPException(status_code=422, detail="Invalid contacts snapshot")

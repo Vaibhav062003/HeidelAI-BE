@@ -54,10 +54,12 @@ class EntitlementContractTest(unittest.TestCase):
         entitlements = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: stored)
         unreadable = types.SimpleNamespace(find_one=lambda *_args, **_kwargs: self.fail("observe mode must not read stored limits"))
         with patch.object(entitlement_service, "db", types.SimpleNamespace(feature_entitlements=unreadable)):
-            with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "observe"}, clear=True):
+            with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "observe", "TALLY_ORG_IDS": "org_1"}, clear=True):
                 self.assertEqual(feature_access("org_1", "AI")["state"], "active")
                 self.assertEqual(feature_access("org_1", "AI")["limits"], {})
                 self.assertEqual(feature_access("org_1", "TALLY")["state"], "active")
+            with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "observe"}, clear=True):
+                self.assertEqual(feature_access("org_1", "TALLY")["state"], "locked")
         with patch.object(entitlement_service, "db", types.SimpleNamespace(feature_entitlements=entitlements)):
             with patch.dict(os.environ, {"ENTITLEMENT_ENFORCEMENT_MODE": "enforce"}, clear=True):
                 self.assertEqual(feature_access("org_1", "AI")["state"], "read_only")

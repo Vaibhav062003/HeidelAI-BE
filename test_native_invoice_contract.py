@@ -10,7 +10,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from unittest.mock import patch
 
-from services.feature_flags import native_invoicing_enabled
+from services.feature_flags import native_invoicing_enabled, tally_enabled
 
 
 class HTTPException(Exception):
@@ -21,12 +21,13 @@ class HTTPException(Exception):
 
 source = Path("services/native_invoice_service.py").read_text()
 tree = ast.parse(source)
-functions = {"_round", "calculate_invoice_totals", "financial_year", "request_fingerprint", "validate_invoice_date", "validate_payment_date", "validate_einvoice_applicability", "quote_claim_id", "claim_quote_revision", "normalize_numbering_config", "format_document_number", "invoice_amounts"}
+functions = {"_round", "calculate_invoice_totals", "financial_year", "request_fingerprint", "validate_invoice_date", "validate_payment_date", "validate_einvoice_applicability", "quote_claim_id", "claim_quote_revision", "normalize_numbering_config", "format_document_number", "invoice_amounts", "invoice_provider"}
 body = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in functions]
 namespace = {
     "Decimal": Decimal, "ROUND_HALF_UP": ROUND_HALF_UP, "deepcopy": deepcopy,
     "HTTPException": HTTPException, "date": date, "MAX_PAISE": 999_999_999_00,
     "hashlib": hashlib, "json": json, "datetime": datetime, "timezone": timezone,
+    "native_invoicing_enabled": native_invoicing_enabled, "tally_enabled": tally_enabled,
     "re": re, "DEFAULT_NUMBERING": {
         "invoice": {"series": "INV", "prefix": "INV/", "suffix": "", "leading_zeros": 6},
         "credit_note": {"series": "CN", "prefix": "CN/", "suffix": "", "leading_zeros": 6},
@@ -45,6 +46,7 @@ claim_quote_revision = namespace["claim_quote_revision"]
 normalize_numbering_config = namespace["normalize_numbering_config"]
 format_document_number = namespace["format_document_number"]
 invoice_amounts = namespace["invoice_amounts"]
+invoice_provider = namespace["invoice_provider"]
 
 
 def line(**changes):
@@ -162,14 +164,50 @@ def test_quote_revision_claim_has_one_owner():
     assert quote_claim_id("org", "quote", 2) != quote_claim_id("org", "quote", 3)
 
 
-def test_native_invoicing_org_allowlist():
+def test_accounting_org_allowlists():
     with patch.dict(os.environ, {}, clear=True):
         assert not native_invoicing_enabled("org-1")
+        assert not tally_enabled("org-1")
     with patch.dict(os.environ, {
         "NATIVE_INVOICING_ORG_IDS": " org-1,org-2 ",
+        "TALLY_ORG_IDS": " org-2,org-3 ",
     }, clear=True):
         assert native_invoicing_enabled("org-1")
         assert not native_invoicing_enabled("org-3")
+        assert not tally_enabled("org-1")
+        assert tally_enabled("org-3")
+
+
+def test_invoice_provider_respects_independent_allowlists():
+    class Collection:
+        def __init__(self, row):
+            self.row = row
+
+        async def find_one(self, *_args, **_kwargs):
+            return self.row
+
+    class Database:
+        def __init__(self, configured=None, has_tally=False):
+            self.settings = Collection({"invoice_provider": configured} if configured else None)
+            self.tally_integrations = Collection({"_id": 1} if has_tally else None)
+
+        def __getitem__(self, _name):
+            return self.settings
+
+    async def exercise():
+        with patch.dict(os.environ, {"NATIVE_INVOICING_ORG_IDS": "org-1"}, clear=True):
+            namespace["db"] = Database(configured="tally", has_tally=True)
+            assert await invoice_provider("org-1") == "native"
+        with patch.dict(os.environ, {"TALLY_ORG_IDS": "org-1"}, clear=True):
+            namespace["db"] = Database()
+            assert await invoice_provider("org-1") == "tally"
+        with patch.dict(os.environ, {"NATIVE_INVOICING_ORG_IDS": "org-1", "TALLY_ORG_IDS": "org-1"}, clear=True):
+            namespace["db"] = Database(configured="native", has_tally=True)
+            assert await invoice_provider("org-1") == "native"
+            namespace["db"] = Database(has_tally=True)
+            assert await invoice_provider("org-1") == "tally"
+
+    asyncio.run(exercise())
 
 
 def test_einvoice_applicability_fails_closed():
@@ -204,7 +242,8 @@ def test_server_side_feature_and_state_contracts():
     entitlements = Path("services/entitlement_service.py").read_text()
     quote_routes = Path("api/quote_routes.py").read_text()
     flags = Path("services/feature_flags.py").read_text()
-    assert 'os.getenv("NATIVE_INVOICING_ORG_IDS", "")' in flags
+    assert '"NATIVE_INVOICING_ORG_IDS"' in flags
+    assert '"TALLY_ORG_IDS"' in flags
     assert "NATIVE_INVOICING_ENABLED" not in flags
     assert 'invoice_provider(user.org_id) != "native"' in routes
     assert routes.index('@router.get("/reports")') < routes.index('@router.get("/{invoice_id}")')
@@ -270,7 +309,8 @@ if __name__ == "__main__":
     test_adjusted_invoice_balances()
     test_idempotency_fingerprint_and_accounting_dates()
     test_quote_revision_claim_has_one_owner()
-    test_native_invoicing_org_allowlist()
+    test_accounting_org_allowlists()
+    test_invoice_provider_respects_independent_allowlists()
     test_einvoice_applicability_fails_closed()
     test_server_side_feature_and_state_contracts()
     print("Native invoice backend contract checks passed.")

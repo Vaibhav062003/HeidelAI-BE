@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from services.feature_flags import native_invoicing_enabled
+from services.feature_flags import native_invoicing_enabled, tally_enabled
 
 from database import get_mongo_client, get_mongo_db
 
@@ -194,7 +194,10 @@ def apply_entitlement(account_id: str, payload: dict) -> dict:
 
 def feature_access(account_id: str, product: str, now: datetime | None = None, *, strict: bool = False) -> dict:
     product = normalize_product(product)
-    if product == "NATIVE_INVOICING" and not native_invoicing_enabled(account_id):
+    if (
+        product == "NATIVE_INVOICING" and not native_invoicing_enabled(account_id)
+        or product == "TALLY" and not tally_enabled(account_id)
+    ):
         return {"state": "locked", "grant_type": "ENV_DISABLED", "starts_at": None, "expires_at": None, "limits": {}}
     if not strict and not enforcement_enabled():
         return {"state": "active", "grant_type": "GRANDFATHERED", "starts_at": None, "expires_at": None, "limits": {}, "observed": True}

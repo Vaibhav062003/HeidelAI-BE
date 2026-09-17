@@ -22,6 +22,7 @@ from PIL import Image, UnidentifiedImageError
 from config.settings import CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CLOUDINARY_CLOUD_NAME
 from database import get_async_mongo_client, get_async_mongo_db
 from services.cloudinary_service import native_invoice_pdf_download_url, upload_native_invoice_pdf
+from services.feature_flags import native_invoicing_enabled, tally_enabled
 from services.native_invoice_asset_service import load_invoice_attachment_images, snapshot_invoice_attachments
 from services.native_invoice_pdf import (
     InvoicePdfError,
@@ -55,7 +56,7 @@ EINVOICE_EXEMPTION_DECLARATION = (
 async def ensure_native_invoice_indexes() -> None:
     if os.getenv("NATIVE_INVOICING_ORG_IDS", "").strip() and not all((CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET)):
         raise RuntimeError("Native invoicing requires Cloudinary credentials for private PDF artifacts")
-    if os.getenv("NATIVE_INVOICING_ORG_IDS", "").strip() or await db.tally_integrations.find_one({}, {"_id": 1}):
+    if os.getenv("NATIVE_INVOICING_ORG_IDS", "").strip() or os.getenv("TALLY_ORG_IDS", "").strip():
         hello = await db.command("hello")
         if not hello.get("setName") and hello.get("msg") != "isdbgrid":
             raise RuntimeError("Invoice finalization requires MongoDB replica-set or mongos transaction support")
@@ -122,10 +123,15 @@ async def ensure_native_invoice_indexes() -> None:
 async def invoice_provider(org_id: str) -> str:
     settings = await db[f"quote_settings_{org_id}"].find_one({"_id": "branding"}, {"invoice_provider": 1})
     configured = (settings or {}).get("invoice_provider")
-    if configured in {"native", "tally"}:
-        return configured
-    tally = await db.tally_integrations.find_one({"org_id": org_id}, {"_id": 1})
-    return "tally" if tally else "native"
+    native_allowed = native_invoicing_enabled(org_id)
+    tally_allowed = tally_enabled(org_id)
+    if configured == "native" and native_allowed:
+        return "native"
+    if configured == "tally" and tally_allowed:
+        return "tally"
+    if tally_allowed and (not native_allowed or await db.tally_integrations.find_one({"org_id": org_id}, {"_id": 1})):
+        return "tally"
+    return "native"
 
 
 def _round(value: Decimal) -> int:
