@@ -25,6 +25,7 @@ temp.py
 tests/*
 !tests/contracts/
 !tests/contracts/test_team_routing_contract.py
+!tests/integration/
 !tests/shopify/
 tests/shopify/*
 !tests/shopify/test_shopify_worker_runtime.py
