@@ -30,8 +30,15 @@ class TallyContactSyncContract(unittest.TestCase):
         self.assertIn('"/api/tally/access"', routes)
         self.assertIn("check_tally_contact_sync_health", scheduler)
         entitlements = pathlib.Path("services/entitlement_service.py").read_text()
-        self.assertIn("if not enforcement_enabled():", entitlements)
+        self.assertIn('product == "TALLY" and not tally_enabled(account_id)', entitlements)
+        self.assertIn("if not strict and not enforcement_enabled():", entitlements)
         self.assertIn('return {"state": "locked"', entitlements)
+
+    def test_contacts_hide_tally_data_outside_org_allowlist(self):
+        contacts = pathlib.Path("services/contacts_service.py").read_text()
+        self.assertIn("include_tally = tally_enabled(org_id)", contacts)
+        self.assertIn('{"platform": {"$ne": "tally"}}', contacts)
+        self.assertIn('if include_tally:\n        projection["tally"] = 1', contacts)
 
 
 if __name__ == "__main__":

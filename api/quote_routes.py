@@ -17,7 +17,7 @@ from services.quote_service import build_quote_document
 from services.utils import serialize_mongo
 from services.work_team_service import list_work_teams, require_conversation_access
 from services.entitlement_service import require_feature
-from services.feature_flags import native_invoicing_enabled
+from services.feature_flags import native_invoicing_enabled, tally_enabled
 from services.native_invoice_service import invoice_provider
 from services.iris_irp_service import save_taxpayer_credentials, taxpayer_credential_status
 from services.india_tax import gst_state_name, is_valid_gstin
@@ -518,8 +518,11 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
     if payload.invoice_provider is not None:
         if payload.invoice_provider == "native" and not native_invoicing_enabled(user.org_id):
             raise HTTPException(status_code=403, detail="Native invoicing is disabled on this deployment")
-        if payload.invoice_provider == "tally" and not await db.tally_integrations.find_one({"org_id": user.org_id}, {"_id": 1}):
-            raise HTTPException(status_code=409, detail="Connect Tally before selecting it as the invoice provider")
+        if payload.invoice_provider == "tally":
+            if not tally_enabled(user.org_id):
+                raise HTTPException(status_code=403, detail="Tally is disabled for this organization")
+            if not await db.tally_integrations.find_one({"org_id": user.org_id}, {"_id": 1}):
+                raise HTTPException(status_code=409, detail="Connect Tally before selecting it as the invoice provider")
         updates["invoice_provider"] = payload.invoice_provider
     effective_seller = updates.get("seller") or current.get("seller") or {}
     previous_gstin = str((current.get("seller") or {}).get("gstin") or "").upper()
@@ -568,7 +571,7 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
         "pdf_design": settings.get("pdf_design") or QuoteDesign().model_dump(),
         "branding_defaults": settings.get("branding_defaults") or QuoteBrandingDefaults().model_dump(),
         "can_edit": True,
-        "invoice_provider": settings.get("invoice_provider") or await invoice_provider(user.org_id),
+        "invoice_provider": await invoice_provider(user.org_id),
         "e_invoice_applicability": settings.get("e_invoice_applicability") or {
             "status": "unassessed", "gstin": (settings.get("seller") or {}).get("gstin", ""), "reporting_window_days": None,
             "b2c_dynamic_qr_required": False, "not_required_reason": None,
