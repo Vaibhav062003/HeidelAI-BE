@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from core.services import services
 from database import get_mongo_db
 from schemas.models import Product
+from services.catalogue_fields import canonical_fields
 
 def _products_collection(org_id: str):
     return db[f"products_{org_id}"]
@@ -214,6 +215,8 @@ async def bulk_upload_products_from_file(
         if "source" not in mongo_doc or not mongo_doc.get("source"):
             mongo_doc["source"] = "csv_upload"
 
+        mongo_doc["_id"] = ObjectId()
+        mongo_doc.update(canonical_fields(mongo_doc))
         products_to_insert.append(mongo_doc)
 
     batch_size = services.BATCH_SIZE
@@ -296,6 +299,8 @@ async def add_single_product(org_id: str, data: dict) -> dict:
     if "source" not in mongo_doc or not mongo_doc.get("source"):
         mongo_doc["source"] = "manual"
 
+    mongo_doc["_id"] = ObjectId()
+    mongo_doc.update(canonical_fields(mongo_doc))
     result = collection.insert_one(mongo_doc)
     mongo_doc["_id"] = str(result.inserted_id)
 

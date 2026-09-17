@@ -207,6 +207,27 @@ def format_dealer_sourcing_message(extracted_attrs: dict, raw_query: str = "") -
         if value and not re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", title, re.IGNORECASE):
             title += f" / {value}"
 
+    # Canonical V5 specifications retain units and comparison operators.
+    # Prices/budgets deliberately remain internal, as in the existing flow.
+    for key, label, unit in (("graphics_card", "GPU", ""), ("ram_gb", "RAM", "GB"),
+                             ("storage_gb", "Storage", "GB"), ("vram_gb", "VRAM", "GB"),
+                             ("frame_rate", "Refresh rate", "Hz"), ("processor", "CPU", "")):
+        for suffix, qualifier in (("", ""), ("_gte", "at least "), ("_lte", "at most "),
+                                  ("_ne", "not "), ("_in", "one of "), ("_nin", "excluding ")):
+            if key == "processor" and not suffix:
+                continue  # Legacy equality formatting above already includes it.
+            value = specs.get(key + suffix)
+            if suffix in {"_in", "_nin"} and isinstance(value, list):
+                value = " or ".join(str(item) for item in value if isinstance(item, (str, int, float)))
+            if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                continue
+            detail = f"{qualifier}{value}{(' ' + unit) if unit else ''}"
+            title += f" / {label}: {detail}"
+    for key, label in (("codes", "Models"), ("brands", "Brands"), ("excluded_brands", "Exclude brands")):
+        values = specs.get(key)
+        if isinstance(values, list) and values:
+            title += f" / {label}: " + ", ".join(str(value) for value in values)
+
     return f"{title}\n\nbhai price and availability?"
 
 

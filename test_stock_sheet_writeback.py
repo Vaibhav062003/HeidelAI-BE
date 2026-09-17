@@ -83,6 +83,31 @@ class StockSheetWritebackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.client.posts), 2)
         self.assertEqual(self.client.posts[-1][1]["headers"]["Authorization"], "Bearer refreshed")
 
+    async def test_minimum_uses_canonical_sku_and_rejects_changed_tax_or_mrp(self):
+        headers = ["SKU", "Model No", "Product Name", "Floor", "GST Rate", "GST Inclusive", "MRP"]
+        self.module._detect_header_row.return_value = (headers, 1, 0)
+        self.connection["column_mapping"] = {"sku": "SKU", "model_no": "Model No", "approved_floor_price": "Floor"}
+        row = ["A1", "A-1", "GPU", 80, 18, False, 200]
+        product, error = self.module.transform_row(dict(zip(headers, row)), self.connection["column_mapping"], "sheet", "org", "component")
+        self.assertFalse(error)
+        product["_id"] = "p"
+        products = Mock()
+        self.module.get_mongo_db = lambda: {"products_org": products}
+        client = Client([row, ["A-1", "A1", "Other", 80, 18, False, 200]])
+        self.module.httpx.AsyncClient = lambda: client
+        result = await self.module._write_product_sheet_values("org", product, {"approved_floor_price": 90, "_minimum_change_id": "c"}, self.connection)
+        self.assertEqual(result["row_number"], 2)
+        self.assertEqual(result["product_document"]["unique_identifier"], "A-1")
+        self.assertEqual(client.rows[1][3], 80)
+        for index, value in [(4, 12), (5, True), (6, 70)]:
+            changed = row.copy()
+            changed[index] = value
+            client = Client([changed])
+            self.module.httpx.AsyncClient = lambda: client
+            with self.assertRaisesRegex(ValueError, "changed"):
+                await self.module._write_product_sheet_values("org", product, {"approved_floor_price": 90}, self.connection)
+            self.assertFalse(client.posts)
+
     async def test_sheet_permission_failure_is_not_success(self):
         with self.assertRaisesRegex(ValueError, "rejected the stock update"):
             await self.write(write_status=403)

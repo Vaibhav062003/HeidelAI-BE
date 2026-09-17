@@ -875,9 +875,13 @@ async def validate_ai_pricing_response(
 ) -> tuple[bool, str]:
     """Audit in shadow; block only in review when a price is not safely backed."""
     pricing_mode = await get_pricing_mode(org_id)
+    quoted_prices = extract_quoted_prices(content)
+    if quoted_prices or _LINE_ITEM_SIGNAL_RE.search(content or ""):
+        from services.b2b_pricing_service import enabled as b2b_enabled, validate_output
+        if await b2b_enabled(org_id):
+            return await validate_output(org_id, conversation_id, content)
     if pricing_mode == "off":
         return True, "pricing_disabled"
-    quoted_prices = extract_quoted_prices(content)
     if not quoted_prices:
         from services.sales_offer_policy import is_outbound_offer
 

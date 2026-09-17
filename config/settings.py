@@ -46,6 +46,14 @@ CLOUDINARY_CLOUD_NAME=os.getenv('CLOUDINARY_CLOUD_NAME')
 CLOUDINARY_API_KEY=os.getenv('CLOUDINARY_API_KEY')
 CLOUDINARY_API_SECRET=os.getenv('CLOUDINARY_API_SECRET')
 
+# IRIS IRP6 e-invoice integration. Taxpayer credentials are encrypted in MongoDB.
+IRIS_IRP_ENV = os.getenv("IRIS_IRP_ENV", "sandbox").strip().lower()
+IRIS_IRP_API_BASE_URL = os.getenv("IRIS_IRP_API_BASE_URL", "").strip().rstrip("/")
+IRIS_IRP_CLIENT_ID = os.getenv("IRIS_IRP_CLIENT_ID", "").strip()
+IRIS_IRP_CLIENT_SECRET = os.getenv("IRIS_IRP_CLIENT_SECRET", "").strip()
+IRIS_IRP_PUBLIC_KEY_PEM = os.getenv("IRIS_IRP_PUBLIC_KEY_PEM", "").strip().replace("\\n", "\n")
+IRP_CREDENTIAL_ENCRYPTION_KEY = os.getenv("IRP_CREDENTIAL_ENCRYPTION_KEY", "").strip()
+
 # Firestore
 SERVICE_ACCOUNT_FILE = os.getenv('FIRESTORE_SERVICE_ACCOUNT_FILE')
 
@@ -116,8 +124,6 @@ GOOGLE_WEBHOOK_BASE_URL = os.getenv("GOOGLE_WEBHOOK_BASE_URL", "").strip().strip
 GOOGLE_WEBHOOK_SECRET = os.getenv("GOOGLE_WEBHOOK_SECRET", "default-webhook-secret-change-me")
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
-os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
-os.environ["LANGCHAIN_PROJECT"] =os.getenv("LANGCHAIN_PROJECT")
 
 #Azure OpenAI
 AZURE_MODEL=os.getenv("AZURE_MODEL")
@@ -132,9 +138,10 @@ AZURE_OPENAI_SUBSCRIPTION_KEY=os.getenv("AZURE_OPENAI_SUBSCRIPTION_KEY")
 AZURE_OPENAI_API_VERSION=os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_DEPLOYMENT=os.getenv("AZURE_DEPLOYMENT")
 
-os.environ["AZURE_OPENAI_API_KEY"] =os.getenv("AZURE_OPENAI_SUBSCRIPTION_KEY")
-os.environ["AZURE_OPENAI_ENDPOINT"] =os.getenv("AZURE_OPENAI_ENDPOINT")
-os.environ["AZURE_OPENAI_DEPLOYMENT"] =os.getenv("AZURE_DEPLOYMENT")
+if AZURE_OPENAI_SUBSCRIPTION_KEY:
+    os.environ["AZURE_OPENAI_API_KEY"] = AZURE_OPENAI_SUBSCRIPTION_KEY
+if AZURE_DEPLOYMENT:
+    os.environ["AZURE_OPENAI_DEPLOYMENT"] = AZURE_DEPLOYMENT
 
 PMA_ORG_ID=os.getenv("PMA_ORG_ID")
 EGENIE_ORG_ID=os.getenv("EGENIE_ORG_ID")

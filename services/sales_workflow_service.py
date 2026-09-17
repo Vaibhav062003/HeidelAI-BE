@@ -16,7 +16,7 @@ from pymongo.errors import DuplicateKeyError
 from schemas.sales_workflow import PurchaseItem
 from services.sales_case_service import _database, _collection, _ensure_org_index, get_active_sales_case
 
-PURCHASE_REQUEST = re.compile(r"\b(need|want|quote|quotation|proforma|buy|proceed|order|invoice|bill|qty|quantity|replace|remove|instead|units?|pcs?)\b", re.I)
+PURCHASE_REQUEST = re.compile(r"\b(need|want|price|rate|best|discount|quote|quotation|proforma|buy|proceed|order|invoice|bill|qty|quantity|replace|remove|instead|units?|pcs?)\b", re.I)
 TERMINAL = {"billed", "paid", "cancelled", "refunded", "lost", "customer_cancelled"}
 
 
@@ -217,6 +217,11 @@ async def prepare_purchase(org_id: str, conversation_id: str, expected_version: 
         raise HTTPException(409, "Purchase changed. Refresh and try again")
     if case.get("billing_status") in TERMINAL:
         raise HTTPException(409, "Start a new purchase before preparing more items")
+    from services import b2b_pricing_service as b2b
+    if await b2b.enabled(org_id):
+        await _collection(org_id).update_one({"case_id": case["case_id"], "status": "active", "version": case["version"]},
+            {"$set": {"b2b_pricing": True, "purchase_path": "quote"}})
+        case = {**case, "b2b_pricing": True, "purchase_path": "quote"}
     if message:
         messages = [message]
         if case.get("last_corrected_at"):
@@ -230,6 +235,7 @@ async def prepare_purchase(org_id: str, conversation_id: str, expected_version: 
         }).sort("timestamp", -1).limit(20).to_list(length=20)
         messages = [{"message_id": str(row.get("message_id") or row.get("id") or row.get("_id")), "text": row["content"][:4000]}
                     for row in reversed(rows) if isinstance(row.get("content"), str) and row["content"].strip()]
+    pricing_message = messages[-1] if messages else None
     seen = set(case.get("prepared_messages") or [])
     messages = [row for row in messages if row["message_id"] not in seen]
     if messages:
@@ -250,10 +256,15 @@ async def prepare_purchase(org_id: str, conversation_id: str, expected_version: 
         await _collection(org_id).update_one({"case_id": case["case_id"], "status": "active"}, {
             "$push": {"prepared_messages": {"$each": [row["message_id"] for row in messages], "$slice": -200}},
         })
+    if case.get("b2b_pricing") and pricing_message:
+        case = await b2b.recommend(case, pricing_message)
     return await assess_and_save(case)
 
 
 async def assess(case: dict) -> dict:
+    if case.get("b2b_pricing"):
+        from services.b2b_pricing_service import assess as assess_b2b
+        return await assess_b2b(case)
     from services.sales_action_service import _product, _stock_count, _name, _sku
     from services.stock_service import effective_stock_product, _stock_fresh
     from services.pricing_policy import PriceSnapshot, QuoteCandidate, decide_pricing_v1
@@ -451,6 +462,8 @@ async def start_action(case: dict, source_id: str, customer_text: str = "") -> d
         return None
     from services.sales_action_service import is_invoice_draft_intent
     bill_request = is_invoice_draft_intent(customer_text) or customer_text.strip().casefold() == "proceed"
+    if case.get("b2b_pricing"):
+        bill_request = (case.get("b2b_decision") or {}).get("intent") == "accept"
     action_type = "create_invoice_draft" if bill_request and case.get("quote_id") and case.get("quoted_version") == case["version"] else "start_checkout" if case.get("purchase_path") == "retail" else "create_quote"
     action_source = f"purchase:{case['version']}:{source_id}"
     updated = await _collection(case["org_id"]).find_one_and_update(
@@ -474,6 +487,10 @@ async def automatic_purchase(org_id: str, conversation_id: str, source_id: str, 
     if not await is_effective_ai_enabled(org_id, conversation_id):
         raise AIProviderUnavailable("ai_disabled", escalation_required=False)
     case = await get_active_sales_case(org_id, conversation_id)
+    from services import b2b_pricing_service as b2b
+    if await b2b.enabled(org_id):
+        if b2b.GREETINGS.fullmatch(text) or await b2b.supplier_message(org_id, source_id):
+            return None
     if not PURCHASE_REQUEST.search(text) and not re.fullmatch(r"\s*(?:stop|unsubscribe)\s*", text, re.I) and not (case and case.get("workflow_version") == 2 and case.get("items")):
         return None
     case = await ensure_case(org_id, conversation_id)
@@ -488,7 +505,13 @@ async def automatic_purchase(org_id: str, conversation_id: str, source_id: str, 
     await event(case, "customer_reply", source_id)
     before_version = case["version"]
     case = await prepare_purchase(org_id, conversation_id, case["version"], message={"message_id": source_id, "text": text[:4000]}, expected_case_id=case["case_id"])
-    if case["version"] == before_version and not re.search(r"\b(quote|quotation|checkout|invoice|bill|proceed)\b", text, re.I):
+    if case.get("b2b_pricing"):
+        decision = case.get("b2b_decision") or {}
+        if decision.get("source_message_id") != source_id or decision.get("intent") == "none":
+            return None
+        if decision.get("intent") == "review" and case.get("items") and all(item.get("product_id") and item.get("quantity") for item in case["items"]):
+            raise AIProviderUnavailable("sales_action_review_required")
+    elif case["version"] == before_version and not re.search(r"\b(quote|quotation|checkout|invoice|bill|proceed)\b", text, re.I):
         return None
     action = await start_action(case, source_id, text)
     if action:
@@ -522,6 +545,17 @@ async def validate_delivery(org_id: str, job_id: str) -> None:
         quote = await _database()[f"quotes_{org_id}"].find_one({"quote_id": quote_id}) or {}
         if quote.get("revision_number") != 1:
             raise AIProviderUnavailable("sales_action_review_required")
+    if case.get("b2b_pricing"):
+        from services.b2b_pricing_service import last_sent_quote, fingerprint, newer_message_query
+        decision = case.get("b2b_decision") or {}
+        if job.get("action_type") == "create_invoice_draft" and (decision.get("intent") != "accept" or not await last_sent_quote(case)):
+            raise AIProviderUnavailable("sales_action_review_required")
+        source = await _database()[f"messages_{org_id}"].find_one({"conversation_id": case["conversation_id"],
+            "$or": [{"message_id": decision.get("source_message_id")}, {"id": decision.get("source_message_id")}]})
+        if not source or fingerprint(source) != decision.get("source_hash"):
+            raise AIProviderUnavailable("sales_action_review_required")
+        if source.get("timestamp") and await _database()[f"messages_{org_id}"].find_one(newer_message_query(case["conversation_id"], source)):
+            raise AIProviderUnavailable("sales_action_review_required")
     conversation = await _database()[f"conversations_{org_id}"].find_one({"conversation_id": case["conversation_id"]}) or {}
     phone = re.sub(r"\D", "", str(conversation.get("customer_id") or ""))
     if phone and await _database().whatsapp_suppressions.find_one({"org_id": org_id, "phone": phone}):
@@ -530,7 +564,7 @@ async def validate_delivery(org_id: str, job_id: str) -> None:
     old = job.get("commercial_snapshot") or {}
     def terms(preparation):
         return [(item.get("product_id"), item.get("quantity"), item.get("unit_price"), item.get("gst_rate"),
-                 item.get("gst_inclusive"), item.get("price_version")) for item in preparation.get("items") or []]
+                 item.get("gst_inclusive"), None if case.get("b2b_pricing") else item.get("price_version")) for item in preparation.get("items") or []]
     if not current["auto_send"] or terms(current) != terms(old) or current.get("retail_link") != old.get("retail_link"):
         raise AIProviderUnavailable("sales_action_review_required")
 

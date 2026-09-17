@@ -329,7 +329,8 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
             "image_url": str(product.get("image_url") or ""),
         }],
         "shipping": 0, "discount": 0,
-        "notes": "Price and stock were checked from the current product catalogue.",
+        "notes": ("Availability and delivery remain subject to fulfilment confirmation. Prices will be rechecked at acceptance."
+                  if case.get("b2b_pricing") else "Price and stock were checked from the current product catalogue."),
         "terms": list(settings.get("terms") or [
             "Quotation is valid until the date shown above.",
             "Warranty is provided as per the manufacturer policy.",
@@ -369,7 +370,9 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
             f"*Quotation {quote['quote_number']}*\n"
             f"{item_text}\n"
             f"GST: Rs.{gst:,.2f}\n*Total: Rs.{float(quote['public_grand_total']):,.2f}*\n"
-            f"Valid until: {quote['valid_until']}\n\nReply *proceed* when you are ready for billing."
+            f"Valid until: {quote['valid_until']}\n"
+            + ("Availability is subject to confirmation. Prices will be rechecked at acceptance.\n" if case.get("b2b_pricing") else "")
+            + "\nReply *proceed* when you are ready for billing."
         ),
         "fields": {"quote_id": quote_id, "quote_number": quote["quote_number"], **({"quoted_version": case["version"]} if purchase else {})},
         "ready_stage": "stock_confirmation", "delivered_stage": "quote_sent",
@@ -389,7 +392,14 @@ async def _invoice_draft(
     case: dict[str, Any], customer_text: str, source_message_id: str,
 ) -> dict[str, Any]:
     source_ids = [str(value) for value in case.get("action_source_message_ids") or [] if value]
-    if not (case.get("workflow_version") == 2 and case.get("quote_id") and customer_text.strip().casefold() == "proceed") and not is_invoice_draft_intent(customer_text, has_source=bool(source_ids or case.get("quote_id"))):
+    b2b_accept = case.get("b2b_pricing") and (case.get("b2b_decision") or {}).get("intent") == "accept"
+    if case.get("b2b_pricing"):
+        from services.b2b_pricing_service import last_sent_quote
+        quote = await last_sent_quote(case)
+        accepted = (case.get("b2b_decision") or {}).get("accepted_quote")
+        if not b2b_accept or not quote or quote != accepted:
+            raise SalesActionBlocked("The quotation changed. Please accept the current quotation before billing.", escalate=True)
+    if not b2b_accept and not (case.get("workflow_version") == 2 and case.get("quote_id") and customer_text.strip().casefold() == "proceed") and not is_invoice_draft_intent(customer_text, has_source=bool(source_ids or case.get("quote_id"))):
         raise SalesActionBlocked("Please confirm which quoted products you want me to send for billing.")
     from services.tally_service import create_tally_invoice_draft
     draft = await create_tally_invoice_draft(
@@ -524,6 +534,9 @@ async def execute_sales_action(
                 if not preparation["auto_send"]:
                     raise SalesActionBlocked("The purchase needs review before billing.", escalate=True)
                 await jobs.update_one({"_id": job_id}, {"$set": {"purchase_version": case["version"], "commercial_snapshot": preparation}})
+                if case.get("b2b_pricing"):
+                    from services.sales_workflow_service import validate_delivery
+                    await validate_delivery(str(case["org_id"]), job_id)
             result = await _invoice_draft(case, customer_text, source_message_id)
         elif action_type == "schedule_followup":
             result = await _schedule_followup(case)

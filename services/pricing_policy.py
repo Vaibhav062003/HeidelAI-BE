@@ -9,7 +9,7 @@ approved floor by :meth:`PriceSnapshot.from_product`.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Literal, Mapping, TypeAlias
@@ -355,3 +355,20 @@ def decide_pricing_v1(
 
 # Short alias for callers that do not need the schema version in the function name.
 decide_pricing = decide_pricing_v1
+
+
+def decide_b2b_pricing(snapshot: PriceSnapshot, quote: QuoteCandidate, *,
+                       evidence_ids: tuple[str, ...] = (), now: datetime | None = None,
+                       max_age: timedelta = timedelta(minutes=60)) -> PricingDecisionV1:
+    """A grounded B2B offer needs a current floor, not a target or exact stock."""
+    floor_only = replace(snapshot, target_selling_price=snapshot.approved_floor_price,
+                         cost_price=None, cost_gst_inclusive=None, stock_available=None)
+    checked = decide_pricing_v1(floor_only, replace(quote, actor="human"), now=now, max_age=max_age)
+    reasons = [reason for reason in checked.reasons if reason != "verified_human_quote"]
+    if not quote.structured:
+        reasons.append("quote_not_structured")
+    if not evidence_ids:
+        reasons.append("human_pricing_evidence_missing")
+    return replace(checked, action="review_required" if reasons else "auto_send",
+                   reasons=tuple(reasons or ["grounded_b2b_offer"]),
+                   target_inr_gst_inclusive=None, schema_version="pricing_decision.b2b.v1")

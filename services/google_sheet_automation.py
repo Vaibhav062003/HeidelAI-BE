@@ -13,6 +13,7 @@ Key behaviors:
 
 import re
 import hashlib
+import json
 import uuid as _uuid
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -218,6 +219,7 @@ async def process_google_sheet_trigger(
         send_whatsapp_message,
         send_whatsapp_template_message,
         create_or_update_whatsapp_conversation,
+        _is_definitive_meta_rejection,
     )
     sem = asyncio.Semaphore(20)  # 20 concurrent sends for high throughput
 
@@ -231,9 +233,7 @@ async def process_google_sheet_trigger(
                 await asyncio.to_thread(_mark_suppressed, org_id, flow_id, phone, sheet_id)
                 return {"sent": 0, "skipped": 1, "errors": 0}
 
-            # Ensure conversation exists before sending — the centralized send functions
-            # use find_one_and_update WITHOUT upsert, so new contacts from sheets would crash.
-            # create_or_update_whatsapp_conversation uses upsert=True and handles name resolution.
+            # Resolve the bound conversation without publishing an unsent message.
             try:
                 conversation_id = await create_or_update_whatsapp_conversation(
                     org_id=org_id,
@@ -245,6 +245,7 @@ async def process_google_sheet_trigger(
                     mode="reply",
                     business_phone_id=phone_id,
                     business_phone=wa_connection.get("phone"),
+                    record_activity=False,
                 )
             except Exception as e:
                 logger.warning(f"[GoogleSheetAuto] Conversation pre-create for {phone}: {e}")
@@ -252,7 +253,8 @@ async def process_google_sheet_trigger(
                 return {"sent": 0, "errors": 1}
 
             msg_id = ""
-            send_ok = False
+            failure = None
+            failure_status = "failed"
             try:
                 if recipient.get("is_template"):
                     # Build template dict matching what send_whatsapp_template_message expects
@@ -275,7 +277,6 @@ async def process_google_sheet_trigger(
                         conversation_id=conversation_id,
                     )
                     msg_id = result.get("message_id", "")
-                    send_ok = True
                 else:
                     # Build message dict matching what send_whatsapp_message expects
                     message_dict = {
@@ -289,13 +290,34 @@ async def process_google_sheet_trigger(
                         mode="reply",
                     )
                     msg_id = result.get("message_id", "")
-                    send_ok = True
+
+                if not isinstance(msg_id, str) or not msg_id.strip():
+                    raise RuntimeError("Delivery outcome is unknown: no message ID returned")
 
             except Exception as e:
                 logger.error(f"[GoogleSheetAuto] WA send failed for {phone}: {e}")
+                # Only a confirmed rejection is safe to label failed and retry.
+                rejected = getattr(e, "delivery_not_attempted", isinstance(e, HTTPException) and _is_definitive_meta_rejection(e.status_code))
+                detail = e.detail if isinstance(e, HTTPException) else None
+                details = detail if isinstance(detail, dict) else {}
+                failure_status = "failed" if rejected else "delivery_unknown"
+                failure = {
+                    "code": details.get("code") or failure_status,
+                    "details": (details.get("message") or (detail if isinstance(detail, str) else None) or "WhatsApp rejected this message.")
+                    if rejected else "Delivery could not be confirmed. Check WhatsApp before sending again.",
+                    "stage": "submission",
+                }
+                if rejected and (not isinstance(e, HTTPException) or e.status_code >= 500):
+                    failure["details"] = "Sending could not start. The automation will retry."
+                if rejected:
+                    try:
+                        await _record_failed_sheet_send(
+                            org_id, flow_id, conversation_id, recipient, wa_id, phone_id, failure,
+                        )
+                    except Exception as sync_error:
+                        logger.error(f"[GoogleSheetAuto] Could not save failed attempt: {sync_error}")
 
-
-            if send_ok:
+            if failure is None:
                 # Immediate atomic write with retry
                 dedup_success = False
                 for attempt in range(3):
@@ -324,9 +346,13 @@ async def process_google_sheet_trigger(
                         await asyncio.sleep(0.3)
 
                 if not dedup_success:
-                    logger.error(f"[GoogleSheetAuto] CRITICAL: Dedup write permanently failed for {phone} — marking failed for retry")
+                    logger.error(f"[GoogleSheetAuto] Dedup write failed after acceptance for {phone}")
                     try:
-                        await asyncio.to_thread(_mark_failed, org_id, flow_id, phone, sheet_id)
+                        await asyncio.to_thread(
+                            _mark_failed, org_id, flow_id, phone, sheet_id,
+                            status="delivery_unknown",
+                            error={"code": "accepted_pending_sync", "message_id": msg_id, "details": "Accepted message could not be recorded in automation results."},
+                        )
                     except Exception as mark_err:
                         logger.error(f"[GoogleSheetAuto] Failed to mark {phone} as failed: {mark_err}")
                     return {"sent": 0, "errors": 1}
@@ -335,7 +361,7 @@ async def process_google_sheet_trigger(
                 # but we still need to ensure the contact record exists
                 try:
                     final_name = customer_name or phone
-                    conversation_id_key = f"whatsapp_{phone}"
+                    conversation_id_key = conversation_id
                     contacts_collection = db[f"contacts_{org_id}"]
                     await asyncio.to_thread(
                         contacts_collection.update_one,
@@ -363,9 +389,12 @@ async def process_google_sheet_trigger(
 
                 return {"sent": 1, "errors": 0}
             else:
-                # Send failed. Move to a retryable failure state.
+                # Retry only confirmed rejections; retain uncertainty in the result record.
                 try:
-                    await asyncio.to_thread(_mark_failed, org_id, flow_id, phone, sheet_id)
+                    await asyncio.to_thread(
+                        _mark_failed, org_id, flow_id, phone, sheet_id,
+                        status=failure_status, error=failure,
+                    )
                 except Exception as e:
                     logger.error(f"[GoogleSheetAuto] Failed to mark {phone} as failed: {e}")
                 return {"sent": 0, "errors": 1}
@@ -883,17 +912,63 @@ def _mark_sent(org_id: str, flow_id: str, phone: str, sheet_id: str, message_id:
     )
 
 
-def _mark_failed(org_id: str, flow_id: str, phone: str, sheet_id: str):
-    """Mark a send attempt as failed so it can be retried on next run."""
+async def _record_failed_sheet_send(org_id, flow_id, conversation_id, recipient, wa_id, phone_id, error):
+    from pymongo import ReturnDocument
+    from schemas.models import MessageRole
+    from services.wa_service import store_whatsapp_message
+    from services.websocket_service import broadcast_main_ws
+
+    payload = {
+        "name": recipient["template_name"],
+        "language": {"code": recipient.get("language_code", "en")},
+        "components": recipient.get("components") or [],
+    } if recipient.get("is_template") else None
+    content = f"Shared a template {recipient['template_name']}" if payload else recipient["resolved_text"]
+    identity = json.dumps([org_id, flow_id, conversation_id, phone_id, content, payload], sort_keys=True)
+    message_id = f"automation-failed-{_uuid.uuid5(_uuid.NAMESPACE_URL, identity)}"
+    messages = db[f"messages_{org_id}"]
+    stored = await asyncio.to_thread(messages.find_one, {"message_id": message_id})
+    if not stored:
+        await store_whatsapp_message(
+            org_id=org_id, content=content, conversation_id=conversation_id,
+            customer_phone_no=recipient["phone_number"], type="template" if payload else "text",
+            payload=payload, recipient_id=wa_id, role=MessageRole.AGENT, mode="reply",
+            sender_name="Automation", message_id=message_id, status="failed", delivery_error=error,
+            business_phone_id=phone_id, bot_context={"source": "google_sheet_automation", "flow_id": flow_id},
+        )
+        stored = await asyncio.to_thread(messages.find_one, {"message_id": message_id})
+    # A newer customer message must win over a slow failure write.
+    conversation = await asyncio.to_thread(
+        db[f"conversations_{org_id}"].find_one_and_update,
+        {"conversation_id": conversation_id, "$or": [
+            {"last_message_timestamp": {"$lte": stored["timestamp"]}},
+            {"last_message_timestamp": None},
+        ]},
+        {"$set": {
+            "last_message": f"Not sent: {content}",
+            "last_message_timestamp": stored["timestamp"], "last_message_is_private_note": False,
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if conversation:
+        await broadcast_main_ws(
+            platform_id=wa_id, platform_type="whatsapp", event_type="conversation_updated",
+            payload={"conversation": serialize_mongo(conversation)},
+        )
+
+
+def _mark_failed(org_id: str, flow_id: str, phone: str, sheet_id: str, *, status="failed", error=None):
+    """Definite rejections can retry; uncertain delivery is held for reconciliation."""
     now = datetime.now(timezone.utc)
     db[SENT_COLLECTION].update_one(
         {"org_id": org_id, "flow_id": flow_id, "phone": phone},
         {
             "$set": {
-                "status": "failed",
+                "status": status,
                 "failed_at": now,
                 "updated_at": now,
                 "sheet_id": sheet_id,
+                **({"delivery_error": error} if error else {}),
             }
         },
         upsert=True,

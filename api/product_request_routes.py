@@ -46,7 +46,7 @@ async def list_requests(request: Request, user: CurrentUser,
     phone_number_id: str = Query("", max_length=128), product_id: str = Query("", max_length=120),
     review: Literal["all", "unmatched", "matched"] = "all", page: int = Query(1, ge=1, le=10000)):
     db = get_async_mongo_db()
-    match = {"org_id": user.org_id}
+    match = {"org_id": user.org_id, "archived_at": {"$exists": False}}
     if status != "all":
         match["status"] = status
     if phone_number_id:

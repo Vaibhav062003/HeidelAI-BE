@@ -33,6 +33,7 @@ from . import internal_sales_learning_routes
 from . import shopify_routes
 from . import pricing_routes
 from . import product_request_routes
+from . import native_invoice_routes
 
 router = APIRouter()
 
@@ -69,3 +70,4 @@ router.include_router(internal_sales_learning_routes.router)
 router.include_router(shopify_routes.router)
 router.include_router(pricing_routes.router)
 router.include_router(product_request_routes.router)
+router.include_router(native_invoice_routes.router)

@@ -5,6 +5,7 @@ timeout is deliberately UNKNOWN, never automatically retried (duplicate risk).
 """
 import asyncio
 import re
+from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
@@ -28,6 +29,7 @@ async def ensure_product_request_indexes():
     db = get_async_mongo_db()
     await db.product_requests.create_index([("org_id", 1), ("status", 1), ("last_asked_at", -1)])
     await db.product_requests.create_index([("org_id", 1), ("product_id", 1), ("business_phone_id", 1)])
+    await db.product_requests.create_index("product_key", unique=True, sparse=True)
     await db.restock_outbox.create_index([("status", 1), ("created_at", 1)])
 
 
@@ -37,9 +39,12 @@ async def capture_product_requests(job, raw_requests, messages):
     db = get_async_mongo_db()
     org = job["org_id"]
     conversation = await db[f"conversations_{org}"].find_one({"conversation_id": job["conversation_id"]})
+    buyer_transaction = job.get("counterparty_role") == "buyer"
     if (not conversation or conversation.get("platform") != "whatsapp"
-            or conversation.get("is_dealer") or conversation.get("persona") in {"dealer", "dealers"}):
+            or (not buyer_transaction and (conversation.get("is_dealer") or conversation.get("persona") in {"dealer", "dealers"}))):
         return
+    # Capture must not race the independent restock worker's index setup.
+    await db.product_requests.create_index("product_key", unique=True, sparse=True)
     for raw in raw_requests[:20]:
         item = grounded_request(raw, messages)
         if not item:
@@ -49,23 +54,32 @@ async def capture_product_requests(job, raw_requests, messages):
         if not isinstance(stamp, datetime):
             continue
         # Insert first, then compare source times: out-of-order workers cannot revive stale interest.
-        base = {"_id": key, "org_id": org, "conversation_id": job["conversation_id"],
+        # Adopt an existing exact-name row without changing its public ID or reviewed state.
+        try:
+            await db.product_requests.update_one(
+                {"_id": key, "org_id": org, "product_key": {"$exists": False}, "archived_at": {"$exists": False}},
+                {"$set": {"product_key": key}})
+        except DuplicateKeyError:
+            pass  # A canonical row already exists, including during concurrent capture.
+        base = {"_id": str(uuid4()), "product_key": key, "org_id": org, "conversation_id": job["conversation_id"],
                 "customer_name": conversation.get("customer_name") or job.get("customer_name"),
                 "customer_phone": re.sub(r"\D", "", str(conversation.get("customer_id") or job.get("customer_phone") or "")),
                 "business_phone_id": str(conversation.get("business_phone_id") or ""),
                 "business_phone": conversation.get("business_phone"),
                 "status": "requested", "created_at": now(), "product_name": item["product_name"]}
         try:
-            await db.product_requests.update_one({"_id": key}, {"$setOnInsert": base}, upsert=True)
+            await db.product_requests.update_one({"product_key": key}, {"$setOnInsert": base}, upsert=True)
         except DuplicateKeyError:
             pass
         update = {"evidence": item["evidence"], "source_message_id": item["source_message_id"],
+                  "product_reference_message_id": item["product_reference_message_id"],
+                  "product_mention": item["product_mention"], "specificity": item["specificity"],
                   "confidence": item["confidence"], "last_asked_at": stamp,
                   "notification_requested": item["notification_requested"]}
         if item["withdrawn"]:
             update["status"] = "dismissed"
         await db.product_requests.update_one(
-            {"_id": key, "$or": [{"last_asked_at": {"$lt": stamp}}, {"last_asked_at": {"$exists": False}}]},
+            {"product_key": key, "archived_at": {"$exists": False}, "$or": [{"last_asked_at": {"$lt": stamp}}, {"last_asked_at": {"$exists": False}}]},
             {"$set": update})
 
 
@@ -107,7 +121,7 @@ async def connection_for(org, phone):
 
 
 async def accessible_request(user, request_id):
-    row = await get_async_mongo_db().product_requests.find_one({"org_id": user.org_id, "_id": request_id})
+    row = await get_async_mongo_db().product_requests.find_one({"org_id": user.org_id, "_id": request_id, "archived_at": {"$exists": False}})
     if not row:
         raise HTTPException(404, "Product request not found")
     conversation = await require_conversation_access(user.org_id, row["conversation_id"], user.user_id, user.role)

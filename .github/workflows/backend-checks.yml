@@ -3,6 +3,13 @@ name: Backend checks
 on:
   pull_request:
   workflow_call:
+    secrets:
+      CLOUDINARY_CLOUD_NAME:
+        required: false
+      CLOUDINARY_API_KEY:
+        required: false
+      CLOUDINARY_API_SECRET:
+        required: false
 
 jobs:
   checks:
@@ -13,7 +20,45 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: python -m pip install -r requirements.txt pytest
+      - run: python -m pip install --no-deps -r requirements.txt && python -m pip install pytest
+      - name: Dependency audit
+        run: |
+          python -m venv /tmp/heidelai-dependency-tools
+          /tmp/heidelai-dependency-tools/bin/pip install pip-audit==2.10.1 poetry==2.4.1 poetry-plugin-export==1.10.0
+          /tmp/heidelai-dependency-tools/bin/poetry check --lock
+          /tmp/heidelai-dependency-tools/bin/poetry export --format requirements.txt --without-hashes --output /tmp/requirements-export.txt
+          diff -u requirements.txt /tmp/requirements-export.txt
+          /tmp/heidelai-dependency-tools/bin/pip-audit --no-deps -r requirements.txt --progress-spinner off
+      - name: Native invoice contracts
+        run: |
+          python test_native_invoice_contract.py
+          python test_india_tax.py
+          python test_native_invoice_pdf.py
+          python -m pytest -q test_native_invoice_pdf_worker.py
+          python test_native_invoice_storage_contract.py
+          python test_native_invoice_cloudinary.py
+          python test_native_invoice_body_limit.py
+          python test_native_invoice_reporting.py
+          python test_native_invoice_backup.py
+          python -m pytest -q test_native_invoice_http_contract.py
+          python -m pytest -q test_native_invoice_receipt_service.py
+          python -m pytest -q test_iris_irp_service.py
+          python test_security_runtime_contract.py
+          python test_reverification.py
+          python test_auth_jwks_cache.py
+      - name: Optional live Cloudinary contract
+        env:
+          RUN_CLOUDINARY_INTEGRATION: ${{ secrets.CLOUDINARY_CLOUD_NAME != '' && secrets.CLOUDINARY_API_KEY != '' && secrets.CLOUDINARY_API_SECRET != '' && '1' || '0' }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: python tests/integration/test_native_invoice_cloudinary.py
+      - name: Start MongoDB replica set
+        run: bash scripts/start_ci_mongo_replset.sh
+      - name: Native invoice MongoDB transactions and restore
+        env:
+          MONGODB_TEST_URI: mongodb://localhost:27017/?replicaSet=rs0&directConnection=true
+        run: python tests/integration/test_native_invoice_mongo.py
       - name: Pricing and sales contracts
         run: |
           python test_pricing_policy_v1.py

@@ -7,6 +7,8 @@ class CurrentUserModel(BaseModel):
     org_id: str
     role: str
     full_name: Optional[str] = "You"
+    # Clerk's factor verification age claim, in minutes. -1 means unavailable.
+    factor_verification_age: tuple[int, int] = (-1, -1)
 
 
 class Token(BaseModel):

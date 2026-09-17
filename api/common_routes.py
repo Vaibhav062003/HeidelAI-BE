@@ -4,7 +4,7 @@ import re
 import requests
 import httpx
 from typing import Optional
-from database import get_mongo_db
+from database import get_async_mongo_db, get_mongo_db
 from config.settings import APP_ID
 from config.settings import ACCESS_TOKEN
 from services.cloudinary_service import upload_media_to_cloudinary
@@ -73,6 +73,7 @@ from loguru import logger
 
 router = APIRouter(tags=["Common Routes"])
 db = get_mongo_db()
+async_db = get_async_mongo_db()
 
 @router.get("/")
 @limiter.limit("60/minute")
@@ -95,6 +96,17 @@ async def health_check_head(request: Request, response: Response):
 @limiter.exempt
 async def health_check_revision(request: Request):
     return {"status": "ok", "revision": os.getenv("GIT_SHA", "unknown")}
+
+
+@router.get("/ready")
+@limiter.exempt
+async def readiness_check(request: Request):
+    try:
+        await asyncio.wait_for(async_db.command("ping"), timeout=2)
+    except Exception as exc:
+        logger.warning("Readiness check failed: {}", type(exc).__name__)
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    return {"status": "ready", "revision": os.getenv("GIT_SHA", "unknown")}
 
 
 @router.get("/favicon.ico", include_in_schema=False)

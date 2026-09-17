@@ -1584,6 +1584,8 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
                     if bulk_ops:
                         db[archived_conversations].bulk_write(bulk_ops, session=session)
                         
+                    db["v5_memory"].delete_many({"org_id": org_id, "conversation_id": {
+                        "$in": [item["conversation_id"] for item in conversations_to_archive]}}, session=session)
                     db[conversations_collection_name].delete_many({"platform": "instagram", "instagram_id": instagram_id}, session=session)
                 
                 # Archiving private notes collection

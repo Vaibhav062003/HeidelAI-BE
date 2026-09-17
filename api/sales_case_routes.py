@@ -37,7 +37,8 @@ from services import sales_workflow_service as workflow
 
 @router.get("/settings")
 async def workflow_settings(user: CurrentUser):
-    return {"enabled": await workflow.enabled(user.org_id)}
+    from services.b2b_pricing_service import enabled as b2b_enabled
+    return {"enabled": await workflow.enabled(user.org_id), "b2b_pricing_enabled": await b2b_enabled(user.org_id)}
 
 
 @router.put("/settings")
@@ -45,10 +46,14 @@ async def update_workflow_settings(payload: WorkflowSettings, user: CurrentUser)
     await admin_required(user)
     from services.entitlement_service import require_feature
     require_feature(user.org_id, "AI", strict=True)
-    await workflow._database().organizations.update_one({"org_id": user.org_id}, {
-        "$set": {"sales_workflow_v2_enabled": payload.enabled},
-    })
-    return {"enabled": payload.enabled}
+    fields = {"sales_workflow_v2_enabled": payload.enabled}
+    if payload.b2b_pricing_enabled is not None:
+        fields["b2b_pricing_enabled"] = payload.b2b_pricing_enabled
+        if payload.b2b_pricing_enabled:
+            from services.b2b_pricing_service import ensure_indexes
+            await ensure_indexes(user.org_id)
+    await workflow._database().organizations.update_one({"org_id": user.org_id}, {"$set": fields})
+    return await workflow_settings(user)
 
 
 async def purchase_access(user, conversation_id):
@@ -64,6 +69,10 @@ async def correct_purchase(request: Request, conversation_id: str, payload: Purc
         from fastapi import HTTPException
         raise HTTPException(409, "A purchase has started. Refresh before applying these edits")
     case = await workflow.ensure_case(user.org_id, conversation_id)
+    from services.b2b_pricing_service import enabled as b2b_enabled
+    if payload.purchase_path == "retail" and await b2b_enabled(user.org_id):
+        from fastapi import HTTPException
+        raise HTTPException(422, "B2B purchases use quotations and billing")
     if payload.case_id != "new" and case["case_id"] != payload.case_id:
         from fastapi import HTTPException
         raise HTTPException(409, "A new purchase has started. Refresh before applying these edits")

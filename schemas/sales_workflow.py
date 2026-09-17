@@ -47,6 +47,7 @@ class NewPurchaseRequest(PreparationRequest):
 class WorkflowSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool
+    b2b_pricing_enabled: bool | None = None
 
 
 class WorkSummary(BaseModel):

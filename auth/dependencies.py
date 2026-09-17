@@ -1,13 +1,23 @@
 from typing import Annotated
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError
+from jwt import PyJWTError
 
 from .service import decode_jwt
 from .models import CurrentUserModel
 
 
 security = HTTPBearer()
+
+
+def _factor_verification_age(payload: dict) -> tuple[int, int]:
+    value = payload.get("fva")
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return (-1, -1)
+    try:
+        return (int(value[0]), int(value[1]))
+    except (TypeError, ValueError):
+        return (-1, -1)
 
 
 async def authenticate_credentials(
@@ -20,9 +30,10 @@ async def authenticate_credentials(
             user_id=payload["sub"],
             org_id=payload["o"]["id"],
             role=payload["o"]["rol"],
-            full_name=payload.get("full_name")
+            full_name=payload.get("full_name"),
+            factor_verification_age=_factor_verification_age(payload),
         )
-    except (JWTError, KeyError, TypeError):
+    except (PyJWTError, KeyError, TypeError):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 

@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 import re
 
 from pymongo import ReturnDocument, UpdateOne
+from bson import ObjectId
+from services.catalogue_fields import canonical_fields
 from pymongo.errors import BulkWriteError
 from loguru import logger
 
@@ -254,8 +256,10 @@ def _source_value_snapshot(doc: dict) -> dict:
 
 def source_snapshot_update(doc: dict, sheet_id: str, sheet_row: int, *, authoritative: bool) -> dict:
     """Publish a complete source snapshot, not a patch to old price approvals."""
-    values = {k: v for k, v in doc.items() if k not in (
-        "_id", "source", "source_sheet_id", "source_sheet_ids", "created_at", "_sheet_row",
+    normalized = {**doc, **canonical_fields(doc)}
+    identity = ObjectId()
+    values = {k: v for k, v in normalized.items() if k not in (
+        "_id", "product_id", "source", "source_sheet_id", "source_sheet_ids", "created_at", "_sheet_row",
     )}
     unset = {}
     if authoritative:
@@ -266,7 +270,8 @@ def source_snapshot_update(doc: dict, sheet_id: str, sheet_row: int, *, authorit
     values[f"source_rows.{sheet_id}"] = sheet_row
     values[f"source_values.{sheet_id}"] = _source_value_snapshot(doc)
     update = {"$set": values, "$addToSet": {"source_sheet_ids": sheet_id},
-              "$setOnInsert": {"source": "google_sheet", "created_at": datetime.now(timezone.utc)}}
+              "$setOnInsert": {"_id": identity, "product_id": f"mongo:oid:{identity}",
+                               "source": "google_sheet", "created_at": datetime.now(timezone.utc)}}
     if unset:
         update["$unset"] = unset
     return update
@@ -548,13 +553,9 @@ def transform_row(
     unique_key = source_row_identity(row_data, column_mapping)
             
     if not unique_key:
-        # Fallback to the first non-empty value in the row
-        for val in doc.values():
-            if val is not None and str(val).strip():
-                unique_key = str(val).strip()
-                break
-
-    doc["model_no"] = unique_key
+        return None, "missing model/SKU identity"
+    if not doc.get("model_no"):
+        doc["model_no"] = unique_key
     doc["unique_identifier"] = unique_key
     
     # Set the product type from the connection config
@@ -1409,7 +1410,18 @@ def _write_columns(headers: list[str], mapping: dict) -> dict[str, int]:
 
 async def write_product_sheet_values(org_id: str, product: dict, changes: dict) -> dict:
     """Serialize Sheet writes with reconciliation, then publish verified values."""
-    connection = await primary_product_sheet(org_id)
+    if "approved_floor_price" in changes:
+        from services.pricing_policy import normalize_inr
+        changes = {**changes, "approved_floor_price": float(normalize_inr(changes["approved_floor_price"]))}
+        source = str(product.get("price_source_sheet_id") or "")
+        connection = await asyncio.to_thread(get_mongo_db().product_sheet_connections.find_one, {
+            "org_id": org_id, "sheet_id": source, "status": "active",
+            "disconnect_requested_at": {"$exists": False},
+        }) if source else None
+        if not connection:
+            raise ValueError("The minimum's owning Sheet is unavailable")
+    else:
+        connection = await primary_product_sheet(org_id)
     database = get_mongo_db()
     sheet_id = connection["sheet_id"]
     claim_id = uuid.uuid4().hex
@@ -1425,6 +1437,10 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
     if not claimed.matched_count:
         raise ValueError("Product Sheet is syncing or being edited. Refresh stock and retry")
     try:
+        if "approved_floor_price" in changes:
+            current = await asyncio.to_thread(database[f"products_{org_id}"].find_one, {"_id": product["_id"]})
+            if not current or current.get("price_version") != product.get("price_version"):
+                raise ValueError("Minimum changed before publication; refresh and review")
         result = await _write_product_sheet_values(org_id, product, changes, connection)
         doc = result.pop("product_document")
         await _renew_product_sheet_sync_claim(database, org_id, sheet_id, claim_id)
@@ -1433,6 +1449,8 @@ async def write_product_sheet_values(org_id: str, product: dict, changes: dict) 
             {"_id": product["_id"]} if product.get("_id") else {"unique_identifier": doc["unique_identifier"], "type": doc["type"]},
             source_snapshot_update(doc, sheet_id, result["row_number"], authoritative=True), upsert=True,
         )
+        if "approved_floor_price" in changes:
+            result.update(price_version=doc.get("price_version"), approved_floor_price=doc.get("approved_floor_price"))
         return result
     finally:
         # A failed/ambiguous write is reconciled by the existing durable scheduler.
@@ -1456,6 +1474,7 @@ async def _write_product_sheet_values(org_id: str, product: dict, changes: dict,
     headers, header_row, col_offset = await _detect_header_row(sheet_id, tab_name, access_token, org_id)
     headers = [""] * col_offset + headers
     requested = {
+        "approved_floor_price": changes.get("approved_floor_price"),
         "price": changes.get("price"),
         "description": changes.get("description"),
         "stock": changes.get("quantity"),
@@ -1481,7 +1500,8 @@ async def _write_product_sheet_values(org_id: str, product: dict, changes: dict,
     row_number = None
     async with httpx.AsyncClient() as client:
         if not row_number:
-            sku_field = "model_no" if "model_no" in by_field else "sku" if "sku" in by_field else None
+            # Use the same identity priority and normalization as source_row_identity.
+            sku_field = next((field for field in ("sku", "sku_full", "model_no", "model_name", "id") if field in by_field), None)
             if not sku_field:
                 raise ValueError("Primary Sheet needs a Model No or SKU column before stock can be written")
             data_start_row = header_row + 1
@@ -1497,18 +1517,20 @@ async def _write_product_sheet_values(org_id: str, product: dict, changes: dict,
                 )
             if lookup.status_code != 200:
                 raise ValueError("Google Sheet products could not be checked before writing")
-            wanted = re.sub(r"[^a-z0-9]+", "", str(product.get("sku") or product.get("model_no") or product.get("name") or "").casefold())
+            wanted = str(product.get("unique_identifier") or product.get("sku") or product.get("model_no") or "").strip().casefold()
             if not wanted:
                 raise ValueError("A product SKU is required before writing stock")
             matches = []
             for offset, existing in enumerate(lookup.json().get("values") or []):
                 index = by_field[sku_field]
                 value = existing[index] if index < len(existing) else ""
-                if re.sub(r"[^a-z0-9]+", "", str(value).casefold()) == wanted:
+                if str(source_row_identity({sku_field: value}, {}) or "").casefold() == wanted:
                     matches.append(data_start_row + offset)
             if len(matches) > 1:
                 raise ValueError("Primary Sheet contains duplicate rows for this SKU")
             row_number = matches[0] if matches else None
+            if "approved_floor_price" in requested and not row_number:
+                raise ValueError("Minimum updates require an existing exact Sheet row")
             if not row_number and sheet_id in (product.get("source_sheet_ids") or []):
                 raise ValueError("Product was removed or renamed in the primary Sheet. Sync stock and retry")
         if row_number:
@@ -1532,7 +1554,7 @@ async def _write_product_sheet_values(org_id: str, product: dict, changes: dict,
                 raise ValueError("Google Sheet row could not be checked before writing")
             row = (response.json().get("values") or [[]])[0]
             sku_index = by_field[sku_field]
-            actual = re.sub(r"[^a-z0-9]+", "", str(row[sku_index] if sku_index < len(row) else "").casefold())
+            actual = str(source_row_identity({sku_field: row[sku_index] if sku_index < len(row) else ""}, {}) or "").casefold()
             if actual != wanted:
                 raise ValueError("Sheet row moved before the update; refresh stock and retry")
             protected = [
@@ -1541,6 +1563,19 @@ async def _write_product_sheet_values(org_id: str, product: dict, changes: dict,
             ]
             if protected:
                 raise ValueError(f"Formula-protected Sheet cell(s) cannot be overwritten: {', '.join(protected)}")
+            if "approved_floor_price" in requested:
+                live, live_error = transform_row(
+                    {header: row[index] if index < len(row) else "" for index, header in enumerate(headers) if header},
+                    connection.get("column_mapping") or {}, sheet_id, org_id, connection.get("product_type", "laptop"))
+                if (live_error or not live or live.get("price_version") != product.get("price_version")
+                        or str(live.get("unique_identifier") or "").casefold() != wanted
+                        or (product.get("type") and live.get("type") != product["type"])):
+                    raise ValueError("Live Sheet identity, price or tax basis changed; refresh and review")
+                from services.pricing_policy import normalize_inr
+                if live.get("selling_gst_inclusive") is None:
+                    raise ValueError("Verify the selling GST basis before publishing a minimum")
+                if live.get("mrp") is not None and normalize_inr(requested["approved_floor_price"]) > normalize_inr(live["mrp"]):
+                    raise ValueError("Minimum cannot exceed the live MRP")
             baseline = (product.get("source_values") or {}).get(sheet_id) or product
             if product.get("source_sheet_ids") and any(
                 not _sheet_value_equal(field, row[by_field[field]] if by_field[field] < len(row) else "", baseline.get(field))
@@ -1552,6 +1587,11 @@ async def _write_product_sheet_values(org_id: str, product: dict, changes: dict,
                 "range": f"{encoded_tab}!{_column_letter(by_field[field])}{row_number}",
                 "values": [[value]],
             } for field, value in requested.items()]
+            if "approved_floor_price" in requested:
+                # Record uncertainty before the network call; never blindly repeat a timed-out write.
+                await asyncio.to_thread(get_mongo_db()[f"products_{org_id}"].update_one,
+                    {"_id": product["_id"], "minimum_publication.change_id": changes.get("_minimum_change_id")},
+                    {"$set": {"minimum_publication.write_attempted": True}})
             response = await client.post(
                 f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchUpdate",
                 json={"valueInputOption": "RAW", "data": data},
@@ -1618,7 +1658,7 @@ async def _write_product_sheet_values(org_id: str, product: dict, changes: dict,
                for field, value in requested.items() for index in [by_field[field]]):
             raise ValueError("Sheet values changed during the update; refresh stock and review")
         index = by_field[sku_field]
-        actual = re.sub(r"[^a-z0-9]+", "", str(values[index] if index < len(values) else "").casefold())
+        actual = str(source_row_identity({sku_field: values[index] if index < len(values) else ""}, {}) or "").casefold()
         if actual != wanted:
             raise ValueError("Sheet row moved during the update; review the Sheet before retrying")
         document, error = transform_row(
@@ -1627,6 +1667,10 @@ async def _write_product_sheet_values(org_id: str, product: dict, changes: dict,
         )
         if error:
             raise ValueError(f"Sheet was written but catalogue validation failed: {error}")
+        if "approved_floor_price" in requested:
+            expected = {**live, "approved_floor_price": float(normalize_inr(requested["approved_floor_price"]))}
+            if document.get("price_version") != _price_version(sheet_id, expected):
+                raise ValueError("Sheet commercial terms changed during publication; verify before using the minimum")
     return {"sheet_id": sheet_id, "row_number": row_number, "updated_fields": sorted(requested), "product_document": document}
 
 

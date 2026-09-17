@@ -85,7 +85,7 @@ def test_ambiguous_verified_order_stays_unlinked():
 
 
 def test_thanks_never_creates_another_quote():
-    with patch.object(workflow, "event", new_callable=AsyncMock), patch.object(workflow, "enabled", AsyncMock(return_value=True)), patch("services.ai_policy_service.is_effective_ai_enabled", AsyncMock(return_value=True)), patch.object(workflow, "get_active_sales_case", AsyncMock(return_value=CASE)), patch.object(workflow, "ensure_case", AsyncMock(return_value=CASE)), patch.object(workflow, "prepare_purchase", AsyncMock(return_value=CASE)), patch.object(workflow, "start_action", new_callable=AsyncMock) as action:
+    with patch("services.b2b_pricing_service.enabled", AsyncMock(return_value=False)), patch.object(workflow, "event", new_callable=AsyncMock), patch.object(workflow, "enabled", AsyncMock(return_value=True)), patch("services.ai_policy_service.is_effective_ai_enabled", AsyncMock(return_value=True)), patch.object(workflow, "get_active_sales_case", AsyncMock(return_value=CASE)), patch.object(workflow, "ensure_case", AsyncMock(return_value=CASE)), patch.object(workflow, "prepare_purchase", AsyncMock(return_value=CASE)), patch.object(workflow, "start_action", new_callable=AsyncMock) as action:
         assert run(workflow.automatic_purchase("org-a", "chat-a", "m2", "thanks")) is None
         action.assert_not_awaited()
 

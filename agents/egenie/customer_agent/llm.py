@@ -4,7 +4,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-os.environ["GEMINI_API_KEY"] = os.getenv('GOOGLE_API_KEY')
+if google_api_key := os.getenv("GOOGLE_API_KEY"):
+    os.environ["GEMINI_API_KEY"] = google_api_key
 
 def get_llm(
     model: str = None,
@@ -31,4 +32,3 @@ def get_llm(
 
 if __name__ == "__main__":
     pass
-

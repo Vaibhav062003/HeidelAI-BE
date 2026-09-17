@@ -21,9 +21,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from core.database import db
-from core.logger import logger
+from core.logger import get_logger
+from database import get_mongo_db
 from services.automation_scheduler import schedule_followup, cancel_conversation_followups
+
+db = get_mongo_db()
+logger = get_logger(__name__)
 
 # =============================================================================
 # CONSTANTS — Change DOCTOR_ORG_ID to enable for a client
