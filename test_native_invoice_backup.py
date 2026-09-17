@@ -18,8 +18,12 @@ def main() -> None:
         "public_id": "native_invoices/org/invoice/v2-a.pdf", "version": 7,
         "sha256": digest, "byte_size": 321, "resource_type": "raw", "delivery_type": "private",
     }
-    records = external_pdf_records({"pdf": pdf, "legacy_pdfs": [{"pdf": {**pdf, "public_id": "legacy"}}]}, "invoice", "invoice-1")
-    assert [record["artifact_state"] for record in records] == ["current", "legacy"]
+    receipt = {**pdf, "public_id": "native_invoices/org/invoice-receipt/v3-b.pdf", "version": 8, "byte_size": 123}
+    records = external_pdf_records(
+        {"pdf": pdf, "legacy_pdfs": [{"pdf": {**pdf, "public_id": "legacy"}}], "receipt": receipt},
+        "invoice", "invoice-1",
+    )
+    assert [record["artifact_state"] for record in records] == ["current", "legacy", "receipt"]
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -36,29 +40,41 @@ def main() -> None:
             "external_artifact_policy": {
                 "provider": "cloudinary", "bytes_included": False, "provider_backup_and_retention_required": True,
             },
-            "external_pdf_artifacts": [records[0]],
+            "external_pdf_artifacts": [records[0], records[2]],
         }
         (root / "manifest.json").write_text(json.dumps(manifest))
 
-        def lookup(*_args, **_kwargs):
+        def lookup(public_id, **_kwargs):
+            expected = pdf if public_id == pdf["public_id"] else receipt
             return {
-                "public_id": pdf["public_id"], "version": 7, "bytes": 321,
+                "public_id": expected["public_id"], "version": expected["version"], "bytes": expected["byte_size"],
                 "resource_type": "raw", "type": "private", "context": {"custom": {"sha256": digest}},
             }
 
         assert verify_external_artifacts(root, resource_lookup=lookup)["org_id"] == "org"
         try:
-            verify_external_artifacts(root, resource_lookup=lambda *_args, **_kwargs: {**lookup(), "context": {}})
+            verify_external_artifacts(root, resource_lookup=lambda *args, **kwargs: {**lookup(*args, **kwargs), "context": {}})
         except BackupError:
             pass
         else:
             raise AssertionError("External PDF verification accepted a missing checksum")
         try:
-            verify_external_artifacts(root, resource_lookup=lambda *_args, **_kwargs: {**lookup(), "resource_type": "image"})
+            verify_external_artifacts(root, resource_lookup=lambda *args, **kwargs: {**lookup(*args, **kwargs), "resource_type": "image"})
         except BackupError:
             pass
         else:
             raise AssertionError("External PDF verification accepted a mismatched resource type")
+        def missing_receipt(public_id, **kwargs):
+            if public_id == receipt["public_id"]:
+                raise FileNotFoundError(public_id)
+            return lookup(public_id, **kwargs)
+
+        try:
+            verify_external_artifacts(root, resource_lookup=missing_receipt)
+        except BackupError:
+            pass
+        else:
+            raise AssertionError("External PDF verification accepted a missing receipt")
 
 
 if __name__ == "__main__":

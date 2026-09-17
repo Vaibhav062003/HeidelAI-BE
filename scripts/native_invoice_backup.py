@@ -20,7 +20,7 @@ from bson import BSON, decode_file_iter
 from pymongo import MongoClient
 
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 TENANT_COLLECTIONS = (
     "native_invoices",
     "native_invoice_sequences",
@@ -83,6 +83,7 @@ def external_pdf_records(document: dict, document_type: str, document_id: str) -
         for entry in document.get("legacy_pdfs") or []
         if isinstance(entry, dict)
     )
+    candidates.append(("receipt", document.get("receipt") or {}))
     return [{
         "document_type": document_type,
         "document_id": document_id,
@@ -146,8 +147,9 @@ def export_backup(uri: str, database: str, output: Path, *, org_id: str) -> dict
                     {"org_id": org_id, "$or": [
                         {"pdf.public_id": {"$type": "string"}},
                         {"legacy_pdfs.pdf.public_id": {"$type": "string"}},
+                        {"receipt.public_id": {"$type": "string"}},
                     ]},
-                    {id_field: 1, "pdf": 1, "legacy_pdfs": 1},
+                    {id_field: 1, "pdf": 1, "legacy_pdfs": 1, "receipt": 1},
                     session=session,
                 ).sort("_id", 1):
                     for artifact in external_pdf_records(document, document_type, str(document.get(id_field) or "")):
@@ -192,6 +194,7 @@ def verify_backup(source: Path) -> dict:
     for artifact in manifest.get("external_pdf_artifacts") or []:
         if (
             artifact.get("document_type") not in {"invoice", "adjustment"}
+            or artifact.get("artifact_state") not in {"current", "legacy", "receipt"}
             or not artifact.get("document_id")
             or not artifact.get("public_id")
             or int(artifact.get("version") or 0) <= 0
