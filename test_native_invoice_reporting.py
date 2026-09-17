@@ -60,7 +60,7 @@ async def _export_contract() -> None:
 
 
 def main() -> None:
-    today = date.today()
+    today = date.fromisoformat(invoice_service._today())
     assert reporting_period(today, today) == (today.isoformat(), today.isoformat())
     assert csv_cell("Customer") == "Customer"
     for value in ("=SUM(A1:A2)", "+cmd", "-1+2", "@formula", "  =hidden"):
