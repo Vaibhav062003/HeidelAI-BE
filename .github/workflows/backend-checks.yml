@@ -79,7 +79,7 @@ jobs:
           python test_inbox_outage.py
           python test_legacy_connection_display.py
           python test_inbox_live_delivery_contract.py
-          python -m unittest test_stock_sheet_writeback test_product_sheet_pricing_foundation test_product_requests test_restock_dispatch -q
+          python -m unittest test_stock_sheet_writeback test_product_sheet_pricing_foundation test_product_requests test_product_request_extraction test_restock_dispatch -q
           python test_entitlement_contract.py
           python test_release_catalogue.py
           python test_release_messaging.py
