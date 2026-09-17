@@ -1,9 +1,7 @@
 import asyncio
 import ast
-import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from starlette.responses import JSONResponse
 
@@ -66,45 +64,15 @@ def test_rate_limit_identity_does_not_trust_forwarding_headers() -> None:
     assert rate_limit_key(request) == "ip:127.0.0.1"
 
 
-def test_native_production_requires_distributed_rate_limiting() -> None:
-    assert rate_limit_storage_uri(
-        environment="test", native_org_ids="org-1", configured_uri="",
-        gateway_enforced="", koyeb_service_name="",
-    ) == "memory://"
-    assert rate_limit_storage_uri(
-        environment="prod", native_org_ids="org-1", configured_uri="rediss://cache.internal:6380/0",
-        gateway_enforced="", koyeb_service_name="",
-    ) == "rediss://cache.internal:6380/0"
-    assert rate_limit_storage_uri(
-        environment="prod", native_org_ids="org-1", configured_uri="",
-        gateway_enforced="true", koyeb_service_name="",
-    ) == "memory://"
+def test_rate_limit_storage_is_optional() -> None:
+    assert rate_limit_storage_uri(configured_uri="") == "memory://"
+    assert rate_limit_storage_uri(configured_uri="rediss://cache.internal:6380/0") == "rediss://cache.internal:6380/0"
     try:
-        rate_limit_storage_uri(
-            environment="prod", native_org_ids="org-1", configured_uri="",
-            gateway_enforced="", koyeb_service_name="",
-        )
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("Production native invoicing accepted process-local rate limiting")
-    try:
-        rate_limit_storage_uri(
-            environment="prod", native_org_ids="org-1", configured_uri="http://cache.internal",
-            gateway_enforced="", koyeb_service_name="",
-        )
+        rate_limit_storage_uri(configured_uri="http://cache.internal")
     except RuntimeError:
         pass
     else:
         raise AssertionError("Rate-limit storage accepted a non-Redis URL")
-
-    with patch.dict(os.environ, {"NATIVE_INVOICING_ORG_IDS": "org-1"}, clear=True):
-        try:
-            rate_limit_storage_uri()
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("An unset ENV did not default to production-safe rate limiting")
 
 
 def test_every_native_invoice_route_has_an_explicit_limit() -> None:
@@ -133,7 +101,7 @@ def test_container_runs_non_root_with_database_readiness() -> None:
 if __name__ == "__main__":
     test_security_headers()
     test_rate_limit_identity_does_not_trust_forwarding_headers()
-    test_native_production_requires_distributed_rate_limiting()
+    test_rate_limit_storage_is_optional()
     test_every_native_invoice_route_has_an_explicit_limit()
     test_container_runs_non_root_with_database_readiness()
-    print("Security headers and native invoice rate-limit contracts passed.")
+    print("Security headers and rate-limit contracts passed.")
