@@ -9,10 +9,12 @@ from fastapi import HTTPException
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+from services.feature_flags import native_invoicing_enabled
+
 from database import get_mongo_client, get_mongo_db
 
 
-PRODUCTS = ("AI", "TALLY", "FOLLOW_UPS", "OFFERS", "AUTOMATIONS", "BROADCASTING", "SEATS", "CHANNELS")
+PRODUCTS = ("AI", "TALLY", "FOLLOW_UPS", "OFFERS", "NATIVE_INVOICING", "AUTOMATIONS", "BROADCASTING", "SEATS", "CHANNELS")
 WIRE_PRODUCTS = PRODUCTS + ("CHATBOT",)
 LIMIT_KEYS = {
     "AI": {"monthly_messages"},
@@ -192,6 +194,8 @@ def apply_entitlement(account_id: str, payload: dict) -> dict:
 
 def feature_access(account_id: str, product: str, now: datetime | None = None, *, strict: bool = False) -> dict:
     product = normalize_product(product)
+    if product == "NATIVE_INVOICING" and not native_invoicing_enabled(account_id):
+        return {"state": "locked", "grant_type": "ENV_DISABLED", "starts_at": None, "expires_at": None, "limits": {}}
     if not strict and not enforcement_enabled():
         return {"state": "active", "grant_type": "GRANDFATHERED", "starts_at": None, "expires_at": None, "limits": {}, "observed": True}
     now = now or datetime.now(timezone.utc)

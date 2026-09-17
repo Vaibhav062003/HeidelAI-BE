@@ -844,6 +844,10 @@ async def process_scheduled_messages(messaging_services: dict) -> None:
             )
             continue
         conversation = await db[f"conversations_{claimed['org_id']}"].find_one({"conversation_id": claimed["conversation_id"]}) or {}
+        from services.sales_workflow_service import followup_obsolete
+        if await followup_obsolete(claimed["org_id"], claimed["conversation_id"], claimed, conversation):
+            await collection.update_one({"_id": claimed["_id"], "claim_id": claim_id}, {"$set": {"status": "aborted", "aborted_at": claim_time}, "$unset": {"active_key": "", "claim_id": "", "claimed_at": ""}})
+            continue
         if (
             claimed.get("sequence_step") == 2
             and conversation.get("last_sender") == "customer"

@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import os
+from urllib.parse import urlsplit
 import re
 import time
 
@@ -7,13 +9,9 @@ import httpx
 import uuid
 from typing import Dict, Optional
 from loguru import logger
-from config.settings import INTERNAL_HMAC_SECRET
+from config.settings import CHATBOT_BASE_URL, INTERNAL_HMAC_SECRET
 from services.ai_reply_guard import AIProviderUnavailable, validate_ai_reply
 from services.internal_request import signed_json
-
-# Base URL for the chatbot API
-CHATBOT_BASE_URL = "https://backend-chatbot.koyeb.app"
-#CHATBOT_BASE_URL = "http://localhost:8001"  For local testing with self-signed certs, ensure to disable SSL verification in httpx client
 
 _HANDOFF_REASON = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 _HANDOFF_REASONS = {
@@ -33,6 +31,40 @@ _HANDOFF_REASONS = {
 _HANDOFF_KEYS = {"requested", "reason_code", "context"}
 _HANDOFF_CONTEXT_MAX_CHARS = 500
 _chatbot_client: Optional[httpx.AsyncClient] = None
+
+
+def _record_learning_later(work) -> None:
+    """Optional analytics must not hold a customer reply behind database writes."""
+    from core.services import services
+    async def record():
+        try:
+            await work
+        except Exception as exc:
+            logger.warning(f"Could not record internal sales learning: {exc}")
+    # ponytail: best effort analytics can be lost on process exit; use the
+    # existing durable event worker if learning becomes delivery-critical.
+    task = asyncio.create_task(record())
+    services.background_tasks.add(task)
+    task.add_done_callback(services.background_tasks.discard)
+
+
+def _chatbot_endpoint(org_id: str) -> str:
+    """Opt one organization into a test endpoint; keep normal routing for others."""
+    target_org = os.getenv("CHATBOT_TEST_ORG_ID", "").strip()
+    if not target_org or org_id != target_org:
+        return f"{CHATBOT_BASE_URL}/api/v2/chat"
+    base = os.getenv("CHATBOT_TEST_BASE_URL", "").strip().rstrip("/")
+    try:
+        parsed = urlsplit(base)
+        valid = (parsed.scheme == "https" and parsed.hostname and not parsed.username
+                 and not parsed.password and not parsed.query and not parsed.fragment
+                 and not parsed.path and not any(char.isspace() for char in base))
+        parsed.port  # Validate a supplied port without exposing the configured URL.
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("CHATBOT_TEST_BASE_URL must be an HTTPS origin without credentials, path, query or fragment")
+    return f"{base}/api/v2/chat"
 
 
 def _chatbot_http_client() -> httpx.AsyncClient:
@@ -174,6 +206,10 @@ async def send_to_agent(
         sales_context,
     )
     sales_event_id = message_id or f"agent_{uuid.uuid4()}"
+    from services.sales_workflow_service import automatic_purchase
+    purchase_reply = await automatic_purchase(org_id, conversation_id, sales_event_id, user_input)
+    if purchase_reply is not None:
+        return purchase_reply
 
     try:
         active_sales_case = await get_active_sales_case(org_id, conversation_id)
@@ -259,19 +295,14 @@ async def send_to_agent(
                 case=active_sales_case,
             )
 
-    recorded, guidance = await asyncio.gather(
-        record_existing_customer_response(),
-        get_sales_guidance(org_id, conversation_id, current_sales_context, user_input),
-        return_exceptions=True,
-    )
-    customer_response_recorded = active_sales_case is not None and not isinstance(recorded, BaseException)
-    if isinstance(recorded, BaseException):
-        logger.warning(f"Could not record customer response for {conversation_id}: {recorded}")
-    if isinstance(guidance, BaseException):
-        logger.warning(f"Could not load internal sales guidance for {conversation_id}: {guidance}")
+    if active_sales_case:
+        _record_learning_later(record_existing_customer_response())
+    customer_response_recorded = active_sales_case is not None
+    try:
+        sales_guidance = await get_sales_guidance(org_id, conversation_id, current_sales_context, user_input)
+    except Exception as exc:
+        logger.warning(f"Could not load internal sales guidance for {conversation_id}: {exc}")
         sales_guidance = {"policy_version": "default", "cohort": "control", "recommended_moves": []}
-    else:
-        sales_guidance = guidance
 
     payload = {
         "conversation_id": conversation_id,
@@ -290,7 +321,7 @@ async def send_to_agent(
     if reply_context_message_id:
         payload["reply_context_message_id"] = reply_context_message_id
 
-    endpoint = f"{CHATBOT_BASE_URL}/api/v2/chat"
+    endpoint = _chatbot_endpoint(org_id)
     body, headers = signed_json(payload, "/api/v2/chat", INTERNAL_HMAC_SECRET, message_id)
 
     try:
@@ -371,7 +402,7 @@ async def send_to_agent(
                     source_message_text=user_input,
                 )
                 if not applied.get("duplicate"):
-                    try:
+                    async def record_decision():
                         from services.sales_learning_service import record_sales_learning_event
 
                         if not customer_response_recorded:
@@ -393,8 +424,7 @@ async def send_to_agent(
                                 source_id=f"{sales_event_id}:commitment",
                                 case=applied["case"],
                             )
-                    except Exception as exc:
-                        logger.warning(f"Could not record internal sales decision: {exc}")
+                    _record_learning_later(record_decision())
                 receipt = applied.get("action_receipt") or {}
                 action_type = str(receipt.get("action_type") or "none")
                 action_source_message_id = str(

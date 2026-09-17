@@ -200,6 +200,7 @@ async def record_outbound_offer(
         amount = float(snapshot.get("public_grand_total") or 0)
         document.update({
             "source_type": "formal_quote",
+            "line_items": snapshot.get("items") or [],
             "quote_id": quote_id,
             "quote_revision": int(revision),
             "quote_number": snapshot.get("quote_number"),
@@ -229,6 +230,8 @@ async def record_outbound_offer(
             "message_preview": (content or "")[:240],
         })
 
+    from services.b2b_pricing_service import capture_sent_minimums
+    document["minimum_snapshots"] = await capture_sent_minimums(org_id, conversation_id, source_message_id, document.get("line_items") or [])
     receipt = await _delivery_collection(org_id).find_one({"_id": source_message_id})
     if receipt:
         document["delivery_status"] = next_delivery_status("sent", str(receipt.get("status") or "sent"))

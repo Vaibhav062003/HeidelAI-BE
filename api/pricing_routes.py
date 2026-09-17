@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from auth.auth_utils import admin_required
 from auth.dependencies import CurrentUser
@@ -33,6 +33,83 @@ class PricingEvaluationPayload(BaseModel):
     temp_id: str = Field(min_length=1, max_length=160)
     content: str = Field(default="", max_length=10_000)
     context: dict | None = None
+
+
+class MinimumUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: str = Field(min_length=1, max_length=240)
+    expected_version: str = Field(min_length=1, max_length=240)
+    request_id: str = Field(min_length=1, max_length=120)
+    minimum: str = Field(pattern=r"^[0-9]{1,9}(?:\.[0-9]{1,2})?$")
+
+
+class MinimumBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[MinimumUpdate] = Field(min_length=1, max_length=50)
+
+
+class MinimumReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["approve", "reject", "verify"]
+
+
+class MinimumLookup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    skus: list[str] = Field(min_length=1, max_length=50)
+
+
+@router.post("/api/pricing/daily-prices/resolve")
+@limiter.limit("10/minute")
+async def resolve_minimum_products(request: Request, payload: MinimumLookup, user: CurrentUser):
+    from services.product_request_service import catalogue_org
+    if any(not value.strip() or len(value) > 240 for value in payload.skus):
+        raise HTTPException(422, "Each SKU must contain between 1 and 240 characters")
+    catalog = await catalogue_org(user.org_id)
+    patterns = [re.compile("^" + re.escape(value.strip()) + "$", re.I) for value in payload.skus]
+    rows = await get_async_mongo_db()[f"products_{catalog}"].find(
+        {"$or": [{key: {"$in": patterns}} for key in ("unique_identifier", "model_no", "sku")]},
+        {"unique_identifier": 1, "model_no": 1, "sku": 1, "price_version": 1},
+    ).limit(101).to_list(101)
+    if len(rows) > 100:
+        raise HTTPException(409, "Catalogue identifiers are ambiguous; resolve duplicate SKUs first")
+    return serialize_mongo({"items": rows})
+
+
+@router.get("/api/pricing/daily-prices")
+@limiter.limit("30/minute")
+async def daily_prices(request: Request, user: CurrentUser, q: str = Query("", max_length=120),
+                       page: int = Query(1, ge=1, le=10000), requested_only: bool = False):
+    from services.daily_pricing_service import daily_prices as load
+    return serialize_mongo(await load(user, q, page, requested_only))
+
+
+@router.post("/api/pricing/daily-prices")
+@limiter.limit("10/minute")
+async def update_minimums(request: Request, payload: MinimumBatch, user: CurrentUser):
+    from services.daily_pricing_service import request_minimum
+    if len({row.product_id for row in payload.items}) != len(payload.items):
+        raise HTTPException(422, "A product can appear only once in a batch")
+    results = []
+    for row in payload.items:
+        try:
+            results.append({"product_id": row.product_id, **await request_minimum(user, row.model_dump())})
+        except (HTTPException, ValueError) as exc:
+            results.append({"product_id": row.product_id, "status": "failed", "error": str(exc.detail if isinstance(exc, HTTPException) else exc)})
+    return serialize_mongo({"results": results})
+
+
+@router.post("/api/pricing/daily-prices/changes/{change_id}")
+@limiter.limit("10/minute")
+async def review_minimum(request: Request, change_id: str, payload: MinimumReview, user: CurrentUser):
+    from services.daily_pricing_service import resolve_minimum
+    return serialize_mongo(await resolve_minimum(user, change_id, payload.action))
+
+
+@router.get("/api/pricing/daily-prices/{product_id}/history")
+@limiter.limit("30/minute")
+async def minimum_history(request: Request, product_id: str, user: CurrentUser):
+    from services.b2b_pricing_service import product_history
+    return serialize_mongo(await product_history(user, product_id))
 
 
 @router.get("/api/pricing/settings")

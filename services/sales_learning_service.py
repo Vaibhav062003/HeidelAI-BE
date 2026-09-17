@@ -12,6 +12,7 @@ EVENT_TYPES = frozenset({
     "customer_reply", "reaction_added", "reaction_removed", "ai_decision",
     "message_delivered", "message_failed", "commitment", "invoice_draft",
     "billed", "paid", "lost", "complaint", "handoff", "correction",
+    "purchase_started", "preparation", "cancelled", "refunded",
 })
 PROFILE_EVENTS = frozenset({"commitment", "billed", "paid", "lost", "complaint"})
 RESOLVED_EVENTS = frozenset({"billed", "paid", "lost", "complaint"})
@@ -132,7 +133,7 @@ async def _ensure_indexes(org_id: str) -> None:
 
 
 async def _update_profile(org_id: str, event_type: str, case: dict[str, Any], language: str, now: datetime) -> None:
-    if event_type not in PROFILE_EVENTS:
+    if case.get("workflow_version") == 2 or event_type not in PROFILE_EVENTS:
         return
     stage, objection, language, move = _segment(case, language)
     profile_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{org_id}:{stage}:{objection}:{language}:{move}").hex
@@ -237,9 +238,14 @@ async def record_reaction(
 
 
 async def record_verified_tally_outcome(
-    org_id: str, conversation_id: str, source_id: str, outcome: str,
+    org_id: str, conversation_id: str, source_id: str, outcome: str, quote_id: str = "",
 ) -> None:
     if outcome not in {"invoice_draft", "billed", "paid"} or not conversation_id:
+        return
+    from services.sales_workflow_service import enabled, verified_outcome
+    if await enabled(org_id):
+        if quote_id:
+            await verified_outcome(org_id, outcome, source_id, quote_id=quote_id)
         return
     from services.sales_case_service import get_active_sales_case, set_verified_sales_outcome
     case = await get_active_sales_case(org_id, conversation_id)
@@ -254,6 +260,9 @@ async def record_verified_tally_outcome(
 
 
 async def get_sales_guidance(org_id: str, conversation_id: str, sales_context: dict[str, Any], text: str) -> dict[str, Any]:
+    from services.sales_workflow_service import enabled
+    if await enabled(org_id):
+        return {"policy_version": "workflow-v2-pilot", "cohort": "control", "recommended_moves": []}
     language = detect_language(text)
     profiles = await _database()[f"sales_learning_profiles_{org_id}"].find({
         "org_id": org_id,
@@ -369,7 +378,9 @@ async def internal_learning_report(org_id: str) -> dict[str, Any]:
     for row in cohorts:
         if row["resolved"] >= 10:
             by_policy.setdefault(row["policy_id"], set()).add(row["cohort"])
+    from services.sales_workflow_service import workflow_report
     return {
+        "purchase_workflow": await workflow_report(org_id),
         "org_id": org_id, "status": status,
         "last_event_at": totals.get("last_event_at"),
         "unique_conversations": unique,

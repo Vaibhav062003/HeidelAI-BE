@@ -1073,6 +1073,9 @@ async def send_whatsapp_message(
                         part_operation,
                     ):
                         raise HTTPException(status_code=409, detail="This reply is already being sent")
+                    if manifest_action_job_id:
+                        from services.sales_workflow_service import validate_delivery
+                        await validate_delivery(org_id, manifest_action_job_id)
                     provider_started = True
                     try:
                         provider_started_at = time.perf_counter()
@@ -1986,6 +1989,7 @@ async def archive_whatsapp_data(org_id: str, phone_id: str, expire_days=30):
                     archived_notes.bulk_write(note_ops, session=session)
 
                 if conversation_ids:
+                    db["v5_memory"].delete_many({"org_id": org_id, **message_filter}, session=session)
                     db[messages_collection_name].delete_many(message_filter, session=session)
                     db[private_notes_collection_name].delete_many(note_filter, session=session)
                     db[conversations_collection_name].delete_many(

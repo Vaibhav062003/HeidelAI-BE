@@ -233,6 +233,12 @@ async def _require_accounting_access(user: CurrentUser, write: bool = False) -> 
         raise HTTPException(status_code=403, detail="Tally accounting is available to admins and Billing team members")
 
 
+async def _require_tally_invoice_provider(user: CurrentUser) -> None:
+    from services.native_invoice_service import invoice_provider
+    if await invoice_provider(user.org_id) != "tally":
+        raise HTTPException(status_code=409, detail="This organization uses native invoicing as its invoice provider")
+
+
 @router.get("/api/integrations/tally")
 @limiter.limit("60/minute")
 async def get_tally_integration(request: Request, user: CurrentUser):
@@ -316,6 +322,7 @@ async def delete_tally_connector_key(request: Request, user: CurrentUser):
 @limiter.limit("20/minute")
 async def post_quote_to_tally(request: Request, quote_id: str, user: CurrentUser):
     await _require_accounting_access(user, write=True)
+    await _require_tally_invoice_provider(user)
     quote = await db[f"quotes_{user.org_id}"].find_one(
         {"org_id": user.org_id, "quote_id": quote_id}, {"_id": 0, "conversation_id": 1}
     )
@@ -563,6 +570,7 @@ async def post_tally_invoice_draft(
     request: Request, conversation_id: str, payload: InvoiceDraftCreatePayload, user: CurrentUser,
 ):
     await _require_accounting_access(user, write=True)
+    await _require_tally_invoice_provider(user)
     return {"draft": await create_tally_invoice_draft(
         user.org_id, user.user_id, user.role, conversation_id, payload.model_dump()
     )}
@@ -583,6 +591,7 @@ async def patch_tally_invoice_draft(
 @limiter.limit("20/minute")
 async def post_tally_invoice_draft_submit(request: Request, draft_id: str, user: CurrentUser):
     await _require_accounting_access(user, write=True)
+    await _require_tally_invoice_provider(user)
     job, created = await submit_tally_invoice_draft(
         user.org_id, user.user_id, user.full_name or "Team member", user.role, draft_id
     )

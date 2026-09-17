@@ -588,7 +588,7 @@ async def create_stock_change(org_id: str, user: dict, product_id: str, version:
 
 
 async def list_stock_changes(org_id: str, status: str = "", product_id: str = "", limit: int = 100) -> list[dict]:
-    match: dict = {"org_id": org_id}
+    match: dict = {"org_id": org_id, "kind": {"$ne": "daily_minimum"}}
     if status:
         match["status"] = status
     if product_id:
@@ -603,6 +603,10 @@ async def review_stock_change(org_id: str, change_id: str, user_id: str, role: s
     change = await db.stock_change_requests.find_one({"org_id": org_id, "change_id": change_id}, {"_id": 0})
     if not change:
         raise HTTPException(status_code=404, detail="Stock change request not found")
+    if change.get("kind") == "daily_minimum":
+        from types import SimpleNamespace
+        from services.daily_pricing_service import resolve_minimum
+        return serialize_mongo(await resolve_minimum(SimpleNamespace(org_id=org_id, user_id=user_id, role=role), change_id, "approve" if approve else "reject"))
     if change["status"] != "pending_approval":
         raise HTTPException(status_code=409, detail="This stock change has already been reviewed")
     if not approve:
@@ -657,6 +661,8 @@ async def _apply_sheet(change: dict, row: dict) -> dict:
 
 
 async def apply_stock_change(change: dict, actor_id: str, role: str) -> dict:
+    if change.get("kind") == "daily_minimum":
+        raise HTTPException(409, "Review minimum changes through Daily prices")
     row = await _find_stock(change["org_id"], change["product_id"])
     if change["base_version"] != row["version"]:
         return serialize_mongo(await _set_status(change, "needs_review", actor_id, role, error="Stock changed before this request was applied"))

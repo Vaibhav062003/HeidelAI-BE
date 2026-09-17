@@ -114,12 +114,14 @@ def _load_agent_service():
     loguru = types.ModuleType("loguru")
     loguru.logger = _Logger()
     settings = types.ModuleType("config.settings")
+    settings.CHATBOT_BASE_URL = "https://chatbot.test"
     settings.X_INTERNAL_SECRET = "test-secret"
     settings.INTERNAL_HMAC_SECRET = "s" * 32
     config = types.ModuleType("config")
     config.settings = settings
     sales_cases = types.ModuleType("services.sales_case_service")
     sales_learning = types.ModuleType("services.sales_learning_service")
+    sales_workflow = types.ModuleType("services.sales_workflow_service")
 
     async def get_active_sales_case(*_args, **_kwargs):
         return None
@@ -136,17 +138,22 @@ def _load_agent_service():
     async def record_customer_response(*_args, **_kwargs):
         return None
 
+    async def automatic_purchase(*_args, **_kwargs):
+        return None
+
     sales_cases.get_active_sales_case = get_active_sales_case
     sales_cases.get_sales_context = get_sales_context
     sales_cases.apply_sales_decision = apply_sales_decision
     sales_cases.sales_context = lambda _case: {"version": 0, "stage": "new", "facts": {}}
     sales_learning.get_sales_guidance = get_sales_guidance
     sales_learning.record_customer_response = record_customer_response
+    sales_workflow.automatic_purchase = automatic_purchase
     sys.modules["loguru"] = loguru
     sys.modules["config"] = config
     sys.modules["config.settings"] = settings
     sys.modules["services.sales_case_service"] = sales_cases
     sys.modules["services.sales_learning_service"] = sales_learning
+    sys.modules["services.sales_workflow_service"] = sales_workflow
     spec = importlib.util.spec_from_file_location("agent_service_contract", ROOT / "services/agent_service.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

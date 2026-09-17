@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from fastapi.responses import JSONResponse
 from core.limiter import limiter
+from core.request_body_limit import NativeInvoiceBodyLimitMiddleware
+from core.security_headers import SecurityHeadersMiddleware
 from slowapi.errors import RateLimitExceeded                       
 from slowapi.middleware import SlowAPIMiddleware                    
 
@@ -66,6 +68,7 @@ app = FastAPI(
 # === Rate Limit State & Middleware ===                           
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)    
+app.add_middleware(NativeInvoiceBodyLimitMiddleware)
 
 @app.exception_handler(RateLimitExceeded)                        
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
@@ -88,6 +91,7 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"]  
 )
+app.add_middleware(SecurityHeadersMiddleware)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000)

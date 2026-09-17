@@ -39,8 +39,9 @@ async def capture_product_requests(job, raw_requests, messages):
     db = get_async_mongo_db()
     org = job["org_id"]
     conversation = await db[f"conversations_{org}"].find_one({"conversation_id": job["conversation_id"]})
+    buyer_transaction = job.get("counterparty_role") == "buyer"
     if (not conversation or conversation.get("platform") != "whatsapp"
-            or conversation.get("is_dealer") or conversation.get("persona") in {"dealer", "dealers"}):
+            or (not buyer_transaction and (conversation.get("is_dealer") or conversation.get("persona") in {"dealer", "dealers"}))):
         return
     # Capture must not race the independent restock worker's index setup.
     await db.product_requests.create_index("product_key", unique=True, sparse=True)

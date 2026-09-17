@@ -267,6 +267,10 @@ async def apply_sales_decision(
         except DuplicateKeyError:
             case = await get_active_sales_case(org_id, conversation_id)
 
+    if case.get("workflow_version") == 2:
+        # V2 requirements and actions are owned by the version-checked workflow.
+        return {"case": case, "duplicate": False, "conflict": True, "rebased": False}
+
     expected = checked["expected_case_version"]
     rebased = False
     for _ in range(3):
@@ -345,7 +349,7 @@ async def apply_sales_decision(
             }
         updated = await collection.find_one_and_update(
             {
-                "_id": case["_id"], "version": current_version,
+                "_id": case["_id"], "version": current_version, "status": "active", "workflow_version": {"$ne": 2},
                 "processed_events": {"$ne": source_message_id},
             },
             {

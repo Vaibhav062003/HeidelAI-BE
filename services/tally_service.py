@@ -14,7 +14,7 @@ from loguru import logger
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from database import get_async_mongo_db
+from database import get_async_mongo_client, get_async_mongo_db
 from services.entitlement_service import feature_access, require_feature
 from services.utils import normalize_phone, serialize_mongo
 from services.websocket_service import broadcast_org_admin_ws
@@ -952,7 +952,7 @@ async def _process_tally_outcome(outbox_id: str) -> bool:
         from services.sales_learning_service import record_verified_tally_outcome
 
         await record_verified_tally_outcome(
-            job["org_id"], job["conversation_id"], job["event_key"], job["outcome_status"],
+            job["org_id"], job["conversation_id"], job["event_key"], job["outcome_status"], quote_id=job["quote_id"],
         )
     except Exception as exc:
         errors.append(f"learning:{type(exc).__name__}")
@@ -2502,6 +2502,13 @@ async def submit_tally_invoice_draft(
             "public_line_total": item["line_total"],
         })
     quote_id = draft.get("quote_id") or f"draft:{draft_id}"
+    if draft.get("quote_id") and await db.native_invoices.find_one({
+        "org_id": org_id,
+        "source_quote_id": quote_id,
+        "source_quote_revision": int(draft.get("quote_revision") or 1),
+        "lifecycle": {"$in": ["issued", "void"]},
+    }, {"_id": 1}):
+        raise HTTPException(status_code=409, detail="This quote revision already has a native invoice")
     quote = {
         "org_id": org_id, "quote_id": quote_id, "revision_number": draft.get("quote_revision") or 1,
         "quote_number": draft["reference"], "issued_on": date.today().isoformat(),
@@ -2523,21 +2530,32 @@ async def submit_tally_invoice_draft(
         "outstanding_amount": float(_money(draft["total"])), "reminder_days_after": settings["reminder_days_after"],
         "created_at": now, "created_by": user_id, "created_by_name": user_name, "updated_at": now, "attempts": 0,
     }
-    try:
-        await db.tally_bill_jobs.insert_one(job)
-        stored, created = job, True
-    except DuplicateKeyError:
+    async def transaction(session):
+        from services.native_invoice_service import claim_quote_revision
+
+        if draft.get("quote_id"):
+            current_quote = await db[f"quotes_{org_id}"].find_one(
+                {"org_id": org_id, "quote_id": quote_id}, {"revision_number": 1}, session=session,
+            )
+            if not current_quote or int(current_quote.get("revision_number") or 1) != job["quote_revision"]:
+                raise HTTPException(status_code=409, detail="The source quote changed. Reopen the latest revision before invoicing.")
+
         stored = await db.tally_bill_jobs.find_one({
             "org_id": org_id, "quote_id": quote_id, "quote_revision": job["quote_revision"],
-        })
-        if not stored:
-            raise HTTPException(status_code=409, detail="The existing Tally invoice job could not be loaded")
-        if stored.get("status") == "delivery_unknown":
-            raise HTTPException(
-                status_code=409,
-                detail="Verify Tally Day Book before retrying this unconfirmed invoice",
+        }, session=session)
+        created = stored is None
+        if stored:
+            job["job_id"] = stored["job_id"]
+        if draft.get("quote_id"):
+            await claim_quote_revision(
+                org_id, quote_id, job["quote_revision"], "tally", job["job_id"], user_id, session,
             )
-        if stored.get("status") == "failed":
+        if not stored:
+            await db.tally_bill_jobs.insert_one(job, session=session)
+            stored = job
+        elif stored.get("status") == "delivery_unknown":
+            raise HTTPException(status_code=409, detail="Verify Tally Day Book before retrying this unconfirmed invoice")
+        elif stored.get("status") == "failed":
             stored = await db.tally_bill_jobs.find_one_and_update(
                 {"_id": stored["_id"], "status": "failed"},
                 {"$set": {
@@ -2552,20 +2570,32 @@ async def submit_tally_invoice_draft(
                     "voucher_number": "", "master_id": "", "result_at": "",
                 }},
                 return_document=ReturnDocument.AFTER,
-            ) or await db.tally_bill_jobs.find_one({"_id": stored["_id"]})
-        if stored.get("status") == "delivery_unknown":
-            raise HTTPException(
-                status_code=409,
-                detail="Verify Tally Day Book before retrying this unconfirmed invoice",
-            )
-        created = False
-    draft_status = stored.get("status") if stored.get("status") in {"completed", "failed", "delivery_unknown"} else "queued"
-    await db.tally_invoice_drafts.update_one(
-        {"_id": draft["_id"]}, {"$set": {
-            "status": draft_status, "job_id": stored["job_id"], "voucher_number": stored.get("voucher_number"),
-            "error": stored.get("error"), "updated_at": now,
-        }}
-    )
+                session=session,
+            ) or await db.tally_bill_jobs.find_one({"_id": stored["_id"]}, session=session)
+        draft_status = stored.get("status") if stored.get("status") in {"completed", "failed", "delivery_unknown"} else "queued"
+        await db.tally_invoice_drafts.update_one(
+            {"_id": draft["_id"], "status": "ready"}, {"$set": {
+                "status": draft_status, "job_id": stored["job_id"], "voucher_number": stored.get("voucher_number"),
+                "error": stored.get("error"), "updated_at": now,
+            }}, session=session,
+        )
+        return stored, created
+
+    try:
+        async with await get_async_mongo_client().start_session() as session:
+            stored, created = await session.with_transaction(transaction)
+    except DuplicateKeyError as exc:
+        if draft.get("quote_id"):
+            from services.native_invoice_service import quote_claim_id
+            claim = await db.invoice_conversion_claims.find_one({
+                "_id": quote_claim_id(org_id, quote_id, job["quote_revision"]),
+            })
+            if claim:
+                raise HTTPException(status_code=409, detail={
+                    "code": "invoice_source_already_claimed",
+                    "message": f"This quote revision is already claimed by {claim.get('provider') or 'another provider'}",
+                }) from exc
+        raise
     return serialize_mongo({
         key: value for key, value in stored.items()
         if key not in {"_id", "request_xml", "readback_request_xml", "tally_response"}

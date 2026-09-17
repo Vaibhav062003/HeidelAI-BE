@@ -326,6 +326,9 @@ async def send_ig_message(
                         logger.exception("Retry could not reconcile a confirmed Instagram message")
                         cached["local_sync_pending"] = True
                 return cached
+            if (bot_context or {}).get("sales_action_job_id"):
+                from services.sales_workflow_service import validate_delivery
+                await validate_delivery(org_id, bot_context["sales_action_job_id"])
             # Build the API URL using the appropriate page_id
             url = f"https://graph.instagram.com/{IG_VERSION}/{instagram_id}/messages"
 
@@ -1581,6 +1584,8 @@ async def archive_instagram_data(org_id: str, instagram_id: str, expire_days=30)
                     if bulk_ops:
                         db[archived_conversations].bulk_write(bulk_ops, session=session)
                         
+                    db["v5_memory"].delete_many({"org_id": org_id, "conversation_id": {
+                        "$in": [item["conversation_id"] for item in conversations_to_archive]}}, session=session)
                     db[conversations_collection_name].delete_many({"platform": "instagram", "instagram_id": instagram_id}, session=session)
                 
                 # Archiving private notes collection

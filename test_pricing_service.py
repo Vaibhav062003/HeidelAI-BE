@@ -147,6 +147,9 @@ class PricingPolicyTest(unittest.TestCase):
 
 class PricingRuntimeTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        b2b_mode = patch("services.b2b_pricing_service.enabled", new=AsyncMock(return_value=False))
+        b2b_mode.start()
+        self.addCleanup(b2b_mode.stop)
         self.pricing_mode = patch(
             "services.pricing_service.get_pricing_mode",
             new=AsyncMock(return_value="review"),

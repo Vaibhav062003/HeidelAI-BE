@@ -4,9 +4,12 @@ import httpx
 from typing import Optional
 import requests
 import io
+import hashlib
 import re
 import uuid
 import cloudinary
+import cloudinary.api
+import cloudinary.uploader
 import cloudinary.utils
 from datetime import datetime, timedelta, timezone
 
@@ -31,6 +34,7 @@ AUDIO_RETENTION_DAYS = 30
 AUDIO_RETENTION_TAG = "heidelai-audio-note"
 TALLY_PDF_RETENTION_DAYS = 30
 TALLY_PDF_RETENTION_TAG = "heidelai-tally-invoice"
+NATIVE_INVOICE_TAG = "heidelai-native-invoice"
 
 
 def _outbound_upload_options(semantic_type: str, convert_audio: bool, media_kind: Optional[str] = None) -> dict:
@@ -142,6 +146,84 @@ async def upload_tally_invoice_pdf(data: bytes, org_id: str, invoice_id: str, al
         "resource_type": result.get("resource_type") or "raw", "delivery_type": result.get("type") or "private",
         "format": result.get("format") or "pdf", "generated_at": now, "expires_at": expires_at,
     }
+
+
+async def upload_native_invoice_pdf(
+    data: bytes,
+    org_id: str,
+    invoice_id: str,
+    invoice_number: str,
+    *,
+    renderer_version: int,
+    issued_revision: int,
+) -> dict:
+    """Store the immutable customer PDF for an issued native invoice."""
+    safe_org = re.sub(r"[^A-Za-z0-9_-]", "-", org_id)[:100] or "organization"
+    safe_invoice = re.sub(r"[^A-Za-z0-9_-]", "-", invoice_id)[:100] or uuid.uuid4().hex
+    safe_number = re.sub(r"[^A-Za-z0-9_-]", "-", invoice_number)[:60] or "invoice"
+    digest = hashlib.sha256(data).hexdigest()
+    file_obj = io.BytesIO(data)
+    file_obj.name = f"{safe_number}.pdf"
+    now = datetime.now(timezone.utc)
+    folder = f"native_invoices/{safe_org}/{safe_invoice}"
+    leaf_id = f"v{renderer_version}-{digest}.pdf"
+    expected_public_id = f"{folder}/{leaf_id}"
+    try:
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload,
+            file_obj,
+            folder=folder,
+            public_id=leaf_id,
+            resource_type="raw",
+            type="private",
+            tags=[NATIVE_INVOICE_TAG],
+            context={
+                "sha256": digest,
+                "renderer_version": str(renderer_version),
+                "issued_revision": str(issued_revision),
+            },
+            overwrite=False,
+            unique_filename=False,
+        )
+    except Exception:
+        # A retry may follow a successful upload whose database write failed.
+        result = await asyncio.to_thread(
+            cloudinary.api.resource,
+            expected_public_id,
+            resource_type="raw",
+            type="private",
+        )
+    if result.get("public_id") != expected_public_id:
+        raise RuntimeError("Cloudinary did not return a native invoice PDF identifier")
+    if int(result.get("bytes") or -1) != len(data):
+        raise RuntimeError("Stored native invoice PDF size does not match the rendered artifact")
+    return {
+        "public_id": result["public_id"],
+        "asset_id": result.get("asset_id"),
+        "version": result.get("version"),
+        "resource_type": result.get("resource_type") or "raw",
+        "delivery_type": result.get("type") or "private",
+        "format": result.get("format") or "pdf",
+        "sha256": digest,
+        "byte_size": len(data),
+        "renderer_version": renderer_version,
+        "issued_revision": issued_revision,
+        "generated_at": now,
+    }
+
+
+def native_invoice_pdf_download_url(pdf: dict, expires_in_seconds: int = 60) -> str:
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(pdf.get("sha256") or ""))
+        or not all(pdf.get(field) is not None for field in ("version", "byte_size", "renderer_version", "issued_revision"))
+    ):
+        raise RuntimeError("Native invoice PDF is not a verified server artifact")
+    return cloudinary.utils.private_download_url(
+        pdf["public_id"], pdf.get("format") or "pdf", resource_type=pdf.get("resource_type") or "raw",
+        type=pdf.get("delivery_type") or "private",
+        expires_at=int(datetime.now(timezone.utc).timestamp()) + expires_in_seconds,
+        attachment=True,
+    )
 
 
 def tally_invoice_pdf_download_url(pdf: dict, expires_in_seconds: int = 300) -> str:

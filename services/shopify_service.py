@@ -1318,6 +1318,11 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
             return
         order = _order_from_webhook(org_id, connection["shop"], payload)
         await _upsert_newer(db.shopify_orders, {"org_id": org_id, "provider_id": order["provider_id"]}, order)
+        from services.sales_workflow_service import verified_outcome
+        stored_order = await db.shopify_orders.find_one({"org_id": org_id, "provider_id": order["provider_id"]}) or order
+        outcome = "refunded" if stored_order.get("payment_status") == "REFUNDED" else "cancelled" if stored_order.get("cancelled_at") else "paid" if stored_order.get("payment_status") == "PAID" else ""
+        if outcome:
+            await verified_outcome(org_id, outcome, f"shopify:{stored_order['provider_id']}:{stored_order.get('provider_updated_at')}:{outcome}", order=stored_order)
         touched = await _mark_order_conversion(org_id, order)
         if touched:
             await _repair_org_checkout_states(org_id, connection, touched)

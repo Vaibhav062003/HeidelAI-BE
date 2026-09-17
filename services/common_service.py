@@ -307,6 +307,8 @@ def _queue_filter_conditions(
                 {"last_message_role": "customer"},
             ]},
         ]})
+    elif attention in {"needs_action", "blocked", "follow_up_due"}:
+        conditions.append({"work_summary.attention": attention})
     elif attention == "unread":
         conditions.append({"unread_count": {"$gt": 0}})
     elif attention == "follow_up":
@@ -704,7 +706,7 @@ async def fetch_conversations_new(
     cursor = (
         collection
         .find(query, projection)
-        .sort("last_message_timestamp", -1)
+        .sort([("work_summary.sort_due_at", 1), ("last_message_timestamp", 1)] if attention in {"needs_action", "blocked", "follow_up_due"} else [("last_message_timestamp", -1)])
         .skip(skip)   # <-- Added skip
         .limit(limit) # <-- Added limit
     )
@@ -754,6 +756,7 @@ async def fetch_conversations_new(
             "last_message_is_private_note": doc.get("last_message_is_private_note", False),
             "last_message_role": doc.get("last_message_role") or doc.get("last_sender"),
             "needs_reply": doc.get("needs_reply"),
+            **({"work_summary": serialize_mongo(doc["work_summary"])} if doc.get("work_summary") else {}),
             "timestamp": (
                 doc["last_message_timestamp"].isoformat()
                 if isinstance(doc.get("last_message_timestamp"), datetime)
