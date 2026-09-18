@@ -7,6 +7,7 @@ IRIS-provided codec must be injected before this adapter is enabled.
 """
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -28,7 +29,7 @@ from config.settings import (
     IRP_CREDENTIAL_ENCRYPTION_KEY,
 )
 from database import get_async_mongo_db
-from services.india_tax import is_valid_gstin
+from services.india_tax import GST_STATE_NAMES, is_valid_gstin
 
 
 db = get_async_mongo_db()
@@ -571,6 +572,10 @@ class IrisIrpAdapter:
             irn = path.rsplit("/", 1)[-1]
             if not _IRN_RE.fullmatch(irn):
                 raise HTTPException(status_code=422, detail="IRN must be 64 hexadecimal characters")
+        elif path.startswith("/eivital/v1.04/Master/gstin/"):
+            gstin = path.rsplit("/", 1)[-1]
+            if not is_valid_gstin(gstin):
+                raise HTTPException(status_code=422, detail="GSTIN is invalid")
         elif path not in _CORE_PATHS:
             raise HTTPException(status_code=500, detail="Unsupported IRIS IRP API path")
         return self.base_url + path
@@ -771,6 +776,19 @@ class IrisIrpAdapter:
         )
         return validate_irn_artifact(self._decode_core(response, session))
 
+    async def get_gstin_details(self, org_id: str, seller_gstin: str, gstin: str) -> dict:
+        gstin = gstin.strip().upper()
+        if not is_valid_gstin(gstin):
+            raise HTTPException(status_code=422, detail="Enter a valid GSTIN with checksum")
+        session = await self._authenticate(org_id, seller_gstin.strip().upper())
+        response = await self._request_json(
+            "POST",
+            f"/eivital/v1.04/Master/gstin/{gstin}",
+            headers=self._auth_headers(seller_gstin, session),
+            retry_safe=True,
+        )
+        return gstin_details_view(self._decode_core(response, session), gstin)
+
     async def get_by_irn(self, org_id: str, gstin: str, irn: str) -> dict:
         irn = irn.strip().lower()
         if not _IRN_RE.fullmatch(irn):
@@ -855,3 +873,38 @@ def iris_irp_adapter(*, codec: IrisIrpCodec | None = None, transport: IrisIrpTra
         credential_collection=credentials,
         cipher=_fernet(),
     )
+
+
+def gstin_details_view(value: dict, requested_gstin: str) -> dict:
+    data: Any = value.get("Data", value) if isinstance(value, dict) else value
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="IRIS GSTIN response is invalid") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="IRIS GSTIN response is invalid")
+    gstin = str(data.get("gstin") or data.get("Gstin") or requested_gstin).strip().upper()
+    if gstin != requested_gstin or not is_valid_gstin(gstin):
+        raise HTTPException(status_code=502, detail="IRIS returned GSTIN details for a different taxpayer")
+    state_code = gstin[:2]
+    state_name = str(data.get("stateCode") or data.get("Stcd") or GST_STATE_NAMES.get(state_code, "")).strip()
+    if state_code not in GST_STATE_NAMES:
+        raise HTTPException(status_code=502, detail="IRIS returned an invalid taxpayer state")
+    parts = [str(data.get(key) or "").strip() for key in ("addrFlno", "addrBno", "addrBnm", "addrSt")]
+    address = ", ".join(part for part in parts if part and part != ".")
+    pincode = re.sub(r"\D", "", str(data.get("addrPncd") or data.get("Pin") or ""))
+    return {
+        "gstin": gstin,
+        "legal_name": str(data.get("legalName") or data.get("LglNm") or "").strip()[:120],
+        "trade_name": str(data.get("tradeName") or data.get("TrdNm") or "").strip()[:120],
+        "address": address[:500],
+        "location": str(data.get("addrLoc") or data.get("Loc") or "").strip()[:120],
+        "pincode": pincode if len(pincode) == 6 else "",
+        "state_code": state_code,
+        "state_name": state_name or GST_STATE_NAMES[state_code],
+        "taxpayer_type": str(data.get("txpType") or "").strip()[:80],
+        "registration_date": str(data.get("dtReg") or "").strip()[:20],
+        "deregistration_date": str(data.get("dtDReg") or "").strip()[:20],
+        "source": "iris_irp",
+    }

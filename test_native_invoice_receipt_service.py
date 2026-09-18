@@ -59,3 +59,38 @@ def test_receipt_artifact_is_revision_bound(monkeypatch) -> None:
             raise AssertionError("A stale payment receipt remained downloadable after the invoice revision changed")
 
     asyncio.run(exercise())
+
+
+def test_create_and_issue_invoice_runs_as_one_replay_safe_operation(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(service, "_direct_issue_operation", lambda *_args: ("request-hash", ()))
+
+    async def preflight(*_args):
+        calls.append("preflight")
+
+    async def create(*_args, direct_issue_key="", direct_issue_hash="", **_kwargs):
+        assert direct_issue_key == "request-key"
+        assert direct_issue_hash == "request-hash"
+        calls.append("create")
+        return {"invoice_id": "invoice-1"}
+
+    async def get(*_args):
+        return {
+            "invoice_id": "invoice-1", "revision": 1, "lifecycle": "draft",
+            "direct_issue_idempotency_key": "request-key", "direct_issue_request_hash": "request-hash",
+        }
+
+    async def attach_and_issue(*_args):
+        calls.append("issue")
+        return {"invoice_id": "invoice-1", "lifecycle": "issued"}
+
+    monkeypatch.setattr(service, "_preflight_direct_issue", preflight)
+    monkeypatch.setattr(service, "create_invoice", create)
+    monkeypatch.setattr(service, "get_invoice", get)
+    monkeypatch.setattr(service, "_attach_and_issue", attach_and_issue)
+
+    result = asyncio.run(service.create_and_issue_invoice(
+        "org-a", "user-a", "User A", {"invoice_date": "2026-09-18"}, [], "request-key",
+    ))
+    assert result["lifecycle"] == "issued"
+    assert calls == ["preflight", "create", "issue"]

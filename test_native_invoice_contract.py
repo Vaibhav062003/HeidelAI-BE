@@ -271,6 +271,9 @@ def test_server_side_feature_and_state_contracts():
     assert '@router.post("/adjustments/{adjustment_id}/pdf/render")' in routes
     assert '@router.get("/adjustments/{adjustment_id}/pdf-link")' in routes
     assert '@router.post("/{invoice_id}/refunds/{refund_id}/reverse")' in routes
+    assert '@router.post("/issue-now", status_code=201)' in routes
+    assert '@router.put("/{invoice_id}/issue-now")' in routes
+    assert "create_and_issue_invoice" in service and "update_and_issue_invoice" in service
     adjustment_service = Path("services/native_invoice_adjustment_service.py").read_text()
     assert "render_native_adjustment_pdf" in adjustment_service
     assert "native_invoice_pdf_download_url" in adjustment_service

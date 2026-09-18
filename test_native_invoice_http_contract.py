@@ -10,12 +10,13 @@ os.environ.setdefault("MONGODB_CLUSTER", "native_invoice_http_test")
 
 from auth.dependencies import get_current_user
 from auth.models import CurrentUserModel
-from services.native_invoice_master_service import _pincode
+from services.native_invoice_master_service import _cursor_offset, _next_cursor, _pincode
 
 
 def test_customer_preset_pincode_is_normalized_or_omitted() -> None:
     assert _pincode("400 001") == "400001"
     assert _pincode("unknown") == ""
+    assert _cursor_offset(_next_cursor(50)) == 50
 
 
 def _routes_module():
@@ -43,15 +44,15 @@ def test_native_invoice_http_auth_tenant_scope_and_admin_gate(monkeypatch) -> No
         assert org_id == "org-a"
         return [{"type": "billing", "member_ids": ["billing-user"]}]
 
-    async def customers(org_id, search, limit):
-        assert (org_id, search, limit) == ("org-a", "Acme", 5)
-        return [{"name": "Acme"}]
+    async def customers(org_id, search, limit, cursor):
+        assert (org_id, search, limit, cursor) == ("org-a", "Acme", 5, "")
+        return {"customers": [{"name": "Acme"}], "next_cursor": None}
 
     monkeypatch.setattr(routes, "list_work_teams", teams)
     monkeypatch.setattr(routes, "customer_presets", customers)
     response = TestClient(app).get("/api/native-invoices/presets/customers?search=Acme&limit=5")
     assert response.status_code == 200
-    assert response.json() == {"customers": [{"name": "Acme"}]}
+    assert response.json() == {"customers": [{"name": "Acme"}], "next_cursor": None}
 
     close = TestClient(app).post(
         "/api/native-invoices/invoice-1/close",
@@ -71,6 +72,9 @@ def test_static_native_invoice_routes_precede_dynamic_invoice_route() -> None:
         ("GET", "/api/native-invoices/export.xlsx"),
         ("GET", "/api/native-invoices/presets/customers"),
         ("GET", "/api/native-invoices/presets/items"),
+        ("GET", "/api/native-invoices/gstin/{gstin}"),
+        ("POST", "/api/native-invoices/issue-now"),
+        ("PUT", "/api/native-invoices/{invoice_id}/issue-now"),
         ("POST", "/api/native-invoices/{invoice_id}/receipt/render"),
         ("GET", "/api/native-invoices/{invoice_id}/receipt-link"),
     }

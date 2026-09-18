@@ -14,6 +14,7 @@ from services.entitlement_service import feature_access, require_feature
 from services.feature_flags import native_invoicing_enabled
 from services.india_tax import gst_state_name, is_valid_gstin
 from services.native_invoice_service import (
+    create_and_issue_invoice,
     create_invoice,
     duplicate_invoice,
     get_invoice,
@@ -28,6 +29,7 @@ from services.native_invoice_service import (
     invoice_view,
     issue_invoice,
     list_invoices,
+    lookup_gstin_details,
     record_payment,
     render_invoice_preview,
     render_invoice_receipt,
@@ -37,6 +39,7 @@ from services.native_invoice_service import (
     set_invoice_archived,
     set_invoice_closed,
     update_invoice,
+    update_and_issue_invoice,
     void_invoice,
 )
 from services.native_invoice_adjustment_service import (
@@ -57,7 +60,7 @@ from services.native_invoice_asset_service import (
     list_invoice_attachment_metadata,
     store_invoice_attachment,
 )
-from services.native_invoice_assets import ATTACHMENT_MAX_BYTES
+from services.native_invoice_assets import ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_COUNT, ATTACHMENT_TOTAL_MAX_BYTES
 from services.native_invoice_master_service import (
     customer_presets,
     item_presets,
@@ -255,6 +258,12 @@ class LogoImage(SignatureImage):
     data_base64: str = Field(min_length=4, max_length=90_000)
 
 
+class InvoiceAttachmentImage(SignatureImage):
+    filename: str = Field(min_length=1, max_length=120)
+    byte_size: int = Field(gt=0, le=ATTACHMENT_MAX_BYTES)
+    data_base64: str = Field(min_length=4, max_length=((ATTACHMENT_MAX_BYTES + 2) // 3) * 4)
+
+
 class PaymentProfile(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -305,6 +314,22 @@ class DocumentReference(BaseModel):
 
 
 InvoiceDraftPayload.model_rebuild()
+
+
+class InvoiceIssueNowPayload(InvoiceDraftPayload):
+    attachment_images: list[InvoiceAttachmentImage] = Field(default_factory=list, max_length=ATTACHMENT_MAX_COUNT)
+
+    @model_validator(mode="after")
+    def validate_attachment_batch(self):
+        if sum(image.byte_size for image in self.attachment_images) > ATTACHMENT_TOTAL_MAX_BYTES:
+            raise ValueError("Invoice attachments exceed the 8 MiB total limit")
+        if len({image.data_base64 for image in self.attachment_images}) != len(self.attachment_images):
+            raise ValueError("The same image cannot be attached twice")
+        return self
+
+
+class InvoiceUpdateIssueNowPayload(InvoiceIssueNowPayload):
+    expected_revision: int = Field(ge=1)
 
 
 class InvoiceUpdatePayload(InvoiceDraftPayload):
@@ -502,20 +527,36 @@ async def get_native_invoice_xlsx_export(
 @limiter.limit("30/minute")
 async def get_native_invoice_customer_presets(
     request: Request, user: CurrentUser,
-    search: str = Query(default="", max_length=100), limit: int = Query(default=100, ge=1, le=100),
+    search: str = Query(default="", max_length=100), limit: int = Query(default=50, ge=1, le=100),
+    cursor: str = Query(default="", max_length=1000),
 ):
     await _require_native_access(user)
-    return {"customers": await customer_presets(user.org_id, search, limit)}
+    try:
+        return await customer_presets(user.org_id, search, limit, cursor)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/presets/items")
 @limiter.limit("30/minute")
 async def get_native_invoice_item_presets(
     request: Request, user: CurrentUser,
-    search: str = Query(default="", max_length=100), limit: int = Query(default=100, ge=1, le=100),
+    search: str = Query(default="", max_length=100), limit: int = Query(default=50, ge=1, le=100),
+    cursor: str = Query(default="", max_length=1000),
 ):
     await _require_native_access(user)
-    return {"items": await item_presets(user.org_id, search, limit)}
+    try:
+        return await item_presets(user.org_id, search, limit, cursor)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/gstin/{gstin}")
+@limiter.limit("30/minute")
+async def get_native_invoice_gstin_details(request: Request, gstin: str, user: CurrentUser):
+    await _require_native_access(user)
+    await _require_native_invoice_provider(user)
+    return {"taxpayer": await lookup_gstin_details(user.org_id, gstin)}
 
 
 @router.post("/preview")
@@ -551,6 +592,39 @@ async def post_native_invoice(
     await _require_native_access(user, write=True)
     await _require_native_invoice_provider(user)
     return {"invoice": await create_invoice(user.org_id, user.user_id, user.full_name or "Team member", payload.model_dump(mode="json"), _idempotency(idempotency_key), user.role)}
+
+
+@router.post("/issue-now", status_code=201)
+@limiter.limit("20/minute")
+async def post_native_invoice_issue_now(
+    request: Request, payload: InvoiceIssueNowPayload, user: CurrentUser,
+    idempotency_key: str = Header(alias="X-Idempotency-Key"),
+):
+    await _require_native_access(user, write=True)
+    await _require_native_invoice_provider(user)
+    values = payload.model_dump(mode="json", exclude_unset=True)
+    attachment_images = values.pop("attachment_images", [])
+    return {"invoice": await create_and_issue_invoice(
+        user.org_id, user.user_id, user.full_name or "Team member", values, attachment_images,
+        _idempotency(idempotency_key), user.role,
+    )}
+
+
+@router.put("/{invoice_id}/issue-now")
+@limiter.limit("20/minute")
+async def put_native_invoice_issue_now(
+    request: Request, invoice_id: str, payload: InvoiceUpdateIssueNowPayload, user: CurrentUser,
+    idempotency_key: str = Header(alias="X-Idempotency-Key"),
+):
+    await _require_native_access(user, write=True)
+    await _require_native_invoice_provider(user)
+    values = payload.model_dump(mode="json", exclude_unset=True)
+    expected_revision = values.pop("expected_revision")
+    attachment_images = values.pop("attachment_images", [])
+    return {"invoice": await update_and_issue_invoice(
+        user.org_id, invoice_id, user.user_id, user.full_name or "Team member", values, expected_revision,
+        attachment_images, _idempotency(idempotency_key), user.role,
+    )}
 
 
 @router.get("/{invoice_id}")
