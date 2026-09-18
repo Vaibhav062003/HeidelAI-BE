@@ -23,7 +23,8 @@ from config.settings import CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET, CLOUDINAR
 from database import get_async_mongo_client, get_async_mongo_db
 from services.cloudinary_service import native_invoice_pdf_download_url, upload_native_invoice_pdf
 from services.feature_flags import native_invoicing_enabled, tally_enabled
-from services.native_invoice_asset_service import load_invoice_attachment_images, snapshot_invoice_attachments
+from services.native_invoice_asset_service import load_invoice_attachment_images, snapshot_invoice_attachments, store_invoice_attachment
+from services.native_invoice_assets import InvoiceAssetError, validate_attachment_images
 from services.native_invoice_pdf import (
     InvoicePdfError,
     RENDERER_VERSION,
@@ -537,7 +538,23 @@ async def get_invoice(org_id: str, invoice_id: str) -> dict:
     return document
 
 
-async def create_invoice(org_id: str, actor_id: str, actor_name: str, payload: dict, idempotency_key: str, actor_role: str = "") -> dict:
+async def lookup_gstin_details(org_id: str, gstin: str) -> dict:
+    from services.iris_irp_service import iris_irp_adapter
+
+    seller = await configured_seller(org_id)
+    adapter = iris_irp_adapter()
+    try:
+        return await adapter.get_gstin_details(org_id, seller["gstin"], gstin)
+    finally:
+        close = getattr(adapter.transport, "aclose", None)
+        if close:
+            await close()
+
+
+async def create_invoice(
+    org_id: str, actor_id: str, actor_name: str, payload: dict, idempotency_key: str, actor_role: str = "",
+    direct_issue_key: str = "", direct_issue_hash: str = "",
+) -> dict:
     payload = deepcopy(payload)
     payload["seller"] = await configured_seller(org_id)
     payload["signature_image"] = canonicalize_signature_image(payload.get("signature_image"))
@@ -591,6 +608,8 @@ async def create_invoice(org_id: str, actor_id: str, actor_name: str, payload: d
         "updated_by": actor_id,
         "create_idempotency_key": idempotency_key,
         "create_request_hash": request_hash,
+        "direct_issue_idempotency_key": direct_issue_key or None,
+        "direct_issue_request_hash": direct_issue_hash or None,
         "audit": [_event("draft_created", actor_id, actor_name=actor_name, actor_role=actor_role, revision_after=1)],
     }
     try:
@@ -609,7 +628,7 @@ async def create_invoice(org_id: str, actor_id: str, actor_name: str, payload: d
 
 async def update_invoice(
     org_id: str, invoice_id: str, actor_id: str, payload: dict, expected_revision: int,
-    actor_name: str = "", actor_role: str = "",
+    actor_name: str = "", actor_role: str = "", direct_issue_key: str = "", direct_issue_hash: str = "",
 ) -> dict:
     payload = deepcopy(payload)
     current = await get_invoice(org_id, invoice_id)
@@ -632,7 +651,8 @@ async def update_invoice(
     now = datetime.now(timezone.utc)
     updated = await invoices.find_one_and_update(
         {"org_id": org_id, "invoice_id": invoice_id, "lifecycle": "draft", "revision": expected_revision},
-        {"$set": {**payload, **totals, "adjusted_total_paise": totals["total_paise"], "updated_at": now, "updated_by": actor_id}, "$inc": {"revision": 1}, "$push": {"audit": _event(
+        {"$set": {**payload, **totals, "adjusted_total_paise": totals["total_paise"], "updated_at": now, "updated_by": actor_id,
+            **({"direct_issue_idempotency_key": direct_issue_key, "direct_issue_request_hash": direct_issue_hash} if direct_issue_key else {})}, "$inc": {"revision": 1}, "$push": {"audit": _event(
             "draft_updated", actor_id, actor_name=actor_name, actor_role=actor_role,
             revision_before=expected_revision, revision_after=expected_revision + 1,
         )}},
@@ -641,6 +661,94 @@ async def update_invoice(
     if not updated:
         raise HTTPException(status_code=409, detail="This invoice draft changed. Reload before saving.")
     return invoice_view(updated)
+
+
+def _direct_issue_operation(payload: dict, attachment_images: list[dict], expected_revision: int | None = None) -> tuple[str, tuple]:
+    try:
+        images = validate_attachment_images(attachment_images)
+    except InvoiceAssetError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    fingerprint = request_fingerprint("issue_now", {
+        "payload": payload,
+        "expected_revision": expected_revision,
+        "attachments": [{"filename": image.filename, "content_type": image.content_type, "sha256": image.sha256} for image in images],
+    })
+    return fingerprint, images
+
+
+def _operation_key(idempotency_key: str, step: str) -> str:
+    return hashlib.sha256(f"{idempotency_key}\0{step}".encode()).hexdigest()
+
+
+async def _preflight_direct_issue(org_id: str, payload: dict, current: dict | None = None) -> dict:
+    document = {**(current or {}), **deepcopy(payload)}
+    document["seller"] = await configured_seller(org_id)
+    if not document.get("signature_image"):
+        raise HTTPException(status_code=409, detail="Add an authorised signature before issuing this invoice")
+    await _validate_einvoice_applicability(org_id, document, None)
+    return document
+
+
+async def _attach_and_issue(
+    org_id: str, invoice_id: str, actor_id: str, revision: int, images: tuple,
+    idempotency_key: str, actor_name: str, actor_role: str,
+) -> dict:
+    for index, image in enumerate(images):
+        result = await store_invoice_attachment(
+            org_id, invoice_id, actor_id, expected_revision=revision,
+            idempotency_key=_operation_key(idempotency_key, f"attachment:{index}"),
+            filename=image.filename, content_type=image.content_type, data=image.data,
+        )
+        revision = int(result["revision"])
+    return await issue_invoice(
+        org_id, invoice_id, actor_id, revision, _operation_key(idempotency_key, "issue"), actor_name, actor_role,
+    )
+
+
+async def create_and_issue_invoice(
+    org_id: str, actor_id: str, actor_name: str, payload: dict, attachment_images: list[dict],
+    idempotency_key: str, actor_role: str = "",
+) -> dict:
+    direct_hash, images = _direct_issue_operation(payload, attachment_images)
+    await _preflight_direct_issue(org_id, payload)
+    created = await create_invoice(
+        org_id, actor_id, actor_name, payload, _operation_key(idempotency_key, "create"), actor_role,
+        direct_issue_key=idempotency_key, direct_issue_hash=direct_hash,
+    )
+    current = await get_invoice(org_id, created["invoice_id"])
+    if current.get("direct_issue_idempotency_key") != idempotency_key or current.get("direct_issue_request_hash") != direct_hash:
+        raise _idempotency_conflict()
+    if current.get("lifecycle") == "issued" and current.get("issue_idempotency_key") == _operation_key(idempotency_key, "issue"):
+        return invoice_view(current)
+    return await _attach_and_issue(
+        org_id, current["invoice_id"], actor_id, int(current["revision"]), images,
+        idempotency_key, actor_name, actor_role,
+    )
+
+
+async def update_and_issue_invoice(
+    org_id: str, invoice_id: str, actor_id: str, actor_name: str, payload: dict, expected_revision: int,
+    attachment_images: list[dict], idempotency_key: str, actor_role: str = "",
+) -> dict:
+    direct_hash, images = _direct_issue_operation(payload, attachment_images, expected_revision)
+    current = await get_invoice(org_id, invoice_id)
+    if current.get("direct_issue_idempotency_key") == idempotency_key:
+        if current.get("direct_issue_request_hash") != direct_hash:
+            raise _idempotency_conflict()
+        if current.get("lifecycle") == "issued" and current.get("issue_idempotency_key") == _operation_key(idempotency_key, "issue"):
+            return invoice_view(current)
+        if current.get("lifecycle") != "draft":
+            raise HTTPException(status_code=409, detail="Only a draft invoice can be issued")
+    else:
+        await _preflight_direct_issue(org_id, payload, current)
+        current = await update_invoice(
+            org_id, invoice_id, actor_id, payload, expected_revision, actor_name, actor_role,
+            direct_issue_key=idempotency_key, direct_issue_hash=direct_hash,
+        )
+    return await _attach_and_issue(
+        org_id, invoice_id, actor_id, int(current["revision"]), images,
+        idempotency_key, actor_name, actor_role,
+    )
 
 
 async def duplicate_invoice(

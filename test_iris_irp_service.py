@@ -20,6 +20,7 @@ from services.iris_irp_service import (  # noqa: E402
     IrisIrpOutcomeUnknown,
     UnconfiguredIrisIrpCodec,
     enforce_reporting_window,
+    gstin_details_view,
     irp_persistence_fields,
     map_domestic_b2b_document,
     validate_base_url,
@@ -217,6 +218,26 @@ def test_mapping_and_reporting_window_contract():
     assert error.value.status_code == 409
 
 
+def test_gstin_details_are_normalized_for_invoice_autofill():
+    details = gstin_details_view({
+        "gstin": "27BCKPS4201C1ZV",
+        "tradeName": "Seller",
+        "legalName": "Seller Private Limited",
+        "addrBnm": "Aries Compound",
+        "addrBno": "106/3",
+        "addrFlno": ".",
+        "addrSt": "Main Road",
+        "addrLoc": "Mumbai",
+        "stateCode": "Maharashtra",
+        "addrPncd": "400001",
+        "txpType": "Regular",
+    }, "27BCKPS4201C1ZV")
+    assert details["state_code"] == "27"
+    assert details["address"] == "106/3, Aries Compound, Main Road"
+    assert details["pincode"] == "400001"
+    assert details["source"] == "iris_irp"
+
+
 @pytest.mark.asyncio
 async def test_generate_contract_auth_cache_headers_and_persistence():
     service, transport, codec, collection = adapter([
@@ -242,6 +263,22 @@ async def test_generate_contract_auth_cache_headers_and_persistence():
     persisted = irp_persistence_fields(artifact, environment="sandbox", cipher=service.cipher, received_at=NOW)
     assert "signed_qr" not in persisted and persisted["schema_version"] == "1.1"
     assert service.cipher.decrypt(persisted["signed_qr_encrypted"].encode()) == b"signed-qr"
+
+
+@pytest.mark.asyncio
+async def test_get_gstin_details_uses_documented_master_endpoint():
+    service, transport, codec, _ = adapter([
+        FakeResponse({"Status": 1, "Data": "GSTIN-DETAILS"}),
+    ], token_cached=True)
+    codec.decrypt_core = lambda data, session_key: {
+        "gstin": "29AAACB2894G1ZJ", "legalName": "Buyer Limited", "tradeName": "Buyer",
+        "addrBno": "7", "addrBnm": "Market Road", "addrLoc": "Bengaluru",
+        "stateCode": "Karnataka", "addrPncd": "560001", "txpType": "Regular",
+    }
+    details = await service.get_gstin_details("org-1", "27BCKPS4201C1ZV", "29AAACB2894G1ZJ")
+    assert details["legal_name"] == "Buyer Limited" and details["state_code"] == "29"
+    assert transport.calls[0][0] == "POST"
+    assert transport.calls[0][1].endswith("/eivital/v1.04/Master/gstin/29AAACB2894G1ZJ")
 
 
 @pytest.mark.asyncio

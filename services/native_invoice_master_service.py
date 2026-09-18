@@ -1,5 +1,7 @@
 """Read-only invoice presets from the existing contacts and product catalogue."""
 
+import base64
+import json
 import re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -9,6 +11,23 @@ from services.india_tax import GST_STATE_NAMES, is_valid_gstin
 
 
 db = get_async_mongo_db()
+
+
+def _cursor_offset(value: str) -> int:
+    if not value:
+        return 0
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+        offset = int(decoded["offset"])
+        if offset < 0:
+            raise ValueError
+        return offset
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid preset cursor") from exc
+
+
+def _next_cursor(offset: int) -> str:
+    return base64.urlsafe_b64encode(json.dumps({"offset": offset}, separators=(",", ":")).encode()).decode().rstrip("=")
 
 
 def _text(value, maximum: int = 500) -> str:
@@ -24,12 +43,15 @@ def _pincode(value) -> str:
     return digits if len(digits) == 6 else ""
 
 
-async def customer_presets(org_id: str, search: str = "", limit: int = 100) -> list[dict]:
+async def customer_presets(org_id: str, search: str = "", limit: int = 50, cursor: str = "") -> dict:
     query = {}
     if search.strip():
         pattern = {"$regex": re.escape(search.strip()), "$options": "i"}
         query = {"$or": [{field: pattern} for field in ("full_name", "customer_name", "company", "email", "phone_number", "gstin", "tally.legal_name")]}
-    rows = await db[f"contacts_{org_id}"].find(query).sort([("full_name", 1), ("_id", 1)]).limit(limit).to_list(length=limit)
+    offset = _cursor_offset(cursor)
+    rows = await db[f"contacts_{org_id}"].find(query).sort([("full_name", 1), ("_id", 1)]).skip(offset).limit(limit + 1).to_list(length=limit + 1)
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     result = []
     seen = set()
     for row in rows:
@@ -60,7 +82,7 @@ async def customer_presets(org_id: str, search: str = "", limit: int = 100) -> l
             "payment_details": "",
             "country_code": "IN",
         })
-    return result
+    return {"customers": result, "next_cursor": _next_cursor(offset + limit) if has_more else None}
 
 
 def _paise(product: dict) -> int:
@@ -71,7 +93,7 @@ def _paise(product: dict) -> int:
         return 0
 
 
-async def item_presets(org_id: str, search: str = "", limit: int = 100) -> list[dict]:
+async def item_presets(org_id: str, search: str = "", limit: int = 50, cursor: str = "") -> dict:
     organization = await db.organizations.find_one({"org_id": org_id}, {"sales_catalogue_org_id": 1}) or {}
     configured = str(organization.get("sales_catalogue_org_id") or "")
     catalogue_org = configured if re.fullmatch(r"[A-Za-z0-9_-]+", configured) else org_id
@@ -79,7 +101,10 @@ async def item_presets(org_id: str, search: str = "", limit: int = 100) -> list[
     if search.strip():
         pattern = {"$regex": re.escape(search.strip()), "$options": "i"}
         query = {"$or": [{field: pattern} for field in ("product_name", "model_name", "description", "model_no", "unique_identifier", "hsn_sac", "hsn", "sac")]}
-    rows = await db[f"products_{catalogue_org}"].find(query).sort([("product_name", 1), ("_id", 1)]).limit(limit).to_list(length=limit)
+    offset = _cursor_offset(cursor)
+    rows = await db[f"products_{catalogue_org}"].find(query).sort([("product_name", 1), ("_id", 1)]).skip(offset).limit(limit + 1).to_list(length=limit + 1)
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     result = []
     for row in rows:
         description = _text(row.get("product_name") or row.get("model_name") or row.get("description"))
@@ -103,4 +128,4 @@ async def item_presets(org_id: str, search: str = "", limit: int = 100) -> list[
             "supply_type": supply_type,
             "line_kind": "item",
         })
-    return result
+    return {"items": result, "next_cursor": _next_cursor(offset + limit) if has_more else None}
