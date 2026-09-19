@@ -62,6 +62,21 @@ def test_native_invoice_http_auth_tenant_scope_and_admin_gate(monkeypatch) -> No
     assert close.status_code == 403
     assert close.json()["detail"] == "This action requires an organization administrator"
 
+    async def delete_draft(org_id, invoice_id, actor_id, revision, idempotency_key):
+        assert (org_id, invoice_id, actor_id, revision, idempotency_key) == (
+            "org-a", "draft-1", "billing-user", 2, "delete-draft-1",
+        )
+        return {"deleted": True, "invoice_id": invoice_id}
+
+    monkeypatch.setattr(routes, "delete_draft_invoice", delete_draft)
+    deleted = TestClient(app).request(
+        "DELETE", "/api/native-invoices/draft-1",
+        headers={"X-Idempotency-Key": "delete-draft-1"},
+        json={"expected_revision": 2, "confirmation": "DELETE"},
+    )
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True, "invoice_id": "draft-1"}
+
 
 def test_static_native_invoice_routes_precede_dynamic_invoice_route() -> None:
     routes = _routes_module()
@@ -77,6 +92,9 @@ def test_static_native_invoice_routes_precede_dynamic_invoice_route() -> None:
         ("PUT", "/api/native-invoices/{invoice_id}/issue-now"),
         ("POST", "/api/native-invoices/{invoice_id}/receipt/render"),
         ("GET", "/api/native-invoices/{invoice_id}/receipt-link"),
+        ("DELETE", "/api/native-invoices/{invoice_id}"),
+        ("POST", "/api/native-invoices/{invoice_id}/deliveries"),
+        ("PUT", "/api/native-invoices/{invoice_id}/reminder-settings"),
     }
     assert expected <= set(paths)
     assert paths.index(("GET", "/api/native-invoices/presets/customers")) < paths.index(("GET", "/api/native-invoices/{invoice_id}"))

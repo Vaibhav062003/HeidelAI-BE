@@ -19,6 +19,10 @@ from services.work_team_service import list_work_teams, require_conversation_acc
 from services.entitlement_service import require_feature
 from services.feature_flags import native_invoicing_enabled, tally_enabled
 from services.native_invoice_service import invoice_provider
+from services.native_invoice_delivery_service import (
+    invoice_delivery_readiness,
+    normalize_delivery_settings,
+)
 from services.iris_irp_service import save_taxpayer_credentials, taxpayer_credential_status
 from services.india_tax import gst_state_name, is_valid_gstin
 
@@ -285,6 +289,27 @@ class InvoiceControlsInput(BaseModel):
         return value
 
 
+class InvoiceDeliveryInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    automatic_reminders_enabled: bool = False
+    default_channels: list[Literal["email", "whatsapp"]] = Field(default_factory=list, max_length=2)
+    whatsapp_phone_id: str = Field(default="", max_length=80)
+    share_template_name: str = Field(default="", max_length=512, pattern=r"^(?:|[a-z0-9_]+)$")
+    reminder_template_name: str = Field(default="", max_length=512, pattern=r"^(?:|[a-z0-9_]+)$")
+    template_language: str = Field(default="en", min_length=2, max_length=10, pattern=r"^[A-Za-z_-]+$")
+
+    @model_validator(mode="after")
+    def validate_channels(self):
+        if len(set(self.default_channels)) != len(self.default_channels):
+            raise ValueError("Invoice delivery channels must be unique")
+        if self.automatic_reminders_enabled and not self.default_channels:
+            raise ValueError("Select at least one channel for automatic reminders")
+        if self.automatic_reminders_enabled and "whatsapp" in self.default_channels and not self.reminder_template_name:
+            raise ValueError("An approved WhatsApp reminder template is required")
+        return self
+
+
 INVOICE_CONTROL_DEFAULTS = {
     "closed_through": None,
     "numbering": {
@@ -328,6 +353,7 @@ class QuoteSettingsPayload(BaseModel):
     invoice_provider: Optional[Literal["native", "tally"]] = None
     e_invoice_applicability: Optional[EInvoiceApplicabilityInput] = None
     invoice_controls: Optional[InvoiceControlsInput] = None
+    invoice_delivery: Optional[InvoiceDeliveryInput] = None
 
 
 class QuotePayload(BaseModel):
@@ -459,6 +485,7 @@ async def get_quote_settings(request: Request, user: CurrentUser):
     organization = await db.organizations.find_one({"org_id": user.org_id}, {"org_name": 1})
     seller = (settings or {}).get("seller") or {}
     iris_status = await taxpayer_credential_status(user.org_id, seller.get("gstin", ""))
+    delivery_readiness = await invoice_delivery_readiness(user.org_id)
     return {
         "settings": {
             "logo_url": (settings or {}).get("logo_url", ""),
@@ -487,6 +514,8 @@ async def get_quote_settings(request: Request, user: CurrentUser):
                 "not_required_reason": None,
             },
             "invoice_controls": _invoice_controls_view((settings or {}).get("invoice_controls")),
+            "invoice_delivery": normalize_delivery_settings((settings or {}).get("invoice_delivery")),
+            "invoice_delivery_readiness": delivery_readiness,
             "iris_irp": iris_status,
         }
     }
@@ -499,6 +528,7 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
     await admin_required(user)
     if (
         payload.e_invoice_applicability is not None or payload.invoice_controls is not None
+        or payload.invoice_delivery is not None
         or payload.invoice_provider is not None or payload.seller is not None
     ) and (response := reverification_required(user)):
         return response
@@ -552,6 +582,17 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
             merged_numbering.update({key: value for key, value in changes["numbering"].items() if value is not None})
             merged["numbering"] = merged_numbering
         updates["invoice_controls"] = merged
+    if payload.invoice_delivery is not None:
+        delivery = normalize_delivery_settings(payload.invoice_delivery.model_dump(mode="json"))
+        if delivery["automatic_reminders_enabled"]:
+            readiness = await invoice_delivery_readiness(user.org_id)
+            if "email" in delivery["default_channels"] and not readiness["gmail_send_ready"]:
+                raise HTTPException(status_code=409, detail="Reconnect Google and grant Gmail send permission before enabling email reminders")
+            if "whatsapp" in delivery["default_channels"]:
+                phone_ids = {row["phone_id"] for row in readiness["whatsapp_connections"]}
+                if not delivery["whatsapp_phone_id"] or delivery["whatsapp_phone_id"] not in phone_ids:
+                    raise HTTPException(status_code=409, detail="Select an active WhatsApp sender before enabling reminders")
+        updates["invoice_delivery"] = delivery
     if not updates:
         raise HTTPException(status_code=422, detail="Add a quote or invoice setting to update")
     settings = await _settings_collection(user.org_id).find_one_and_update(
@@ -577,6 +618,8 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
             "b2c_dynamic_qr_required": False, "not_required_reason": None,
         },
         "invoice_controls": _invoice_controls_view(settings.get("invoice_controls")),
+        "invoice_delivery": normalize_delivery_settings(settings.get("invoice_delivery")),
+        "invoice_delivery_readiness": await invoice_delivery_readiness(user.org_id),
     }}
 
 
