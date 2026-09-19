@@ -2,9 +2,11 @@ import importlib.util
 from io import BytesIO
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
+import services.native_invoice_pdf as native_invoice_pdf
 from services.native_invoice_pdf import (
     FONT_DIR,
     InvoicePdfError,
@@ -72,6 +74,16 @@ class NativeInvoicePdfTests(unittest.TestCase):
         self.assertGreater(data.count(b"/Type /Page"), 1)
         self.assertGreater(len(data), 10_000)
         self.assertEqual(data, render_native_invoice_pdf(invoice()))
+
+    def test_empty_payment_details_are_hidden(self):
+        value = invoice()
+        value["items"] = value["items"][:1]
+        value["payment_profile"] = {
+            "account_name": "", "bank_name": "", "account_number": "", "ifsc": "", "upi_id": "", "qr_enabled": False,
+        }
+        with patch.object(native_invoice_pdf, "_section", wraps=native_invoice_pdf._section) as section:
+            render_native_invoice_pdf(value)
+        self.assertNotIn("PAYMENT DETAILS", [call.args[1] for call in section.call_args_list])
 
     def test_unsupported_glyph_fails_closed(self):
         value = invoice()

@@ -17,7 +17,8 @@ from urllib.parse import urlencode
 
 from fontTools.ttLib import TTFont
 from fpdf import FPDF
-from fpdf.enums import XPos, YPos
+from fpdf.enums import MethodReturnValue, XPos, YPos
+from fpdf.fonts import FontFace
 from PIL import Image
 
 from services.native_invoice_assets import (
@@ -30,11 +31,20 @@ from services.native_invoice_assets import (
 from services.india_tax import gst_state_name
 
 
-RENDERER_VERSION = 3
+RENDERER_VERSION = 4
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts" / "native_invoice"
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _COLOR = re.compile(r"#[0-9A-Fa-f]{6}")
 DEFAULT_COLUMNS = ("description", "hsn_sac", "quantity", "unit_rate", "gst_rate", "tax", "total")
+COLUMN_WEIGHTS = {
+    "description": 3.0,
+    "hsn_sac": 1.15,
+    "quantity": 1.1,
+    "unit_rate": 1.55,
+    "gst_rate": 0.9,
+    "tax": 1.45,
+    "total": 1.6,
+}
 DEFAULT_LABELS = {
     "title": "TAX INVOICE",
     "supplier": "SUPPLIER",
@@ -242,19 +252,23 @@ class _InvoicePdf(FPDF):
 
     def header(self):
         if self.watermark:
-            self.set_font("Noto", "B", 42)
-            self.set_text_color(229, 229, 229) if self.watermark == "PAID" else self.set_text_color(241, 218, 218)
-            with self.rotation(35, self.w / 2, self.h / 2):
-                self.set_xy(0, self.h / 2 - 10)
+            self.set_font("Noto", "B", 48)
+            accent = self.presentation.accent
+            self.set_text_color(*(round(channel + (255 - channel) * 0.94) for channel in accent))
+            with self.rotation(-12, self.w / 2, self.h / 2):
+                self.set_xy(0, self.h / 2 - 12)
                 self.cell(self.w, 20, self.watermark, align="C")
             self.set_xy(self.l_margin, self.t_margin)
+        if self.page_no() == 1:
+            return
         self.set_text_color(*self.presentation.accent)
         self.set_font("Noto", "B", 9)
         self.cell(95, 5, _text((self.invoice.get("seller") or {}).get("name") or "Organization"))
         self.set_font("Noto", "", 8)
         name = _document_title(self.invoice).title()
         state = {"draft": "DRAFT preview", "void": f"VOID {name}"}.get(self.invoice.get("lifecycle"), name)
-        self.cell(0, 5, f"{state} - {_text(self.invoice.get('invoice_number'))}", align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        number = _text(self.invoice.get("invoice_number"))
+        self.cell(0, 5, " · ".join(filter(None, [state, number])), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         self.set_draw_color(210, 210, 205)
         self.line(self.l_margin, self.get_y() + 1, self.w - self.r_margin, self.get_y() + 1)
         self.ln(4)
@@ -304,23 +318,120 @@ def _paragraph(pdf: _InvoicePdf, value: Any, *, bold: bool = False, size: float 
     pdf.multi_cell(0, 4.5, _text(value), new_x=XPos.LMARGIN, new_y=YPos.NEXT, wrapmode="CHAR")
 
 
-def _party(pdf: _InvoicePdf, title: str, party: dict) -> None:
-    _section(pdf, title)
-    _paragraph(pdf, party.get("name") or "-", bold=True, size=9.5)
+def _party_lines(party: dict) -> list[str]:
+    lines = []
     legal = " | ".join(filter(None, [_text(party.get("legal_name")), _text(party.get("trade_name"))]))
     if legal and legal != _text(party.get("name")):
-        _paragraph(pdf, legal)
-    if party.get("gstin"):
-        _paragraph(pdf, f"GSTIN: {party['gstin']}")
-    _paragraph(pdf, f"State: {_state(party.get('state_code'))}")
-    _paragraph(pdf, "Country: India")
-    _paragraph(pdf, party.get("address") or "-")
+        lines.append(legal)
+    lines.append(_text(party.get("address") or "-"))
     locality = " ".join(filter(None, [_text(party.get("location")), _text(party.get("pincode"))]))
     if locality:
-        _paragraph(pdf, locality)
+        lines.append(locality)
+    lines.append(_state(party.get("state_code")))
+    if party.get("gstin"):
+        lines.append(f"GSTIN: {party['gstin']}")
     contact = " | ".join(filter(None, [_text(party.get("phone")), _text(party.get("email"))]))
     if contact:
-        _paragraph(pdf, contact)
+        lines.append(contact)
+    return lines
+
+
+def _write_block(
+    pdf: _InvoicePdf, *, x: float, y: float, width: float, label: str, headline: str = "",
+    lines: list[str] | None = None, align: str = "L",
+) -> float:
+    pdf.set_xy(x, y)
+    pdf.set_text_color(*pdf.presentation.accent)
+    pdf.set_font("Noto", "B", 7)
+    pdf.cell(width, 4, label.upper(), align=align, new_x=XPos.LEFT, new_y=YPos.NEXT)
+    cursor = y + 5
+    if headline:
+        pdf.set_font("Noto", "B", 10)
+        pdf.set_text_color(35, 35, 35)
+        pdf.set_xy(x, cursor)
+        height = float(pdf.multi_cell(
+            width, 4.5, _text(headline), align=align, wrapmode="CHAR", dry_run=True,
+            output=MethodReturnValue.HEIGHT,
+        ))
+        pdf.set_xy(x, cursor)
+        pdf.multi_cell(width, 4.5, _text(headline), align=align, wrapmode="CHAR")
+        cursor += height + 1
+    if lines:
+        pdf.set_font("Noto", "", 7.5)
+        pdf.set_text_color(80, 80, 80)
+        value = "\n".join(filter(None, (_text(line) for line in lines)))
+        pdf.set_xy(x, cursor)
+        height = float(pdf.multi_cell(
+            width, 4, value, align=align, wrapmode="CHAR", dry_run=True,
+            output=MethodReturnValue.HEIGHT,
+        ))
+        pdf.set_xy(x, cursor)
+        pdf.multi_cell(width, 4, value, align=align, wrapmode="CHAR")
+        cursor += height
+    return cursor
+
+
+def _document_header(pdf: _InvoicePdf, invoice: dict, labels: dict[str, str], title: str, number: str) -> None:
+    content_width = pdf.w - pdf.l_margin - pdf.r_margin
+    gap = 10
+    left_width = content_width * 0.57
+    right_width = content_width - left_width - gap
+    y = pdf.get_y()
+    seller = invoice.get("seller") or {}
+    left_end = _write_block(
+        pdf, x=pdf.l_margin, y=y, width=left_width, label=labels["supplier"],
+        headline=seller.get("name") or "Organization", lines=_party_lines(seller),
+    )
+    if invoice.get("_pdf_document_kind") in {"credit_note", "debit_note"}:
+        source = invoice.get("source_invoice_number") or invoice.get("source_invoice_id") or "-"
+        metadata = [
+            f"Note date: {_date(invoice.get('invoice_date'))}",
+            f"Original invoice: {source}",
+            f"Reason: {invoice.get('reason') or '-'}",
+        ]
+    else:
+        metadata = [
+            f"{labels['invoice_date']}: {_date(invoice.get('invoice_date'))}",
+            f"{labels['due_date']}: {_date(invoice.get('due_date'))}",
+        ]
+    right_end = _write_block(
+        pdf, x=pdf.l_margin + left_width + gap, y=y, width=right_width, label=title,
+        headline=number, lines=metadata, align="R",
+    )
+    pdf.set_y(max(left_end, right_end) + 4)
+    pdf.set_draw_color(*pdf.presentation.accent)
+    pdf.set_line_width(0.6)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+    pdf.set_line_width(0.2)
+    pdf.ln(5)
+
+
+def _billing_blocks(pdf: _InvoicePdf, invoice: dict, labels: dict[str, str]) -> None:
+    content_width = pdf.w - pdf.l_margin - pdf.r_margin
+    gap = 10
+    left_width = content_width * 0.55
+    right_width = content_width - left_width - gap
+    y = pdf.get_y()
+    customer = invoice.get("customer") or {}
+    left_end = _write_block(
+        pdf, x=pdf.l_margin, y=y, width=left_width, label=labels["recipient"],
+        headline=customer.get("name") or "-", lines=_party_lines(customer),
+    )
+    supply_lines = [
+        f"{labels['place_of_supply']}: {_state(invoice.get('place_of_supply_state_code'))}",
+        f"{labels['reverse_charge']}: {'Yes' if invoice.get('reverse_charge') else 'No'}",
+    ]
+    if invoice.get("shipping_address"):
+        supply_lines.extend([
+            labels["delivery_address"],
+            _text(invoice["shipping_address"]),
+            _state(invoice.get("shipping_state_code") or customer.get("state_code")),
+        ])
+    right_end = _write_block(
+        pdf, x=pdf.l_margin + left_width + gap, y=y, width=right_width,
+        label=labels["place_of_supply"], lines=supply_lines, align="R",
+    )
+    pdf.set_y(max(left_end, right_end) + 6)
 
 
 def _issued_at(invoice: dict) -> datetime:
@@ -348,28 +459,131 @@ def _watermark(invoice: dict, *, final: bool) -> str | None:
     return None
 
 
-def _item_column(item: dict, column: str, labels: dict[str, str]) -> tuple[str, bool]:
+def _item_column(item: dict, column: str) -> str:
     if column == "description":
         line_kind = str(item.get("line_kind") or "item")
         prefix = {"shipping": "Shipping: ", "surcharge": "Surcharge: "}.get(line_kind, "")
-        return prefix + _text(item.get("description") or "-"), True
+        return prefix + _text(item.get("description") or "-")
     if column == "hsn_sac":
-        return f"{labels['hsn_sac']}: {item.get('hsn_sac') or '-'}", False
+        return _text(item.get("hsn_sac") or "-")
     if column == "quantity":
-        return f"{labels['quantity']}: {item.get('quantity') or 0} {item.get('uqc') or ''}", False
+        return f"{item.get('quantity') or 0} {item.get('uqc') or ''}".strip()
     if column == "unit_rate":
-        basis = "GST inclusive" if item.get("gst_inclusive") else "before GST"
-        return f"{labels['unit_rate']}: {_money(item.get('unit_price_paise'))} ({basis})", False
+        return _money(item.get("unit_price_paise"))
     if column == "gst_rate":
-        return f"{labels['gst_rate']}: {Decimal(str(item.get('gst_rate_bps') or 0)) / 100}%", False
+        return f"{Decimal(str(item.get('gst_rate_bps') or 0)) / 100}%"
     if column == "tax":
+        return _money(sum(int(item.get(key) or 0) for key in ("cgst_paise", "sgst_paise", "igst_paise")))
+    return _money(item.get("total_paise"))
+
+
+def _table_labels(labels: dict[str, str]) -> dict[str, str]:
+    return {
+        "description": "Description",
+        "hsn_sac": labels["hsn_sac"],
+        "quantity": labels["quantity"],
+        "unit_rate": labels["unit_rate"],
+        "gst_rate": labels["gst_rate"],
+        "tax": labels["tax"],
+        "total": labels["line_total"],
+    }
+
+
+def _items_table(pdf: _InvoicePdf, items: list[dict], columns: tuple[str, ...], labels: dict[str, str]) -> None:
+    def align(column: str) -> str:
+        return "R" if column in {"unit_rate", "tax", "total"} else "C" if column != "description" else "L"
+
+    pdf.set_draw_color(225, 225, 220)
+    pdf.set_font("Noto", "", 7)
+    with pdf.table(
+        col_widths=tuple(COLUMN_WEIGHTS[column] for column in columns),
+        headings_style=FontFace(emphasis="B", size_pt=6.5, color=(255, 255, 255), fill_color=pdf.presentation.accent),
+        line_height=4, min_row_height=8, padding=(1.5, 1.2), v_align="MIDDLE", wrapmode="CHAR",
+    ) as table:
+        heading = table.row()
+        for column in columns:
+            heading.cell(_table_labels(labels)[column], align=align(column))
+        for item in items:
+            row = table.row()
+            for column in columns:
+                style = FontFace(emphasis="B", size_pt=7) if column == "description" else None
+                row.cell(_item_column(item, column), align=align(column), style=style)
+
+
+def _summary_blocks(pdf: _InvoicePdf, invoice: dict, labels: dict[str, str]) -> None:
+    rates: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for item in invoice.get("items") or []:
+        bucket = rates[int(item.get("gst_rate_bps") or 0)]
+        for key in ("taxable_value_paise", "cgst_paise", "sgst_paise", "igst_paise"):
+            bucket[key] += int(item.get(key) or 0)
+
+    totals = [(labels["subtotal"], int(invoice.get("subtotal_paise") or 0))]
+    if invoice.get("discount_paise"):
+        totals.append((labels["discount"], -int(invoice["discount_paise"])))
+    totals.append((labels["taxable_value"], int(invoice.get("taxable_value_paise") or 0)))
+    for label, field in (("CGST", "cgst_paise"), ("SGST", "sgst_paise"), ("IGST", "igst_paise")):
+        if invoice.get(field):
+            totals.append((label, int(invoice[field])))
+    totals.append((labels["invoice_total"], int(invoice.get("total_paise") or 0)))
+    needed = max(22, len(rates) * 10 + 9, len(totals) * 5 + 9)
+    if pdf.get_y() + needed > pdf.h - pdf.b_margin:
+        pdf.add_page()
+    content_width = pdf.w - pdf.l_margin - pdf.r_margin
+    gap = 12
+    left_width = content_width * 0.52
+    right_width = content_width - left_width - gap
+    y = pdf.get_y() + 5
+    left_x = pdf.l_margin
+    right_x = left_x + left_width + gap
+
+    pdf.set_text_color(*pdf.presentation.accent)
+    pdf.set_font("Noto", "B", 7)
+    pdf.set_xy(left_x, y)
+    pdf.cell(left_width, 5, labels["gst_summary"].upper())
+    cursor = y + 6
+    pdf.set_text_color(65, 65, 65)
+    pdf.set_font("Noto", "", 7)
+    for rate in sorted(rates):
+        bucket = rates[rate]
         taxes = [
-            f"{label}: {_money(item[key])}"
-            for label, key in (("CGST", "cgst_paise"), ("SGST", "sgst_paise"), ("IGST", "igst_paise"))
-            if int(item.get(key) or 0)
+            f"{name}: {_money(bucket[key])}"
+            for name, key in (("CGST", "cgst_paise"), ("SGST", "sgst_paise"), ("IGST", "igst_paise"))
+            if bucket[key]
         ]
-        return f"{labels['taxable']}: {_money(item.get('taxable_value_paise'))} | {labels['tax']}: {' | '.join(taxes) or 'INR 0.00'}", False
-    return f"{labels['line_total']}: {_money(item.get('total_paise'))}", False
+        value = "  ·  ".join([
+            f"{Decimal(rate) / 100}%",
+            f"{labels['taxable']}: {_money(bucket['taxable_value_paise'])}",
+            *(taxes or ["GST: INR 0.00"]),
+        ])
+        pdf.set_xy(left_x, cursor)
+        height = float(pdf.multi_cell(
+            left_width, 4, value, wrapmode="CHAR", dry_run=True, output=MethodReturnValue.HEIGHT,
+        ))
+        pdf.set_xy(left_x, cursor)
+        pdf.multi_cell(left_width, 4, value, wrapmode="CHAR")
+        cursor += height + 2
+    left_end = cursor
+
+    pdf.set_xy(right_x, y)
+    pdf.set_text_color(*pdf.presentation.accent)
+    pdf.set_font("Noto", "B", 7)
+    pdf.cell(right_width, 5, labels["totals"].upper(), align="R")
+    cursor = y + 6
+    for index, (label, amount) in enumerate(totals):
+        final = index == len(totals) - 1
+        if final:
+            pdf.set_draw_color(*pdf.presentation.accent)
+            pdf.set_line_width(0.5)
+            pdf.line(right_x, cursor, right_x + right_width, cursor)
+            pdf.set_line_width(0.2)
+            cursor += 2
+        pdf.set_text_color(35, 35, 35)
+        pdf.set_font("Noto", "B" if final else "", 9 if final else 7.5)
+        pdf.set_xy(right_x, cursor)
+        pdf.cell(right_width * 0.55, 5, label)
+        pdf.cell(right_width * 0.45, 5, _money(amount), align="R")
+        cursor += 5
+    pdf.set_y(max(left_end, cursor) + 4)
 
 
 def _draw_image(pdf: _InvoicePdf, image: InvoiceImage, *, x: float, y: float, max_width: float, max_height: float) -> float:
@@ -462,30 +676,14 @@ def render_native_invoice_pdf(invoice: dict, *, final: bool = True) -> bytes:
     if logo:
         max_width, max_height = {"small": (28, 14), "medium": (42, 20), "large": (56, 26)}[presentation.logo_size]
         image_y = pdf.get_y()
-        height = _draw_image(pdf, logo, x=pdf.w - pdf.r_margin - max_width, y=image_y, max_width=max_width, max_height=max_height)
+        height = _draw_image(pdf, logo, x=pdf.l_margin, y=image_y, max_width=max_width, max_height=max_height)
         pdf.set_y(image_y + height + 2)
-    pdf.set_text_color(*presentation.accent)
-    pdf.set_font("Noto", "B", 20)
     base_title = document_title if is_adjustment else labels["title"]
     title = f"VOID {base_title}" if lifecycle == "void" else f"DRAFT - {base_title}" if lifecycle == "draft" else base_title
-    pdf.cell(0, 10, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Noto", "", 9)
+    _document_header(pdf, invoice, labels, title, document_number)
     if lifecycle == "void":
         _paragraph(pdf, f"Voided: {_date(invoice.get('voided_at'))} | Reason: {invoice.get('void_reason') or '-'}", bold=True)
-    if is_adjustment:
-        _paragraph(pdf, f"Note number: {document_number} | Note date: {_date(invoice.get('invoice_date'))}")
-        source_reference = invoice.get("source_invoice_number") or invoice.get("source_invoice_id") or "-"
-        _paragraph(pdf, f"Original invoice: {source_reference} dated {_date(invoice.get('source_invoice_date'))} | Reason: {invoice.get('reason') or '-'}", bold=True)
-    else:
-        _paragraph(pdf, f"{labels['invoice_number']}: {document_number} | {labels['invoice_date']}: {_date(invoice.get('invoice_date'))} | {labels['due_date']}: {_date(invoice.get('due_date'))}")
-    _paragraph(pdf, f"{labels['place_of_supply']}: {_state(invoice.get('place_of_supply_state_code'))} | {labels['reverse_charge']}: {'Yes' if invoice.get('reverse_charge') else 'No'}")
-
-    _party(pdf, labels["supplier"], invoice.get("seller") or {})
-    _party(pdf, labels["recipient"], invoice.get("customer") or {})
-    if invoice.get("shipping_address"):
-        _section(pdf, labels["delivery_address"])
-        _paragraph(pdf, invoice["shipping_address"])
-        _paragraph(pdf, f"State: {_state(invoice.get('shipping_state_code') or (invoice.get('customer') or {}).get('state_code'))}")
+    _billing_blocks(pdf, invoice, labels)
 
     if invoice.get("document_references"):
         _section(pdf, "DOCUMENT REFERENCES")
@@ -495,53 +693,16 @@ def render_native_invoice_pdf(invoice: dict, *, final: bool = True) -> bytes:
             note = f" | {reference.get('note')}" if reference.get("note") else ""
             _paragraph(pdf, f"{label}: {reference.get('reference')}{dated}{note}")
 
-    _section(pdf, labels["items"])
-    for index, item in enumerate(invoice.get("items") or [], start=1):
-        if pdf.get_y() > pdf.h - 48:
-            pdf.add_page()
-            _section(pdf, labels["items_continued"])
-        details = []
-        for column in presentation.columns:
-            value, bold = _item_column(item, column, labels)
-            if bold:
-                if details:
-                    _paragraph(pdf, " | ".join(details))
-                    details = []
-                _paragraph(pdf, f"{index}. {value}", bold=True, size=9)
-            else:
-                details.append(value)
-                if len(details) == 2:
-                    _paragraph(pdf, " | ".join(details))
-                    details = []
-        if details:
-            _paragraph(pdf, " | ".join(details))
-        pdf.set_draw_color(225, 225, 220)
-        pdf.line(pdf.l_margin, pdf.get_y() + 1, pdf.w - pdf.r_margin, pdf.get_y() + 1)
-        pdf.ln(3)
+    _items_table(pdf, invoice.get("items") or [], presentation.columns, labels)
 
-    _section(pdf, labels["gst_summary"])
-    rates: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for item in invoice.get("items") or []:
-        bucket = rates[int(item.get("gst_rate_bps") or 0)]
-        for key in ("taxable_value_paise", "cgst_paise", "sgst_paise", "igst_paise"):
-            bucket[key] += int(item.get(key) or 0)
-    for rate in sorted(rates):
-        bucket = rates[rate]
-        _paragraph(pdf, f"{Decimal(rate) / 100}% | {labels['taxable']}: {_money(bucket['taxable_value_paise'])} | CGST: {_money(bucket['cgst_paise'])} | SGST: {_money(bucket['sgst_paise'])} | IGST: {_money(bucket['igst_paise'])}")
-
-    _section(pdf, labels["totals"])
-    _paragraph(pdf, f"{labels['subtotal']}: {_money(invoice.get('subtotal_paise'))}")
-    if int(invoice.get("discount_paise") or 0):
-        _paragraph(pdf, f"{labels['discount']}: {_money(invoice.get('discount_paise'))}")
-    _paragraph(pdf, f"{labels['taxable_value']}: {_money(invoice.get('taxable_value_paise'))}")
-    _paragraph(pdf, f"CGST: {_money(invoice.get('cgst_paise'))} | SGST: {_money(invoice.get('sgst_paise'))} | IGST: {_money(invoice.get('igst_paise'))}")
-    _paragraph(pdf, f"{labels['invoice_total']}: {_money(invoice.get('total_paise'))}", bold=True, size=11)
+    _summary_blocks(pdf, invoice, labels)
 
     payment_profile = invoice.get("payment_profile") or {}
     legacy_payment = (invoice.get("seller") or {}).get("payment_details")
-    if payment_profile or legacy_payment:
+    has_payment_details = any(payment_profile.get(field) for field in ("account_name", "bank_name", "account_number", "ifsc", "upi_id"))
+    if has_payment_details or legacy_payment or payment_qr:
         _section(pdf, "PAYMENT DETAILS")
-        if payment_profile:
+        if has_payment_details:
             if payment_profile.get("account_name"):
                 _paragraph(pdf, f"Account name: {payment_profile['account_name']}")
             if payment_profile.get("bank_name"):
@@ -572,14 +733,27 @@ def render_native_invoice_pdf(invoice: dict, *, final: bool = True) -> bytes:
             _paragraph(pdf, f"{index}. {term}")
     if pdf.get_y() > pdf.h - (55 if signature else 32):
         pdf.add_page()
-    _section(pdf, labels["authorization"])
-    _paragraph(pdf, f"For {(invoice.get('seller') or {}).get('name') or 'Organization'}", bold=True)
+    authorization_width = min(70, (pdf.w - pdf.l_margin - pdf.r_margin) * 0.42)
+    authorization_x = pdf.w - pdf.r_margin - authorization_width
+    pdf.set_x(authorization_x)
+    pdf.set_draw_color(*presentation.accent)
+    pdf.line(authorization_x, pdf.get_y(), authorization_x + authorization_width, pdf.get_y())
+    pdf.ln(3)
+    pdf.set_x(authorization_x)
+    pdf.set_text_color(*presentation.accent)
+    pdf.set_font("Noto", "B", 7)
+    pdf.cell(authorization_width, 4, labels["authorization"].upper(), align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_x(authorization_x)
+    pdf.set_text_color(35, 35, 35)
+    pdf.set_font("Noto", "B", 8)
+    pdf.cell(authorization_width, 5, f"For {(invoice.get('seller') or {}).get('name') or 'Organization'}", align="R", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if signature:
         image_y = pdf.get_y()
-        height = _draw_image(pdf, signature, x=pdf.l_margin, y=image_y, max_width=48, max_height=24)
+        height = _draw_image(pdf, signature, x=pdf.w - pdf.r_margin - 48, y=image_y, max_width=48, max_height=24)
         pdf.set_y(image_y + height + 2)
-    _paragraph(pdf, f"{labels['authorised_signatory']}: {invoice.get('authorized_signatory') or 'Authorised representative'}")
-    _paragraph(pdf, f"Electronically generated {document_title.lower()}.", size=7.5)
+    pdf.set_x(authorization_x)
+    pdf.set_font("Noto", "", 7.5)
+    pdf.multi_cell(authorization_width, 4, f"{invoice.get('authorized_signatory') or 'Authorised representative'}\n{labels['authorised_signatory']}", align="R")
 
     if qr_image:
         if pdf.get_y() > pdf.h - 70:
