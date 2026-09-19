@@ -40,6 +40,7 @@ invoices = db.native_invoices
 sequences = db.native_invoice_sequences
 conversion_claims = db.invoice_conversion_claims
 adjustments = db.native_invoice_adjustments
+deletions = db.native_invoice_deletions
 MAX_PAISE = 999_999_999_00
 INDIA = ZoneInfo("Asia/Kolkata")
 DEFAULT_NUMBERING = {
@@ -112,6 +113,8 @@ async def ensure_native_invoice_indexes() -> None:
         [("org_id", 1), ("void_idempotency_key", 1)], unique=True,
         partialFilterExpression={"void_idempotency_key": {"$type": "string"}},
     )
+    await deletions.create_index([("org_id", 1), ("invoice_id", 1)], unique=True)
+    await deletions.create_index([("org_id", 1), ("idempotency_key", 1)], unique=True)
     await invoices.update_many(
         {"adjusted_total_paise": {"$exists": False}},
         [{"$set": {"adjusted_total_paise": {"$max": [0, {"$add": [
@@ -832,6 +835,58 @@ async def set_invoice_archived(
     return invoice_view(updated)
 
 
+async def delete_draft_invoice(
+    org_id: str, invoice_id: str, actor_id: str, expected_revision: int, idempotency_key: str,
+) -> dict:
+    """Permanently remove an unnumbered draft and its private attachment bytes."""
+    request_hash = request_fingerprint("delete_draft_invoice", {
+        "invoice_id": invoice_id, "expected_revision": expected_revision, "confirmation": "DELETE",
+    })
+    replay = await deletions.find_one({"org_id": org_id, "idempotency_key": idempotency_key})
+    if replay:
+        if replay.get("request_hash") != request_hash:
+            raise _idempotency_conflict()
+        return {"deleted": True, "invoice_id": replay["invoice_id"]}
+
+    async def transaction(session):
+        current = await invoices.find_one({"org_id": org_id, "invoice_id": invoice_id}, session=session)
+        if not current:
+            replayed = await deletions.find_one({"org_id": org_id, "invoice_id": invoice_id}, session=session)
+            if replayed and replayed.get("idempotency_key") == idempotency_key and replayed.get("request_hash") == request_hash:
+                return replayed
+            raise HTTPException(status_code=404, detail="Invoice draft not found")
+        if current.get("lifecycle") != "draft" or current.get("invoice_number") or current.get("issued_at"):
+            raise HTTPException(status_code=409, detail="Only an unissued draft can be permanently deleted")
+        if int(current.get("revision") or 1) != expected_revision:
+            raise HTTPException(status_code=409, detail="This invoice draft changed. Reload before deleting it.")
+        now = datetime.now(timezone.utc)
+        tombstone = {
+            "org_id": org_id, "invoice_id": invoice_id,
+            "source_quote_id": current.get("source_quote_id"),
+            "source_quote_revision": current.get("source_quote_revision"),
+            "deleted_at": now, "deleted_by": actor_id,
+            "idempotency_key": idempotency_key, "request_hash": request_hash,
+        }
+        await deletions.insert_one(tombstone, session=session)
+        await db.native_invoice_attachments.delete_many({"org_id": org_id, "invoice_id": invoice_id}, session=session)
+        await db.native_invoice_delivery_jobs.delete_many({"org_id": org_id, "invoice_id": invoice_id}, session=session)
+        await db.native_invoice_reminder_preferences.delete_many({"org_id": org_id, "invoice_id": invoice_id}, session=session)
+        deleted = await invoices.delete_one({"_id": current["_id"], "revision": expected_revision}, session=session)
+        if deleted.deleted_count != 1:
+            raise HTTPException(status_code=409, detail="This invoice draft changed. Reload before deleting it.")
+        return tombstone
+
+    try:
+        async with await get_async_mongo_client().start_session() as session:
+            deleted = await session.with_transaction(transaction)
+    except DuplicateKeyError as exc:
+        replay = await deletions.find_one({"org_id": org_id, "idempotency_key": idempotency_key})
+        if not replay or replay.get("request_hash") != request_hash:
+            raise _idempotency_conflict() from exc
+        deleted = replay
+    return {"deleted": True, "invoice_id": deleted["invoice_id"]}
+
+
 async def set_invoice_closed(
     org_id: str, invoice_id: str, actor_id: str, expected_revision: int, closed: bool, idempotency_key: str,
     reason: str, actor_name: str = "", actor_role: str = "",
@@ -1247,7 +1302,7 @@ async def issue_invoice(
             {"$set": {"lifecycle": "issued", "invoice_number": number, "financial_year": year,
                 "series": numbering["series"], "numbering": numbering, "attachments": attachment_snapshot,
                 "einvoice_exemption_declaration": EINVOICE_EXEMPTION_DECLARATION if assessment.get("not_required_reason") == "notified_exemption" else None,
-                "issued_at": now, "issued_by": actor_id, "issue_idempotency_key": idempotency_key, "issue_request_hash": request_hash, "pdf_state": "pending", "pdf_renderer_version": RENDERER_VERSION, "issued_revision": expected_revision + 1, "updated_at": now, "updated_by": actor_id}, "$inc": {"revision": 1}, "$push": {"audit": _event(
+                "issued_at": now, "issued_by": actor_id, "issue_idempotency_key": idempotency_key, "issue_request_hash": request_hash, "pdf_state": "pending", "pdf_renderer_version": RENDERER_VERSION, "issued_revision": expected_revision + 1, "reminder_schedule_state": "pending", "updated_at": now, "updated_by": actor_id}, "$inc": {"revision": 1}, "$push": {"audit": _event(
                 "issued", actor_id, actor_name=actor_name, actor_role=actor_role,
                 revision_before=expected_revision, revision_after=expected_revision + 1,
                 details={"invoice_number": number, "financial_year": year},
@@ -1283,6 +1338,15 @@ async def issue_invoice(
         pass
     document = await get_invoice(org_id, invoice_id)
     return invoice_view(document)
+
+
+async def _refresh_delivery_reminders(org_id: str, invoice_id: str) -> None:
+    try:
+        from services.native_invoice_delivery_service import refresh_invoice_reminders
+        await refresh_invoice_reminders(org_id, invoice_id)
+    except Exception:
+        # Financial state is authoritative; delivery reconciliation must never roll it back.
+        pass
 
 
 async def record_payment(
@@ -1325,6 +1389,7 @@ async def record_payment(
                 raise _idempotency_conflict()
             return invoice_view(latest)
         raise HTTPException(status_code=409, detail="This invoice changed while the payment was being recorded")
+    await _refresh_delivery_reminders(org_id, invoice_id)
     return invoice_view(updated)
 
 
@@ -1367,6 +1432,7 @@ async def reverse_payment(
     )
     if not updated:
         raise HTTPException(status_code=409, detail="This invoice changed while the payment was being reversed")
+    await _refresh_delivery_reminders(org_id, invoice_id)
     return invoice_view(updated)
 
 
@@ -1414,6 +1480,7 @@ async def void_invoice(
         await render_invoice_pdf(org_id, invoice_id, actor_id)
     except Exception:
         pass
+    await _refresh_delivery_reminders(org_id, invoice_id)
     return invoice_view(await get_invoice(org_id, invoice_id))
 
 

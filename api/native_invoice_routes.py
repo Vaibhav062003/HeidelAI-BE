@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Literal, Optional
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from auth.auth_utils import reverification_required
 from auth.dependencies import CurrentUser
@@ -16,6 +16,7 @@ from services.india_tax import gst_state_name, is_valid_gstin
 from services.native_invoice_service import (
     create_and_issue_invoice,
     create_invoice,
+    delete_draft_invoice,
     duplicate_invoice,
     get_invoice,
     export_invoices_csv,
@@ -61,6 +62,13 @@ from services.native_invoice_asset_service import (
     store_invoice_attachment,
 )
 from services.native_invoice_assets import ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_COUNT, ATTACHMENT_TOTAL_MAX_BYTES
+from services.native_invoice_delivery_service import (
+    cancel_invoice_delivery,
+    configure_invoice_reminders,
+    enqueue_manual_deliveries,
+    list_invoice_deliveries,
+    retry_invoice_delivery,
+)
 from services.native_invoice_master_service import (
     customer_presets,
     item_presets,
@@ -340,6 +348,41 @@ class RevisionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_revision: int = Field(ge=1)
+
+
+class DeleteDraftPayload(RevisionPayload):
+    confirmation: Literal["DELETE"]
+
+
+class InvoiceDeliveryPayload(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    kind: Literal["share", "payment_reminder"]
+    channels: list[Literal["email", "whatsapp"]] = Field(min_length=1, max_length=2)
+    email: Optional[EmailStr] = None
+    phone: str = Field(default="", max_length=40)
+
+    @field_validator("channels")
+    @classmethod
+    def unique_channels(cls, value):
+        if len(set(value)) != len(value):
+            raise ValueError("Delivery channels must be unique")
+        return value
+
+
+class InvoiceReminderSettingsPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    channels: list[Literal["email", "whatsapp"]] = Field(default_factory=list, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_channels(self):
+        if len(set(self.channels)) != len(self.channels):
+            raise ValueError("Reminder channels must be unique")
+        if self.enabled and not self.channels:
+            raise ValueError("Select at least one reminder channel")
+        return self
 
 
 class PaymentPayload(BaseModel):
@@ -693,6 +736,66 @@ async def post_native_invoice_unarchive(
         user.org_id, invoice_id, user.user_id, payload.expected_revision, False, _idempotency(idempotency_key),
         payload.reason, user.full_name or "Team member", user.role,
     )}
+
+
+@router.delete("/{invoice_id}")
+@limiter.limit("10/minute")
+async def delete_native_invoice_draft(
+    request: Request, invoice_id: str, payload: DeleteDraftPayload, user: CurrentUser,
+    idempotency_key: str = Header(alias="X-Idempotency-Key"),
+):
+    await _require_native_access(user, write=True)
+    return await delete_draft_invoice(
+        user.org_id, invoice_id, user.user_id, payload.expected_revision, _idempotency(idempotency_key),
+    )
+
+
+@router.get("/{invoice_id}/deliveries")
+@limiter.limit("60/minute")
+async def get_native_invoice_deliveries(request: Request, invoice_id: str, user: CurrentUser):
+    await _require_native_access(user)
+    return await list_invoice_deliveries(user.org_id, invoice_id)
+
+
+@router.post("/{invoice_id}/deliveries", status_code=202)
+@limiter.limit("20/minute")
+async def post_native_invoice_delivery(
+    request: Request, invoice_id: str, payload: InvoiceDeliveryPayload, user: CurrentUser,
+    idempotency_key: str = Header(alias="X-Idempotency-Key"),
+):
+    await _require_native_access(user, write=True)
+    return {"deliveries": await enqueue_manual_deliveries(
+        user.org_id, invoice_id, user.user_id, payload.model_dump(mode="json"), _idempotency(idempotency_key),
+    )}
+
+
+@router.put("/{invoice_id}/reminder-settings")
+@limiter.limit("20/minute")
+async def put_native_invoice_reminder_settings(
+    request: Request, invoice_id: str, payload: InvoiceReminderSettingsPayload, user: CurrentUser,
+):
+    await _require_native_access(user, write=True)
+    return {"reminder_settings": await configure_invoice_reminders(
+        user.org_id, invoice_id, user.user_id, payload.enabled, payload.channels,
+    )}
+
+
+@router.post("/{invoice_id}/deliveries/{delivery_id}/retry")
+@limiter.limit("20/minute")
+async def post_native_invoice_delivery_retry(
+    request: Request, invoice_id: str, delivery_id: str, user: CurrentUser,
+):
+    await _require_native_access(user, write=True)
+    return {"delivery": await retry_invoice_delivery(user.org_id, invoice_id, delivery_id, user.user_id)}
+
+
+@router.post("/{invoice_id}/deliveries/{delivery_id}/cancel")
+@limiter.limit("20/minute")
+async def post_native_invoice_delivery_cancel(
+    request: Request, invoice_id: str, delivery_id: str, user: CurrentUser,
+):
+    await _require_native_access(user, write=True)
+    return {"delivery": await cancel_invoice_delivery(user.org_id, invoice_id, delivery_id, user.user_id)}
 
 
 @router.post("/{invoice_id}/close")

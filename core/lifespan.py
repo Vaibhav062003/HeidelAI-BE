@@ -38,6 +38,11 @@ from services.native_invoice_pdf_worker import (
     shutdown_native_invoice_pdf_worker,
     startup_native_invoice_pdf_worker,
 )
+from services.native_invoice_delivery_service import (
+    ensure_native_invoice_delivery_indexes,
+    shutdown_native_invoice_delivery_worker,
+    startup_native_invoice_delivery_worker,
+)
 
 
 async def _run_startup() -> None:
@@ -61,6 +66,8 @@ async def _run_startup() -> None:
         ("native invoice asset indexes", ensure_native_invoice_asset_indexes),
         ("IRIS IRP indexes", ensure_iris_irp_indexes),
         ("native invoice PDF retry worker", startup_native_invoice_pdf_worker),
+        ("native invoice delivery indexes", ensure_native_invoice_delivery_indexes),
+        ("native invoice delivery worker", startup_native_invoice_delivery_worker),
         ("push notification workers", start_push_notification_workers),
         ("intent worker", startup_intent_worker),
         ("doctor followup worker", startup_doctor_followup_worker),
@@ -94,6 +101,7 @@ async def lifespan(app: FastAPI):
         await shutdown_google_scheduler()
         await shutdown_doctor_followup_worker()
         await shutdown_native_invoice_pdf_worker()
+        await shutdown_native_invoice_delivery_worker()
         if revocation_task:
             if not revocation_task.done():
                 revocation_task.cancel()
