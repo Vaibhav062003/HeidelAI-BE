@@ -1,7 +1,5 @@
 """Admin-only endpoints for durable WhatsApp backup history imports."""
 
-from __future__ import annotations
-
 import asyncio
 import hashlib
 import re
