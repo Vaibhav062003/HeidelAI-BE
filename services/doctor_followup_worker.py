@@ -40,6 +40,7 @@ PATIENT_NAME_KEYWORDS = ["patient name"]
 MOBILE_NO_KEYWORDS = ["mobile", "phone", "contact"]
 DIAGNOSIS_KEYWORDS = ["diagnosis"]
 FOLLOWUP_DATE_KEYWORDS = ["next follow-up date", "next followup date", "next follow up date", "next follow"]
+TIME_KEYWORDS = ["time", "appointment time", "check-up time", "visit time"]
 
 TRACKING_COLLECTION = "doctor_followup_tracking"
 FLOW_ID = "__doctor_followup_reminder__"
@@ -378,6 +379,7 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
         raw_phone = _find_column(row_data, MOBILE_NO_KEYWORDS) or ""
         diagnosis = _find_column(row_data, DIAGNOSIS_KEYWORDS) or ""
         next_date_str = _find_column(row_data, FOLLOWUP_DATE_KEYWORDS) or ""
+        time_str = _find_column(row_data, TIME_KEYWORDS) or "10:00 AM"
 
         # Skip rows missing required data (name + phone + followup date are required)
         if not patient_name or not raw_phone or not next_date_str:
@@ -421,10 +423,14 @@ async def process_doctor_followups(org_id: str, sheet_id: str):
         if fire_at_utc < now_utc:
             fire_at_utc = now_utc + timedelta(minutes=2)
 
+        # Format the date nicely for the message (e.g. "21 September 2026")
+        display_date = target_date.strftime("%d %B %Y")
+
         message_text = (
-            f"Hi {patient_name}, this is a reminder from Dr. Mhaske Hospital.\n"
-            f"You have a follow-up visit scheduled for {next_date_str} regarding {diagnosis}.\n"
-            f"Please visit the hospital as scheduled."
+            f"Dear {patient_name},\n\n"
+            f"Thank you for visiting Mhaske Hospital!\n\n"
+            f"Your Next Check-up is scheduled for {display_date}\n\n"
+            f"Feel free to contact if any change : +91 8686222230"
         )
 
         # --- If date changed, cancel old tracking (will be replaced by new upsert) ---
