@@ -30,6 +30,11 @@ db = get_mongo_db()
 ESCALATION_RETENTION = timedelta(days=90)
 _escalation_indexes_ready: set[str] = set()
 EVERYONE_ROOM_ID = "team_room_everyone"
+ANNOUNCEMENTS_ROOM_ID = "team_room_announcements"
+SYSTEM_ROOMS = {
+    EVERYONE_ROOM_ID: ("everyone", "Everyone"),
+    ANNOUNCEMENTS_ROOM_ID: ("announcements", "Announcements"),
+}
 
 
 def resolve_team_scope(org_id: str) -> str:
@@ -71,20 +76,21 @@ def _membership_created_at(membership: dict) -> datetime:
 
 
 async def _group_member_records(org_id: str) -> tuple[str, dict, dict[str, dict], set[str]]:
-    """Return active group members and management-org admins from cached Clerk data."""
+    """Return active team-scope members and the admins allowed to manage rooms."""
     from api.transfer_routes import get_org_memberships, membership_public_data
 
     scope, organizations, current = _group_organizations(org_id)
     membership_lists = await asyncio.gather(*(
         get_org_memberships(str(organization["org_id"])) for organization in organizations
     ))
+    is_grouped = bool(current.get("workspace_group_id"))
     child_ids = {
         str(organization["org_id"])
         for organization in organizations
-        if organization.get("workspace_kind") != "management"
+        if is_grouped and organization.get("workspace_kind") != "management"
     }
     members: dict[str, dict] = {}
-    management_admin_ids: set[str] = set()
+    room_admin_ids: set[str] = set()
     for organization, memberships in zip(organizations, membership_lists):
         workspace_id = str(organization["org_id"])
         workspace_name = str(organization.get("org_name") or workspace_id)
@@ -105,22 +111,26 @@ async def _group_member_records(org_id: str) -> tuple[str, dict, dict[str, dict]
             })
             member["_joinedAt"] = min(member["_joinedAt"], _membership_created_at(membership))
             role = str(membership.get("role") or "").removeprefix("org:").lower()
-            if organization.get("workspace_kind") == "management" and role == "admin":
-                management_admin_ids.add(user_id)
-            if organization.get("workspace_kind") != "management":
+            manages_scope = (
+                organization.get("workspace_kind") == "management"
+                if is_grouped else workspace_id == org_id
+            )
+            if manages_scope and role == "admin":
+                room_admin_ids.add(user_id)
+            if is_grouped and organization.get("workspace_kind") != "management":
                 member["workspaceNames"].append(workspace_name)
                 member["_workspaceIds"].add(workspace_id)
 
     for member in members.values():
         workspace_ids = member["_workspaceIds"]
         member["workspaceNames"] = sorted(set(member["workspaceNames"]))
-        member["allWorkspaces"] = bool(child_ids) and workspace_ids >= child_ids
-    return scope, current, members, management_admin_ids
+        member["allWorkspaces"] = is_grouped and bool(child_ids) and workspace_ids >= child_ids
+    return scope, current, members, room_admin_ids
 
 
 async def fetch_team_directory(org_id: str, current_user_id: str | None = None) -> Dict:
     """Return active Clerk members across every workspace in this group."""
-    scope, current, members, management_admin_ids = await _group_member_records(org_id)
+    scope, current, members, room_admin_ids = await _group_member_records(org_id)
 
     result = []
     for member in members.values():
@@ -130,7 +140,7 @@ async def fetch_team_directory(org_id: str, current_user_id: str | None = None) 
     return {
         "team_scope_id": scope,
         "workspace_kind": current.get("workspace_kind") or "standalone",
-        "canManageRooms": bool(current_user_id and current_user_id in management_admin_ids),
+        "canManageRooms": bool(current_user_id and current_user_id in room_admin_ids),
         "members": result,
     }
 
@@ -141,7 +151,7 @@ async def require_team_recipient(org_id: str, sender_id: str, recipient_id: str)
     directory = await fetch_team_directory(org_id)
     by_id = {member["userId"]: member for member in directory["members"]}
     if sender_id not in by_id or recipient_id not in by_id:
-        raise HTTPException(status_code=403, detail="The recipient is not in this workspace group")
+        raise HTTPException(status_code=403, detail="The recipient is not an active team member")
     return str(directory["team_scope_id"]), by_id[recipient_id]
 
 
@@ -152,7 +162,9 @@ def _room_name(value: str) -> str:
     return name
 
 
-def _room_response(doc: dict, current_user_id: str | None = None) -> dict:
+def _room_response(
+    doc: dict, current_user_id: str | None = None, can_manage_rooms: bool = False
+) -> dict:
     participants = list(doc.get("participants") or [])
     is_participant = bool(current_user_id and current_user_id in participants)
     timestamp = doc.get("last_message_timestamp")
@@ -169,73 +181,81 @@ def _room_response(doc: dict, current_user_id: str | None = None) -> dict:
         "participants": participants,
         "member_count": len(participants),
         "is_participant": is_participant,
+        "can_post": is_participant and (
+            doc.get("chat_type") != "announcements" or can_manage_rooms
+        ),
         "is_online": False,
     }
 
 
-async def _ensure_everyone_room(org_id: str) -> tuple[str, dict, dict[str, dict], set[str]]:
-    scope, current, members, admin_ids = await _group_member_records(org_id)
-    if not current.get("workspace_group_id"):
-        return scope, {}, members, admin_ids
-
+async def _ensure_system_rooms(org_id: str) -> tuple[str, dict[str, dict], dict[str, dict], set[str]]:
+    scope, _, members, admin_ids = await _group_member_records(org_id)
     collection = get_async_mongo_db()[f"team_conversations_{scope}"]
-    existing = await collection.find_one({"conversation_id": EVERYONE_ROOM_ID}, {"_id": 0}) or {}
     participant_ids = sorted(members)
-    unread = {user_id: int((existing.get("unread") or {}).get(user_id, 0)) for user_id in participant_ids}
-    existing_joined_at = existing.get("joined_at") or {}
-    joined_at = {
-        user_id: existing_joined_at.get(user_id, member["_joinedAt"])
-        for user_id, member in members.items()
-    }
-    now = datetime.now(timezone.utc)
-    room_update: dict = {"$set": {"participants": participant_ids, "joined_at": joined_at}}
-    if not existing:
-        room_update["$setOnInsert"] = {
-            "conversation_id": EVERYONE_ROOM_ID,
-            "type": "team",
-            "chat_type": "everyone",
-            "name": "Everyone",
-            "created_at": now,
-            "updated_at": now,
-            "last_message": "",
-            "unread": {},
+    rooms: dict[str, dict] = {}
+    for room_id, (chat_type, name) in SYSTEM_ROOMS.items():
+        existing = await collection.find_one({"conversation_id": room_id}, {"_id": 0}) or {}
+        unread = {
+            user_id: int((existing.get("unread") or {}).get(user_id, 0))
+            for user_id in participant_ids
         }
-    removed_unread = set(existing.get("unread") or {}) - set(participant_ids)
-    if removed_unread:
-        room_update["$unset"] = {f"unread.{user_id}": "" for user_id in removed_unread}
-    await collection.update_one(
-        {"conversation_id": EVERYONE_ROOM_ID},
-        room_update,
-        upsert=True,
-    )
-    room = {**existing, "conversation_id": EVERYONE_ROOM_ID, "type": "team", "chat_type": "everyone",
-            "name": "Everyone", "participants": participant_ids, "joined_at": joined_at, "unread": unread}
-    return scope, room, members, admin_ids
+        existing_joined_at = existing.get("joined_at") or {}
+        joined_at = {
+            user_id: existing_joined_at.get(user_id, member["_joinedAt"])
+            for user_id, member in members.items()
+        }
+        room_update: dict = {"$set": {"participants": participant_ids, "joined_at": joined_at}}
+        if not existing:
+            room_update["$setOnInsert"] = {
+                "conversation_id": room_id,
+                "type": "team",
+                "chat_type": chat_type,
+                "name": name,
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+                "last_message": "",
+                "unread": {},
+            }
+        removed_unread = set(existing.get("unread") or {}) - set(participant_ids)
+        if removed_unread:
+            room_update["$unset"] = {f"unread.{user_id}": "" for user_id in removed_unread}
+        await collection.update_one({"conversation_id": room_id}, room_update, upsert=True)
+        rooms[room_id] = {
+            **existing,
+            "conversation_id": room_id,
+            "type": "team",
+            "chat_type": chat_type,
+            "name": name,
+            "participants": participant_ids,
+            "joined_at": joined_at,
+            "unread": unread,
+        }
+    return scope, rooms, members, admin_ids
 
 
 async def require_team_room(
-    org_id: str, user_id: str, conversation_id: str
+    org_id: str, user_id: str, conversation_id: str, for_post: bool = False
 ) -> tuple[str, dict] | None:
     """Return a room with active participants, or None when the ID is a direct chat."""
     scope = resolve_team_scope(org_id)
     collection = get_async_mongo_db()[f"team_conversations_{scope}"]
-    room = await collection.find_one(
-        {"conversation_id": conversation_id, "chat_type": {"$in": ["room", "everyone"]}},
-        {"_id": 0},
-    )
-    if not room and conversation_id == EVERYONE_ROOM_ID:
-        scope, room, _, _ = await _ensure_everyone_room(org_id)
+    if conversation_id in SYSTEM_ROOMS:
+        scope, rooms, members, admin_ids = await _ensure_system_rooms(org_id)
+        room = rooms[conversation_id]
+    else:
+        room = await collection.find_one(
+            {"conversation_id": conversation_id, "chat_type": "room"},
+            {"_id": 0},
+        )
+        if room:
+            scope, _, members, admin_ids = await _group_member_records(org_id)
     if not room:
         if conversation_id.startswith("team_room_"):
             raise HTTPException(status_code=404, detail="Team room not found")
         return None
 
-    scope, _, members, _ = await _group_member_records(org_id)
     active_ids = set(members)
-    if room.get("chat_type") == "everyone":
-        scope, room, members, _ = await _ensure_everyone_room(org_id)
-        active_ids = set(members)
-    else:
+    if room.get("chat_type") == "room":
         participants = [item for item in room.get("participants", []) if item in active_ids]
         if participants != room.get("participants", []):
             joined_at = {key: value for key, value in (room.get("joined_at") or {}).items() if key in participants}
@@ -251,18 +271,20 @@ async def require_team_room(
             room.update({"participants": participants, "joined_at": joined_at, "unread": unread})
     if user_id not in active_ids or user_id not in room.get("participants", []):
         raise HTTPException(status_code=403, detail="You are not a member of this team room")
+    if for_post and room.get("chat_type") == "announcements" and user_id not in admin_ids:
+        raise HTTPException(status_code=403, detail="Only organization admins can post announcements")
     return scope, room
 
 
 async def create_team_room(org_id: str, creator_id: str, name: str, member_ids: list[str]) -> dict:
-    scope, current, members, admin_ids = await _group_member_records(org_id)
-    if not current.get("workspace_group_id") or creator_id not in admin_ids:
-        raise HTTPException(status_code=403, detail="Only a main organization admin can create rooms")
+    scope, _, members, admin_ids = await _group_member_records(org_id)
+    if creator_id not in admin_ids:
+        raise HTTPException(status_code=403, detail="Only an organization admin can create rooms")
     participants = list(dict.fromkeys([creator_id, *member_ids]))
-    if not 3 <= len(participants) <= 100:
-        raise HTTPException(status_code=422, detail="Choose 2-99 other active team members")
+    if not 2 <= len(participants) <= 100:
+        raise HTTPException(status_code=422, detail="Choose 1-99 other active team members")
     if any(user_id not in members for user_id in participants):
-        raise HTTPException(status_code=422, detail="Every room member must belong to this workspace group")
+        raise HTTPException(status_code=422, detail="Every room member must be an active team member")
     now = datetime.now(timezone.utc)
     room = {
         "conversation_id": f"team_room_{uuid.uuid4().hex}",
@@ -282,15 +304,15 @@ async def create_team_room(org_id: str, creator_id: str, name: str, member_ids: 
     await broadcast_team_conversation_updated(
         scope, room["conversation_id"], sorted(set(participants) | admin_ids), {"action": "created"}
     )
-    return _room_response(room, creator_id)
+    return _room_response(room, creator_id, True)
 
 
 async def update_team_room(
     org_id: str, admin_id: str, room_id: str, name: str | None, member_ids: list[str] | None
 ) -> dict:
-    scope, current, members, admin_ids = await _group_member_records(org_id)
-    if not current.get("workspace_group_id") or admin_id not in admin_ids:
-        raise HTTPException(status_code=403, detail="Only a main organization admin can manage rooms")
+    scope, _, members, admin_ids = await _group_member_records(org_id)
+    if admin_id not in admin_ids:
+        raise HTTPException(status_code=403, detail="Only an organization admin can manage rooms")
     collection = get_async_mongo_db()[f"team_conversations_{scope}"]
     room = await collection.find_one({"conversation_id": room_id, "chat_type": "room"}, {"_id": 0})
     if not room:
@@ -303,7 +325,7 @@ async def update_team_room(
     if member_ids is not None:
         participants = list(dict.fromkeys(member_ids))
         if len(participants) > 100 or any(user_id not in members for user_id in participants):
-            raise HTTPException(status_code=422, detail="Room members must be active members of this workspace group")
+            raise HTTPException(status_code=422, detail="Room members must be active team members")
         now = datetime.now(timezone.utc)
         previous_joined = room.get("joined_at") or {}
         update["participants"] = participants
@@ -324,7 +346,7 @@ async def update_team_room(
     notify_ids = sorted(set(old_participants) | set(room.get("participants") or []) | admin_ids)
     from services.websocket_service import broadcast_team_conversation_updated
     await broadcast_team_conversation_updated(scope, room_id, notify_ids, {"action": "updated"})
-    return _room_response(room, admin_id)
+    return _room_response(room, admin_id, True)
 
 
 async def leave_team_room(org_id: str, user_id: str, room_id: str) -> dict:
@@ -411,9 +433,9 @@ async def fetch_team_conversations(
     Return all team conversations where current_user_id is a participant.
     Reads from: team_conversations_{org_id}
     """
-    scope, _, members, admin_ids = await _ensure_everyone_room(org_id)
+    scope, _, members, admin_ids = await _ensure_system_rooms(org_id)
     if current_user_id not in members:
-        raise HTTPException(status_code=403, detail="You are not an active member of this workspace group")
+        raise HTTPException(status_code=403, detail="You are not an active organization member")
     async_db = get_async_mongo_db()
     collection = async_db[f"team_conversations_{scope}"]
 
@@ -458,8 +480,10 @@ async def fetch_team_conversations(
             if current_user_id not in participants and current_user_id not in admin_ids:
                 continue
 
-        if doc.get("chat_type") in {"room", "everyone"}:
-            result.append(_room_response(doc, current_user_id))
+        if doc.get("chat_type") in {"room", "everyone", "announcements"}:
+            result.append(
+                _room_response(doc, current_user_id, current_user_id in admin_ids)
+            )
             continue
 
         other_participants = [p for p in participants if p != current_user_id]
@@ -490,6 +514,7 @@ async def fetch_team_conversations(
             "participants": participants,
             "member_count": len(participants),
             "is_participant": True,
+            "can_post": True,
             "is_online": is_online,
         })
 

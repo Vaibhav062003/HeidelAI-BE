@@ -366,7 +366,7 @@ async def send_message_endpoint(
             raise HTTPException(status_code=422, detail="Team messages require text content")
         from services.team_service import require_team_recipient, require_team_room
 
-        room_access = await require_team_room(org_id, user.user_id, conversation_id)
+        room_access = await require_team_room(org_id, user.user_id, conversation_id, for_post=True)
         if room_access:
             org_id, room = room_access
             participants = list(room.get("participants") or [])
