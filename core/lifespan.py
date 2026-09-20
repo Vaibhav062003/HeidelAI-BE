@@ -43,6 +43,7 @@ from services.native_invoice_delivery_service import (
     shutdown_native_invoice_delivery_worker,
     startup_native_invoice_delivery_worker,
 )
+from services.whatsapp_history_import import start_history_import_worker, stop_history_import_worker
 
 
 async def _run_startup() -> None:
@@ -71,6 +72,7 @@ async def _run_startup() -> None:
         ("push notification workers", start_push_notification_workers),
         ("intent worker", startup_intent_worker),
         ("doctor followup worker", startup_doctor_followup_worker),
+        ("WhatsApp history import worker", start_history_import_worker),
         ("bulk job recovery", lambda: asyncio.to_thread(recover_stale_bulk_jobs)),
         ("prompt cache loading", lambda: asyncio.to_thread(load_prompts_into_cache)),
         ("Shopify legacy repair", repair_legacy_shopify_connections),
@@ -102,6 +104,7 @@ async def lifespan(app: FastAPI):
         await shutdown_doctor_followup_worker()
         await shutdown_native_invoice_pdf_worker()
         await shutdown_native_invoice_delivery_worker()
+        await stop_history_import_worker()
         if revocation_task:
             if not revocation_task.done():
                 revocation_task.cancel()

@@ -2,6 +2,8 @@
 
 from starlette.responses import JSONResponse
 
+from services.whatsapp_history_import import MAX_REQUEST_BYTES
+
 
 class RequestBodyTooLarge(Exception):
     pass
@@ -22,6 +24,8 @@ class NativeInvoiceBodyLimitMiddleware:
         method = method.upper()
         if method in {"GET", "HEAD", "OPTIONS"}:
             return None
+        if method == "POST" and path.rstrip("/") == "/api/whatsapp/history-imports":
+            return MAX_REQUEST_BYTES
         if path.startswith("/api/native-invoices"):
             if path.startswith("/api/native-invoices/master"):
                 return cls.IMPORT_LIMIT
