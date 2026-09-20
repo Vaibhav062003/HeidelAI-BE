@@ -36,6 +36,10 @@ CLERK_CACHE_TTL = 300  # seconds
 _clerk_cache: TTLCache = TTLCache(maxsize=500, ttl=CLERK_CACHE_TTL)
 _http_client = httpx.AsyncClient(timeout=10.0)
 
+
+def invalidate_org_memberships(org_id: str) -> None:
+    _clerk_cache.pop(org_id, None)
+
 async def get_org_memberships(org_id: str) -> list:
     """Fetch org memberships from Clerk, cached per org for 5 minutes."""
     if org_id in _clerk_cache:

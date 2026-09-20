@@ -128,7 +128,8 @@ async def clerk_membership_webhook(request: Request):
     event_type = event.get("type")
     deleted_events = {"organizationMembership.deleted", "organization_membership.deleted"}
     created_events = {"organizationMembership.created", "organization_membership.created"}
-    if event_type not in deleted_events | created_events:
+    updated_events = {"organizationMembership.updated", "organization_membership.updated"}
+    if event_type not in deleted_events | created_events | updated_events:
         return {"status": "ignored"}
     event_at = event.get("timestamp")
     if not isinstance(event_at, int) or isinstance(event_at, bool) or event_at <= 0:
@@ -143,6 +144,12 @@ async def clerk_membership_webhook(request: Request):
         raise HTTPException(status_code=422, detail="Membership organization is missing")
     if not isinstance(user_id, str) or not user_id.startswith("user_"):
         raise HTTPException(status_code=422, detail="Membership user is missing")
+
+    from api.transfer_routes import invalidate_org_memberships
+    invalidate_org_memberships(org_id)
+
+    if event_type in updated_events:
+        return {"status": "success"}
 
     if event_type in created_events:
         await asyncio.to_thread(

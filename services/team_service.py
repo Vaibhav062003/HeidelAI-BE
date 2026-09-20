@@ -8,12 +8,13 @@ Reads from isolated collections:
 
 Sending team messages is still handled by common_service.send_message
 (platform="internal"), which writes into these same collections.
-WebSocket broadcasting (broadcast_team_message) is unchanged.
+Room and message changes are broadcast through the shared team scope.
 """
 
 import asyncio
 import base64
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 
@@ -28,6 +29,7 @@ from services.utils import serialize_mongo
 db = get_mongo_db()
 ESCALATION_RETENTION = timedelta(days=90)
 _escalation_indexes_ready: set[str] = set()
+EVERYONE_ROOM_ID = "team_room_everyone"
 
 
 def resolve_team_scope(org_id: str) -> str:
@@ -53,8 +55,23 @@ def _group_organizations(org_id: str) -> tuple[str, list[dict], dict]:
     return scope, organizations or [current], current
 
 
-async def fetch_team_directory(org_id: str) -> Dict:
-    """Return active Clerk members across every workspace in this group."""
+def _membership_created_at(membership: dict) -> datetime:
+    value = membership.get("created_at") or membership.get("createdAt")
+    try:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value / (1000 if value > 10**11 else 1), timezone.utc)
+        if isinstance(value, str) and value:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (OverflowError, TypeError, ValueError):
+        pass
+    return datetime.now(timezone.utc)
+
+
+async def _group_member_records(org_id: str) -> tuple[str, dict, dict[str, dict], set[str]]:
+    """Return active group members and management-org admins from cached Clerk data."""
     from api.transfer_routes import get_org_memberships, membership_public_data
 
     scope, organizations, current = _group_organizations(org_id)
@@ -67,6 +84,7 @@ async def fetch_team_directory(org_id: str) -> Dict:
         if organization.get("workspace_kind") != "management"
     }
     members: dict[str, dict] = {}
+    management_admin_ids: set[str] = set()
     for organization, memberships in zip(organizations, membership_lists):
         workspace_id = str(organization["org_id"])
         workspace_name = str(organization.get("org_name") or workspace_id)
@@ -83,21 +101,36 @@ async def fetch_team_directory(org_id: str) -> Dict:
                 "avatarUrl": public.get("image_url"),
                 "workspaceNames": [],
                 "_workspaceIds": set(),
+                "_joinedAt": _membership_created_at(membership),
             })
+            member["_joinedAt"] = min(member["_joinedAt"], _membership_created_at(membership))
+            role = str(membership.get("role") or "").removeprefix("org:").lower()
+            if organization.get("workspace_kind") == "management" and role == "admin":
+                management_admin_ids.add(user_id)
             if organization.get("workspace_kind") != "management":
                 member["workspaceNames"].append(workspace_name)
                 member["_workspaceIds"].add(workspace_id)
 
-    result = []
     for member in members.values():
-        workspace_ids = member.pop("_workspaceIds")
+        workspace_ids = member["_workspaceIds"]
         member["workspaceNames"] = sorted(set(member["workspaceNames"]))
         member["allWorkspaces"] = bool(child_ids) and workspace_ids >= child_ids
-        result.append(member)
+    return scope, current, members, management_admin_ids
+
+
+async def fetch_team_directory(org_id: str, current_user_id: str | None = None) -> Dict:
+    """Return active Clerk members across every workspace in this group."""
+    scope, current, members, management_admin_ids = await _group_member_records(org_id)
+
+    result = []
+    for member in members.values():
+        public_member = {key: value for key, value in member.items() if not key.startswith("_")}
+        result.append(public_member)
     result.sort(key=lambda member: (member["name"].casefold(), member["email"].casefold()))
     return {
         "team_scope_id": scope,
         "workspace_kind": current.get("workspace_kind") or "standalone",
+        "canManageRooms": bool(current_user_id and current_user_id in management_admin_ids),
         "members": result,
     }
 
@@ -110,6 +143,211 @@ async def require_team_recipient(org_id: str, sender_id: str, recipient_id: str)
     if sender_id not in by_id or recipient_id not in by_id:
         raise HTTPException(status_code=403, detail="The recipient is not in this workspace group")
     return str(directory["team_scope_id"]), by_id[recipient_id]
+
+
+def _room_name(value: str) -> str:
+    name = " ".join((value or "").split())
+    if not 1 <= len(name) <= 80:
+        raise HTTPException(status_code=422, detail="Room name must be 1-80 characters")
+    return name
+
+
+def _room_response(doc: dict, current_user_id: str | None = None) -> dict:
+    participants = list(doc.get("participants") or [])
+    is_participant = bool(current_user_id and current_user_id in participants)
+    timestamp = doc.get("last_message_timestamp")
+    return {
+        "id": doc.get("conversation_id"),
+        "customer_name": doc.get("name") or doc.get("customer_name") or doc.get("conversation_id"),
+        "name": doc.get("name"),
+        "last_message": doc.get("last_message", "") if is_participant else "",
+        "timestamp": (serialize_mongo(timestamp) if isinstance(timestamp, datetime) else timestamp) if is_participant else None,
+        "unread_count": (doc.get("unread") or {}).get(current_user_id, 0) if is_participant else 0,
+        "platform": "internal",
+        "type": "team",
+        "chat_type": doc.get("chat_type") or "direct",
+        "participants": participants,
+        "member_count": len(participants),
+        "is_participant": is_participant,
+        "is_online": False,
+    }
+
+
+async def _ensure_everyone_room(org_id: str) -> tuple[str, dict, dict[str, dict], set[str]]:
+    scope, current, members, admin_ids = await _group_member_records(org_id)
+    if not current.get("workspace_group_id"):
+        return scope, {}, members, admin_ids
+
+    collection = get_async_mongo_db()[f"team_conversations_{scope}"]
+    existing = await collection.find_one({"conversation_id": EVERYONE_ROOM_ID}, {"_id": 0}) or {}
+    participant_ids = sorted(members)
+    unread = {user_id: int((existing.get("unread") or {}).get(user_id, 0)) for user_id in participant_ids}
+    existing_joined_at = existing.get("joined_at") or {}
+    joined_at = {
+        user_id: existing_joined_at.get(user_id, member["_joinedAt"])
+        for user_id, member in members.items()
+    }
+    now = datetime.now(timezone.utc)
+    room_update: dict = {"$set": {"participants": participant_ids, "joined_at": joined_at}}
+    if not existing:
+        room_update["$setOnInsert"] = {
+            "conversation_id": EVERYONE_ROOM_ID,
+            "type": "team",
+            "chat_type": "everyone",
+            "name": "Everyone",
+            "created_at": now,
+            "updated_at": now,
+            "last_message": "",
+            "unread": {},
+        }
+    removed_unread = set(existing.get("unread") or {}) - set(participant_ids)
+    if removed_unread:
+        room_update["$unset"] = {f"unread.{user_id}": "" for user_id in removed_unread}
+    await collection.update_one(
+        {"conversation_id": EVERYONE_ROOM_ID},
+        room_update,
+        upsert=True,
+    )
+    room = {**existing, "conversation_id": EVERYONE_ROOM_ID, "type": "team", "chat_type": "everyone",
+            "name": "Everyone", "participants": participant_ids, "joined_at": joined_at, "unread": unread}
+    return scope, room, members, admin_ids
+
+
+async def require_team_room(
+    org_id: str, user_id: str, conversation_id: str
+) -> tuple[str, dict] | None:
+    """Return a room with active participants, or None when the ID is a direct chat."""
+    scope = resolve_team_scope(org_id)
+    collection = get_async_mongo_db()[f"team_conversations_{scope}"]
+    room = await collection.find_one(
+        {"conversation_id": conversation_id, "chat_type": {"$in": ["room", "everyone"]}},
+        {"_id": 0},
+    )
+    if not room and conversation_id == EVERYONE_ROOM_ID:
+        scope, room, _, _ = await _ensure_everyone_room(org_id)
+    if not room:
+        if conversation_id.startswith("team_room_"):
+            raise HTTPException(status_code=404, detail="Team room not found")
+        return None
+
+    scope, _, members, _ = await _group_member_records(org_id)
+    active_ids = set(members)
+    if room.get("chat_type") == "everyone":
+        scope, room, members, _ = await _ensure_everyone_room(org_id)
+        active_ids = set(members)
+    else:
+        participants = [item for item in room.get("participants", []) if item in active_ids]
+        if participants != room.get("participants", []):
+            joined_at = {key: value for key, value in (room.get("joined_at") or {}).items() if key in participants}
+            unread = {key: value for key, value in (room.get("unread") or {}).items() if key in participants}
+            room_update: dict = {"$set": {"participants": participants, "joined_at": joined_at}}
+            removed_ids = set(room.get("participants") or []) - set(participants)
+            if removed_ids:
+                room_update["$unset"] = {f"unread.{user_id}": "" for user_id in removed_ids}
+            await collection.update_one(
+                {"conversation_id": conversation_id},
+                room_update,
+            )
+            room.update({"participants": participants, "joined_at": joined_at, "unread": unread})
+    if user_id not in active_ids or user_id not in room.get("participants", []):
+        raise HTTPException(status_code=403, detail="You are not a member of this team room")
+    return scope, room
+
+
+async def create_team_room(org_id: str, creator_id: str, name: str, member_ids: list[str]) -> dict:
+    scope, current, members, admin_ids = await _group_member_records(org_id)
+    if not current.get("workspace_group_id") or creator_id not in admin_ids:
+        raise HTTPException(status_code=403, detail="Only a main organization admin can create rooms")
+    participants = list(dict.fromkeys([creator_id, *member_ids]))
+    if not 3 <= len(participants) <= 100:
+        raise HTTPException(status_code=422, detail="Choose 2-99 other active team members")
+    if any(user_id not in members for user_id in participants):
+        raise HTTPException(status_code=422, detail="Every room member must belong to this workspace group")
+    now = datetime.now(timezone.utc)
+    room = {
+        "conversation_id": f"team_room_{uuid.uuid4().hex}",
+        "type": "team",
+        "chat_type": "room",
+        "name": _room_name(name),
+        "participants": participants,
+        "joined_at": {user_id: now for user_id in participants},
+        "created_by": creator_id,
+        "created_at": now,
+        "updated_at": now,
+        "last_message": "",
+        "unread": {user_id: 0 for user_id in participants},
+    }
+    await get_async_mongo_db()[f"team_conversations_{scope}"].insert_one(room.copy())
+    from services.websocket_service import broadcast_team_conversation_updated
+    await broadcast_team_conversation_updated(
+        scope, room["conversation_id"], sorted(set(participants) | admin_ids), {"action": "created"}
+    )
+    return _room_response(room, creator_id)
+
+
+async def update_team_room(
+    org_id: str, admin_id: str, room_id: str, name: str | None, member_ids: list[str] | None
+) -> dict:
+    scope, current, members, admin_ids = await _group_member_records(org_id)
+    if not current.get("workspace_group_id") or admin_id not in admin_ids:
+        raise HTTPException(status_code=403, detail="Only a main organization admin can manage rooms")
+    collection = get_async_mongo_db()[f"team_conversations_{scope}"]
+    room = await collection.find_one({"conversation_id": room_id, "chat_type": "room"}, {"_id": 0})
+    if not room:
+        raise HTTPException(status_code=404, detail="Team room not found")
+
+    update: dict = {"updated_at": datetime.now(timezone.utc)}
+    old_participants = list(room.get("participants") or [])
+    if name is not None:
+        update["name"] = _room_name(name)
+    if member_ids is not None:
+        participants = list(dict.fromkeys(member_ids))
+        if len(participants) > 100 or any(user_id not in members for user_id in participants):
+            raise HTTPException(status_code=422, detail="Room members must be active members of this workspace group")
+        now = datetime.now(timezone.utc)
+        previous_joined = room.get("joined_at") or {}
+        update["participants"] = participants
+        update["joined_at"] = {user_id: previous_joined.get(user_id, now) for user_id in participants}
+        previous_unread = room.get("unread") or {}
+        update["unread"] = {user_id: int(previous_unread.get(user_id, 0)) for user_id in participants}
+    database_update: dict = {"$set": {key: value for key, value in update.items() if key != "unread"}}
+    if member_ids is not None:
+        previous_unread = room.get("unread") or {}
+        for user_id in update["participants"]:
+            if user_id not in previous_unread:
+                database_update["$set"][f"unread.{user_id}"] = 0
+        removed_ids = set(old_participants) - set(update["participants"])
+        if removed_ids:
+            database_update["$unset"] = {f"unread.{user_id}": "" for user_id in removed_ids}
+    await collection.update_one({"conversation_id": room_id}, database_update)
+    room.update(update)
+    notify_ids = sorted(set(old_participants) | set(room.get("participants") or []) | admin_ids)
+    from services.websocket_service import broadcast_team_conversation_updated
+    await broadcast_team_conversation_updated(scope, room_id, notify_ids, {"action": "updated"})
+    return _room_response(room, admin_id)
+
+
+async def leave_team_room(org_id: str, user_id: str, room_id: str) -> dict:
+    scope, _, _, admin_ids = await _group_member_records(org_id)
+    collection = get_async_mongo_db()[f"team_conversations_{scope}"]
+    room = await collection.find_one({"conversation_id": room_id, "chat_type": "room"}, {"_id": 0})
+    if not room or user_id not in room.get("participants", []):
+        raise HTTPException(status_code=404, detail="Team room not found")
+    participants = [item for item in room["participants"] if item != user_id]
+    joined_at = {key: value for key, value in (room.get("joined_at") or {}).items() if key != user_id}
+    await collection.update_one(
+        {"conversation_id": room_id},
+        {
+            "$set": {"participants": participants, "joined_at": joined_at,
+                     "updated_at": datetime.now(timezone.utc)},
+            "$unset": {f"unread.{user_id}": ""},
+        },
+    )
+    from services.websocket_service import broadcast_team_conversation_updated
+    await broadcast_team_conversation_updated(
+        scope, room_id, sorted(set(room["participants"]) | admin_ids), {"action": "left", "user_id": user_id}
+    )
+    return {"status": "success"}
 
 
 def _canonical_escalation_status(status: str) -> str:
@@ -173,10 +411,16 @@ async def fetch_team_conversations(
     Return all team conversations where current_user_id is a participant.
     Reads from: team_conversations_{org_id}
     """
+    scope, _, members, admin_ids = await _ensure_everyone_room(org_id)
+    if current_user_id not in members:
+        raise HTTPException(status_code=403, detail="You are not an active member of this workspace group")
     async_db = get_async_mongo_db()
-    collection = async_db[f"team_conversations_{org_id}"]
+    collection = async_db[f"team_conversations_{scope}"]
 
-    query = {"participants": current_user_id}
+    query = (
+        {"$or": [{"participants": current_user_id}, {"chat_type": "room"}]}
+        if current_user_id in admin_ids else {"participants": current_user_id}
+    )
     projection = {"_id": 0}
 
     cursor = (
@@ -190,11 +434,39 @@ async def fetch_team_conversations(
     result = []
     for doc in raw_docs:
         participants = doc.get("participants", [])
+        if doc.get("chat_type") == "room":
+            active_participants = [user_id for user_id in participants if user_id in members]
+            if active_participants != participants:
+                joined_at = {
+                    key: value for key, value in (doc.get("joined_at") or {}).items()
+                    if key in active_participants
+                }
+                unread = {
+                    key: value for key, value in (doc.get("unread") or {}).items()
+                    if key in active_participants
+                }
+                room_update: dict = {"$set": {"participants": active_participants, "joined_at": joined_at}}
+                removed_ids = set(participants) - set(active_participants)
+                if removed_ids:
+                    room_update["$unset"] = {f"unread.{user_id}": "" for user_id in removed_ids}
+                await collection.update_one(
+                    {"conversation_id": doc.get("conversation_id")},
+                    room_update,
+                )
+                doc.update({"participants": active_participants, "joined_at": joined_at, "unread": unread})
+                participants = active_participants
+            if current_user_id not in participants and current_user_id not in admin_ids:
+                continue
+
+        if doc.get("chat_type") in {"room", "everyone"}:
+            result.append(_room_response(doc, current_user_id))
+            continue
+
         other_participants = [p for p in participants if p != current_user_id]
 
         # Is any other participant currently online?
         is_online = any(
-            services.client_metadata.get(client_id, {}).get("team_scope_id") == org_id
+            services.client_metadata.get(client_id, {}).get("team_scope_id") == scope
             for p_id in other_participants
             for client_id in services.agent_clients.get(p_id, set())
         )
@@ -213,11 +485,15 @@ async def fetch_team_conversations(
             "unread_count": user_unread,
             "platform": "internal",
             "type": "team",
+            "chat_type": "direct",
+            "name": None,
             "participants": participants,
+            "member_count": len(participants),
+            "is_participant": True,
             "is_online": is_online,
         })
 
-    logger.info(f"[team_service] Fetched {len(result)} team conversations for {current_user_id} in org {org_id}")
+    logger.info(f"[team_service] Fetched {len(result)} team conversations for {current_user_id} in org {scope}")
     return result
 
 
@@ -469,9 +745,12 @@ async def fetch_team_messages(
     Resets unread in: team_conversations_{org_id}
     """
     try:
+        scope = resolve_team_scope(org_id)
+        room_access = await require_team_room(org_id, agent_id, conversation_id)
+        room = room_access[1] if room_access else None
         async_db = get_async_mongo_db()
-        team_messages_col = async_db[f"team_messages_{org_id}"]
-        team_convos_col = async_db[f"team_conversations_{org_id}"]
+        team_messages_col = async_db[f"team_messages_{scope}"]
+        team_convos_col = async_db[f"team_conversations_{scope}"]
 
         # 1. Authorization & Reset unread count for this agent
         # We combine this into one update_one to verify participation
@@ -485,8 +764,12 @@ async def fetch_team_messages(
             return {"messages": []}
 
         # 2. Fetch messages
+        message_query: dict = {"conversation_id": conversation_id}
+        joined_at = (room or {}).get("joined_at", {}).get(agent_id)
+        if joined_at:
+            message_query["timestamp"] = {"$gte": _membership_created_at({"created_at": joined_at})}
         cursor = team_messages_col.find(
-            {"conversation_id": conversation_id},
+            message_query,
             {"_id": 0}
         ).sort("timestamp", 1)
         
@@ -500,7 +783,7 @@ async def fetch_team_messages(
 
         logger.info(
             f"[team_service] Fetched {len(messages)} messages "
-            f"for conversation {conversation_id} in org {org_id}"
+            f"for conversation {conversation_id} in org {scope}"
         )
         return {"messages": messages}
 
