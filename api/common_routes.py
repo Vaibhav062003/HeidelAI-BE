@@ -327,6 +327,7 @@ async def send_message_endpoint(
     media_kind: Optional[str] = Form(None),
     duration_ms: Optional[int] = Form(None),
     pricing_decision_id: Optional[str] = Form(None),
+    recipient_user_id: Optional[str] = Form(None),
 ):    
     """
     Send a message to a specific conversation.
@@ -360,6 +361,31 @@ async def send_message_endpoint(
             context_dict = json.loads(context)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON format in context field")
+    if platform == "internal":
+        if file or not content or not content.strip():
+            raise HTTPException(status_code=422, detail="Team messages require text content")
+        if not recipient_user_id and isinstance(context_dict, dict):
+            legacy_recipients = [
+                item for item in context_dict.get("participants", [])
+                if isinstance(item, str) and item != user.user_id
+            ]
+            if len(legacy_recipients) == 1:
+                recipient_user_id = legacy_recipients[0]
+        if not recipient_user_id or len(recipient_user_id) > 128:
+            raise HTTPException(status_code=422, detail="A valid team recipient is required")
+        from services.team_service import require_team_recipient
+
+        org_id, _ = await require_team_recipient(org_id, user.user_id, recipient_user_id)
+        participants = sorted([user.user_id, recipient_user_id])
+        conversation_id = f"team_{participants[0]}_{participants[1]}"
+        safe_context = {
+            "participants": participants,
+            "sender_id": user.user_id,
+            "sender_name": sender_name,
+        }
+        if isinstance(context_dict, dict) and context_dict.get("mid"):
+            safe_context["mid"] = str(context_dict["mid"])[:256]
+        context_dict = safe_context
     if isinstance(context_dict, dict) and "offer" in context_dict:
         try:
             from services.sales_offer_policy import render_structured_offer_message, structured_offer_snapshot

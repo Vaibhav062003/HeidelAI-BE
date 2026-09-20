@@ -19,7 +19,9 @@ from services.team_service import (
     fetch_ai_escalations,
     fetch_ai_escalations_v2,
     update_escalation_status,
-    create_ai_escalation
+    create_ai_escalation,
+    fetch_team_directory,
+    resolve_team_scope,
 )
 from fastapi import APIRouter, HTTPException, Header, Query
 from auth.dependencies import CurrentUser
@@ -32,6 +34,13 @@ from auth.dependencies import CurrentUser
 
 
 router = APIRouter(prefix="/api/team", tags=["Team Routes"])
+
+
+@router.get("/directory")
+async def get_team_directory(user: CurrentUser):
+    if not user.org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    return await fetch_team_directory(user.org_id)
 
 
 @router.get("/conversations")
@@ -47,7 +56,7 @@ async def get_team_conversations(user: CurrentUser):
 
     try:
         conversations = await fetch_team_conversations(
-            org_id=org_id,
+            org_id=resolve_team_scope(org_id),
             current_user_id=user.user_id,
         )
         return conversations
@@ -71,7 +80,7 @@ async def get_team_messages(conversation_id: str, user: CurrentUser):
 
     try:
         result = await fetch_team_messages(
-            org_id=org_id,
+            org_id=resolve_team_scope(org_id),
             conversation_id=conversation_id,
             agent_id=user.user_id,
         )
