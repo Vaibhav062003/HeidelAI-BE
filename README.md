@@ -2,6 +2,10 @@
 
 This is the backend for the HeidelAI project.
 
+## WhatsApp browser calls
+
+Configure coturn REST credentials with `WHATSAPP_CALL_TURN_URLS` and `WHATSAPP_CALL_TURN_SECRET` (or supply managed, short-lived credentials through `WHATSAPP_CALL_ICE_SERVERS_JSON`), then run `python3 scripts/check_whatsapp_call_production.py --live-cloudinary` in production. The live check uploads, downloads, and removes a tiny private test recording.
+
 ## Product entitlements
 
 Set `ENTITLEMENT_HMAC_SECRET` to the same secret used by the CRM product adapter, `INTERNAL_HMAC_SECRET` to the Math API signing secret, and `CRM_COMMERCIAL_BASE_URL` to the CRM origin. `BILLING_PROXY_ENABLED` defaults to `false`, which keeps `/api/billing/*` available but returns a stable 503 without forwarding credentials to CRM. `ENTITLEMENT_ENFORCEMENT_MODE` defaults to `observe`; in that mode every product is active with unlimited capacity while entitlement writes, usage counters, history, and CRM usage pulls continue normally. Set it to `enforce` only after the CRM entitlement import reports every AI-enabled organization in sync; startup refuses enforcement while an AI organization is missing an active AI or legacy CHATBOT grant. Trial and monthly quota boundaries use `Asia/Kolkata`.

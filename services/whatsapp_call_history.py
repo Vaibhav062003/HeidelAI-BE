@@ -22,11 +22,28 @@ CALL_HISTORY_FIELDS = (
     "connected_at",
     "ended_at",
     "duration_seconds",
+    "recording",
 )
 
 CALL_HISTORY_PROJECTION = {field: 1 for field in CALL_HISTORY_FIELDS} | {"_id": 0}
 TERMINAL_CALL_STATES = {"completed", "declined", "missed", "failed"}
 STORED_TERMINAL_CALL_STATES = TERMINAL_CALL_STATES | {"ended", "terminate", "terminated", "rejected"}
+
+
+def recording_retention_deadline(stopped_at: datetime, days: int = 15) -> datetime:
+    return (meta_datetime(stopped_at) or datetime.now(timezone.utc)) + timedelta(days=days)
+
+
+def recording_quota_evictions(recordings: list[dict], new_size: int, quota: int) -> tuple[list, bool]:
+    used = sum(max(0, int(row.get("size_bytes") or 0)) for row in recordings)
+    evictions = []
+    for row in recordings:
+        if used + new_size <= quota:
+            break
+        if row.get("status") == "ready":
+            evictions.append(row["_id"])
+            used -= max(0, int(row.get("size_bytes") or 0))
+    return evictions, used + new_size <= quota
 
 
 def meta_datetime(value, fallback: datetime | None = None) -> datetime | None:

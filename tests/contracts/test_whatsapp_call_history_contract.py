@@ -11,6 +11,8 @@ from services.whatsapp_call_history import (  # noqa: E402
     decode_call_cursor,
     encode_call_cursor,
     provider_lifecycle_filter,
+    recording_quota_evictions,
+    recording_retention_deadline,
 )
 
 
@@ -66,5 +68,19 @@ assert "connected" in ringing_filter["state"]["$nin"] and "completed" in ringing
 cursor = encode_call_cursor(now, "wacid.test")
 assert decode_call_cursor(cursor) == (now, "wacid.test")
 assert "session" not in CALL_HISTORY_PROJECTION and "sdp" not in CALL_HISTORY_PROJECTION
+assert "recording" in CALL_HISTORY_PROJECTION and "recording_storage" not in CALL_HISTORY_PROJECTION
+
+assert recording_retention_deadline(now) == now + timedelta(days=15)
+evictions, fits = recording_quota_evictions([
+    {"_id": "old", "status": "ready", "size_bytes": 400},
+    {"_id": "active", "status": "assembling", "size_bytes": 500},
+    {"_id": "new", "status": "ready", "size_bytes": 300},
+], 400, 1000)
+assert evictions == ["old", "new"] and fits
+evictions, fits = recording_quota_evictions([
+    {"_id": "old", "status": "ready", "size_bytes": 50},
+    {"_id": "active", "status": "assembling", "size_bytes": 900},
+], 200, 1000)
+assert evictions == ["old"] and not fits
 
 print("WhatsApp call history check passed.")
