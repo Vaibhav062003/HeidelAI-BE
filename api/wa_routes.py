@@ -3,6 +3,11 @@ import uuid
 import asyncio
 import httpx
 import requests
+import re
+import json
+import base64
+import hashlib
+import hmac
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 
@@ -30,7 +35,21 @@ from services.utils import serialize_mongo
 from schemas.models import WhatsappAuthRequest, WhatsappConnectionLabelRequest, WhatsappDisconnectRequest, MessageRole, Template, BulkMessageRequest
 from services.wa_service import broadcast_whatsapp_message, finalize_whatsapp_revocation, store_whatsapp_message, send_whatsapp_message, get_templates, create_templates, create_bulk_job, get_broadcast_suppressed_phone_keys, run_bulk_send_job, resolve_outbound_whatsapp_connection
 from services.platforms.whatsapp_service import WhatsAppService
-from services.cloudinary_service import check_cloudinary_storage_limit
+from services.cloudinary_service import (
+    CALL_RECORDING_MAX_BYTES,
+    CALL_RECORDING_MAX_DURATION_SECONDS,
+    CALL_RECORDING_MAX_PART_BYTES,
+    CALL_RECORDING_MAX_PARTS,
+    CALL_RECORDING_MIME_TYPES,
+    CALL_RECORDING_RETENTION_DAYS,
+    check_cloudinary_storage_limit,
+    delete_whatsapp_call_asset,
+    upload_whatsapp_call_recording,
+    verify_whatsapp_call_part_response,
+    whatsapp_call_part_metadata,
+    whatsapp_call_part_upload_signature,
+    whatsapp_call_recording_download_url,
+)
 from database import get_async_mongo_db, get_mongo_db
 from auth.dependencies import CurrentUser
 from auth.auth_utils import admin_required, require_auth
@@ -44,6 +63,9 @@ from config.settings import (
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
+    WHATSAPP_CALL_ICE_SERVERS_JSON,
+    WHATSAPP_CALL_TURN_SECRET,
+    WHATSAPP_CALL_TURN_URLS,
     LEE_DEALER_ORG_ID
 )
 from services.websocket_service import broadcast_main_ws
@@ -57,6 +79,7 @@ from services.whatsapp_call_history import (
     decode_call_cursor,
     encode_call_cursor,
     meta_datetime,
+    recording_retention_deadline,
 )
 from services.whatsapp_connection_service import (
     choose_connection_slot,
@@ -82,6 +105,28 @@ whatsapp_service = WhatsAppService()
 db = get_mongo_db()
 
 router = APIRouter(prefix="/api/whatsapp", tags=["WhatsApp"])
+RECORDING_CONSENT_METHOD = "verbal_agent_attestation"
+RECORDING_NOTICE_VERSION = "call-recording-v1"
+
+
+def _recording_consent(method: object, notice_version: object, user: CurrentUser) -> dict:
+    if method != RECORDING_CONSENT_METHOD or notice_version != RECORDING_NOTICE_VERSION:
+        raise HTTPException(status_code=422, detail="Record customer consent before starting the recording")
+    organization = db.organizations.find_one({"org_id": user.org_id}, {"org_name": 1}) or {}
+    controller_name = organization.get("org_name") or user.org_id
+    return {
+        "method": RECORDING_CONSENT_METHOD,
+        "notice_version": RECORDING_NOTICE_VERSION,
+        "attested_by": user.user_id,
+        "attested_at": datetime.now(timezone.utc),
+        "controller_name": controller_name,
+        "notice_text": (
+            f"{controller_name} would like to record this call for service, support, and quality purposes. "
+            "HeidelAI stores the recording for up to 15 days; the business may download a copy under its "
+            "retention policy. You can refuse or ask us to stop recording at any time without ending the call. "
+            "Privacy details are at heidelai.com/privacy-policy."
+        ),
+    }
 
 
 def _whatsapp_schema_ready(org_id: str) -> bool:
@@ -476,6 +521,34 @@ async def list_whatsapp_calls(
     return {"items": serialize_mongo(rows), "next_before": next_before}
 
 
+@router.get("/calls/ice-config")
+@limiter.limit("30/minute")
+async def get_whatsapp_call_ice_config(request: Request, user: CurrentUser):
+    try:
+        configured = json.loads(WHATSAPP_CALL_ICE_SERVERS_JSON)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="WhatsApp call relay configuration is invalid") from exc
+    servers = []
+    for value in configured if isinstance(configured, list) else []:
+        urls = value.get("urls") if isinstance(value, dict) else None
+        url_list = [urls] if isinstance(urls, str) else urls if isinstance(urls, list) else []
+        url_list = [url for url in url_list if isinstance(url, str) and url.startswith(("stun:", "stuns:", "turn:", "turns:"))]
+        if not url_list:
+            continue
+        server = {"urls": url_list}
+        if isinstance(value.get("username"), str) and isinstance(value.get("credential"), str):
+            server.update(username=value["username"], credential=value["credential"])
+        servers.append(server)
+    turn_urls = [url.strip() for url in WHATSAPP_CALL_TURN_URLS.split(",") if url.strip().startswith(("turn:", "turns:"))]
+    if turn_urls and WHATSAPP_CALL_TURN_SECRET:
+        username = f"{int(datetime.now(timezone.utc).timestamp()) + 3600}:{user.user_id}"
+        credential = base64.b64encode(hmac.new(
+            WHATSAPP_CALL_TURN_SECRET.encode(), username.encode(), hashlib.sha1
+        ).digest()).decode()
+        servers.append({"urls": turn_urls, "username": username, "credential": credential})
+    return {"iceServers": servers}
+
+
 @router.get("/calls/{call_id}")
 @limiter.limit("60/minute")
 async def get_whatsapp_call(request: Request, call_id: str, user: CurrentUser):
@@ -489,6 +562,352 @@ async def get_whatsapp_call(request: Request, call_id: str, user: CurrentUser):
             user.org_id, call["conversation_id"], user.user_id, user.role
         )
     return serialize_mongo(call)
+
+
+def _owned_recording_call(call_id: str, user: CurrentUser, device_id: str | None = None) -> dict:
+    call = db.whatsapp_calls.find_one({"org_id": user.org_id, "call_id": call_id})
+    if not call:
+        raise HTTPException(status_code=404, detail="This WhatsApp call is no longer available")
+    if call.get("agent_id") != user.user_id:
+        raise HTTPException(status_code=403, detail="Only the agent who handled this call can record it")
+    if call.get("agent_device_id") and device_id is not None and device_id != call["agent_device_id"]:
+        raise HTTPException(status_code=403, detail="This call is active in another browser")
+    if canonical_call_state(call.get("state")) not in {"connected", "completed", "declined", "missed", "failed"}:
+        raise HTTPException(status_code=409, detail="This call is not ready for recording")
+    return call
+
+
+def _recording_session(call_id: str, session_id: str, user: CurrentUser) -> dict:
+    session = db.whatsapp_call_recordings.find_one({
+        "org_id": user.org_id,
+        "call_id": call_id,
+        "session_id": session_id,
+    })
+    if not session:
+        raise HTTPException(status_code=404, detail="This recording session is no longer available")
+    return session
+
+
+@router.post("/calls/{call_id}/recording-sessions")
+@limiter.limit("30/minute")
+async def start_whatsapp_call_recording(request: Request, call_id: str, body: dict, user: CurrentUser):
+    device_id = body.get("device_id") if isinstance(body.get("device_id"), str) else None
+    if not device_id:
+        raise HTTPException(status_code=422, detail="A recording device ID is required")
+    call = _owned_recording_call(call_id, user, device_id)
+    if canonical_call_state(call.get("state")) not in {"connected", "completed"} and not call.get("connected_at"):
+        raise HTTPException(status_code=409, detail="This call was not connected")
+    raw_session_id = body.get("session_id")
+    try:
+        session_id = str(uuid.UUID(str(raw_session_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=422, detail="A valid recording session ID is required") from exc
+    mime_type = str(body.get("mime_type") or "").lower().strip()[:100]
+    if mime_type.split(";", 1)[0] not in CALL_RECORDING_MIME_TYPES:
+        raise HTTPException(status_code=415, detail="The call recording format is not supported")
+    filename = re.sub(r"[^A-Za-z0-9._-]", "-", str(body.get("filename") or f"whatsapp-call-{call_id}.webm"))[:220]
+    if not filename:
+        raise HTTPException(status_code=422, detail="A recording filename is required")
+    consent = _recording_consent(body.get("consent_method"), body.get("notice_version"), user)
+
+    sessions = db.whatsapp_call_recordings
+    existing = sessions.find_one({"org_id": user.org_id, "call_id": call_id})
+    if existing:
+        if existing.get("session_id") != session_id:
+            raise HTTPException(status_code=409, detail="This call already has a recording session")
+        return serialize_mongo({"session_id": session_id, "status": existing.get("status")})
+
+    now = datetime.now(timezone.utc)
+    session = {
+        "org_id": user.org_id,
+        "call_id": call_id,
+        "session_id": session_id,
+        "agent_id": user.user_id,
+        "device_id": device_id,
+        "status": "recording",
+        "filename": filename,
+        "mime_type": mime_type,
+        "started_at": now,
+        "expires_at": recording_retention_deadline(now, CALL_RECORDING_RETENTION_DAYS),
+        "parts": {},
+        "planned_parts": {},
+        "confirmed_bytes": 0,
+        "updated_at": now,
+        "consent": consent,
+        "audit": [{"event": "consent_attested", **consent}],
+    }
+    try:
+        sessions.insert_one(session)
+    except DuplicateKeyError:
+        existing = sessions.find_one({"org_id": user.org_id, "call_id": call_id}) or {}
+        if existing.get("session_id") != session_id:
+            raise HTTPException(status_code=409, detail="This call already has a recording session")
+    db.whatsapp_calls.update_one(
+        {"org_id": user.org_id, "call_id": call_id},
+        {"$set": {"recording": {
+            "status": "processing",
+            "filename": filename,
+            "mime_type": mime_type,
+            "recorded_at": now,
+            "expires_at": session["expires_at"],
+            "consent_recorded_at": consent["attested_at"],
+        }}},
+    )
+    return serialize_mongo({
+        "session_id": session_id,
+        "status": "recording",
+        "chunk_seconds": 60,
+        "max_parts": CALL_RECORDING_MAX_PARTS,
+        "max_part_bytes": CALL_RECORDING_MAX_PART_BYTES,
+        "max_duration_seconds": CALL_RECORDING_MAX_DURATION_SECONDS,
+    })
+
+
+@router.post("/calls/{call_id}/recording-sessions/{session_id}/parts/{sequence}/signature")
+@limiter.limit("90/minute")
+async def sign_whatsapp_call_recording_part(
+    request: Request,
+    call_id: str,
+    session_id: str,
+    sequence: int,
+    user: CurrentUser,
+):
+    _owned_recording_call(call_id, user)
+    if sequence < 0 or sequence >= CALL_RECORDING_MAX_PARTS:
+        raise HTTPException(status_code=422, detail="The recording segment number is invalid")
+    session = _recording_session(call_id, session_id, user)
+    if session.get("status") != "recording":
+        raise HTTPException(status_code=409, detail="This recording session is already closing")
+    key = f"{sequence:03d}"
+    if (session.get("parts") or {}).get(key):
+        return {"confirmed": True}
+    planned = (session.get("planned_parts") or {}).get(key)
+    if planned:
+        await delete_whatsapp_call_asset({"public_id": planned, "resource_type": "raw", "delivery_type": "private"})
+    signed = whatsapp_call_part_upload_signature(
+        user.org_id,
+        call_id,
+        session_id,
+        sequence,
+        session["expires_at"],
+    )
+    db.whatsapp_call_recordings.update_one(
+        {"_id": session["_id"], "status": "recording"},
+        {"$set": {f"planned_parts.{key}": signed["params"]["public_id"], "updated_at": datetime.now(timezone.utc)}},
+    )
+    return signed
+
+
+@router.post("/calls/{call_id}/recording-sessions/{session_id}/parts/{sequence}/complete")
+@limiter.limit("90/minute")
+async def complete_whatsapp_call_recording_part(
+    request: Request,
+    call_id: str,
+    session_id: str,
+    sequence: int,
+    body: dict,
+    user: CurrentUser,
+):
+    _owned_recording_call(call_id, user)
+    if sequence < 0 or sequence >= CALL_RECORDING_MAX_PARTS:
+        raise HTTPException(status_code=422, detail="The recording segment number is invalid")
+    session = _recording_session(call_id, session_id, user)
+    if session.get("status") != "recording":
+        raise HTTPException(status_code=409, detail="This recording session is already closing")
+    key = f"{sequence:03d}"
+    expected_public_id = (session.get("planned_parts") or {}).get(key)
+    if not expected_public_id or not verify_whatsapp_call_part_response(body, expected_public_id):
+        raise HTTPException(status_code=422, detail="The recording segment upload could not be verified")
+    try:
+        part = await whatsapp_call_part_metadata(expected_public_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="The recording segment could not be verified") from exc
+    if part.get("version") != body.get("version") or part.get("public_id") != expected_public_id:
+        raise HTTPException(status_code=422, detail="The recording segment upload does not match")
+    existing_parts = session.get("parts") or {}
+    if existing_parts.get(key):
+        return {"sequence": sequence, "bytes": existing_parts[key].get("bytes"), "status": "confirmed"}
+    if part["bytes"] <= 0 or part["bytes"] > CALL_RECORDING_MAX_PART_BYTES:
+        await delete_whatsapp_call_asset(part)
+        raise HTTPException(status_code=413, detail="The recording segment is too large")
+    now = datetime.now(timezone.utc)
+    result = db.whatsapp_call_recordings.update_one(
+        {
+            "_id": session["_id"],
+            "status": "recording",
+            f"parts.{key}": {"$exists": False},
+            "confirmed_bytes": {"$lte": CALL_RECORDING_MAX_BYTES - part["bytes"]},
+        },
+        {
+            "$set": {f"parts.{key}": part, "last_part_at": now, "updated_at": now},
+            "$inc": {"confirmed_bytes": part["bytes"]},
+        },
+    )
+    if not result.modified_count:
+        current = db.whatsapp_call_recordings.find_one({"_id": session["_id"]}, {f"parts.{key}": 1}) or {}
+        if not (current.get("parts") or {}).get(key):
+            await delete_whatsapp_call_asset(part)
+            raise HTTPException(status_code=413, detail="The recording is too large or already closing")
+    return {"sequence": sequence, "bytes": part["bytes"], "status": "confirmed"}
+
+
+@router.post("/calls/{call_id}/recording-sessions/{session_id}/finalize")
+@limiter.limit("30/minute")
+async def finalize_whatsapp_call_recording(
+    request: Request,
+    call_id: str,
+    session_id: str,
+    body: dict,
+    user: CurrentUser,
+):
+    _owned_recording_call(call_id, user)
+    try:
+        last_sequence = int(body.get("last_sequence"))
+        duration_seconds = int(body.get("duration_seconds"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Recording duration and final segment are required") from exc
+    if not 0 <= last_sequence < CALL_RECORDING_MAX_PARTS or not 1 <= duration_seconds <= CALL_RECORDING_MAX_DURATION_SECONDS:
+        raise HTTPException(status_code=422, detail="The recording limits are invalid")
+    stop_reason = body.get("stop_reason")
+    if stop_reason not in {None, "consent_withdrawn"}:
+        raise HTTPException(status_code=422, detail="The recording stop reason is invalid")
+    session = _recording_session(call_id, session_id, user)
+    if session.get("status") in {"finalizing", "assembling", "ready"}:
+        return {"session_id": session_id, "status": "ready" if session.get("status") == "ready" else "processing"}
+    parts = session.get("parts") or {}
+    if session.get("status") != "recording" or any(f"{sequence:03d}" not in parts for sequence in range(last_sequence + 1)):
+        raise HTTPException(status_code=409, detail="The final recording segment has not been confirmed")
+    now = datetime.now(timezone.utc)
+    expires_at = recording_retention_deadline(now, CALL_RECORDING_RETENTION_DAYS)
+    audit = [{"event": "finalize_requested", "at": now, "by": user.user_id}]
+    if stop_reason == "consent_withdrawn":
+        audit.append({"event": "consent_withdrawn", "at": now, "by": user.user_id})
+    db.whatsapp_call_recordings.update_one(
+        {"_id": session["_id"], "status": "recording"},
+        {"$set": {
+            "status": "finalizing",
+            "last_sequence": last_sequence,
+            "duration_seconds": duration_seconds,
+            "stopped_at": now,
+            "expires_at": expires_at,
+            "next_attempt_at": now,
+            "updated_at": now,
+        }, "$push": {"audit": {"$each": audit}}},
+    )
+    db.whatsapp_calls.update_one(
+        {"org_id": user.org_id, "call_id": call_id},
+        {"$set": {
+            "recording.status": "processing",
+            "recording.duration_seconds": duration_seconds,
+            "recording.expires_at": expires_at,
+            **({"recording.consent_withdrawn_at": now} if stop_reason == "consent_withdrawn" else {}),
+        }},
+    )
+    return {"session_id": session_id, "status": "processing"}
+
+
+@router.post("/calls/{call_id}/recording")
+@limiter.limit("10/minute")
+async def upload_whatsapp_call_recording_route(
+    request: Request,
+    call_id: str,
+    user: CurrentUser,
+    duration_seconds: int = Form(..., ge=1, le=CALL_RECORDING_MAX_DURATION_SECONDS),
+    consent_method: str = Form(...),
+    notice_version: str = Form(...),
+    file: UploadFile = File(...),
+):
+    calls = db.whatsapp_calls
+    call = calls.find_one({"org_id": user.org_id, "call_id": call_id})
+    if not call:
+        raise HTTPException(status_code=404, detail="This WhatsApp call is no longer available")
+    if call.get("agent_id") != user.user_id:
+        raise HTTPException(status_code=403, detail="Only the agent who handled this call can upload its recording")
+    if canonical_call_state(call.get("state")) not in {"connected", "completed", "declined", "missed", "failed"}:
+        raise HTTPException(status_code=409, detail="This call is not ready for a recording")
+    consent = _recording_consent(consent_method, notice_version, user)
+
+    mime_type = (file.content_type or "").lower().split(";", 1)[0].strip()
+    if mime_type not in CALL_RECORDING_MIME_TYPES:
+        raise HTTPException(status_code=415, detail="The call recording format is not supported")
+    if not file.size:
+        raise HTTPException(status_code=422, detail="The call recording is empty")
+    if file.size > CALL_RECORDING_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="The call recording is too large")
+    now = datetime.now(timezone.utc)
+    expires_at = recording_retention_deadline(meta_datetime(call.get("ended_at")) or now, CALL_RECORDING_RETENTION_DAYS)
+    if expires_at <= now:
+        raise HTTPException(status_code=410, detail="The recording retention window has ended")
+    await file.seek(0)
+    try:
+        if not await check_cloudinary_storage_limit():
+            raise RuntimeError("Recording storage is currently full")
+        uploaded = await upload_whatsapp_call_recording(file, user.org_id, call_id, expires_at, consent)
+    except Exception as exc:
+        logger.error("WhatsApp call recording upload failed for {}: {}", call_id, type(exc).__name__)
+        calls.update_one(
+            {"org_id": user.org_id, "call_id": call_id, "recording.status": {"$ne": "ready"}},
+            {"$set": {"recording": {
+                "status": "failed",
+                "filename": file.filename,
+                "mime_type": file.content_type,
+                "size_bytes": file.size,
+                "recorded_at": now,
+                "expires_at": expires_at,
+            }}},
+        )
+        raise HTTPException(status_code=502, detail="The recording could not be backed up") from exc
+
+    calls.update_one(
+        {"org_id": user.org_id, "call_id": call_id},
+        {"$set": {"recording": uploaded["recording"], "recording_storage": uploaded["storage"]}},
+    )
+    if call.get("wa_id"):
+        await broadcast_main_ws(call["wa_id"], "whatsapp", "whatsapp_call", {
+            "id": call_id,
+            "call_id": call_id,
+            "event": "recording_ready",
+            "status": canonical_call_state(call.get("state")),
+            "conversation_id": call.get("conversation_id"),
+            "recording": uploaded["recording"],
+        })
+    return serialize_mongo(uploaded["recording"])
+
+
+@router.get("/calls/{call_id}/recording")
+@limiter.limit("30/minute")
+async def download_whatsapp_call_recording(request: Request, call_id: str, user: CurrentUser):
+    call = db.whatsapp_calls.find_one({"org_id": user.org_id, "call_id": call_id})
+    if not call:
+        raise HTTPException(status_code=404, detail="This WhatsApp call is no longer available")
+    if call.get("conversation_id") and call.get("agent_id") != user.user_id:
+        await require_conversation_access(user.org_id, call["conversation_id"], user.user_id, user.role)
+
+    recording = call.get("recording") or {}
+    expires_at = meta_datetime(recording.get("expires_at"))
+    if recording.get("status") == "expired" or (expires_at and expires_at <= datetime.now(timezone.utc)):
+        calls = db.whatsapp_calls
+        calls.update_one(
+            {"org_id": user.org_id, "call_id": call_id},
+            {"$set": {"recording.status": "expired", "recording.expired_reason": "retention"}},
+        )
+        raise HTTPException(status_code=410, detail="This call recording has expired")
+    if recording.get("status") != "ready" or not call.get("recording_storage"):
+        raise HTTPException(status_code=404, detail="This call does not have a downloadable recording")
+    try:
+        download_url = whatsapp_call_recording_download_url(call["recording_storage"])
+    except Exception as exc:
+        logger.error("WhatsApp call recording download failed for {}: {}", call_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="The recording download could not be prepared") from exc
+    db.whatsapp_call_recordings.update_one(
+        {"org_id": user.org_id, "call_id": call_id},
+        {"$push": {"audit": {"$each": [{"event": "recording_downloaded", "at": datetime.now(timezone.utc), "by": user.user_id}], "$slice": -1000}}},
+    )
+    return serialize_mongo({
+        "download_url": download_url,
+        "filename": recording.get("filename") or f"whatsapp-call-{call_id}.webm",
+        "expires_at": expires_at,
+    })
 
 
 @router.post("/calls")

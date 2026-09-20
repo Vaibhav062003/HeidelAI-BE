@@ -7,11 +7,15 @@ import io
 import hashlib
 import re
 import uuid
+import os
+import tempfile
 import cloudinary
 import cloudinary.api
 import cloudinary.uploader
 import cloudinary.utils
 from datetime import datetime, timedelta, timezone
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 # Internal modules
 from config.settings import (
@@ -21,6 +25,7 @@ from config.settings import (
     WA_VERSION,
 )
 from loguru import logger
+from services.whatsapp_call_history import recording_quota_evictions, recording_retention_deadline
 
 
 # Cloudinary configuration
@@ -35,6 +40,14 @@ AUDIO_RETENTION_TAG = "heidelai-audio-note"
 TALLY_PDF_RETENTION_DAYS = 30
 TALLY_PDF_RETENTION_TAG = "heidelai-tally-invoice"
 NATIVE_INVOICE_TAG = "heidelai-native-invoice"
+CALL_RECORDING_RETENTION_DAYS = 15
+CALL_RECORDING_TAG = "heidelai-whatsapp-call"
+CALL_RECORDING_MAX_BYTES = 32 * 1024 * 1024
+CALL_RECORDING_MAX_PART_BYTES = 2 * 1024 * 1024
+CALL_RECORDING_MAX_PARTS = 31
+CALL_RECORDING_MAX_DURATION_SECONDS = 30 * 60
+CALL_RECORDING_ORG_QUOTA_BYTES = 1024 * 1024 * 1024
+CALL_RECORDING_MIME_TYPES = {"audio/mp4", "audio/ogg", "audio/webm"}
 
 
 def _outbound_upload_options(semantic_type: str, convert_audio: bool, media_kind: Optional[str] = None) -> dict:
@@ -118,6 +131,547 @@ async def cleanup_expired_audio_notes(days_threshold: int = AUDIO_RETENTION_DAYS
     except Exception as exc:
         logger.error(f"Failed to delete expired audio notes: {exc}")
         return 0
+
+
+async def upload_whatsapp_call_recording(file, org_id: str, call_id: str, expires_at: datetime, consent: dict) -> dict:
+    from database import get_mongo_db
+
+    db = get_mongo_db()
+    if db.whatsapp_call_recordings.find_one({"org_id": org_id, "call_id": call_id}, {"_id": 1}):
+        raise RuntimeError("This call already has a recording session")
+    safe_call_id = re.sub(r"[^A-Za-z0-9_-]", "-", call_id)[:160]
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]", "-", file.filename or f"{safe_call_id}.webm")[:220]
+    result = await asyncio.to_thread(
+        cloudinary.uploader.upload,
+        file.file,
+        folder=f"whatsapp_call_recordings/{org_id}",
+        public_id=safe_call_id,
+        resource_type="video",
+        type="private",
+        tags=[CALL_RECORDING_TAG],
+        context={"expires_at": expires_at.isoformat(), "call_id": call_id},
+        overwrite=True,
+    )
+    if not result.get("public_id"):
+        raise RuntimeError("Cloudinary did not return a call recording identifier")
+    uploaded = {
+        "recording": {
+            "status": "ready",
+            "filename": safe_filename,
+            "mime_type": (file.content_type or "audio/webm").lower(),
+            "size_bytes": result.get("bytes") or file.size,
+            "recorded_at": datetime.now(timezone.utc),
+            "expires_at": expires_at,
+            "consent_recorded_at": consent["attested_at"],
+        },
+        "storage": {
+            "public_id": result["public_id"],
+            "asset_id": result.get("asset_id"),
+            "resource_type": result.get("resource_type") or "video",
+            "delivery_type": result.get("type") or "private",
+            "format": result.get("format"),
+        },
+    }
+    session = {
+        "org_id": org_id,
+        "call_id": call_id,
+        "session_id": f"legacy-{uuid.uuid4()}",
+        "status": "assembling",
+        "filename": safe_filename,
+        "mime_type": uploaded["recording"]["mime_type"],
+        "started_at": uploaded["recording"]["recorded_at"],
+        "stopped_at": uploaded["recording"]["recorded_at"],
+        "expires_at": expires_at,
+        "size_bytes": int(uploaded["recording"]["size_bytes"] or 0),
+        "storage": uploaded["storage"],
+        "consent": consent,
+        "audit": [{"event": "consent_attested", **consent}],
+    }
+    try:
+        db.whatsapp_call_recordings.insert_one(session)
+        await _enforce_recording_quota(db, session, session["size_bytes"])
+        db.whatsapp_call_recordings.update_one(
+            {"org_id": org_id, "call_id": call_id, "session_id": session["session_id"]},
+            {"$set": {"status": "ready", "ready_at": datetime.now(timezone.utc)}, "$push": {"audit": {"event": "recording_ready", "at": datetime.now(timezone.utc)}}},
+        )
+    except Exception:
+        await delete_whatsapp_call_asset(uploaded["storage"])
+        db.whatsapp_call_recordings.delete_one({"org_id": org_id, "call_id": call_id, "session_id": session["session_id"]})
+        raise
+    return uploaded
+
+
+def whatsapp_call_part_upload_signature(org_id: str, call_id: str, session_id: str, sequence: int, expires_at: datetime) -> dict:
+    safe_org = re.sub(r"[^A-Za-z0-9_-]", "-", org_id)[:100]
+    safe_call = re.sub(r"[^A-Za-z0-9_-]", "-", call_id)[:160]
+    public_id = f"whatsapp_call_parts/{safe_org}/{safe_call}/{session_id}/{sequence:03d}"
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    params = {
+        "context": f"call_id={call_id}|expires_at={expires_at.isoformat()}",
+        "overwrite": "false",
+        "public_id": public_id,
+        "tags": f"{CALL_RECORDING_TAG},recording-session-{session_id}",
+        "timestamp": timestamp,
+        "type": "private",
+    }
+    return {
+        "upload_url": f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/raw/upload",
+        "cloud_name": CLOUDINARY_CLOUD_NAME,
+        "api_key": CLOUDINARY_API_KEY,
+        "signature": cloudinary.utils.api_sign_request(params, CLOUDINARY_API_SECRET),
+        "params": params,
+    }
+
+
+def verify_whatsapp_call_part_response(payload: dict, expected_public_id: str) -> bool:
+    public_id = str(payload.get("public_id") or "")
+    version = payload.get("version")
+    signature = str(payload.get("signature") or "")
+    if public_id != expected_public_id or not isinstance(version, int) or not signature:
+        return False
+    return cloudinary.utils.verify_api_response_signature(public_id, version, signature)
+
+
+async def whatsapp_call_part_metadata(public_id: str) -> dict:
+    result = await asyncio.to_thread(
+        cloudinary.api.resource,
+        public_id,
+        resource_type="raw",
+        type="private",
+    )
+    return {
+        "public_id": result.get("public_id"),
+        "asset_id": result.get("asset_id"),
+        "resource_type": "raw",
+        "delivery_type": "private",
+        "format": result.get("format") or "bin",
+        "bytes": int(result.get("bytes") or 0),
+        "version": result.get("version"),
+    }
+
+
+async def delete_whatsapp_call_asset(storage: dict) -> bool:
+    return await asyncio.to_thread(_delete_whatsapp_call_recording_sync, storage)
+
+
+def whatsapp_call_recording_download_url(storage: dict, expires_in_seconds: int = 300) -> str:
+    if not storage.get("public_id"):
+        raise RuntimeError("Call recording storage metadata is missing")
+    return cloudinary.utils.private_download_url(
+        storage["public_id"],
+        storage.get("format") or "webm",
+        resource_type=storage.get("resource_type") or "video",
+        type=storage.get("delivery_type") or "private",
+        expires_at=int(datetime.now(timezone.utc).timestamp()) + expires_in_seconds,
+        attachment=True,
+    )
+
+
+def _delete_whatsapp_call_recording_sync(storage: dict) -> bool:
+    result = cloudinary.uploader.destroy(
+        storage.get("public_id"),
+        resource_type=storage.get("resource_type") or "video",
+        type=storage.get("delivery_type") or "private",
+        invalidate=True,
+    )
+    return result.get("result") in {"ok", "not found"}
+
+
+def _recording_assets(session: dict) -> list[dict]:
+    assets = list((session.get("parts") or {}).values())
+    if session.get("pending_storage"):
+        assets.append(session["pending_storage"])
+    if session.get("storage"):
+        assets.append(session["storage"])
+    return [asset for asset in assets if asset.get("public_id")]
+
+
+async def _delete_recording_assets(session: dict) -> bool:
+    for asset in _recording_assets(session):
+        if not await asyncio.to_thread(_delete_whatsapp_call_recording_sync, asset):
+            return False
+    return True
+
+
+async def _enforce_recording_quota(db, session: dict, new_size: int) -> None:
+    locks = db.whatsapp_recording_quota_locks
+    now = datetime.now(timezone.utc)
+    token = uuid.uuid4().hex
+    try:
+        await asyncio.to_thread(
+            locks.update_one,
+            {"_id": session["org_id"]},
+            {"$setOnInsert": {"lease_until": datetime.fromtimestamp(0, tz=timezone.utc)}},
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        pass
+    claimed = await asyncio.to_thread(
+        locks.find_one_and_update,
+        {"_id": session["org_id"], "lease_until": {"$lte": now}},
+        {"$set": {"lease_until": now + timedelta(minutes=15), "lease_token": token}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed:
+        raise RuntimeError("Recording quota is currently being updated")
+    try:
+        rows = await asyncio.to_thread(
+            lambda: list(db.whatsapp_call_recordings.find(
+                {
+                    "org_id": session["org_id"],
+                    "status": {"$in": ["ready", "assembling"]},
+                    "session_id": {"$ne": session["session_id"]},
+                },
+            ).sort("stopped_at", 1))
+        )
+        eviction_ids, fits = recording_quota_evictions(rows, new_size, CALL_RECORDING_ORG_QUOTA_BYTES)
+        for old in (row for row in rows if row.get("_id") in eviction_ids):
+            if not await _delete_recording_assets(old):
+                raise RuntimeError("Old recording could not be removed for quota")
+            await asyncio.to_thread(
+                db.whatsapp_call_recordings.update_one,
+                {"_id": old["_id"], "status": "ready"},
+                {"$set": {"status": "expired", "expired_reason": "quota", "expired_at": now}, "$push": {"audit": {"event": "expired_quota", "at": now}}, "$unset": {"storage": "", "parts": ""}},
+            )
+            await asyncio.to_thread(
+                db.whatsapp_calls.update_one,
+                {"org_id": old["org_id"], "call_id": old["call_id"]},
+                {"$set": {"recording.status": "expired", "recording.expired_reason": "quota"}, "$unset": {"recording_storage": ""}},
+            )
+        if not fits:
+            raise RuntimeError("Organization recording quota is full")
+    finally:
+        await asyncio.to_thread(
+            locks.update_one,
+            {"_id": session["org_id"], "lease_token": token},
+            {"$set": {"lease_until": datetime.fromtimestamp(0, tz=timezone.utc)}, "$unset": {"lease_token": ""}},
+        )
+
+
+async def _assemble_call_recording(db, session: dict) -> None:
+    parts = session.get("parts") or {}
+    last_sequence = min(int(session.get("last_sequence") or 0), CALL_RECORDING_MAX_PARTS - 1)
+    ordered = []
+    for sequence in range(last_sequence + 1):
+        part = parts.get(f"{sequence:03d}")
+        if not part:
+            break
+        ordered.append(part)
+    if not ordered:
+        raise RuntimeError("No confirmed recording segments are available")
+
+    mime_type = str(session.get("mime_type") or "audio/webm").lower()
+    extension = "m4a" if "mp4" in mime_type else "ogg" if "ogg" in mime_type else "webm"
+    temp = tempfile.NamedTemporaryFile(suffix=f".{extension}", delete=False)
+    temp_path = temp.name
+    temp.close()
+    try:
+        total = 0
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            with open(temp_path, "wb") as output:
+                for part in ordered:
+                    url = cloudinary.utils.private_download_url(
+                        part["public_id"], part.get("format") or "bin",
+                        resource_type="raw", type="private",
+                        expires_at=int(datetime.now(timezone.utc).timestamp()) + 300,
+                    )
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    output.write(response.content)
+                    total += len(response.content)
+        if total <= 0 or total > CALL_RECORDING_MAX_BYTES:
+            raise RuntimeError("The assembled recording has an invalid size")
+        safe_org = re.sub(r"[^A-Za-z0-9_-]", "-", session["org_id"])[:100]
+        safe_call = re.sub(r"[^A-Za-z0-9_-]", "-", session["call_id"])[:160]
+        result = await asyncio.to_thread(
+            cloudinary.uploader.upload,
+            temp_path,
+            public_id=f"whatsapp_call_recordings/{safe_org}/{safe_call}",
+            resource_type="video",
+            type="private",
+            tags=[CALL_RECORDING_TAG],
+            context={"call_id": session["call_id"], "expires_at": session["expires_at"].isoformat()},
+            overwrite=True,
+        )
+        storage = {
+            "public_id": result["public_id"],
+            "asset_id": result.get("asset_id"),
+            "resource_type": result.get("resource_type") or "video",
+            "delivery_type": result.get("type") or "private",
+            "format": result.get("format") or extension,
+        }
+        size_bytes = int(result.get("bytes") or total)
+        await asyncio.to_thread(
+            db.whatsapp_call_recordings.update_one,
+            {"_id": session["_id"], "lease_token": session["lease_token"]},
+            {"$set": {"size_bytes": size_bytes, "pending_storage": storage}},
+        )
+        try:
+            await _enforce_recording_quota(db, session, size_bytes)
+        except Exception:
+            if await delete_whatsapp_call_asset(storage):
+                await asyncio.to_thread(
+                    db.whatsapp_call_recordings.update_one,
+                    {"_id": session["_id"], "lease_token": session["lease_token"]},
+                    {"$unset": {"pending_storage": ""}},
+                )
+            raise
+        recording = {
+            "status": "ready",
+            "filename": session["filename"],
+            "mime_type": mime_type,
+            "size_bytes": size_bytes,
+            "duration_seconds": session.get("duration_seconds"),
+            "recorded_at": session["started_at"],
+            "expires_at": session["expires_at"],
+            "partial": len(ordered) != last_sequence + 1,
+        }
+        await asyncio.to_thread(
+            db.whatsapp_calls.update_one,
+            {"org_id": session["org_id"], "call_id": session["call_id"]},
+            {"$set": {"recording": recording, "recording_storage": storage}},
+        )
+        await asyncio.to_thread(
+            db.whatsapp_call_recordings.update_one,
+            {"_id": session["_id"], "lease_token": session["lease_token"]},
+            {"$set": {"status": "ready", "storage": storage, "size_bytes": size_bytes, "ready_at": datetime.now(timezone.utc)}, "$push": {"audit": {"event": "recording_ready", "at": datetime.now(timezone.utc)}}, "$unset": {"pending_storage": "", "lease_token": "", "lease_until": "", "next_attempt_at": ""}},
+        )
+        if all([await delete_whatsapp_call_asset(part) for part in ordered]):
+            await asyncio.to_thread(
+                db.whatsapp_call_recordings.update_one,
+                {"_id": session["_id"]},
+                {"$unset": {"parts": "", "planned_parts": ""}},
+            )
+        call = await asyncio.to_thread(db.whatsapp_calls.find_one, {"org_id": session["org_id"], "call_id": session["call_id"]})
+        if call and call.get("wa_id"):
+            from services.websocket_service import broadcast_main_ws
+            await broadcast_main_ws(call["wa_id"], "whatsapp", "whatsapp_call", {
+                "id": session["call_id"], "call_id": session["call_id"], "event": "recording_ready",
+                "status": call.get("state"), "conversation_id": call.get("conversation_id"), "recording": recording,
+            })
+    finally:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+async def process_call_recording_jobs() -> int:
+    from database import get_mongo_db
+    from services.whatsapp_call_history import meta_datetime
+
+    db = get_mongo_db()
+    sessions = db.whatsapp_call_recordings
+    now = datetime.now(timezone.utc)
+    stale_before = now - timedelta(minutes=10)
+    candidates = await asyncio.to_thread(
+        lambda: list(sessions.find({"status": "recording", "$or": [
+            {"started_at": {"$lte": now - timedelta(seconds=CALL_RECORDING_MAX_DURATION_SECONDS + 60)}},
+            {"last_part_at": {"$lte": stale_before}},
+            {"last_part_at": {"$exists": False}, "started_at": {"$lte": stale_before}},
+        ]}).limit(50))
+    )
+    for candidate in candidates:
+        call = await asyncio.to_thread(db.whatsapp_calls.find_one, {"org_id": candidate["org_id"], "call_id": candidate["call_id"]}, {"state": 1})
+        started_at = meta_datetime(candidate.get("started_at"), now) or now
+        timed_out = started_at <= now - timedelta(seconds=CALL_RECORDING_MAX_DURATION_SECONDS + 60)
+        terminal = str((call or {}).get("state") or "").lower() in {"completed", "declined", "missed", "failed", "ended", "terminated", "rejected"}
+        if not timed_out and not terminal:
+            continue
+        sequences = [int(key) for key in (candidate.get("parts") or {}) if str(key).isdigit()]
+        await asyncio.to_thread(
+            sessions.update_one,
+            {"_id": candidate["_id"], "status": "recording"},
+            {"$set": {
+                "status": "finalizing",
+                "stopped_at": now,
+                "expires_at": recording_retention_deadline(now, CALL_RECORDING_RETENTION_DAYS),
+                "last_sequence": max(sequences, default=0),
+                "duration_seconds": max(1, min(CALL_RECORDING_MAX_DURATION_SECONDS, int((now - started_at).total_seconds()))),
+                "next_attempt_at": now,
+            }},
+        )
+
+    completed = 0
+    for _ in range(5):
+        token = uuid.uuid4().hex
+        session = await asyncio.to_thread(
+            sessions.find_one_and_update,
+            {
+                "status": {"$in": ["finalizing", "assembling"]},
+                "next_attempt_at": {"$lte": now},
+                "$or": [{"lease_until": {"$lte": now}}, {"lease_until": {"$exists": False}}],
+            },
+            {"$set": {"status": "assembling", "lease_token": token, "lease_until": now + timedelta(minutes=5)}},
+            sort=[("next_attempt_at", 1)],
+            return_document=ReturnDocument.AFTER,
+        )
+        if not session:
+            break
+        try:
+            await _assemble_call_recording(db, session)
+            completed += 1
+        except Exception as exc:
+            attempts = int(session.get("attempts") or 0) + 1
+            failed = attempts >= 8
+            logger.error("WhatsApp recording finalization failed for {}: {}", session.get("call_id"), type(exc).__name__)
+            await asyncio.to_thread(
+                sessions.update_one,
+                {"_id": session["_id"], "lease_token": token},
+                {"$set": {
+                    "status": "failed" if failed else "finalizing",
+                    "attempts": attempts,
+                    "next_attempt_at": now + timedelta(seconds=min(300, 2 ** attempts)),
+                    "last_error": type(exc).__name__,
+                }, "$unset": {"lease_token": "", "lease_until": ""}},
+            )
+            if failed:
+                await asyncio.to_thread(
+                    db.whatsapp_calls.update_one,
+                    {"org_id": session["org_id"], "call_id": session["call_id"], "recording.status": {"$ne": "ready"}},
+                    {"$set": {"recording.status": "failed"}},
+                )
+    return completed
+
+
+async def cleanup_expired_call_recordings() -> int:
+    from database import get_mongo_db
+
+    db = get_mongo_db()
+    calls = db.whatsapp_calls
+    sessions = db.whatsapp_call_recordings
+    now = datetime.now(timezone.utc)
+    deleted = 0
+    rows = await asyncio.to_thread(lambda: list(sessions.find({
+        "expires_at": {"$lte": now},
+        "status": {"$ne": "expired"},
+        "$or": [{"status": {"$ne": "deleting"}}, {"delete_lease_until": {"$lte": now}}],
+    }).limit(500)))
+    for row in rows:
+        claimed = await asyncio.to_thread(
+            sessions.find_one_and_update,
+            {
+                "_id": row["_id"],
+                "$or": [{"status": {"$ne": "deleting"}}, {"delete_lease_until": {"$lte": now}}],
+            },
+            {"$set": {"status": "deleting", "delete_lease_until": now + timedelta(minutes=5)}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            continue
+        try:
+            if not await _delete_recording_assets(claimed):
+                raise RuntimeError("Cloudinary did not confirm recording deletion")
+            await asyncio.to_thread(
+                sessions.update_one,
+                {"_id": claimed["_id"], "status": "deleting"},
+                {"$set": {"status": "expired", "expired_reason": "retention", "expired_at": now}, "$push": {"audit": {"event": "expired_retention", "at": now}}, "$unset": {"storage": "", "pending_storage": "", "parts": "", "planned_parts": "", "delete_lease_until": ""}},
+            )
+            await asyncio.to_thread(
+                calls.update_one,
+                {"org_id": claimed["org_id"], "call_id": claimed["call_id"]},
+                {"$set": {"recording.status": "expired", "recording.expired_reason": "retention"}, "$unset": {"recording_storage": ""}},
+            )
+            deleted += 1
+        except Exception as exc:
+            logger.error("Failed to delete expired WhatsApp recording {}: {}", claimed.get("call_id"), type(exc).__name__)
+            await asyncio.to_thread(
+                sessions.update_one,
+                {"_id": claimed["_id"], "status": "deleting"},
+                {"$set": {"status": row["status"]}, "$unset": {"delete_lease_until": ""}},
+            )
+
+    # Legacy whole-file recordings remain eligible during the compatibility window.
+    rows = await asyncio.to_thread(
+        lambda: list(calls.find(
+            {"recording.status": {"$in": ["ready", "expired"]}, "recording.expires_at": {"$lte": now}},
+            {"_id": 1, "recording_storage": 1},
+        ).limit(500))
+    )
+    for row in rows:
+        storage = row.get("recording_storage") or {}
+        try:
+            removed = not storage.get("public_id") or await asyncio.to_thread(_delete_whatsapp_call_recording_sync, storage)
+            if not removed:
+                continue
+            await asyncio.to_thread(
+                calls.update_one,
+                {"_id": row["_id"], "recording.status": {"$in": ["ready", "expired"]}, "recording.expires_at": {"$lte": now}},
+                {"$set": {"recording.status": "expired", "recording.expired_reason": "retention"}, "$unset": {"recording_storage": ""}},
+            )
+            deleted += 1
+        except Exception as exc:
+            logger.error(f"Failed to delete expired WhatsApp call recording: {exc}")
+    if deleted:
+        logger.info(f"Deleted {deleted} expired WhatsApp call recordings")
+    return deleted
+
+
+def _cleanup_orphaned_call_recording_parts_sync() -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    deleted = 0
+    cursor = None
+    while True:
+        page = cloudinary.api.resources_by_tag(
+            CALL_RECORDING_TAG,
+            resource_type="raw",
+            type="private",
+            max_results=500,
+            **({"next_cursor": cursor} if cursor else {}),
+        )
+        for asset in page.get("resources", []):
+            try:
+                created_at = datetime.fromisoformat(str(asset.get("created_at") or "").replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if created_at <= cutoff and _delete_whatsapp_call_recording_sync({
+                "public_id": asset.get("public_id"),
+                "resource_type": "raw",
+                "delivery_type": "private",
+            }):
+                deleted += 1
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return deleted
+
+
+async def cleanup_orphaned_call_recording_parts() -> int:
+    from database import get_mongo_db
+
+    locks = get_mongo_db().whatsapp_recording_quota_locks
+    lock_id = "__orphaned_call_recording_parts__"
+    now = datetime.now(timezone.utc)
+    token = uuid.uuid4().hex
+    try:
+        try:
+            await asyncio.to_thread(
+                locks.update_one,
+                {"_id": lock_id},
+                {"$setOnInsert": {"lease_until": datetime.fromtimestamp(0, tz=timezone.utc)}},
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            pass
+        claimed = await asyncio.to_thread(
+            locks.find_one_and_update,
+            {"_id": lock_id, "lease_until": {"$lte": now}},
+            {"$set": {"lease_until": now + timedelta(hours=1), "lease_token": token}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not claimed:
+            return 0
+        return await asyncio.to_thread(_cleanup_orphaned_call_recording_parts_sync)
+    except Exception as exc:
+        logger.error("Failed to delete orphaned WhatsApp recording parts: {}", type(exc).__name__)
+        return 0
+    finally:
+        await asyncio.to_thread(
+            locks.update_one,
+            {"_id": lock_id, "lease_token": token},
+            {"$set": {"lease_until": datetime.fromtimestamp(0, tz=timezone.utc)}, "$unset": {"lease_token": ""}},
+        )
 
 
 async def upload_tally_invoice_pdf(data: bytes, org_id: str, invoice_id: str, alter_id: str) -> dict:

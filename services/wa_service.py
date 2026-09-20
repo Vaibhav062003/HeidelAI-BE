@@ -2960,6 +2960,19 @@ def ensure_whatsapp_call_indexes() -> None:
             [("org_id", 1), ("conversation_id", 1), ("updated_at", -1), ("call_id", -1)],
             name="org_conversation_call_history",
         )
+        db.whatsapp_call_recordings.create_index(
+            [("org_id", 1), ("call_id", 1)],
+            unique=True,
+            name="org_call_recording_unique",
+        )
+        db.whatsapp_call_recordings.create_index(
+            [("status", 1), ("next_attempt_at", 1), ("lease_until", 1)],
+            name="recording_finalize_queue",
+        )
+        db.whatsapp_call_recordings.create_index(
+            [("expires_at", 1), ("status", 1)],
+            name="recording_retention_queue",
+        )
     except Exception as e:
         logger.warning(f"Failed to create WhatsApp call index: {e}")
 

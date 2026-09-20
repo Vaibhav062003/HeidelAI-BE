@@ -137,7 +137,12 @@ def start_scheduler():
     global _scheduler
     if _scheduler and _scheduler.running:
         return _scheduler
-    from services.cloudinary_service import cleanup_expired_audio_notes
+    from services.cloudinary_service import (
+        cleanup_expired_audio_notes,
+        cleanup_expired_call_recordings,
+        cleanup_orphaned_call_recording_parts,
+        process_call_recording_jobs,
+    )
     from services.oos_service import process_pending_oos_sends, process_expired_oos_requests, process_pending_oos_reply_steps
     from services.push_notification_service import process_pending_member_device_revocations, process_pending_push_notifications
     from services.pricing_service import process_pending_pricing_escalations
@@ -173,6 +178,9 @@ def start_scheduler():
     scheduler.add_job(process_pending_push_notifications, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_member_device_revocations, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(cleanup_expired_audio_notes, "cron", hour=3, minute=30, max_instances=1, coalesce=True)
+    scheduler.add_job(process_call_recording_jobs, "interval", seconds=10, max_instances=1, coalesce=True)
+    scheduler.add_job(cleanup_expired_call_recordings, "interval", minutes=5, max_instances=1, coalesce=True)
+    scheduler.add_job(cleanup_orphaned_call_recording_parts, "cron", hour=4, minute=0, max_instances=1, coalesce=True)
     scheduler.add_job(cleanup_expired_tally_pdfs, "cron", hour=3, minute=45, max_instances=1, coalesce=True)
     scheduler.start()
     _scheduler = scheduler
