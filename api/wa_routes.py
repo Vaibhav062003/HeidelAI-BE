@@ -45,6 +45,7 @@ from services.cloudinary_service import (
     CALL_RECORDING_RETENTION_DAYS,
     check_cloudinary_storage_limit,
     delete_whatsapp_call_asset,
+    delete_whatsapp_call_recording_assets,
     upload_whatsapp_call_recording,
     verify_whatsapp_call_part_response,
     whatsapp_call_part_metadata,
@@ -945,6 +946,57 @@ async def download_whatsapp_call_recording(request: Request, call_id: str, user:
         "filename": recording.get("filename") or f"whatsapp-call-{call_id}.webm",
         "expires_at": expires_at,
     })
+
+
+@router.delete("/calls/{call_id}/recording")
+@limiter.limit("10/minute")
+async def delete_whatsapp_call_recording_route(request: Request, call_id: str, user: CurrentUser):
+    await admin_required(user)
+    calls = db.whatsapp_calls
+    call = calls.find_one({"org_id": user.org_id, "call_id": call_id})
+    if not call:
+        raise HTTPException(status_code=404, detail="This WhatsApp call is no longer available")
+    recording = call.get("recording") or {}
+    if recording.get("status") == "expired" and recording.get("expired_reason") == "admin_deleted":
+        return {"status": "deleted"}
+    if recording.get("status") != "ready":
+        raise HTTPException(status_code=404, detail="This call does not have a deletable recording")
+
+    session = db.whatsapp_call_recordings.find_one({"org_id": user.org_id, "call_id": call_id})
+    assets = dict(session or {})
+    if call.get("recording_storage"):
+        assets["storage"] = call["recording_storage"]
+    try:
+        if not await delete_whatsapp_call_recording_assets(assets):
+            raise RuntimeError("Cloudinary did not confirm recording deletion")
+    except Exception as exc:
+        logger.error("WhatsApp call recording deletion failed for {}: {}", call_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="The recording could not be deleted") from exc
+
+    now = datetime.now(timezone.utc)
+    deleted_recording = {
+        **recording,
+        "status": "expired",
+        "expired_reason": "admin_deleted",
+        "expired_at": now,
+    }
+    if session:
+        db.whatsapp_call_recordings.update_one(
+            {"_id": session["_id"]},
+            {
+                "$set": {"status": "expired", "expired_reason": "admin_deleted", "expired_at": now},
+                "$push": {"audit": {"event": "deleted_by_admin", "at": now, "by": user.user_id}},
+                "$unset": {
+                    "storage": "", "pending_storage": "", "parts": "", "planned_parts": "",
+                    "lease_token": "", "lease_until": "", "delete_lease_until": "", "next_attempt_at": "",
+                },
+            },
+        )
+    calls.update_one(
+        {"org_id": user.org_id, "call_id": call_id},
+        {"$set": {"recording": deleted_recording}, "$unset": {"recording_storage": ""}},
+    )
+    return {"status": "deleted"}
 
 
 @router.post("/calls")

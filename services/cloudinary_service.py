@@ -286,7 +286,7 @@ def _recording_assets(session: dict) -> list[dict]:
     return [asset for asset in assets if asset.get("public_id")]
 
 
-async def _delete_recording_assets(session: dict) -> bool:
+async def delete_whatsapp_call_recording_assets(session: dict) -> bool:
     for asset in _recording_assets(session):
         if not await asyncio.to_thread(_delete_whatsapp_call_recording_sync, asset):
             return False
@@ -326,7 +326,7 @@ async def _enforce_recording_quota(db, session: dict, new_size: int) -> None:
         )
         eviction_ids, fits = recording_quota_evictions(rows, new_size, CALL_RECORDING_ORG_QUOTA_BYTES)
         for old in (row for row in rows if row.get("_id") in eviction_ids):
-            if not await _delete_recording_assets(old):
+            if not await delete_whatsapp_call_recording_assets(old):
                 raise RuntimeError("Old recording could not be removed for quota")
             await asyncio.to_thread(
                 db.whatsapp_call_recordings.update_one,
@@ -560,7 +560,7 @@ async def cleanup_expired_call_recordings() -> int:
         if not claimed:
             continue
         try:
-            if not await _delete_recording_assets(claimed):
+            if not await delete_whatsapp_call_recording_assets(claimed):
                 raise RuntimeError("Cloudinary did not confirm recording deletion")
             await asyncio.to_thread(
                 sessions.update_one,
