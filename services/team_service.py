@@ -30,6 +30,88 @@ ESCALATION_RETENTION = timedelta(days=90)
 _escalation_indexes_ready: set[str] = set()
 
 
+def resolve_team_scope(org_id: str) -> str:
+    """Use the shared workspace group for team chat, or the org for legacy tenants."""
+    organization = db.organizations.find_one(
+        {"org_id": org_id}, {"workspace_group_id": 1, "_id": 0}
+    ) or {}
+    return str(organization.get("workspace_group_id") or org_id)
+
+
+def _group_organizations(org_id: str) -> tuple[str, list[dict], dict]:
+    current = db.organizations.find_one(
+        {"org_id": org_id},
+        {"org_id": 1, "org_name": 1, "workspace_group_id": 1, "workspace_kind": 1, "_id": 0},
+    ) or {"org_id": org_id, "org_name": org_id}
+    scope = str(current.get("workspace_group_id") or org_id)
+    if not current.get("workspace_group_id"):
+        return scope, [current], current
+    organizations = list(db.organizations.find(
+        {"workspace_group_id": scope},
+        {"org_id": 1, "org_name": 1, "workspace_kind": 1, "_id": 0},
+    ))
+    return scope, organizations or [current], current
+
+
+async def fetch_team_directory(org_id: str) -> Dict:
+    """Return active Clerk members across every workspace in this group."""
+    from api.transfer_routes import get_org_memberships, membership_public_data
+
+    scope, organizations, current = _group_organizations(org_id)
+    membership_lists = await asyncio.gather(*(
+        get_org_memberships(str(organization["org_id"])) for organization in organizations
+    ))
+    child_ids = {
+        str(organization["org_id"])
+        for organization in organizations
+        if organization.get("workspace_kind") != "management"
+    }
+    members: dict[str, dict] = {}
+    for organization, memberships in zip(organizations, membership_lists):
+        workspace_id = str(organization["org_id"])
+        workspace_name = str(organization.get("org_name") or workspace_id)
+        for membership in memberships:
+            public = membership_public_data(membership)
+            user_id = str(public.get("user_id") or "")
+            if not user_id or public.get("banned"):
+                continue
+            member = members.setdefault(user_id, {
+                "userId": user_id,
+                "name": " ".join(filter(None, [public.get("first_name"), public.get("last_name")]))
+                    or public.get("identifier") or "Unknown",
+                "email": public.get("identifier") or "",
+                "avatarUrl": public.get("image_url"),
+                "workspaceNames": [],
+                "_workspaceIds": set(),
+            })
+            if organization.get("workspace_kind") != "management":
+                member["workspaceNames"].append(workspace_name)
+                member["_workspaceIds"].add(workspace_id)
+
+    result = []
+    for member in members.values():
+        workspace_ids = member.pop("_workspaceIds")
+        member["workspaceNames"] = sorted(set(member["workspaceNames"]))
+        member["allWorkspaces"] = bool(child_ids) and workspace_ids >= child_ids
+        result.append(member)
+    result.sort(key=lambda member: (member["name"].casefold(), member["email"].casefold()))
+    return {
+        "team_scope_id": scope,
+        "workspace_kind": current.get("workspace_kind") or "standalone",
+        "members": result,
+    }
+
+
+async def require_team_recipient(org_id: str, sender_id: str, recipient_id: str) -> tuple[str, dict]:
+    if not recipient_id or recipient_id == sender_id:
+        raise HTTPException(status_code=422, detail="Choose another active team member")
+    directory = await fetch_team_directory(org_id)
+    by_id = {member["userId"]: member for member in directory["members"]}
+    if sender_id not in by_id or recipient_id not in by_id:
+        raise HTTPException(status_code=403, detail="The recipient is not in this workspace group")
+    return str(directory["team_scope_id"]), by_id[recipient_id]
+
+
 def _canonical_escalation_status(status: str) -> str:
     return "reviewed" if status == "reviewed" else "pending_human_review"
 
@@ -112,8 +194,9 @@ async def fetch_team_conversations(
 
         # Is any other participant currently online?
         is_online = any(
-            p_id in services.agent_clients and services.agent_clients[p_id]
+            services.client_metadata.get(client_id, {}).get("team_scope_id") == org_id
             for p_id in other_participants
+            for client_id in services.agent_clients.get(p_id, set())
         )
 
         unread_map = doc.get("unread", {})

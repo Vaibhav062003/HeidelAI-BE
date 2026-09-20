@@ -95,7 +95,7 @@ def revoke_invite(request: Request, req: RevokeInviteRequest, user: CurrentUser)
 @limiter.limit("30/minute")
 def delete_member(request: Request, user: CurrentUser, user_id: str = Query(...)):
     ORG_ID = user.org_id
-    if user.role != "admin":
+    if user.role not in {"admin", "org:admin"}:
         raise HTTPException(status_code=403, detail="Admins only")
     url = f"{base_url}/organizations/{ORG_ID}/memberships/{user_id}"
     try:

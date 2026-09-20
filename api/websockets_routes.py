@@ -244,7 +244,7 @@ async def main_ws(websocket: WebSocket, client_id: str):
     try:
         org = await asyncio.to_thread(db.organizations.find_one,
             {"org_id": user.org_id},
-            {"ig_id": 1, "wa_id": 1, "_id": 0}
+            {"ig_id": 1, "wa_id": 1, "workspace_group_id": 1, "_id": 0}
         ) or {}
         ig_ids = await asyncio.to_thread(_active_account_ids,
             org.get("ig_id"),
@@ -278,6 +278,7 @@ async def main_ws(websocket: WebSocket, client_id: str):
             "wa_ids": sorted(wa_ids),
             "user_id": user.user_id,
             "org_id": user.org_id,
+            "team_scope_id": str(org.get("workspace_group_id") or user.org_id),
             "role": user.role,
             "agent_name": user.full_name,
         }

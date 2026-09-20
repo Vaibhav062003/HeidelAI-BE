@@ -561,13 +561,15 @@ async def broadcast_team_message(org_id: str, conversation_id: str, participants
     for user_id in participants:
         if user_id in services.agent_clients:
             for client_id in list(services.agent_clients[user_id]):
+                if services.client_metadata.get(client_id, {}).get("team_scope_id") != org_id:
+                    continue
                 ws = services.active_clients.get(client_id)
                 if ws:
                     try:
                         await ws.send_json({
                             "type": "new_team_message",
                             "data": {
-                                "org_id": org_id,
+                                "team_scope_id": org_id,
                                 "conversation_id": conversation_id,
                                 **safe_payload
                             }
