@@ -364,20 +364,25 @@ async def send_message_endpoint(
     if platform == "internal":
         if file or not content or not content.strip():
             raise HTTPException(status_code=422, detail="Team messages require text content")
-        if not recipient_user_id and isinstance(context_dict, dict):
-            legacy_recipients = [
-                item for item in context_dict.get("participants", [])
-                if isinstance(item, str) and item != user.user_id
-            ]
-            if len(legacy_recipients) == 1:
-                recipient_user_id = legacy_recipients[0]
-        if not recipient_user_id or len(recipient_user_id) > 128:
-            raise HTTPException(status_code=422, detail="A valid team recipient is required")
-        from services.team_service import require_team_recipient
+        from services.team_service import require_team_recipient, require_team_room
 
-        org_id, _ = await require_team_recipient(org_id, user.user_id, recipient_user_id)
-        participants = sorted([user.user_id, recipient_user_id])
-        conversation_id = f"team_{participants[0]}_{participants[1]}"
+        room_access = await require_team_room(org_id, user.user_id, conversation_id)
+        if room_access:
+            org_id, room = room_access
+            participants = list(room.get("participants") or [])
+        else:
+            if not recipient_user_id and isinstance(context_dict, dict):
+                legacy_recipients = [
+                    item for item in context_dict.get("participants", [])
+                    if isinstance(item, str) and item != user.user_id
+                ]
+                if len(legacy_recipients) == 1:
+                    recipient_user_id = legacy_recipients[0]
+            if not recipient_user_id or len(recipient_user_id) > 128:
+                raise HTTPException(status_code=422, detail="A valid team recipient is required")
+            org_id, _ = await require_team_recipient(org_id, user.user_id, recipient_user_id)
+            participants = sorted([user.user_id, recipient_user_id])
+            conversation_id = f"team_{participants[0]}_{participants[1]}"
         safe_context = {
             "participants": participants,
             "sender_id": user.user_id,

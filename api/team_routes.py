@@ -6,11 +6,14 @@ Dedicated API routes for team (internal) conversations.
 Endpoints:
   GET  /api/team/conversations                        → list team conversations
   GET  /api/team/conversations/{conversation_id}/messages → fetch messages
+  POST /api/team/rooms                                → create a private room
+  PATCH /api/team/rooms/{room_id}                     → manage a private room
+  POST /api/team/rooms/{room_id}/leave                → leave a private room
 
 Message sending continues to use the existing shared endpoint:
   POST /api/conversations/send-message  (platform="internal")
 
-WebSocket events (new_team_message) are also unchanged.
+WebSocket events keep messages and room membership changes in sync.
 """
 
 from services.team_service import (
@@ -21,26 +24,58 @@ from services.team_service import (
     update_escalation_status,
     create_ai_escalation,
     fetch_team_directory,
-    resolve_team_scope,
+    create_team_room,
+    update_team_room,
+    leave_team_room,
 )
 from fastapi import APIRouter, HTTPException, Header, Query
 from auth.dependencies import CurrentUser
 from config import settings
 from typing import Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from loguru import logger
 
-from auth.dependencies import CurrentUser
-
-
 router = APIRouter(prefix="/api/team", tags=["Team Routes"])
+
+
+class RoomCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    member_ids: list[str] = Field(default_factory=list, max_length=99)
+
+
+class RoomUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    member_ids: Optional[list[str]] = Field(default=None, max_length=100)
 
 
 @router.get("/directory")
 async def get_team_directory(user: CurrentUser):
     if not user.org_id:
         raise HTTPException(status_code=400, detail="Invalid organization ID")
-    return await fetch_team_directory(user.org_id)
+    return await fetch_team_directory(user.org_id, user.user_id)
+
+
+@router.post("/rooms")
+async def add_team_room(payload: RoomCreate, user: CurrentUser):
+    if not user.org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    return await create_team_room(user.org_id, user.user_id, payload.name, payload.member_ids)
+
+
+@router.patch("/rooms/{room_id}")
+async def edit_team_room(room_id: str, payload: RoomUpdate, user: CurrentUser):
+    if not user.org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    if payload.name is None and payload.member_ids is None:
+        raise HTTPException(status_code=422, detail="Provide a room name or members")
+    return await update_team_room(user.org_id, user.user_id, room_id, payload.name, payload.member_ids)
+
+
+@router.post("/rooms/{room_id}/leave")
+async def exit_team_room(room_id: str, user: CurrentUser):
+    if not user.org_id:
+        raise HTTPException(status_code=400, detail="Invalid organization ID")
+    return await leave_team_room(user.org_id, user.user_id, room_id)
 
 
 @router.get("/conversations")
@@ -56,7 +91,7 @@ async def get_team_conversations(user: CurrentUser):
 
     try:
         conversations = await fetch_team_conversations(
-            org_id=resolve_team_scope(org_id),
+            org_id=org_id,
             current_user_id=user.user_id,
         )
         return conversations
@@ -80,7 +115,7 @@ async def get_team_messages(conversation_id: str, user: CurrentUser):
 
     try:
         result = await fetch_team_messages(
-            org_id=resolve_team_scope(org_id),
+            org_id=org_id,
             conversation_id=conversation_id,
             agent_id=user.user_id,
         )

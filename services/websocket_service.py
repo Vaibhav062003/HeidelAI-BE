@@ -546,18 +546,10 @@ async def broadcast_on_stats_update(
     end_time = time.time()
     logger.success(f"✅ Dashboard stats broadcast completed for {org_id} in {end_time - start_time:.2f}s")
 
-async def broadcast_team_message(org_id: str, conversation_id: str, participants: list, payload: dict):
-    """
-    Broadcast an internal message to all online participants in a team chat.
-    """
-    logger.info(f"📡 Broadcasting team message to {len(participants)} participants")
-    
+async def _broadcast_team_event(event_type: str, org_id: str, conversation_id: str, participants: list, payload: dict):
     if not participants:
-        logger.warning(f"⚠️ No participants found for broadcasting in conversation {conversation_id}")
         return
-
     safe_payload = jsonable_encoder(payload)
-    
     for user_id in participants:
         if user_id in services.agent_clients:
             for client_id in list(services.agent_clients[user_id]):
@@ -567,22 +559,30 @@ async def broadcast_team_message(org_id: str, conversation_id: str, participants
                 if ws:
                     try:
                         await ws.send_json({
-                            "type": "new_team_message",
+                            "type": event_type,
                             "data": {
                                 "team_scope_id": org_id,
                                 "conversation_id": conversation_id,
                                 **safe_payload
                             }
                         })
-                        logger.success(f"Sent team message to agent {user_id} (client {client_id})")
                     except Exception:
-                        logger.error(f"Failed to send team message to {client_id}")
+                        logger.error(f"Failed to send {event_type} to {client_id}")
                         await cleanup_client(client_id)
                 else:
-                    logger.warning(f"WebSocket not found for active client {client_id}")
                     await cleanup_client(client_id)
-        else:
-            pass
+
+
+async def broadcast_team_message(org_id: str, conversation_id: str, participants: list, payload: dict):
+    """Broadcast an internal message to all online participants in a team chat."""
+    await _broadcast_team_event("new_team_message", org_id, conversation_id, participants, payload)
+
+
+async def broadcast_team_conversation_updated(
+    org_id: str, conversation_id: str, participants: list, payload: dict
+):
+    """Tell affected clients to refresh their team conversation list."""
+    await _broadcast_team_event("team_conversation_updated", org_id, conversation_id, participants, payload)
 
 async def broadcast_ai_escalation(org_id: str, payload: dict):
     """

@@ -35,6 +35,18 @@ class WorkspaceGroupTests(unittest.TestCase):
         self.assertIn('"sender_id": user.user_id', route)
         self.assertIn('.get("team_scope_id") != org_id', websocket)
 
+    def test_group_rooms_enforce_membership_and_join_time(self):
+        root = Path(__file__).parent
+        service = (root / "services/team_service.py").read_text(encoding="utf-8")
+        route = (root / "api/common_routes.py").read_text(encoding="utf-8")
+        common = (root / "services/common_service.py").read_text(encoding="utf-8")
+        self.assertIn('EVERYONE_ROOM_ID = "team_room_everyone"', service)
+        self.assertIn('message_query["timestamp"] = {"$gte":', service)
+        self.assertIn('user_id not in room.get("participants", [])', service)
+        self.assertIn('doc.get("last_message", "") if is_participant else ""', service)
+        self.assertIn('room_access = await require_team_room', route)
+        self.assertIn('for recipient_id in recipient_ids', common)
+
 
 if __name__ == "__main__":
     unittest.main()

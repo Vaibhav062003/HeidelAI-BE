@@ -1517,6 +1517,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             convo_doc = {
                 "conversation_id": conversation_id,
                 "type": "team",
+                "chat_type": "direct",
                 "participants": participants,
                 "created_at": now,
                 "updated_at": now,
@@ -1528,9 +1529,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             convo_collection.insert_one(convo_doc)
             convo = convo_doc
         
-        # Ensure participants are populated for broadcasting
-        if not participants:
-            participants = convo.get("participants", [])
+        # The stored participant list is authoritative for rooms and existing DMs.
+        participants = convo.get("participants", [])
         
         # Self-healing: if participants list is broken (e.g. contains 'user' as a separate element)
         if participants and ("user" in participants):
@@ -1553,6 +1553,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         messages_collection = db[f"team_messages_{org_id}"]
         sender_id = context.get("sender_id") if context else None
         sender_name = context.get("sender_name") if context else None
+        if sender_id not in participants:
+            raise HTTPException(status_code=403, detail="You are not a member of this team conversation")
         
         msg_id = str(uuid.uuid4())
         msg_doc = {
@@ -1571,12 +1573,7 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
         }
         messages_collection.insert_one(msg_doc)
         
-        recipient_id = None
-        if "participants" in convo:
-            for p in convo["participants"]:
-                if p != sender_id:
-                    recipient_id = p
-                    break
+        recipient_ids = [participant for participant in participants if participant != sender_id]
         
         update_query = {
             "$set": {
@@ -1587,8 +1584,8 @@ async def send_message(org_id: str, platform: str, conversation_id: str, content
             }
         }
         
-        if recipient_id:
-            update_query["$inc"] = {f"unread.{recipient_id}": 1}
+        if recipient_ids:
+            update_query["$inc"] = {f"unread.{recipient_id}": 1 for recipient_id in recipient_ids}
             
         convo_collection.update_one(
             {"conversation_id": conversation_id},
