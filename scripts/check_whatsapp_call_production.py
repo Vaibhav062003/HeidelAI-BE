@@ -34,9 +34,14 @@ for server in ice_servers if isinstance(ice_servers, list) else []:
         and server.get("username")
         and server.get("credential")
     )
+cloudflare_key_id = os.getenv("CLOUDFLARE_TURN_KEY_ID", "").strip()
+cloudflare_api_token = os.getenv("CLOUDFLARE_TURN_API_TOKEN", "").strip()
+if bool(cloudflare_key_id) != bool(cloudflare_api_token):
+    errors.append("configure both CLOUDFLARE_TURN_KEY_ID and CLOUDFLARE_TURN_API_TOKEN")
+has_turn = has_turn or bool(cloudflare_key_id and cloudflare_api_token)
 has_turn = has_turn or bool(os.getenv("WHATSAPP_CALL_TURN_SECRET") and os.getenv("WHATSAPP_CALL_TURN_URLS"))
 if not has_turn:
-    errors.append("configure coturn with WHATSAPP_CALL_TURN_SECRET and WHATSAPP_CALL_TURN_URLS, or provide credentialed TURN JSON")
+    errors.append("configure Cloudflare TURN, coturn, or credentialed TURN JSON")
 
 if errors:
     print("WhatsApp call production preflight failed: " + "; ".join(errors), file=sys.stderr)

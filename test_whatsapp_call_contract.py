@@ -1,4 +1,5 @@
 import ast
+import re
 from pathlib import Path
 
 
@@ -32,6 +33,17 @@ def call_event_payload_keys(source: str) -> list[set[str]]:
     return payloads
 
 
+safe_ice_node = next(
+    node for node in ast.parse(wa_routes).body
+    if isinstance(node, ast.FunctionDef) and node.name == "_safe_ice_servers"
+)
+safe_ice_namespace = {"re": re}
+exec(compile(ast.Module(body=[safe_ice_node], type_ignores=[]), "api/wa_routes.py", "exec"), safe_ice_namespace)
+assert safe_ice_namespace["_safe_ice_servers"]([
+    {"urls": ["turn:example.com:53?transport=udp", "turns:example.com:5349"], "username": "u", "credential": "p"}
+]) == [{"urls": ["turns:example.com:5349"], "username": "u", "credential": "p"}]
+
+
 assert '{"org_id": user.org_id, "call_id": call_id}' in wa_routes
 payloads = call_event_payload_keys(wa_routes) + call_event_payload_keys(webhook_routes)
 assert len(payloads) == 5 and all({"id", "call_id"} <= keys for keys in payloads)
@@ -50,6 +62,10 @@ assert '"errors": safe_call.get("errors") or value.get("errors")' in webhook_rou
 assert 'call.get("status") or call.get("event")' in webhook_routes
 assert '@router.get("/calls")' in wa_routes
 assert '@router.get("/calls/ice-config")' in wa_routes
+assert "CLOUDFLARE_TURN_KEY_ID" in wa_routes and "CLOUDFLARE_TURN_API_TOKEN" in wa_routes
+assert "rtc.live.cloudflare.com/v1/turn/keys/" in wa_routes
+assert 'json={"ttl": 3600}' in wa_routes
+assert 're.search(r":53(?:\\?|$)", url)' in wa_routes
 assert 'hashlib.sha1' in wa_routes and 'timestamp()) + 3600' in wa_routes
 assert '@router.get("/calls/{call_id}")' in wa_routes
 assert '@router.post("/calls/{call_id}/recording")' in wa_routes

@@ -10,6 +10,7 @@ import hashlib
 import hmac
 from typing import Optional
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 # Third-party modules
 import cloudinary
@@ -63,6 +64,8 @@ from config.settings import (
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
     CLOUDINARY_API_SECRET,
+    CLOUDFLARE_TURN_API_TOKEN,
+    CLOUDFLARE_TURN_KEY_ID,
     WHATSAPP_CALL_ICE_SERVERS_JSON,
     WHATSAPP_CALL_TURN_SECRET,
     WHATSAPP_CALL_TURN_URLS,
@@ -521,24 +524,58 @@ async def list_whatsapp_calls(
     return {"items": serialize_mongo(rows), "next_before": next_before}
 
 
-@router.get("/calls/ice-config")
-@limiter.limit("30/minute")
-async def get_whatsapp_call_ice_config(request: Request, user: CurrentUser):
-    try:
-        configured = json.loads(WHATSAPP_CALL_ICE_SERVERS_JSON)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=503, detail="WhatsApp call relay configuration is invalid") from exc
+def _safe_ice_servers(configured):
     servers = []
     for value in configured if isinstance(configured, list) else []:
         urls = value.get("urls") if isinstance(value, dict) else None
         url_list = [urls] if isinstance(urls, str) else urls if isinstance(urls, list) else []
-        url_list = [url for url in url_list if isinstance(url, str) and url.startswith(("stun:", "stuns:", "turn:", "turns:"))]
+        url_list = [
+            url for url in url_list
+            if isinstance(url, str)
+            and url.startswith(("stun:", "stuns:", "turn:", "turns:"))
+            and not re.search(r":53(?:\?|$)", url)
+        ]
         if not url_list:
             continue
         server = {"urls": url_list}
         if isinstance(value.get("username"), str) and isinstance(value.get("credential"), str):
             server.update(username=value["username"], credential=value["credential"])
         servers.append(server)
+    return servers
+
+
+@router.get("/calls/ice-config")
+@limiter.limit("30/minute")
+async def get_whatsapp_call_ice_config(request: Request, user: CurrentUser):
+    if bool(CLOUDFLARE_TURN_KEY_ID) != bool(CLOUDFLARE_TURN_API_TOKEN):
+        raise HTTPException(status_code=503, detail="Cloudflare TURN configuration is incomplete")
+    if CLOUDFLARE_TURN_KEY_ID:
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                response = await client.post(
+                    f"https://rtc.live.cloudflare.com/v1/turn/keys/{quote(CLOUDFLARE_TURN_KEY_ID, safe='')}/credentials/generate-ice-servers",
+                    headers={"Authorization": f"Bearer {CLOUDFLARE_TURN_API_TOKEN}"},
+                    json={"ttl": 3600},
+                )
+                response.raise_for_status()
+                payload = response.json()
+            servers = _safe_ice_servers(payload.get("iceServers") if isinstance(payload, dict) else [])
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Cloudflare TURN credential request failed: {}", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="WhatsApp call relay is temporarily unavailable") from exc
+        if not any(
+            server.get("username") and server.get("credential")
+            and any(url.startswith(("turn:", "turns:")) for url in server["urls"])
+            for server in servers
+        ):
+            raise HTTPException(status_code=503, detail="Cloudflare returned no usable TURN relay")
+        return {"iceServers": servers}
+
+    try:
+        configured = json.loads(WHATSAPP_CALL_ICE_SERVERS_JSON)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=503, detail="WhatsApp call relay configuration is invalid") from exc
+    servers = _safe_ice_servers(configured)
     turn_urls = [url.strip() for url in WHATSAPP_CALL_TURN_URLS.split(",") if url.strip().startswith(("turn:", "turns:"))]
     if turn_urls and WHATSAPP_CALL_TURN_SECRET:
         username = f"{int(datetime.now(timezone.utc).timestamp()) + 3600}:{user.user_id}"
