@@ -70,6 +70,7 @@ assert 'hashlib.sha1' in wa_routes and 'timestamp()) + 3600' in wa_routes
 assert '@router.get("/calls/{call_id}")' in wa_routes
 assert '@router.post("/calls/{call_id}/recording")' in wa_routes
 assert '@router.get("/calls/{call_id}/recording")' in wa_routes
+assert '@router.delete("/calls/{call_id}/recording")' in wa_routes
 assert '@router.post("/calls/{call_id}/recording-sessions")' in wa_routes
 assert '/parts/{sequence}/signature' in wa_routes
 assert '/parts/{sequence}/complete' in wa_routes
@@ -87,6 +88,16 @@ assert '"lease_token": token' in cloudinary_service
 assert '"delete_lease_until": now + timedelta(minutes=5)' in cloudinary_service
 assert 'recording_quota_evictions' in cloudinary_service
 assert '"event": "recording_downloaded"' in wa_routes
+delete_recording_route = next(
+    node for node in ast.parse(wa_routes).body
+    if isinstance(node, ast.AsyncFunctionDef) and node.name == "delete_whatsapp_call_recording_route"
+)
+assert any(
+    isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "admin_required"
+    for node in ast.walk(delete_recording_route)
+)
+assert "admin_deleted" in ast.get_source_segment(wa_routes, delete_recording_route)
+assert "delete_whatsapp_call_recording_assets" in cloudinary_service
 assert '"event": "consent_withdrawn"' in wa_routes
 assert '"recording.status": {"$in": ["ready", "expired"]}' in cloudinary_service
 assert 'scheduler.add_job(process_call_recording_jobs, "interval", seconds=10' in scheduler
