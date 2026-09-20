@@ -4,7 +4,7 @@ This is the backend for the HeidelAI project.
 
 ## WhatsApp browser calls
 
-Configure coturn REST credentials with `WHATSAPP_CALL_TURN_URLS` and `WHATSAPP_CALL_TURN_SECRET` (or supply managed, short-lived credentials through `WHATSAPP_CALL_ICE_SERVERS_JSON`), then run `python3 scripts/check_whatsapp_call_production.py --live-cloudinary` in production. The live check uploads, downloads, and removes a tiny private test recording.
+Configure `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_API_TOKEN` for managed, one-hour TURN credentials. Existing coturn (`WHATSAPP_CALL_TURN_URLS` and `WHATSAPP_CALL_TURN_SECRET`) and `WHATSAPP_CALL_ICE_SERVERS_JSON` configurations remain supported as fallbacks. Then run `python3 scripts/check_whatsapp_call_production.py --live-cloudinary` in production; the live check uploads, downloads, and removes a tiny private test recording.
 
 ## WhatsApp history imports
 
