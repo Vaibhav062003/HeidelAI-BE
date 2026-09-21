@@ -31,6 +31,93 @@ def functions(path, names, **scope):
 
 
 class InboxOutageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_message_history_indexes_are_created_once_per_org(self):
+        messages = SimpleNamespace(create_index=AsyncMock())
+        notes = SimpleNamespace(create_index=AsyncMock())
+        database = {
+            "messages_org": messages,
+            "private_notes_org": notes,
+        }
+        scope = functions(
+            "services/common_service.py",
+            ["ensure_message_history_indexes"],
+            HISTORY_INDEXED_ORGS=set(),
+            HISTORY_INDEX_LOCKS={},
+            get_async_mongo_db=lambda: database,
+        )
+
+        await asyncio.gather(
+            scope["ensure_message_history_indexes"]("org"),
+            scope["ensure_message_history_indexes"]("org"),
+        )
+
+        keys = [("conversation_id", 1), ("timestamp", -1), ("id", -1)]
+        messages.create_index.assert_awaited_once_with(keys, name="conversation_history")
+        notes.create_index.assert_awaited_once_with(keys, name="conversation_history")
+
+    async def test_message_history_reads_are_async_and_parallel(self):
+        started = set()
+        both_started = asyncio.Event()
+
+        class Cursor:
+            def __init__(self, name, rows):
+                self.name = name
+                self.rows = rows
+
+            def sort(self, *_args):
+                return self
+
+            def limit(self, *_args):
+                return self
+
+            async def to_list(self, *, length):
+                started.add(self.name)
+                if len(started) == 2:
+                    both_started.set()
+                await asyncio.wait_for(both_started.wait(), 0.2)
+                return self.rows[:length]
+
+        class HistoryCollection:
+            def __init__(self, name, rows):
+                self.name = name
+                self.rows = rows
+
+            def find(self, *_args):
+                return Cursor(self.name, self.rows)
+
+        class ConversationCollection:
+            async def find_one(self, *_args, **_kwargs):
+                return {"assigned_agent": {"id": "agent"}}
+
+        rows = {
+            "messages_org": HistoryCollection("messages", [
+                {"id": "m3", "timestamp": datetime(2026, 9, 21, 3, tzinfo=timezone.utc)},
+                {"id": "m1", "timestamp": datetime(2026, 9, 21, 1, tzinfo=timezone.utc)},
+            ]),
+            "private_notes_org": HistoryCollection("notes", [
+                {"id": "n2", "timestamp": datetime(2026, 9, 21, 2, tzinfo=timezone.utc)},
+            ]),
+            "conversations_org": ConversationCollection(),
+        }
+        scope = functions(
+            "services/common_service.py",
+            ["fetch_messages"],
+            require_conversation_access=AsyncMock(),
+            ensure_message_history_indexes=AsyncMock(),
+            get_async_mongo_db=lambda: rows,
+            can_claim_conversation_ownership=AsyncMock(return_value=False),
+            HTTPException=RuntimeError,
+        )
+
+        result = await scope["fetch_messages"]("org", "conversation", "agent", "Agent", limit=2)
+
+        self.assertEqual(started, {"messages", "notes"})
+        self.assertEqual([message["id"] for message in result["messages"]], ["n2", "m3"])
+        self.assertTrue(result["has_more"])
+        self.assertEqual(result["next_cursor"], "2026-09-21T02:00:00+00:00__n2")
+        self.assertEqual(result["assignment"], {"assigned_agent": {"id": "agent"}})
+        scope["ensure_message_history_indexes"].assert_awaited_once_with("org")
+
     def websocket_scope(self, db, duplicate=False):
         socket = SimpleNamespace(headers={}, accept=AsyncMock(), close=AsyncMock(), send_json=AsyncMock())
         state = SimpleNamespace(active_clients={}, client_metadata={}, org_clients=defaultdict(set),

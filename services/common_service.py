@@ -68,6 +68,8 @@ def validate_outbound_attachment(file) -> None:
 FOCUS_GROUPS = {"needs_now", "high_intent", "waiting", "later"}
 SEARCH_INDEXED_ORGS = set()
 SEARCH_INDEX_LOCKS: Dict[str, asyncio.Lock] = {}
+HISTORY_INDEXED_ORGS = set()
+HISTORY_INDEX_LOCKS: Dict[str, asyncio.Lock] = {}
 
 def build_focus_group_condition(
     focus_group: str,
@@ -181,6 +183,22 @@ async def ensure_conversation_search_indexes(org_id: str) -> None:
             default_language="none",
         )
         SEARCH_INDEXED_ORGS.add(org_id)
+
+
+async def ensure_message_history_indexes(org_id: str) -> None:
+    if org_id in HISTORY_INDEXED_ORGS:
+        return
+    lock = HISTORY_INDEX_LOCKS.setdefault(org_id, asyncio.Lock())
+    async with lock:
+        if org_id in HISTORY_INDEXED_ORGS:
+            return
+        async_db = get_async_mongo_db()
+        keys = [("conversation_id", 1), ("timestamp", -1), ("id", -1)]
+        await asyncio.gather(
+            async_db[f"messages_{org_id}"].create_index(keys, name="conversation_history"),
+            async_db[f"private_notes_{org_id}"].create_index(keys, name="conversation_history"),
+        )
+        HISTORY_INDEXED_ORGS.add(org_id)
 
 
 def _search_snippet(value: object, query: str, limit: int = 160) -> str:
@@ -885,15 +903,17 @@ async def fetch_messages(
     """
     try:
         await require_conversation_access(org_id, conversation_id, agent_id, role)
+        await ensure_message_history_indexes(org_id)
+        async_db = get_async_mongo_db()
         org_messages_collection_name = f"messages_{org_id}"
         private_note_collection_name = f"private_notes_{org_id}"
         org_conversations_collection_name = f"conversations_{org_id}"
 
-        convo_collection = db[org_conversations_collection_name]
+        convo_collection = async_db[org_conversations_collection_name]
         now = datetime.now(timezone.utc)
         assigned_convo = None
         if await can_claim_conversation_ownership(org_id, agent_id, role):
-            assigned_convo = convo_collection.find_one_and_update(
+            assigned_convo = await convo_collection.find_one_and_update(
                 {
                     "conversation_id": conversation_id,
                     "$or": [
@@ -923,7 +943,7 @@ async def fetch_messages(
             )
 
         if assigned_convo is None:
-            assigned_convo = convo_collection.find_one(
+            assigned_convo = await convo_collection.find_one(
                 {"conversation_id": conversation_id},
                 projection={"assigned_agent": 1, "assignment_history": 1, "type": 1, "participants": 1, "_id": 0}
             )
@@ -960,24 +980,18 @@ async def fetch_messages(
                 raise HTTPException(status_code=400, detail="Invalid `before` cursor")
 
         fetch_limit = limit + 1
-
-        messages, notes = [], []
-
-        if org_messages_collection_name in db.list_collection_names():
-            messages = list(
-                db[org_messages_collection_name]
-                .find(time_filter, {"_id": 0})
-                .sort([("timestamp", -1), ("id", -1)])  # ← compound sort
-                .limit(fetch_limit)
-            )
-
-        if private_note_collection_name in db.list_collection_names():
-            notes = list(
-                db[private_note_collection_name]
-                .find(time_filter, {"_id": 0})
-                .sort([("timestamp", -1), ("id", -1)])  # ← compound sort
-                .limit(fetch_limit)
-            )
+        messages, notes = await asyncio.gather(
+            async_db[org_messages_collection_name]
+            .find(time_filter, {"_id": 0})
+            .sort([("timestamp", -1), ("id", -1)])
+            .limit(fetch_limit)
+            .to_list(length=fetch_limit),
+            async_db[private_note_collection_name]
+            .find(time_filter, {"_id": 0})
+            .sort([("timestamp", -1), ("id", -1)])
+            .limit(fetch_limit)
+            .to_list(length=fetch_limit),
+        )
 
         combined = messages + notes
         combined.sort(key=lambda x: (x.get("timestamp"), x.get("id")), reverse=True)
