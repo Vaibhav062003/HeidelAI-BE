@@ -996,6 +996,10 @@ async def rollback_upload_batch(batch_id: str, user: CurrentUser):
         raise HTTPException(status_code=400, detail="Invalid organization ID")
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, lambda: delete_upload_batch(org_id, batch_id))
+    if result.get("reason") == "not_found":
+        raise HTTPException(status_code=404, detail="Upload batch not found")
+    if result.get("reason") == "invalid_batch":
+        raise HTTPException(status_code=409, detail="Upload batch has no deletion identifier")
     return result
 
 

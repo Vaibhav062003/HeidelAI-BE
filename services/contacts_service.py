@@ -814,8 +814,10 @@ async def get_uploaded_contacts_paginated(
 
         total   = col.count_documents(query)
         skip    = (page - 1) * limit
-        cursor  = col.find(query, {"_id": 0}).skip(skip).limit(limit).sort("upload_metadata.uploaded_date", -1)
+        cursor  = col.find(query).skip(skip).limit(limit).sort("upload_metadata.uploaded_date", -1)
         contacts = list(cursor)
+        for contact in contacts:
+            contact["record_id"] = str(contact.pop("_id"))
 
         return {"contacts": contacts, "total": total, "page": page, "limit": limit}
     except Exception as e:
@@ -828,15 +830,17 @@ async def get_upload_batches(org_id: str) -> list[dict]:
     try:
         batch_col = db[f"contact_upload_batches_{org_id}"]
         batches = list(
-            batch_col.find({}, {"_id": 0}).sort("uploaded_date", -1)
+            batch_col.find({}).sort("uploaded_date", -1)
         )
+        for batch in batches:
+            batch["record_id"] = str(batch.pop("_id"))
         return batches
     except Exception as e:
         logger.error(f"get_upload_batches error: {e}")
         return []
 
 
-def delete_uploaded_contact(org_id: str, conversation_id: str) -> dict:
+def delete_uploaded_contact(org_id: str, identifier: str) -> dict:
     """
     Delete or demote a single bulk-uploaded contact.
 
@@ -846,28 +850,38 @@ def delete_uploaded_contact(org_id: str, conversation_id: str) -> dict:
       → only remove is_bulk_uploaded flag & upload_metadata; preserve the live record.
     """
     col = db[f"contacts_{org_id}"]
-    contact = col.find_one({"conversation_id": conversation_id})
+    contact = None
+    if ObjectId.is_valid(identifier):
+        contact = col.find_one({"_id": ObjectId(identifier), "is_bulk_uploaded": True})
+    if not contact:
+        contact = col.find_one({"conversation_id": identifier, "is_bulk_uploaded": True})
 
     if not contact:
         return {"deleted": False, "reason": "not_found"}
+
+    selector = {"_id": contact["_id"], "is_bulk_uploaded": True}
 
     # Heuristic: a "real" contact has a non-null whatsapp_id or instagram_id
     has_live_identity = bool(contact.get("whatsapp_id") or contact.get("instagram_id"))
 
     if has_live_identity:
         # Demote only — keep the record for the live chat
-        col.update_one(
-            {"conversation_id": conversation_id},
+        result = col.update_one(
+            selector,
             {"$unset": {"is_bulk_uploaded": "", "upload_metadata": "", "name_locked_by_vcf": ""},
              "$set":   {"updated_at": datetime.now(timezone.utc)}}
         )
+        if not result.modified_count:
+            return {"deleted": False, "reason": "not_found"}
         return {"deleted": False, "demoted": True, "reason": "live_contact_preserved"}
     else:
-        col.delete_one({"conversation_id": conversation_id})
+        result = col.delete_one(selector)
+        if not result.deleted_count:
+            return {"deleted": False, "reason": "not_found"}
         return {"deleted": True}
 
 
-def delete_upload_batch(org_id: str, batch_id: str) -> dict:
+def delete_upload_batch(org_id: str, identifier: str) -> dict:
     """
     Rollback an entire upload batch.
 
@@ -880,28 +894,40 @@ def delete_upload_batch(org_id: str, batch_id: str) -> dict:
     batch_col  = db[f"contact_upload_batches_{org_id}"]
     now        = datetime.now(timezone.utc)
 
-    contacts_in_batch = list(col.find({"upload_metadata.batch_id": batch_id}))
+    batch = None
+    if ObjectId.is_valid(identifier):
+        batch = batch_col.find_one({"_id": ObjectId(identifier)})
+    if not batch:
+        batch = batch_col.find_one({"batch_id": identifier})
+    if not batch:
+        return {"deleted_count": 0, "demoted_count": 0, "reason": "not_found"}
+
+    batch_id = batch.get("batch_id")
+    if not batch_id:
+        return {"deleted_count": 0, "demoted_count": 0, "reason": "invalid_batch"}
+
+    contacts_in_batch = list(col.find({"is_bulk_uploaded": True, "upload_metadata.batch_id": batch_id}))
 
     deleted_count = 0
     demoted_count = 0
 
     for contact in contacts_in_batch:
-        conversation_id  = contact.get("conversation_id")
         has_live_identity = bool(contact.get("whatsapp_id") or contact.get("instagram_id"))
+        selector = {"_id": contact["_id"], "is_bulk_uploaded": True}
 
         if has_live_identity:
-            col.update_one(
-                {"conversation_id": conversation_id},
+            result = col.update_one(
+                selector,
                 {"$unset": {"is_bulk_uploaded": "", "upload_metadata": "", "name_locked_by_vcf": ""},
                  "$set":   {"updated_at": now}}
             )
-            demoted_count += 1
+            demoted_count += result.modified_count
         else:
-            col.delete_one({"conversation_id": conversation_id})
-            deleted_count += 1
+            result = col.delete_one(selector)
+            deleted_count += result.deleted_count
 
     # Remove the batch record itself
-    batch_col.delete_one({"batch_id": batch_id})
+    batch_col.delete_one({"_id": batch["_id"]})
     logger.info(f"Batch {batch_id} rolled back: {deleted_count} deleted, {demoted_count} demoted")
 
     return {
