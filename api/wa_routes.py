@@ -2518,32 +2518,31 @@ async def get_whatsapp_profile(request: Request, user: CurrentUser):
 
 @router.get("/templates")
 @limiter.limit("60/minute")
-async def fetch_templates(request: Request, user: CurrentUser):
+async def fetch_templates(
+    request: Request,
+    user: CurrentUser,
+    phone_id: Optional[str] = Query(None, max_length=128),
+):
     """
     fetch prebuilt templates:
     """
     try:
         org_id = user.org_id
-        org_document = db.organizations.find_one({"org_id": org_id})
-
-        wa_id = org_document.get("wa_id")
-        logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
-
-        connection = db.whatsapp_connections.find_one(
-            {"wa_id": wa_id, "org_id": org_id},
-            {"_id": 0, "access_token": 1}
+        connection = await asyncio.to_thread(
+            resolve_outbound_whatsapp_connection,
+            org_id,
+            None,
+            phone_id,
         )
-
-        access_token = connection["access_token"] if connection else None
-
-        if not connection or "access_token" not in connection:
+        if not connection:
             raise HTTPException(
-                status_code=404,
-                detail="WhatsApp connection not found or access token missing"
+                status_code=404 if phone_id else 409,
+                detail="WhatsApp connection not found" if phone_id else "Connect a WhatsApp number before managing templates",
             )
-
-        logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
-
+        wa_id = connection.get("wa_id") or connection.get("waba_id")
+        access_token = connection.get("access_token")
+        if not wa_id or not access_token:
+            raise HTTPException(status_code=409, detail="Reconnect this WhatsApp number before managing templates")
 
         templates = await get_templates(org_id, wa_id, access_token)
 
@@ -2553,6 +2552,8 @@ async def fetch_templates(request: Request, user: CurrentUser):
             "templates": templates
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching prebuilt templates: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch prebuilt templates: {str(e)}")
@@ -2565,23 +2566,21 @@ async def whatsapp_create_template(request: Request, user: CurrentUser, template
     """
     try:
         org_id = user.org_id
-        org_document = db.organizations.find_one({"org_id": org_id})
-
-        wa_id = org_document.get("wa_id")
-        logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
-
-        connection = db.whatsapp_connections.find_one(
-            {"wa_id": wa_id, "org_id": org_id},
-            {"_id": 0, "access_token": 1}
+        connection = await asyncio.to_thread(
+            resolve_outbound_whatsapp_connection,
+            org_id,
+            None,
+            template.phone_id,
         )
-
-        access_token = connection["access_token"] if connection else None
-
-        if not connection or "access_token" not in connection:
+        if not connection:
             raise HTTPException(
-                status_code=404,
-                detail="WhatsApp connection not found or access token missing"
+                status_code=404 if template.phone_id else 409,
+                detail="WhatsApp connection not found" if template.phone_id else "Connect a WhatsApp number before managing templates",
             )
+        wa_id = connection.get("wa_id") or connection.get("waba_id")
+        access_token = connection.get("access_token")
+        if not wa_id or not access_token:
+            raise HTTPException(status_code=409, detail="Reconnect this WhatsApp number before managing templates")
 
         logger.info(f"Creating WhatsApp template: name={template.name}, language={template.language}, category={template.category}, components_count={len(template.components)}")
         
