@@ -56,6 +56,27 @@ def test_outbound_paths_use_bound_sender_and_customer_fields() -> None:
     assert wa_service.count("upsert=True") >= 3
 
 
+def test_template_routes_use_the_selected_whatsapp_connection() -> None:
+    routes = _source("api/wa_routes.py")
+    common = _source("api/common_routes.py")
+    models = _source("schemas/models.py")
+
+    fetch = routes[routes.index("async def fetch_templates"):routes.index('@router.post("/templates")')]
+    create = routes[routes.index("async def whatsapp_create_template"):routes.index('@router.delete("/templates/{template_name}")')]
+    upload = common[common.index("async def upload_media"):common.index('@router.post("/api/whatsapp/upload-media")')]
+    template_model = models[models.index("class Template(BaseModel)"):models.index("# Interactive WhatsApp Message Models")]
+
+    assert "phone_id: Optional[str] = Query(None, max_length=128)" in fetch
+    assert "template.phone_id" in create
+    assert "phone_id: Optional[str] = Form(None, max_length=128)" in upload
+    assert "phone_id: Optional[str] = Field(default=None, max_length=128)" in template_model
+    for source in (fetch, create, upload):
+        assert "resolve_outbound_whatsapp_connection" in source
+        assert "org_document" not in source
+    assert 'connection.get("wa_id") or connection.get("waba_id")' in fetch
+    assert 'connection.get("wa_id") or connection.get("waba_id")' in create
+
+
 class _Cursor(list):
     def limit(self, count: int):
         return _Cursor(self[:count])
@@ -102,6 +123,14 @@ def test_outbound_resolver_prefers_exact_then_primary_then_sole_legacy() -> None
     assert resolve("org", "waba", "two") == secondary
     assert resolve("org", "waba") == primary
 
+    other_waba = {"org_id": "org", "wa_id": "other-waba", "phone_id": "three", "slot": 2}
+    inactive = {"org_id": "org", "wa_id": "other-waba", "phone_id": "inactive", "is_active": False}
+    namespace["db"] = _Db([primary, other_waba, inactive])
+    assert resolve("org", None, "three") == other_waba
+    assert resolve("org", None, "missing") is None
+    assert resolve("org", None, "inactive") is None
+    assert resolve("another-org", None, "three") is None
+
     legacy = {"org_id": "org", "wa_id": "waba", "phone_id": "legacy"}
     namespace["db"] = _Db([legacy])
     assert resolve("org", "waba") == legacy
@@ -112,5 +141,6 @@ def test_outbound_resolver_prefers_exact_then_primary_then_sole_legacy() -> None
 
 if __name__ == "__main__":
     test_outbound_paths_use_bound_sender_and_customer_fields()
+    test_template_routes_use_the_selected_whatsapp_connection()
     test_outbound_resolver_prefers_exact_then_primary_then_sole_legacy()
     print("WhatsApp outbound binding contract passed.")

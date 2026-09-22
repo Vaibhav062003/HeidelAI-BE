@@ -252,6 +252,7 @@ class InviteTeamMembersRequest(BaseModel):
     member_emails: List[EmailStr]
 
 class Template(BaseModel):
+    phone_id: Optional[str] = Field(default=None, max_length=128)
     name: str
     language: str
     category: str

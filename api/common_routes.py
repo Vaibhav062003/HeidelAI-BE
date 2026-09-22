@@ -67,7 +67,7 @@ from services.products_service import (
     delete_product_by_id
 )
 
-from services.wa_service import send_whatsapp_reaction
+from services.wa_service import resolve_outbound_whatsapp_connection, send_whatsapp_reaction
 from loguru import logger
 
 
@@ -1005,31 +1005,31 @@ async def rollback_upload_batch(batch_id: str, user: CurrentUser):
 
 @router.post("/api/templates/upload-media")
 @limiter.limit("30/minute")
-async def upload_media(request: Request, user: CurrentUser, file: UploadFile = File(...)):
+async def upload_media(
+    request: Request,
+    user: CurrentUser,
+    file: UploadFile = File(...),
+    phone_id: Optional[str] = Form(None, max_length=128),
+):
     """
     Creates upload session and uploads file to Meta.
     Returns uploaded file handle.
     """
     org_id = user.org_id
-    org_document = db.organizations.find_one({"org_id": org_id})
-
-    wa_id = org_document.get("wa_id")
-    logger.success(f"Fetched wa_id: {wa_id} for org_id: {org_id}")
-
-    connection = db.whatsapp_connections.find_one(
-            {"wa_id": wa_id, "org_id": org_id},
-            {"_id": 0, "access_token": 1}
-
-        )
-    access_token = connection["access_token"] if connection else None
-
-    if not connection or "access_token" not in connection:
+    connection = await asyncio.to_thread(
+        resolve_outbound_whatsapp_connection,
+        org_id,
+        None,
+        phone_id,
+    )
+    if not connection:
         raise HTTPException(
-            status_code=404,
-            detail="WhatsApp connection not found or access token missing"
+            status_code=404 if phone_id else 409,
+            detail="WhatsApp connection not found" if phone_id else "Connect a WhatsApp number before managing templates",
         )
-
-    logger.success(f"Fetched WhatsApp connection for wa_id: {wa_id}")
+    access_token = connection.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=409, detail="Reconnect this WhatsApp number before managing templates")
 
     try:
         file_content = await file.read()
@@ -1088,6 +1088,8 @@ async def upload_media(request: Request, user: CurrentUser, file: UploadFile = F
 
             return upload_res.json() 
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Upload failed: {e}")
         raise HTTPException(
