@@ -82,6 +82,10 @@ class _Collection:
         self.document.update(update.get("$set", {}))
         return types.SimpleNamespace(matched_count=1)
 
+    async def find_one_and_update(self, _query, update, **_kwargs):
+        self.document.update(update.get("$set", {}))
+        return self.document
+
 
 class _Cursor:
     def __init__(self, documents):
@@ -265,6 +269,11 @@ def test_effective_ai_state_fails_closed():
             "auto_ai_disabled": True,
             "auto_ai_disabled_until": now - timedelta(minutes=1),
         }, True),
+        ({"is_ai_enabled": True}, {
+            "is_ai_enabled": False,
+            "auto_ai_disabled": True,
+            "auto_ai_disabled_until": None,
+        }, False),
         ({"is_ai_enabled": True}, RuntimeError("database unavailable"), False),
     )
     for organization, conversation, expected in cases:
@@ -293,6 +302,28 @@ def test_whatsapp_number_policy_defaults_and_updates():
     updated = asyncio.run(module.update_org_ai_policy("org", True, 60, True, ["line-two"]))
     assert updated["whatsapp_enabled_phone_ids"] == ["line-two"]
     assert module.db.organizations.document["ai_disabled_whatsapp_phone_ids"] == ["historical-line", "line-one"]
+
+
+def test_indefinite_pause_can_only_resume_manually():
+    module = _load_ai_policy_service()
+    conversation = {
+        "conversation_id": "whatsapp_123456",
+        "platform": "whatsapp",
+        "business_phone_id": "primary",
+        "is_ai_enabled": True,
+    }
+    module.db = _DB({"is_ai_enabled": True}, conversation)
+
+    paused = asyncio.run(module.set_conversation_ai_state("org", "whatsapp_123456", "pause_indefinitely"))
+    assert paused["pause_minutes"] is None
+    assert conversation["is_ai_enabled"] is False
+    assert conversation["auto_ai_disabled"] is True
+    assert conversation["auto_ai_disabled_until"] is None
+    assert asyncio.run(module.is_effective_ai_enabled("org", "whatsapp_123456")) is False
+
+    asyncio.run(module.set_conversation_ai_state("org", "whatsapp_123456", "resume"))
+    assert conversation["is_ai_enabled"] is True
+    assert conversation["auto_ai_disabled"] is False
 
 
 def test_channel_and_scheduler_contract():
@@ -369,6 +400,7 @@ if __name__ == "__main__":
     test_all_clients_use_shared_guard()
     test_effective_ai_state_fails_closed()
     test_whatsapp_number_policy_defaults_and_updates()
+    test_indefinite_pause_can_only_resume_manually()
     test_channel_and_scheduler_contract()
     test_reply_validator()
     print("AI fail-closed contract: ok")

@@ -184,7 +184,7 @@ async def is_effective_ai_enabled(org_id: str, conversation_id: str) -> bool:
 async def set_conversation_ai_state(
     org_id: str,
     conversation_id: str,
-    action: Literal["pause", "resume"],
+    action: Literal["pause", "pause_indefinitely", "resume"],
     duration_minutes: int | None = None,
 ) -> dict:
     if not conversation_id.startswith(("whatsapp_", "instagram_")):
@@ -218,6 +218,14 @@ async def set_conversation_ai_state(
             "is_ai_enabled": False,
             "auto_ai_disabled": True,
             "auto_ai_disabled_until": now + timedelta(minutes=minutes),
+            "ai_state_updated_at": now,
+        }}
+    elif action == "pause_indefinitely":
+        minutes = 0
+        update = {"$set": {
+            "is_ai_enabled": False,
+            "auto_ai_disabled": True,
+            "auto_ai_disabled_until": None,
             "ai_state_updated_at": now,
         }}
     else:
@@ -262,7 +270,7 @@ async def resume_expired_ai_pauses(now: datetime | None = None) -> int:
             continue
         collection = db[f"conversations_{org_id}"]
         cursor = collection.find(
-            {"auto_ai_disabled": True, "auto_ai_disabled_until": {"$lte": now}},
+            {"auto_ai_disabled": True, "auto_ai_disabled_until": {"$type": "date", "$lte": now}},
             {"conversation_id": 1},
         )
         async for item in cursor:
@@ -270,7 +278,7 @@ async def resume_expired_ai_pauses(now: datetime | None = None) -> int:
                 {
                     "conversation_id": item["conversation_id"],
                     "auto_ai_disabled": True,
-                    "auto_ai_disabled_until": {"$lte": now},
+                    "auto_ai_disabled_until": {"$type": "date", "$lte": now},
                 },
                 {"$set": {
                     "is_ai_enabled": True,
