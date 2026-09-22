@@ -16,7 +16,7 @@ from database import get_async_mongo_db
 from services.pricing_decision_service import get_pricing_settings
 from services.pricing_policy import PriceSnapshot, QuoteCandidate, decide_pricing_v1
 from services.pricing_service import _floor_tax_basis, floor_snapshot
-from services.quote_service import build_quote_document
+from services.quote_service import DEFAULT_QUOTE_FOOTER, build_quote_document
 from services.sales_case_service import sales_action_job_id, set_sales_action_state
 
 
@@ -343,7 +343,7 @@ async def _create_quote(case: dict[str, Any], source_message_id: str) -> dict[st
         "branding": {"document_title": "Quotation", "build_title": "",
                      "build_label": "", "build_promise": "GST invoice",
                      "theme": "slate", "cover_image_url": "",
-                     "footer_text": "Thank you for your business.",
+                     "footer_text": DEFAULT_QUOTE_FOOTER,
                      "component_categories": [], "design": None},
     }
     document = {

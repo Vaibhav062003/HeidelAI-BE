@@ -13,7 +13,7 @@ from auth.dependencies import CurrentUser
 from core.limiter import limiter
 from database import get_async_mongo_db
 from services.cloudinary_service import upload_media_to_cloudinary
-from services.quote_service import build_quote_document
+from services.quote_service import DEFAULT_QUOTE_FOOTER, build_quote_document, can_edit_quote_footer, quote_footer
 from services.utils import serialize_mongo
 from services.work_team_service import list_work_teams, require_conversation_access
 from services.entitlement_service import require_feature
@@ -202,7 +202,7 @@ class QuoteBranding(BaseModel):
     build_promise: str = Field(default="Manufacturer warranty / GST invoice", max_length=100)
     theme: Literal["slate", "emerald", "blue", "burgundy"] = "slate"
     cover_image_url: str = Field(default="", max_length=2048)
-    footer_text: str = Field(default="Thank you for the opportunity to build this with you.", max_length=240)
+    footer_text: str = Field(default=DEFAULT_QUOTE_FOOTER, max_length=240)
     component_categories: list[QuoteComponentCategory] = Field(default_factory=list, max_length=20)
     design: Optional[QuoteDesign] = None
 
@@ -214,7 +214,7 @@ class QuoteBrandingDefaults(BaseModel):
     build_title: str = Field(default="Performance Workstation", min_length=1, max_length=80)
     build_label: str = Field(default="Custom PC", min_length=1, max_length=30)
     build_promise: str = Field(default="Manufacturer warranty / GST invoice", max_length=100)
-    footer_text: str = Field(default="Thank you for your business.", max_length=240)
+    footer_text: str = Field(default=DEFAULT_QUOTE_FOOTER, max_length=240)
     component_categories: list[QuoteComponentCategory] = Field(default_factory=list, max_length=20)
 
 
@@ -384,6 +384,20 @@ def _settings_collection(org_id: str):
     return db[f"quote_settings_{org_id}"]
 
 
+def _branding_defaults(settings: dict | None, org_id: str) -> dict:
+    defaults = dict((settings or {}).get("branding_defaults") or QuoteBrandingDefaults().model_dump())
+    defaults["footer_text"] = quote_footer(org_id, defaults.get("footer_text"))
+    return defaults
+
+
+def _apply_footer_policy(document: dict, org_id: str) -> dict:
+    document = dict(document)
+    branding = dict(document.get("branding") or {})
+    branding["footer_text"] = quote_footer(org_id, branding.get("footer_text"))
+    document["branding"] = branding
+    return document
+
+
 def _document(payload: QuotePayload, user: CurrentUser) -> dict:
     return build_quote_document(
         {key: value for key, value in payload.model_dump(mode="json").items() if key != "expected_revision" and (key not in {"case_id", "purchase_version"} or value is not None)}, org_id=user.org_id,
@@ -438,7 +452,11 @@ async def list_quotes(
         query,
         {"revisions": 0},
     ).sort("created_at", -1).skip((page - 1) * limit).to_list(length=limit + 1)
-    return {"quotes": serialize_mongo(rows[:limit]), "page": page, "has_more": len(rows) > limit}
+    return {
+        "quotes": serialize_mongo([_apply_footer_policy(row, user.org_id) for row in rows[:limit]]),
+        "page": page,
+        "has_more": len(rows) > limit,
+    }
 
 
 @router.post("", status_code=201)
@@ -503,8 +521,9 @@ async def get_quote_settings(request: Request, user: CurrentUser):
                 "state_code": seller.get("state_code", ""),
             },
             "pdf_design": (settings or {}).get("pdf_design") or QuoteDesign().model_dump(),
-            "branding_defaults": (settings or {}).get("branding_defaults") or QuoteBrandingDefaults().model_dump(),
+            "branding_defaults": _branding_defaults(settings, user.org_id),
             "can_edit": user.role in {"admin", "org:admin"},
+            "can_edit_footer": can_edit_quote_footer(user.org_id),
             "invoice_provider": await invoice_provider(user.org_id),
             "e_invoice_applicability": (settings or {}).get("e_invoice_applicability") or {
                 "status": "unassessed",
@@ -544,7 +563,9 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
     if payload.pdf_design is not None:
         updates["pdf_design"] = payload.pdf_design.model_dump()
     if payload.branding_defaults is not None:
-        updates["branding_defaults"] = payload.branding_defaults.model_dump()
+        defaults = payload.branding_defaults.model_dump()
+        defaults["footer_text"] = quote_footer(user.org_id, defaults.get("footer_text"))
+        updates["branding_defaults"] = defaults
     if payload.invoice_provider is not None:
         if payload.invoice_provider == "native" and not native_invoicing_enabled(user.org_id):
             raise HTTPException(status_code=403, detail="Native invoicing is disabled on this deployment")
@@ -610,8 +631,9 @@ async def update_quote_settings(request: Request, payload: QuoteSettingsPayload,
         "logo_url": settings.get("logo_url", ""),
         "seller": settings.get("seller", {}),
         "pdf_design": settings.get("pdf_design") or QuoteDesign().model_dump(),
-        "branding_defaults": settings.get("branding_defaults") or QuoteBrandingDefaults().model_dump(),
+        "branding_defaults": _branding_defaults(settings, user.org_id),
         "can_edit": True,
+        "can_edit_footer": can_edit_quote_footer(user.org_id),
         "invoice_provider": await invoice_provider(user.org_id),
         "e_invoice_applicability": settings.get("e_invoice_applicability") or {
             "status": "unassessed", "gstin": (settings.get("seller") or {}).get("gstin", ""), "reporting_window_days": None,
@@ -702,7 +724,10 @@ async def get_quote_revisions(request: Request, quote_id: str, user: CurrentUser
     return {
         "quote_id": quote_id,
         "current_revision": int(quote.get("revision_number") or 1),
-        "revisions": serialize_mongo(list(reversed(quote.get("revisions") or []))),
+        "revisions": serialize_mongo([
+            _apply_footer_policy(revision, user.org_id)
+            for revision in reversed(quote.get("revisions") or [])
+        ]),
     }
 
 

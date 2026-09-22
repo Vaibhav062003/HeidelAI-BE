@@ -1,16 +1,34 @@
 """Shared quote totals and storage shape for UI and AI-created quotes."""
 
+import os
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
 from services.quote_math import quote_line_amounts
 
+DEFAULT_QUOTE_FOOTER = "Powered by Heidelai.com | AI Sales Agent"
+FOOTER_EDIT_ORGS = {
+    value.strip() for value in os.getenv("FOOTER_EDIT_ORGS", "").split(",") if value.strip()
+}
+
+
+def can_edit_quote_footer(org_id: str) -> bool:
+    return org_id in FOOTER_EDIT_ORGS
+
+
+def quote_footer(org_id: str, value: object = None) -> str:
+    custom = str(value or "").strip()
+    return custom if custom and can_edit_quote_footer(org_id) else DEFAULT_QUOTE_FOOTER
+
 
 def build_quote_document(
     payload: dict[str, Any], *, org_id: str, actor_id: str, actor_name: str,
 ) -> dict[str, Any]:
     data = deepcopy(payload)
+    branding = data.get("branding") or {}
+    branding["footer_text"] = quote_footer(org_id, branding.get("footer_text"))
+    data["branding"] = branding
     stored_items = []
     subtotal = 0.0
     gst_total = 0.0

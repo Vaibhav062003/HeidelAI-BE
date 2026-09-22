@@ -12,6 +12,12 @@ Set `WHATSAPP_HISTORY_IMPORT_ENCRYPTION_KEY` to a dedicated Fernet key before en
 
 ## Product entitlements
 
+Quotation footer editing is disabled by default. Enable it for selected organizations with comma-separated, exact Clerk organization IDs:
+
+```env
+FOOTER_EDIT_ORGS=org_id_one,org_id_two
+```
+
 Set `ENTITLEMENT_HMAC_SECRET` to the same secret used by the CRM product adapter, `INTERNAL_HMAC_SECRET` to the Math API signing secret, and `CRM_COMMERCIAL_BASE_URL` to the CRM origin. `BILLING_PROXY_ENABLED` defaults to `false`, which keeps `/api/billing/*` available but returns a stable 503 without forwarding credentials to CRM. `ENTITLEMENT_ENFORCEMENT_MODE` defaults to `observe`; in that mode every product is active with unlimited capacity while entitlement writes, usage counters, history, and CRM usage pulls continue normally. Set it to `enforce` only after the CRM entitlement import reports every AI-enabled organization in sync; startup refuses enforcement while an AI organization is missing an active AI or legacy CHATBOT grant. Trial and monthly quota boundaries use `Asia/Kolkata`.
 
 Native invoicing is disabled by default. Enable it for selected organizations with comma-separated, exact organization IDs:
