@@ -1034,6 +1034,14 @@ async def create_or_update_instagram_conversation(org_id: str,
     """
     conversation_id = f"instagram_{username}"
 
+    saved_contact = await asyncio.to_thread(
+        db[f"contacts_{org_id}"].find_one,
+        {"instagram_id": sender_id, "name_locked_by_user": True, "deleted_at": {"$exists": False}},
+        {"full_name": 1, "_id": 0},
+    )
+    if saved_contact and saved_contact.get("full_name"):
+        customer_name = saved_contact["full_name"]
+
     now = datetime.now(timezone.utc)
     
     # Get the org-specific collection

@@ -6,7 +6,7 @@ import re
 import sys
 import types
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from test_uploaded_contacts_delete_contract import Collection, Database, Logger, ObjectId, Result, matches
@@ -129,6 +129,19 @@ def test_customers():
     restored = env["save_directory_contact"]("org", {"full_name": "Restored", "phone_number": "9000000001"})
     assert restored["contact_id"] == contact_id and "deleted_at" not in restored
     assert len(database["contacts_org"].rows) == 1
+    # A later Instagram webhook must preserve the saved name until deletion.
+    database["contacts_org"].rows.append({"_id": ObjectId("64b000000000000000000099"),
+        "instagram_id": "ig-user", "full_name": "Saved Instagram Name", "name_locked_by_user": True})
+    database["conversations_org"].rows.append({"conversation_id": "instagram_ada", "next_action_at": None})
+    async def noop(*args, **kwargs): pass
+    env.update(services=types.SimpleNamespace(org_convo_viewers={}, instagram_connections_map={}),
+               abort_scheduled_message=noop, reopen_conversation=noop, broadcast_main_ws=noop, timedelta=timedelta)
+    load("services/ig_service.py", env, {"create_or_update_instagram_conversation"})
+    asyncio.run(env["create_or_update_instagram_conversation"]("org", "account", "ig-user", "Provider Name", "ada", "Hi", "customer"))
+    assert database["conversations_org"].rows[-1]["customer_name"] == "Saved Instagram Name"
+    env["delete_directory_contact"]("org", "64b000000000000000000099")
+    asyncio.run(env["create_or_update_instagram_conversation"]("org", "account", "ig-user", "Provider Name", "ada", "Hi", "customer"))
+    assert database["conversations_org"].rows[-1]["customer_name"] == "Provider Name"
 
 
 def graph(text="live", trigger="instagram_message"):
