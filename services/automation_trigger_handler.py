@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 # === Internal Modules ===
 from database import get_mongo_db
 from services.automation_keywords import message_contains_keyword
+from services.automation_capabilities import normalize_trigger, TRIGGER_ALIASES
 
 from loguru import logger
 
@@ -100,7 +101,7 @@ async def _find_matching_triggers(
     query = {
         "org_id": org_id,
         "status": "active",
-        "trigger_type": trigger_type
+        "trigger_type": {"$in": [trigger_type, *[alias for alias, canonical in TRIGGER_ALIASES.items() if canonical == trigger_type]]}
     }
     
     # Add platform filter if applicable
@@ -131,7 +132,7 @@ def _event_to_trigger_type(event_type: str, platform: str) -> str:
         "tag_removed": "contact_tag_removed"
     }
     
-    return event_map.get(event_type, event_type)
+    return normalize_trigger(event_map.get(event_type, event_type))
 
 
 def _trigger_matches_criteria(trigger: Dict, trigger_data: Dict) -> bool:

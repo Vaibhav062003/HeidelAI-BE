@@ -323,7 +323,9 @@ async def execute_add_tag(context, node_id: str, config: Dict, trigger_data: Dic
             {"$addToSet": {"categories": tag_name}}
         )
         
-        if result.modified_count > 0:
+        if not result.matched_count:
+            context.log(node_id, "add_tag", "error", "Contact not found", success=False)
+        elif result.modified_count > 0:
             context.log(node_id, "add_tag", "success", f"Tag '{tag_name}' added", success=True)
         else:
             context.log(node_id, "add_tag", "info", f"Tag '{tag_name}' already present", success=True)
@@ -353,7 +355,9 @@ async def execute_remove_tag(context, node_id: str, config: Dict, trigger_data: 
             {"$pull": {"categories": tag_name}}
         )
         
-        if result.modified_count > 0:
+        if not result.matched_count:
+            context.log(node_id, "remove_tag", "error", "Contact not found", success=False)
+        elif result.modified_count > 0:
             context.log(node_id, "remove_tag", "success", f"Tag '{tag_name}' removed", success=True)
         else:
             context.log(node_id, "remove_tag", "info", f"Tag '{tag_name}' not present", success=True)
@@ -438,8 +442,9 @@ async def execute_http_request(context, node_id: str, config: Dict, trigger_data
     # Parse body
     try:
         body = json_lib.loads(body_str) if body_str else {}
-    except:
-        body = {}
+    except json_lib.JSONDecodeError:
+        context.log(node_id, "api", "error", "Invalid JSON request body", success=False)
+        return
     
     context.log(node_id, "api", "executing", f"{method} {url}")
     
@@ -468,7 +473,7 @@ async def execute_http_request(context, node_id: str, config: Dict, trigger_data
             if 200 <= response.status_code < 300:
                 context.log(node_id, "api", "success", f"HTTP {response.status_code}", success=True)
             else:
-                context.log(node_id, "api", "warning", f"HTTP {response.status_code}", success=True)
+                context.log(node_id, "api", "error", f"HTTP {response.status_code}", success=False)
                 
     except Exception as e:
         context.log(node_id, "api", "error", f"HTTP request failed: {str(e)}", success=False)

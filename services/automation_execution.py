@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 # === Internal Modules ===
 from database import get_mongo_db
 from services.automation_actions import execute_action_node
+from services.automation_state import published_snapshot
+from services.automation_capabilities import normalize_trigger, validate_executable_flow
 from loguru import logger
 
 db = get_mongo_db()
@@ -82,6 +84,7 @@ class FlowExecutionContext:
         if success:
             logger.info(f"[{self.execution_id}] {node_id}: {message}")
         else:
+            self.mark_failed(message, node_id)
             logger.error(f"[{self.execution_id}] {node_id}: {message}")
     
     def set_variable(self, key: str, value: Any):
@@ -185,7 +188,6 @@ async def execute_automation_flow(
         source_id = next((trigger_data.get(key) for key in ("message_id", "comment_id", "event_id", "row_id") if trigger_data.get(key)), None)
         if not source_id:
             source_id = hashlib.sha256(json.dumps(trigger_data, sort_keys=True, default=str).encode()).hexdigest()
-        await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", 1, f"automation:{flow_id}:{trigger_type}:{source_id}")
         flows_collection = _automation_flows_collection(org_id)
         flow = flows_collection.find_one({"flow_id": flow_id, "org_id": org_id})
         
@@ -203,7 +205,9 @@ async def execute_automation_flow(
             success=True
         )
         
-        flow_data = flow.get("flow_data", {})
+        flow_data = published_snapshot(flow).get("flow_data", {})
+        validate_executable_flow(flow_data)
+        await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", 1, f"automation:{flow_id}:{trigger_type}:{source_id}")
         nodes = flow_data.get("nodes", {})
         connections = flow_data.get("connections", [])
         triggers = flow_data.get("triggers", [])
@@ -216,12 +220,12 @@ async def execute_automation_flow(
             "google_sheet_row": "google_sheet",
         }
 
-        expected_trigger_type = event_to_trigger_map.get(context.trigger_type, context.trigger_type)
+        expected_trigger_type = normalize_trigger(event_to_trigger_map.get(context.trigger_type, context.trigger_type))
 
         # Find matching trigger
         start_node_id = None
         for trigger_config in triggers:
-            ttype = trigger_config.get("type")
+            ttype = normalize_trigger(trigger_config.get("type"))
             if ttype == expected_trigger_type or ttype in (context.trigger_type,):
                 start_node_id = trigger_config.get("start_node_id")
                 logger.info(f"✅ Found matching trigger, starting at node: {start_node_id}")
@@ -231,7 +235,10 @@ async def execute_automation_flow(
             raise Exception(f"No matching trigger found for type: {expected_trigger_type}")
 
         logger.info(f"🚀 Executing flow from start_node: {start_node_id}")
-        await _execute_node(context, start_node_id, nodes, connections)
+        if not await _execute_node(context, start_node_id, nodes, connections):
+            if context.status != "failed":
+                context.mark_failed("Workflow stopped because an action failed.")
+            return context.to_dict()
 
         context.mark_success()
         
@@ -278,6 +285,8 @@ async def _execute_node(
     connections: List[Dict]
 ) -> bool:
     """Execute a single node and its connected nodes"""
+    if context.status == "failed":
+        return False
     if node_id not in nodes:
         context.log(
             node_id=node_id,
@@ -291,6 +300,8 @@ async def _execute_node(
     node = nodes[node_id]
     node_type = node.get("type")
     node_config = node.get("config", {})
+    if node_type == "message" and "content" not in node_config:
+        node_config = {**node_config, "content": node.get("content", {})}
     
     context.log(
         node_id=node_id,
@@ -311,29 +322,38 @@ async def _execute_node(
                 success=True
             )
         
+        elif node_type == "stop":
+            context.log(node_id, node_type, "stop", node_config.get("reason") or "Flow stopped")
+            return True
+
         # Handle CONDITION nodes
         elif node_type == "condition":
             result = await _execute_condition_node(context, node_id, node_config)
             next_nodes = _get_conditional_next_nodes(node_id, connections, result)
             for next_node_id in next_nodes:
-                await _execute_node(context, next_node_id, nodes, connections)
+                if not await _execute_node(context, next_node_id, nodes, connections):
+                    return False
             return True
         
         # Handle RANDOMIZER nodes
         elif node_type == "randomizer":
             next_node_id = await _execute_randomizer_node(context, node_id, connections)
             if next_node_id:
-                await _execute_node(context, next_node_id, nodes, connections)
+                if not await _execute_node(context, next_node_id, nodes, connections):
+                    return False
             return True
         
         # Handle all ACTION nodes
         else:
             await execute_action_node(context, node_id, node_type, node_config)
         
+        if context.status == "failed":
+            return False
         # Find and execute next connected nodes
         next_nodes = _get_next_nodes(node_id, connections)
         for next_node_id in next_nodes:
-            await _execute_node(context, next_node_id, nodes, connections)
+            if not await _execute_node(context, next_node_id, nodes, connections):
+                return False
         
         return True
         
@@ -350,8 +370,10 @@ async def _execute_node(
 
 async def _execute_condition_node(context: FlowExecutionContext, node_id: str, config: Dict) -> bool:
     variable = config.get("variable")
-    operator = config.get("operator")
+    operator = {"includes": "contains", "not_includes": "not_contains"}.get(config.get("operator"), config.get("operator"))
     value = config.get("value")
+    if operator not in {"equals", "not_equals", "contains", "not_contains", "greater_than", "less_than"}:
+        raise ValueError(f"Unsupported condition operator: {operator}")
     var_value = context.get_variable(variable)
     
     result = False
@@ -417,12 +439,9 @@ def _get_conditional_next_nodes(node_id: str, connections: List[Dict], condition
     matching_nodes = []
     for conn in connections:
         if conn.get("source") == node_id:
-            source_handle = conn.get("sourceHandle", "")
-            if result_str in source_handle.lower():
+            source_handle = conn.get("source_handle") or conn.get("sourceHandle", "")
+            if result_str == source_handle.lower():
                 matching_nodes.append(conn["target"])
-    
-    if not matching_nodes:
-        matching_nodes = _get_next_nodes(node_id, connections)
     
     return matching_nodes
 

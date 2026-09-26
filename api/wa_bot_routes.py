@@ -36,6 +36,7 @@ class WaBotFlowBody(BaseModel):
     plus any extra fields.  We use `Any` to stay forward-compatible.
     """
     name: str = Field(..., min_length=1, max_length=255)
+    expected_draft_version: Optional[int] = Field(None, ge=1)
     model_config = {"extra": "allow"}  # accept all flat WaBot fields
 
     def flat_dict(self) -> dict:
@@ -43,6 +44,7 @@ class WaBotFlowBody(BaseModel):
 
 
 class WaBotPublishBody(BaseModel):
+    expected_draft_version: Optional[int] = Field(None, ge=1)
     phone_ids: list[str] = Field(default_factory=list)
 
 
@@ -206,6 +208,7 @@ async def publish_flow(flow_id: str, user: CurrentUser, payload: WaBotPublishBod
                 org_id=org_id,
                 flow_id=flow_id,
                 phone_ids=payload.phone_ids,
+                expected_draft_version=payload.expected_draft_version,
                 updated_by=user.user_id,
             )
         finally:
