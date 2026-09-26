@@ -37,7 +37,7 @@ class TallyContactSyncContract(unittest.TestCase):
     def test_contacts_hide_tally_data_outside_org_allowlist(self):
         contacts = pathlib.Path("services/contacts_service.py").read_text()
         self.assertIn("include_tally = tally_enabled(org_id)", contacts)
-        self.assertIn('{"platform": {"$ne": "tally"}}', contacts)
+        self.assertIn('query["platform"] = {"$ne": "tally"}', contacts)
         self.assertIn('if include_tally:\n        projection["tally"] = 1', contacts)
 
 

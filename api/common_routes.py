@@ -1,3 +1,4 @@
+from pydantic import BaseModel, Field
 import json
 import os
 import re
@@ -38,6 +39,7 @@ from services.common_service import (
 from services.contacts_service import (
     get_contacts_for_org, 
     get_contacts_page_for_org,
+    save_directory_contact, delete_directory_contact,
     update_contact_tag_categories,
     update_contact_labels,
     add_tag_to_org_metadata,
@@ -661,6 +663,32 @@ async def get_contacts(
 
     return await get_contacts_page_for_org(org_id, page, limit, search, tags[:20], snapshot)
 
+class ContactProfileRequest(BaseModel):
+    full_name: str | None = Field(None, min_length=1, max_length=255)
+    phone_number: str | None = Field(None, max_length=40)
+    email: str | None = Field(None, max_length=254)
+    company: str | None = Field(None, max_length=255)
+    country: str | None = Field(None, max_length=100)
+    categories: list[str] = Field(default_factory=list, max_length=50)
+    model_config = {"extra": "forbid"}
+
+
+@router.post("/api/contacts", status_code=201)
+@limiter.limit("30/minute")
+async def create_contact_profile(request: Request, payload: ContactProfileRequest, user: CurrentUser):
+    contact = await asyncio.to_thread(save_directory_contact, user.org_id, payload.model_dump(exclude_unset=True))
+    return {"contact": contact}
+
+
+@router.patch("/api/contacts/{contact_id}")
+@limiter.limit("60/minute")
+async def update_contact_profile(request: Request, contact_id: str, payload: ContactProfileRequest, user: CurrentUser):
+    contact = await asyncio.to_thread(save_directory_contact, user.org_id, payload.model_dump(exclude_unset=True), contact_id)
+    return {"contact": contact}
+
+
+
+
 @router.post("/api/contacts/update-categories")
 @limiter.limit("60/minute")
 async def update_contact_categories(request: Request, body: UpdateCategoriesRequest, user: CurrentUser):
@@ -1001,6 +1029,12 @@ async def rollback_upload_batch(batch_id: str, user: CurrentUser):
     if result.get("reason") == "invalid_batch":
         raise HTTPException(status_code=409, detail="Upload batch has no deletion identifier")
     return result
+
+
+@router.delete("/api/contacts/{contact_id}")
+@limiter.limit("30/minute")
+async def delete_contact_profile(request: Request, contact_id: str, user: CurrentUser):
+    return await asyncio.to_thread(delete_directory_contact, user.org_id, contact_id)
 
 
 @router.post("/api/templates/upload-media")
