@@ -55,12 +55,25 @@ def _normalized_phone_ids(phone_ids: List[str]) -> List[str]:
 async def _validate_publish_phone_ids(org_id: str, phone_ids: List[str], session=None) -> List[str]:
     normalized = _normalized_phone_ids(phone_ids)
     if not normalized:
-        connections = await db.whatsapp_connections.find({'org_id': org_id, 'is_active': {'$ne': False}}, {'phone_id': 1, 'slot': 1, '_id': 0}, session=session).to_list(length=2)
-        if len(connections) != 1 or not connections[0].get('phone_id'):
-            raise ValueError('Select at least one active WhatsApp phone number')
-        normalized = [str(connections[0]['phone_id'])]
-    connections = await db.whatsapp_connections.find({'org_id': org_id, 'phone_id': {'$in': normalized}, 'is_active': {'$ne': False}}, {'phone_id': 1, '_id': 0}, session=session).to_list(length=len(normalized))
-    found = {str(connection.get('phone_id') or '') for connection in connections}
+        connections = await db.whatsapp_connections.find(
+            {"org_id": org_id, "is_active": {"$ne": False}},
+            {"phone_id": 1, "slot": 1, "_id": 0},
+            session=session,
+        ).to_list(length=2)
+        if len(connections) != 1 or not connections[0].get("phone_id"):
+            raise ValueError("Select at least one active WhatsApp phone number")
+        normalized = [str(connections[0]["phone_id"])]
+
+    connections = await db.whatsapp_connections.find(
+        {
+            "org_id": org_id,
+            "phone_id": {"$in": normalized},
+            "is_active": {"$ne": False},
+        },
+        {"phone_id": 1, "_id": 0},
+        session=session,
+    ).to_list(length=len(normalized))
+    found = {str(connection.get("phone_id") or "") for connection in connections}
     missing = [phone_id for phone_id in normalized if phone_id not in found]
     if missing:
         raise ValueError(f"Unknown or inactive WhatsApp phone IDs: {', '.join(missing)}")
@@ -68,19 +81,39 @@ async def _validate_publish_phone_ids(org_id: str, phone_ids: List[str], session
 
 
 async def _clear_flow_bindings(org_id: str, flow_id: str, session=None) -> None:
-    await db.whatsapp_connections.update_many({'org_id': org_id, 'wa_bot_flow_id': flow_id}, {'$unset': {'wa_bot_flow_id': ''}}, session=session)
+    await db.whatsapp_connections.update_many(
+        {"org_id": org_id, "wa_bot_flow_id": flow_id},
+        {"$unset": {"wa_bot_flow_id": ""}},
+        session=session,
+    )
 
 
 async def _bind_flow_to_phone_ids(org_id: str, flow_id: str, phone_ids: List[str], session=None) -> None:
-    previous = await db.whatsapp_connections.find({'org_id': org_id, 'phone_id': {'$in': phone_ids}, 'wa_bot_flow_id': {'$ne': flow_id}}, {'wa_bot_flow_id': 1, '_id': 0}, session=session).to_list(length=len(phone_ids))
-    replaced_flow_ids = {str(item.get('wa_bot_flow_id')) for item in previous if item.get('wa_bot_flow_id')}
+    previous = await db.whatsapp_connections.find(
+        {"org_id": org_id, "phone_id": {"$in": phone_ids}, "wa_bot_flow_id": {"$ne": flow_id}},
+        {"wa_bot_flow_id": 1, "_id": 0},
+        session=session,
+    ).to_list(length=len(phone_ids))
+    replaced_flow_ids = {
+        str(item.get("wa_bot_flow_id")) for item in previous if item.get("wa_bot_flow_id")
+    }
     await _clear_flow_bindings(org_id, flow_id, session=session)
-    await db.whatsapp_connections.update_many({'org_id': org_id, 'phone_id': {'$in': phone_ids}, 'is_active': {'$ne': False}}, {'$set': {'wa_bot_flow_id': flow_id}}, session=session)
+    await db.whatsapp_connections.update_many(
+        {"org_id": org_id, "phone_id": {"$in": phone_ids}, "is_active": {"$ne": False}},
+        {"$set": {"wa_bot_flow_id": flow_id}},
+        session=session,
+    )
     now = datetime.now(timezone.utc)
     for replaced_flow_id in replaced_flow_ids:
-        remaining = await db.whatsapp_connections.count_documents({'org_id': org_id, 'wa_bot_flow_id': replaced_flow_id, 'is_active': {'$ne': False}}, session=session)
+        remaining = await db.whatsapp_connections.count_documents({
+            "org_id": org_id, "wa_bot_flow_id": replaced_flow_id, "is_active": {"$ne": False},
+        }, session=session)
         if remaining == 0:
-            await _col(org_id).update_one({'flow_id': replaced_flow_id, 'org_id': org_id}, {'$set': {'status': 'draft', 'published_at': None, 'updated_at': now}}, session=session)
+            await _col(org_id).update_one(
+                {"flow_id": replaced_flow_id, "org_id": org_id},
+                {"$set": {"status": "draft", "published_at": None, "updated_at": now}},
+                session=session,
+            )
 
 # ─── CREATE ───────────────────────────────────────────────────────────────────
 

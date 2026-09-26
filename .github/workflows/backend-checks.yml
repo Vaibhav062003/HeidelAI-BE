@@ -85,6 +85,9 @@ jobs:
           python test_whatsapp_call_contract.py
           python tests/contracts/test_whatsapp_call_history_contract.py
           python tests/contracts/test_uploaded_contacts_delete_contract.py
+          python tests/contracts/test_contacts_pagination_contract.py
+          python tests/contracts/test_tally_contact_sync_contract.py
+          python tests/contracts/test_active_flow_completion.py
           python -m unittest test_stock_sheet_writeback test_product_sheet_pricing_foundation test_product_requests test_product_request_extraction test_restock_dispatch -q
           python test_entitlement_contract.py
           python test_release_catalogue.py
