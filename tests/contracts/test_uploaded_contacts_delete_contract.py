@@ -21,9 +21,10 @@ class ObjectId:
 
 
 class Result:
-    def __init__(self, *, deleted_count=0, modified_count=0):
+    def __init__(self, *, deleted_count=0, modified_count=0, matched_count=0):
         self.deleted_count = deleted_count
         self.modified_count = modified_count
+        self.matched_count = matched_count
 
 
 def field(row, dotted_key):
@@ -36,7 +37,20 @@ def field(row, dotted_key):
 
 
 def matches(row, query):
-    return all(field(row, key) == value for key, value in query.items())
+    for key, value in query.items():
+        actual = field(row, key)
+        if key == "$and":
+            if not all(matches(row, part) for part in value): return False
+        elif key == "$or":
+            if not any(matches(row, part) for part in value): return False
+        elif isinstance(value, dict):
+            for operator, expected in value.items():
+                if operator == "$exists" and (key in row) != expected: return False
+                if operator == "$ne" and actual == expected: return False
+                if operator == "$in" and actual not in expected: return False
+        elif actual != value:
+            return False
+    return True
 
 
 class Cursor:
@@ -68,20 +82,20 @@ class Collection:
     def count_documents(self, query):
         return sum(matches(row, query) for row in self.rows)
 
-    def find(self, query):
+    def find(self, query, projection=None, **kwargs):
         return Cursor([dict(row) for row in self.rows if matches(row, query)])
 
-    def find_one(self, query):
+    def find_one(self, query, projection=None, **kwargs):
         return next((dict(row) for row in self.rows if matches(row, query)), None)
 
-    def update_one(self, query, update):
+    def update_one(self, query, update, **kwargs):
         row = next((row for row in self.rows if matches(row, query)), None)
         if not row:
             return Result()
         for key in update.get("$unset", {}):
             row.pop(key, None)
         row.update(update.get("$set", {}))
-        return Result(modified_count=1)
+        return Result(modified_count=1, matched_count=1)
 
     def delete_one(self, query):
         row = next((row for row in self.rows if matches(row, query)), None)
@@ -116,6 +130,7 @@ def load_functions(database):
         "get_upload_batches",
         "delete_uploaded_contact",
         "delete_upload_batch",
+        "delete_directory_contact",
     }
     tree = ast.parse(Path("services/contacts_service.py").read_text())
     functions = [
@@ -148,9 +163,11 @@ def test_uploaded_contact_record_ids_and_deletion():
     assert all("_id" not in row for row in page["contacts"])
 
     assert functions["delete_uploaded_contact"]("org", upload_id) == {"deleted": True}
-    assert functions["delete_uploaded_contact"]("org", "whatsapp_live")["demoted"] is True
-    assert len(contacts.rows) == 1
-    assert "is_bulk_uploaded" not in contacts.rows[0]
+    assert functions["delete_uploaded_contact"]("org", "whatsapp_live") == {"deleted": True}
+    assert len(contacts.rows) == 2
+    assert all(row.get("deleted_at") for row in contacts.rows)
+    assert contacts.rows[1]["conversation_id"] == "whatsapp_live"
+    assert asyncio.run(functions["get_uploaded_contacts_paginated"]("org"))["contacts"] == []
 
 
 def test_uploaded_batch_record_id_and_rollback():

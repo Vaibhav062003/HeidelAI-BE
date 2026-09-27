@@ -25,6 +25,7 @@ os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017")
 # Keep this contract runnable in the repo's minimal local virtualenv.
 database_stub = ModuleType("database")
 database_stub.get_async_mongo_db = lambda: None
+database_stub.get_async_mongo_client = lambda: None
 sys.modules["database"] = database_stub
 loguru_stub = ModuleType("loguru")
 loguru_stub.logger = SimpleNamespace(
@@ -450,13 +451,13 @@ class AsyncCollection:
     def __init__(self, documents=None):
         self.documents = [deepcopy(document) for document in (documents or [])]
 
-    def find(self, query, _projection=None):
+    def find(self, query, _projection=None, **_kwargs):
         return AsyncCursor([document for document in self.documents if _matches(document, query)])
 
-    async def find_one(self, query):
+    async def find_one(self, query, **_kwargs):
         return next((deepcopy(document) for document in self.documents if _matches(document, query)), None)
 
-    async def find_one_and_update(self, query, update, return_document=None):
+    async def find_one_and_update(self, query, update, return_document=None, **_kwargs):
         for document in self.documents:
             if _matches(document, query):
                 document.update(deepcopy(update.get("$set", {})))
@@ -465,7 +466,7 @@ class AsyncCollection:
                 return deepcopy(document)
         return None
 
-    async def update_many(self, query, update):
+    async def update_many(self, query, update, **_kwargs):
         matched = 0
         for document in self.documents:
             if not _matches(document, query):
@@ -488,6 +489,27 @@ class AsyncCollection:
         return SimpleNamespace(inserted_id=document.get("flow_id"))
 
 
+class AsyncTransaction:
+    def __init__(self, database):
+        self.database = database
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        pass
+
+    async def with_transaction(self, callback):
+        collections = [self.database.whatsapp_connections, *self.database.collections.values()]
+        before = [deepcopy(collection.documents) for collection in collections]
+        try:
+            return await callback(self)
+        except Exception:
+            for collection, documents in zip(collections, before):
+                collection.documents = documents
+            raise
+
+
 class AsyncDB:
     def __init__(self):
         self.whatsapp_connections = AsyncCollection([
@@ -502,7 +524,9 @@ class AsyncDB:
                     "flow_id": "flow-1",
                     "name": "Bound flow",
                     "status": "draft",
-                    "nodes": {"start": {"type": "text"}},
+                    "trigger_messages": "hello",
+                    "start_node_id": "start",
+                    "nodes": {"start": {"type": "text", "content": "Hello"}},
                 },
             ])
         }
@@ -510,10 +534,14 @@ class AsyncDB:
     def __getitem__(self, name):
         return self.collections[name]
 
+    async def start_session(self):
+        return AsyncTransaction(self)
+
 
 def test_publish_binds_connections_without_adding_phone_ids_to_flow(monkeypatch):
     database = AsyncDB()
     monkeypatch.setattr(wa_bot_service, "db", database)
+    monkeypatch.setattr(wa_bot_service, "get_async_mongo_client", lambda: database)
 
     published = asyncio.run(wa_bot_service.publish_wa_bot_flow(
         "org", "flow-1", ["phone-2", "phone-2", "phone-1"], updated_by="user",
@@ -535,6 +563,7 @@ def test_publish_binds_connections_without_adding_phone_ids_to_flow(monkeypatch)
 def test_publish_rejects_unknown_phone_and_delete_or_duplicate_stays_unbound(monkeypatch):
     database = AsyncDB()
     monkeypatch.setattr(wa_bot_service, "db", database)
+    monkeypatch.setattr(wa_bot_service, "get_async_mongo_client", lambda: database)
 
     try:
         asyncio.run(wa_bot_service.publish_wa_bot_flow("org", "flow-1", ["missing"]))

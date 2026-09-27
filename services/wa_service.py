@@ -352,9 +352,9 @@ async def create_or_update_whatsapp_conversation(
     contact_doc = await asyncio.to_thread(
         contacts_col.find_one,
         {"phone_number": customer_phone_no},
-        {"name_locked_by_vcf": 1, "full_name": 1, "_id": 0}
+        {"name_locked_by_vcf": 1, "name_locked_by_user": 1, "deleted_at": 1, "full_name": 1, "_id": 0}
     )
-    is_name_locked_by_vcf = contact_doc.get("name_locked_by_vcf", False) if contact_doc else False
+    is_name_locked_by_vcf = bool(contact_doc and not contact_doc.get("deleted_at") and (contact_doc.get("name_locked_by_vcf") or contact_doc.get("name_locked_by_user")))
 
     if is_name_locked_by_vcf and contact_doc.get("full_name"):
         # VCF name takes absolute priority — never overwrite

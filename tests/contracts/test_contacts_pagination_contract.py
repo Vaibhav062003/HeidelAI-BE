@@ -74,9 +74,9 @@ def load_helpers(collection):
     tree = ast.parse(Path("services/contacts_service.py").read_text())
     functions = [
         node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_get_contacts_page"
+        if isinstance(node, ast.FunctionDef) and node.name in {"_get_contacts_page", "directory_contact"}
     ]
-    namespace = {"db": Database(collection), "re": re, "ObjectId": ObjectId, "HTTPException": ValueError}
+    namespace = {"db": Database(collection), "re": re, "ObjectId": ObjectId, "HTTPException": ValueError, "tally_enabled": lambda org: False}
     exec(compile(ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])), "contacts", "exec"), namespace)
     return namespace
 
@@ -97,6 +97,7 @@ def test_contact_page_and_bulk_audience():
     assert collection.cursor.limited == 10
     assert collection.cursor.sorted == ("_id", -1)
     filtered_query = collection.query["$and"][0]
+    assert filtered_query["$and"][0]["deleted_at"] == {"$exists": False}
     assert filtered_query["$and"][0]["$or"][0] == {"categories": {"$in": ["lead"]}}
     assert filtered_query["$and"][1]["$or"][0]["full_name"]["$regex"] == r"Sam\.\*"
 

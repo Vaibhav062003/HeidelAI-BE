@@ -559,8 +559,8 @@ async def aggregate_dashboard_stats(
             "conversationFlow": flow,
             "aiMetrics": {
                 "conversationsHandled": curr_hl.get("ai_handled", 0),
-                "avgResponseTime": 12,
-                "escalationRate": 15.4
+                "avgResponseTime": None,
+                "escalationRate": None
             },
             "humanPerformance": human_performance,
             "followupTracker": followup_tracker,

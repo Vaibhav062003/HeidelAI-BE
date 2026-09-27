@@ -12,7 +12,7 @@ from pymongo.errors import PyMongoError, BulkWriteError
 
 # Internal Modules
 from core.services import services
-from database import get_mongo_db
+from database import get_mongo_db, get_mongo_client
 from loguru import logger
 from services.feature_flags import tally_enabled
 from services.websocket_service import broadcast_on_stats_update
@@ -23,6 +23,81 @@ db = get_mongo_db()
 
 # Pre-compiled regex patterns for performance
 EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+
+
+def directory_contact(contact):
+    result = dict(contact)
+    contact_id = result.pop("_id", None)
+    if contact_id is not None:
+        result["contact_id"] = str(contact_id)
+    return result
+
+
+def save_directory_contact(org_id: str, values: dict, contact_id: str | None = None):
+    collection = db[f"contacts_{org_id}"]
+    fields = {key: value for key, value in values.items() if key in {"full_name", "phone_number", "email", "company", "country", "categories"}}
+    if "full_name" in fields:
+        fields["full_name"] = str(fields["full_name"] or "").strip()
+        if not fields["full_name"]:
+            raise HTTPException(422, "Contact name is required.")
+    if fields.get("email") and not _validate_email(fields["email"]):
+        raise HTTPException(422, "Enter a valid email address.")
+    if "phone_number" in fields:
+        phone = normalize_phone(fields["phone_number"] or "", default_country_code=get_org_default_country_code(org_id))
+        if not re.fullmatch(r"\+?\d{10,15}", phone or ""):
+            raise HTTPException(422, "Enter a valid phone number.")
+        fields["phone_number"] = phone
+    if "categories" in fields:
+        fields["categories"] = list(dict.fromkeys(str(tag).strip() for tag in fields["categories"] if str(tag).strip()))
+
+    def save(session):
+        now = datetime.now(timezone.utc)
+        existing = None
+        if contact_id:
+            if not ObjectId.is_valid(contact_id):
+                raise HTTPException(404, "Contact not found.")
+            existing = collection.find_one({"_id": ObjectId(contact_id), "deleted_at": {"$exists": False}}, session=session)
+            if not existing:
+                raise HTTPException(404, "Contact not found.")
+            if fields.get("phone_number") != existing.get("phone_number") and "phone_number" in fields and (existing.get("conversation_id") or existing.get("whatsapp_id") or existing.get("instagram_id") or existing.get("tally")):
+                raise HTTPException(409, "The messaging or accounting identity cannot be changed here.")
+        elif not fields.get("full_name") or not fields.get("phone_number"):
+            raise HTTPException(422, "Name and phone number are required.")
+        if fields.get("phone_number"):
+            other = collection.find_one({"phone_number": fields["phone_number"]}, session=session)
+            if other and (not existing or other["_id"] != existing["_id"]):
+                if not contact_id and other.get("deleted_at"):
+                    existing = other
+                else:
+                    raise HTTPException(409, "This phone number already has a saved contact.")
+        if existing and existing.get("platform") == "tally" and any(key in fields and fields[key] != existing.get(key) for key in ("full_name", "email", "company", "phone_number")):
+            raise HTTPException(409, "Edit accounting-owned details in Tally.")
+        fields["updated_at"] = now
+        if "full_name" in fields:
+            fields["name_locked_by_user"] = True
+        if existing:
+            result = collection.find_one_and_update({"_id": existing["_id"]}, {"$set": fields, "$unset": {"deleted_at": ""}}, return_document=True, session=session)
+        else:
+            result = {**fields, "platform": "manual", "created_at": now, "categories": fields.get("categories", []), "labels": []}
+            result["_id"] = collection.insert_one(result, session=session).inserted_id
+        if fields.get("full_name"):
+            conversation_ids = list(dict.fromkeys([*(result.get("conversation_ids") or []), result.get("conversation_id")]))
+            conversation_ids = [value for value in conversation_ids if value]
+            if conversation_ids:
+                db[f"conversations_{org_id}"].update_many({"conversation_id": {"$in": conversation_ids}}, {"$set": {"customer_name": fields["full_name"], "customer_name_prefixes": name_search_prefixes(fields["full_name"])}}, session=session)
+        return directory_contact(result)
+    with get_mongo_client().start_session() as session:
+        return session.with_transaction(save)
+
+
+def delete_directory_contact(org_id: str, contact_id: str):
+    if not ObjectId.is_valid(contact_id):
+        raise HTTPException(404, "Contact not found.")
+    result = db[f"contacts_{org_id}"].update_one({"_id": ObjectId(contact_id)}, {"$set": {"deleted_at": datetime.now(timezone.utc)}})
+    if not result.matched_count:
+        raise HTTPException(404, "Contact not found.")
+    return {"deleted": True}
+
 
 def store_contact_background(background_tasks: BackgroundTasks, org_id: str, platform: str, contact_data: dict):
     """
@@ -54,8 +129,8 @@ def store_contact(org_id: str, platform: str, contact_data: dict):
 
     # Check if the contact's name was locked by a VCF upload.
     # If so, we must NOT overwrite the name from a webhook/API call.
-    existing_contact = contacts_collection.find_one(unique_filter, {"name_locked_by_vcf": 1, "_id": 0})
-    is_name_locked = existing_contact.get("name_locked_by_vcf", False) if existing_contact else False
+    existing_contact = contacts_collection.find_one(unique_filter, {"name_locked_by_vcf": 1, "name_locked_by_user": 1, "deleted_at": 1, "_id": 0})
+    is_name_locked = bool(existing_contact and not existing_contact.get("deleted_at") and (existing_contact.get("name_locked_by_vcf") or existing_contact.get("name_locked_by_user")))
 
     set_on_insert_doc = {
         "created_at": now,
@@ -111,14 +186,16 @@ def _get_contacts_for_org(org_id: str):
         contacts_collection = db[collection_name]
 
         include_tally = tally_enabled(org_id)
-        query = {} if include_tally else {"platform": {"$ne": "tally"}}
-        projection = {"_id": 0} if include_tally else {"_id": 0, "tally": 0}
+        query = {"deleted_at": {"$exists": False}}
+        if not include_tally:
+            query["platform"] = {"$ne": "tally"}
+        projection = None if include_tally else {"tally": 0}
 
         cursor = contacts_collection.find(query, projection).batch_size(services.BATCH_SIZE)
 
         contacts = []
         for contact in cursor:
-            contacts.append(contact)
+            contacts.append(directory_contact(contact))
 
         logger.info(f"Retrieved {len(contacts)} contacts for org {org_id}.")
         return contacts
@@ -142,7 +219,9 @@ def _get_contacts_page(
 ) -> dict:
     collection = db[f"contacts_{org_id}"]
     include_tally = tally_enabled(org_id)
-    query: dict = {} if include_tally else {"platform": {"$ne": "tally"}}
+    query: dict = {"deleted_at": {"$exists": False}}
+    if not include_tally:
+        query["platform"] = {"$ne": "tally"}
     tags = [str(tag).strip()[:100] for tag in tags[:20] if str(tag).strip()]
 
     if tags:
@@ -169,7 +248,7 @@ def _get_contacts_page(
             query = search_query
 
     projection = {
-        "_id": 0,
+        "_id": 1,
         "platform": 1,
         "full_name": 1,
         "country": 1,
@@ -205,7 +284,7 @@ def _get_contacts_page(
         .limit(limit)
     )
     return {
-        "contacts": contacts,
+        "contacts": [directory_contact(contact) for contact in contacts],
         "total": total,
         "page": page,
         "limit": limit,
@@ -711,6 +790,7 @@ def process_bulk_wa_contact_upload(
             update_doc: dict = {
                 "$set": set_fields,
                 "$setOnInsert": contact_on_insert,
+                "$unset": {"deleted_at": ""},
             }
 
             bulk_ops.append(
@@ -794,7 +874,7 @@ async def get_uploaded_contacts_paginated(
             return {"contacts": [], "total": 0, "page": page, "limit": limit}
 
         col = db[collection_name]
-        query: dict = {"is_bulk_uploaded": True}
+        query: dict = {"is_bulk_uploaded": True, "deleted_at": {"$exists": False}}
 
         if batch_id:
             query["upload_metadata.batch_id"] = batch_id
@@ -818,6 +898,7 @@ async def get_uploaded_contacts_paginated(
         contacts = list(cursor)
         for contact in contacts:
             contact["record_id"] = str(contact.pop("_id"))
+            contact["contact_id"] = contact["record_id"]
 
         return {"contacts": contacts, "total": total, "page": page, "limit": limit}
     except Exception as e:
@@ -840,45 +921,12 @@ async def get_upload_batches(org_id: str) -> list[dict]:
         return []
 
 
-def delete_uploaded_contact(org_id: str, identifier: str) -> dict:
-    """
-    Delete or demote a single bulk-uploaded contact.
-
-    - If the contact was created ONLY by a bulk upload (no whatsapp_id, no Instagram messaging)
-      → permanently delete the document.
-    - If it existed before (has whatsapp_id or instagram_id = real conversation activity)
-      → only remove is_bulk_uploaded flag & upload_metadata; preserve the live record.
-    """
-    col = db[f"contacts_{org_id}"]
-    contact = None
-    if ObjectId.is_valid(identifier):
-        contact = col.find_one({"_id": ObjectId(identifier), "is_bulk_uploaded": True})
-    if not contact:
-        contact = col.find_one({"conversation_id": identifier, "is_bulk_uploaded": True})
-
+def delete_uploaded_contact(org_id: str, conversation_id: str) -> dict:
+    query = {"_id": ObjectId(conversation_id)} if ObjectId.is_valid(conversation_id) else {"conversation_id": conversation_id}
+    contact = db[f"contacts_{org_id}"].find_one(query)
     if not contact:
         return {"deleted": False, "reason": "not_found"}
-
-    selector = {"_id": contact["_id"], "is_bulk_uploaded": True}
-
-    # Heuristic: a "real" contact has a non-null whatsapp_id or instagram_id
-    has_live_identity = bool(contact.get("whatsapp_id") or contact.get("instagram_id"))
-
-    if has_live_identity:
-        # Demote only — keep the record for the live chat
-        result = col.update_one(
-            selector,
-            {"$unset": {"is_bulk_uploaded": "", "upload_metadata": "", "name_locked_by_vcf": ""},
-             "$set":   {"updated_at": datetime.now(timezone.utc)}}
-        )
-        if not result.modified_count:
-            return {"deleted": False, "reason": "not_found"}
-        return {"deleted": False, "demoted": True, "reason": "live_contact_preserved"}
-    else:
-        result = col.delete_one(selector)
-        if not result.deleted_count:
-            return {"deleted": False, "reason": "not_found"}
-        return {"deleted": True}
+    return delete_directory_contact(org_id, str(contact["_id"]))
 
 
 def delete_upload_batch(org_id: str, identifier: str) -> dict:
@@ -912,6 +960,8 @@ def delete_upload_batch(org_id: str, identifier: str) -> dict:
     demoted_count = 0
 
     for contact in contacts_in_batch:
+        if contact.get("deleted_at"):
+            continue
         has_live_identity = bool(contact.get("whatsapp_id") or contact.get("instagram_id"))
         selector = {"_id": contact["_id"], "is_bulk_uploaded": True}
 
