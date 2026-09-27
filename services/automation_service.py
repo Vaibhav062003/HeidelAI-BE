@@ -8,8 +8,8 @@ from pydantic import TypeAdapter
 # Internal Modules
 from database import get_mongo_db, get_mongo_client
 from fastapi import HTTPException
-from services.automation_state import published_snapshot, public_flow, version_query, draft_fields
-from services.automation_capabilities import normalize_trigger, validate_executable_flow, AUTOMATION_NODE_TYPES
+from services.automation_state import public_flow, version_query, draft_fields
+from services.automation_capabilities import normalize_trigger, validate_executable_flow
 from schemas.models import WhatsAppInteractiveMessage
 from services.automation_keywords import message_contains_keyword
 from services.utils import get_first_name, inject_variables, serialize_mongo
@@ -380,43 +380,6 @@ def _extract_delay_and_message(
     return delay_seconds, message_config
 
 
-def _extract_message_from_start(
-    start_node_id: str,
-    nodes: dict,
-    connections: list,
-) -> Optional[dict]:
-    """
-    Walk from start_node_id to find the first message node.
-    Used by _handle_google_sheet_trigger.
-
-    Handles both node structures the frontend may produce:
-      - node.config.content.text  (primary — used by execution engine)
-      - node.content.text         (fallback / alternate serialisation)
-    """
-    visited: set = set()
-    queue: list = [start_node_id]
-
-    while queue:
-        node_id = queue.pop(0)
-        if node_id in visited:
-            continue
-        visited.add(node_id)
-
-        node = nodes.get(node_id, {})
-        if node.get("type") == "message":
-            # Return the full content object (which contains text, template_name, etc.)
-            content = node.get("config", {}).get("content", {})
-            if not content:
-                content = node.get("content", {})
-            if content:
-                return content
-
-        next_ids = _children(node_id, connections)
-        queue.extend(next_ids)
-
-    return None
-
-
 def _handle_google_sheet_trigger(
     org_id: str,
     flow_id: str,
@@ -443,8 +406,9 @@ def _handle_google_sheet_trigger(
         )
         return None
 
-    # Get message config from the flow's message node
-    message_config = _extract_message_from_start(start_node_id, nodes, connections)
+    # Publication validates that the start step is the only message.
+    node = nodes[start_node_id]
+    message_config = node.get("config", {}).get("content") or node.get("content", {})
     if not message_config:
         logger.debug(
              "Message extraction debug for flow {}: start_node_id={}, node_count={}, connection_count={}",
@@ -550,21 +514,6 @@ def _register_single_trigger(
         session=session,
     )
     logger.info(f"Registered trigger: {trigger_type} for flow {flow_id}")
-
-
-async def _register_flow_triggers(org_id: str, flow_id: str, flow_data: Dict):
-    """
-    Register all non-followup triggers. Kept for backward compatibility.
-    """
-    for idx, trigger_config in enumerate(flow_data.get("triggers", [])):
-        trigger_type = trigger_config.get("type")
-        if trigger_type in ("whatsapp_followup", "google_sheet"):
-            continue
-        config = trigger_config.get("config", {})
-        start_node_id = trigger_config.get("start_node_id")
-        if not start_node_id:
-            continue
-        _register_single_trigger(org_id, flow_id, idx, trigger_type, config, start_node_id)
 
 
 # =============================================================================

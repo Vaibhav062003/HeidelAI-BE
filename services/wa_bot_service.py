@@ -32,7 +32,7 @@ from database import get_async_mongo_db, get_async_mongo_client
 from fastapi import HTTPException
 from pydantic import TypeAdapter
 from schemas.models import WhatsAppInteractiveMessage
-from services.automation_state import WA_DRAFT_FIELDS, published_snapshot, public_flow, version_query, draft_fields
+from services.automation_state import WA_DRAFT_FIELDS, public_flow, version_query, draft_fields
 from services.utils import serialize_mongo
 from loguru import logger
 

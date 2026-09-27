@@ -24,7 +24,6 @@ def automation_capabilities():
     return {
         "node_types": sorted(AUTOMATION_NODE_TYPES),
         "nodes_by_trigger": NODES_BY_TRIGGER,
-        "features": {"email_accounts": False, "preview_test": False, "live_test": False},
     }
 
 

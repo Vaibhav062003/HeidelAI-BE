@@ -189,13 +189,27 @@ async def test_automation():
     assert database["automation_triggers"].rows[0]["status"] == "inactive"
 
     caps = env["automation_capabilities"]()
-    assert "trigger_email_received" not in caps["node_types"] and not caps["features"]["live_test"]
+    assert "trigger_email_received" not in caps["node_types"]
     assert "action_send_dm" not in caps["nodes_by_trigger"]["trigger_instagram_message"]
     for bad in [graph(trigger="email_received"), {"nodes": {"x": {"type": "email"}}, "triggers": [{"type": "instagram_message", "start_node_id": "x"}]}]:
         try:
             env["validate_executable_flow"](bad)
             assert False, "unsupported automation must fail"
         except ValueError: pass
+
+    # Sheet publication keeps the message content in either stored format.
+    load("services/automation_service.py", env, {"_handle_google_sheet_trigger"})
+    for nested in (False, True):
+        sheet_graph = graph("Sheet message", trigger="google_sheet")
+        config = {"sheet_id": "sheet", "column_name": "phone"}
+        sheet_graph["triggers"][0]["config"] = config
+        if nested:
+            node = sheet_graph["nodes"]["message"]
+            node["config"] = {"content": node.pop("content")}
+        assert env["validate_executable_flow"](sheet_graph) == "google_sheet"
+        env["_handle_google_sheet_trigger"]("org", "sheet-flow", 0, config, "message", sheet_graph["nodes"], [])
+        registered = database["automation_triggers"].rows[-1]
+        assert registered["message_config"] == {"text": "Sheet message"}
 
     # The real traversal must stop at failures and Stop nodes; text export is read.
     env["logger"].info = lambda *args: None
