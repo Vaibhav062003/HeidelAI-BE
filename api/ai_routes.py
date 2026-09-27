@@ -66,7 +66,7 @@ class AIPolicyRequest(BaseModel):
 
 
 class ConversationAIStateRequest(BaseModel):
-    action: Literal["pause", "resume"]
+    action: Literal["pause", "pause_indefinitely", "resume"]
     duration_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
 
 
