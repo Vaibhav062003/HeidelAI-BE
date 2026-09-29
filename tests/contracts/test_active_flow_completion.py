@@ -283,6 +283,7 @@ class AsyncCollection:
     def rows(self, value): self.collection.rows = value
     async def find_one(self, *args, **kwargs): return self.collection.find_one(*args, **kwargs)
     async def find_one_and_update(self, *args, **kwargs): return self.collection.find_one_and_update(*args, **kwargs)
+    async def update_many(self, *args, **kwargs): return self.collection.update_many(*args, **kwargs)
 
 
 class AsyncSession(Session):
