@@ -1522,24 +1522,12 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 }
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
-                                # --- SHAKTI MOTORS CUSTOM BOT INTERCEPTOR ---
-                                from services.shakti_bot_service import handle_shakti_message, SHAKTI_ORG_ID
-                                if False and org_id == SHAKTI_ORG_ID:  # Disabled at user request
-                                    await handle_shakti_message(
-                                        org_id=org_id,
-                                        conversation_id=conversation_id,
-                                        message_type=message_type,
-                                        content=content,
-                                        sender_name=sender_name2,
-                                        whatsapp_business_id=whatsapp_business_id,
-                                        message_dict=message
-                                    )
-                                    await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id, conversation_id=conversation_id)
-                                    return {"status": "ok"}
-                                # --------------------------------------------
 
-                                # Execute the WhatsApp Automation Flow first (if it exists)
-                                # Runs on all environments and regardless of AI toggle
+
+                                #  Don't execute for heidel_ai as it is not on whatsapp flow yet but has AI
+
+                                    # Execute the WhatsApp Automation Flow first (if it exists)
+                                    # Runs on all environments and regardless of AI toggle
                                 if whatsapp_flow:
                                     automation_response = await execute_whatsapp_flow(
                                         flow=whatsapp_flow,

@@ -182,56 +182,19 @@ async def get_wa_bot_flow(org_id: str, flow_id: str) -> Optional[Dict]:
 
 # ─── UPDATE (PATCH) ───────────────────────────────────────────────────────────
 
-async def update_wa_bot_flow(
-    org_id: str,
-    flow_id: str,
-    payload: Dict[str, Any],
-    updated_by: Optional[str] = None,
-) -> Optional[Dict]:
-    """
-    Replace the mutable fields of an existing WaBot flow.
-
-    Uses optimistic locking via version_query() and increments the draft
-    version via draft_fields().  Status is never changed by a PATCH —
-    only the explicit publish / unpublish endpoints may toggle it.
-    """
-    try:
-        col = _col(org_id)
-
-        flow = await col.find_one({"flow_id": flow_id, "org_id": org_id})
-        if not flow:
-            return None
-
-        query = version_query(flow, payload.get("expected_draft_version"))
-        fields = draft_fields(flow, payload, WA_DRAFT_FIELDS)
-
-        fields.update({
-            "updated_at": datetime.now(timezone.utc),
-            "updated_by": updated_by,
-            "flow_type":  "wabot",
-            "trigger_from":  "webhook",
-            "trigger_event": "message_received",
-        })
-
-        # Never let a PATCH change the publication status —
-        # only publish / unpublish endpoints should do that.
-        fields.pop("status", None)
-
-        result = await col.find_one_and_update(
-            query,
-            {"$set": fields},
-            return_document=True,
-        )
-
-        if not result:
-            raise HTTPException(409, "This workflow changed. Reload before saving.")
-
-        logger.info(f"Updated wa_bot_flow {flow_id} for org {org_id}")
-        return serialize_mongo(public_flow(result))
-
-    except Exception as e:
-        logger.error(f"update_wa_bot_flow error: {e}")
-        raise
+async def update_wa_bot_flow(org_id: str, flow_id: str, payload: Dict[str, Any], updated_by: Optional[str] = None) -> Optional[Dict]:
+    col = _col(org_id)
+    flow = await col.find_one({"flow_id": flow_id, "org_id": org_id})
+    if not flow:
+        return None
+    query = version_query(flow, payload.get("expected_draft_version"))
+    fields = draft_fields(flow, payload, WA_DRAFT_FIELDS)
+    fields.update(updated_at=datetime.now(timezone.utc), updated_by=updated_by,
+                  trigger_from="webhook", trigger_event="message_received")
+    result = await col.find_one_and_update(query, {"$set": fields}, return_document=True)
+    if not result:
+        raise HTTPException(409, "This workflow changed. Reload before saving.")
+    return serialize_mongo(public_flow(result))
 
 
 # ─── DELETE ───────────────────────────────────────────────────────────────────
@@ -285,57 +248,28 @@ def _validate_wa_bot_draft(flow):
 
 async def publish_wa_bot_flow(org_id: str, flow_id: str, phone_ids: List[str], updated_by: Optional[str] = None, expected_draft_version: Optional[int] = None) -> Optional[Dict]:
     async def publish(session):
-        col = _col(org_id)
-        flow = await col.find_one({"flow_id": flow_id, "org_id": org_id}, session=session)
+        flow = await _col(org_id).find_one({"flow_id": flow_id, "org_id": org_id}, session=session)
         if not flow:
             return None
-
         query = version_query(flow, expected_draft_version)
         _validate_wa_bot_draft(flow)
         normalized = await _validate_publish_phone_ids(org_id, phone_ids, session=session)
-
-        # Snapshot the current draft content for safe rollback
+        # Snapshot the current draft, rather than a previous published snapshot.
         snapshot = {key: flow[key] for key in WA_DRAFT_FIELDS if key in flow}
         now = datetime.now(timezone.utc)
-        version = flow.get("version", 1)
-
-        # Demote all other flows in this org to draft
-        await col.update_many(
-            {"org_id": org_id, "flow_id": {"$ne": flow_id}},
-            {"$set": {
-                "status": "draft",
-                "published_at": None,
-                "updated_at": now,
-            }},
-            session=session,
-        )
-
-        # Activate this flow with version-aware query
-        result = await col.find_one_and_update(
-            query,
-            {"$set": {
-                "status":        "active",
-                "trigger_from":  "webhook",
-                "trigger_event": "message_received",
-                "published_at":  now,
-                "updated_at":    now,
-                "updated_by":    updated_by,
-                "published_snapshot": snapshot,
-                "published_version": version,
-            }},
-            return_document=True,
-            session=session,
-        )
-
+        result = await _col(org_id).find_one_and_update(query, {"$set": {
+            "status": "active", "trigger_from": "webhook", "trigger_event": "message_received",
+            "published_at": now, "updated_at": now, "updated_by": updated_by,
+            "published_snapshot": snapshot, "published_version": flow.get("version", 1),
+        }}, return_document=True, session=session)
         if not result:
             raise HTTPException(409, "This workflow changed. Reload before publishing.")
-
         await _bind_flow_to_phone_ids(org_id, flow_id, normalized, session=session)
         return result
-
     async with await get_async_mongo_client().start_session() as session:
         result = await session.with_transaction(publish)
     return serialize_mongo(public_flow(result)) if result else None
+
 
 # ─── UNPUBLISH ────────────────────────────────────────────────────────────────
 
