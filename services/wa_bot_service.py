@@ -302,7 +302,8 @@ def _validate_wa_bot_draft(flow):
 
 async def publish_wa_bot_flow(org_id: str, flow_id: str, phone_ids: List[str], updated_by: Optional[str] = None, expected_draft_version: Optional[int] = None) -> Optional[Dict]:
     async def publish(session):
-        flow = await _col(org_id).find_one({"flow_id": flow_id, "org_id": org_id}, session=session)
+        col = _col(org_id)
+        flow = await col.find_one({"flow_id": flow_id, "org_id": org_id}, session=session)
         if not flow:
             return None
         query = version_query(flow, expected_draft_version)
@@ -348,7 +349,6 @@ async def publish_wa_bot_flow(org_id: str, flow_id: str, phone_ids: List[str], u
     async with await get_async_mongo_client().start_session() as session:
         result = await session.with_transaction(publish)
     return serialize_mongo(public_flow(result)) if result else None
-
 
 # ─── UNPUBLISH ────────────────────────────────────────────────────────────────
 
