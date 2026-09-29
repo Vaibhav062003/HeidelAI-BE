@@ -6,7 +6,7 @@ from pymongo import ReturnDocument
 from pydantic import TypeAdapter
 
 # Internal Modules
-from database import get_mongo_db
+from database import get_mongo_db, get_async_mongo_db
 from schemas.models import WhatsAppInteractiveMessage
 from services.automation_keywords import message_contains_keyword
 from services.utils import get_first_name, inject_variables, serialize_mongo
@@ -15,6 +15,7 @@ from core.services import services
 from loguru import logger
 
 db = get_mongo_db()
+async_db = get_async_mongo_db()
 
 InteractiveMessageAdapter = TypeAdapter(WhatsAppInteractiveMessage)
 
@@ -778,8 +779,8 @@ async def _send_interactive_message(org_id: str, whatsapp_business_id: str, conv
         logger.error(f"[{org_id}] Failed to validate interactive data for '{label}': {e}")
         return False
 
-def _complete_onboarding(org_id: str, conversation_id: str):
-    db[f"conversations_{org_id}"].update_one(
+async def _complete_onboarding(org_id: str, conversation_id: str):
+    await async_db[f"conversations_{org_id}"].update_one(
         {"conversation_id": conversation_id},
         {"$set": {"onboarding_stage": "completed"}},
     )
@@ -855,7 +856,7 @@ async def execute_whatsapp_flow(
         node_data = flow_nodes[selection_id]
         node_type = node_data.get("type")
 
-        _complete_onboarding(org_id, conversation_id)
+        await _complete_onboarding(org_id, conversation_id)
 
         if node_type == "text":
             logger.info(f"[{org_id}] Sending text node response for '{selection_id}'")
@@ -914,7 +915,7 @@ async def execute_whatsapp_flow(
             node_data = flow_nodes[start_node_id]
             node_type = node_data.get("type")
 
-            _complete_onboarding(org_id, conversation_id)
+            await _complete_onboarding(org_id, conversation_id)
 
             if node_type == "text":
                 await _send_text_message(**ctx, raw_content=node_data.get("content", ""), template_variables=template_variables)
@@ -937,7 +938,7 @@ async def execute_whatsapp_flow(
             # Send welcome message
             if welcome_type == "text":
                 await _send_text_message(**ctx, raw_content=welcome_message.get("content", ""), template_variables=template_variables)
-                _complete_onboarding(org_id, conversation_id)  # plain-text welcome → done immediately
+                await _complete_onboarding(org_id, conversation_id)  # plain-text welcome → done immediately
                 logger.success(f"[{org_id}] Successfully sent text welcome message and completed onboarding.")
                 return True
 

@@ -231,9 +231,16 @@ async def update_wa_bot_flow(
         col = _col(org_id)
         now = datetime.now(timezone.utc)
 
-        # Never overwrite identity / immutable fields via PATCH
-        for key in ("_id", "flow_id", "org_id", "created_at", "created_by"):
-            payload.pop(key, None)
+        # Whitelist — only these fields may be patched from the frontend.
+        # Internal / computed fields (trigger_count, last_run, published_at,
+        # flow_id, org_id, created_at, created_by) are never overwritable.
+        ALLOWED_PATCH_FIELDS = {
+            "name", "status", "flow_type", "trigger_type",
+            "trigger_from", "trigger_event", "trigger_messages",
+            "welcome_message", "introduction_message",
+            "nodes", "start_node_id", "ui_config",
+        }
+        payload = {k: v for k, v in payload.items() if k in ALLOWED_PATCH_FIELDS}
 
         set_fields = {
             **payload,
@@ -325,6 +332,16 @@ async def publish_wa_bot_flow(
             return None
         normalized_phone_ids = await _validate_publish_phone_ids(org_id, phone_ids)
         await _bind_flow_to_phone_ids(org_id, flow_id, normalized_phone_ids)
+
+        # Ensure only 1 active flow per org — demote all others to draft
+        await col.update_many(
+            {"org_id": org_id, "flow_id": {"$ne": flow_id}},
+            {"$set": {
+                "status": "draft",
+                "published_at": None,
+                "updated_at": now,
+            }}
+        )
 
         result = await col.find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
