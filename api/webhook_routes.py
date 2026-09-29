@@ -1524,7 +1524,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
 
                                 # --- SHAKTI MOTORS CUSTOM BOT INTERCEPTOR ---
                                 from services.shakti_bot_service import handle_shakti_message, SHAKTI_ORG_ID
-                                if org_id == SHAKTI_ORG_ID:
+                                if False and org_id == SHAKTI_ORG_ID:  # Disabled at user request
                                     await handle_shakti_message(
                                         org_id=org_id,
                                         conversation_id=conversation_id,

@@ -337,12 +337,12 @@ async def _trigger_google_sheet_automations(org_id: str, sheet_id: str) -> None:
     except Exception as e:
         logger.error(f"[Scheduler] Error processing doctor follow-ups for sheet {sheet_id}: {e}")
 
-    # Shakti Motors booking confirmations (client-specific, no-ops for other orgs)
-    try:
-        from services.shakti_booking_worker import process_shakti_bookings
-        await process_shakti_bookings(org_id, sheet_id)
-    except Exception as e:
-        logger.error(f"[Scheduler] Error processing Shakti bookings for sheet {sheet_id}: {e}")
+    # Shakti Motors booking confirmations (DISABLED)
+    # try:
+    #     from services.shakti_booking_worker import process_shakti_bookings
+    #     await process_shakti_bookings(org_id, sheet_id)
+    # except Exception as e:
+    #     logger.error(f"[Scheduler] Error processing Shakti bookings for sheet {sheet_id}: {e}")
 
 
 # ─── MongoDB Indexes ──────────────────────────────────────────────────────────
