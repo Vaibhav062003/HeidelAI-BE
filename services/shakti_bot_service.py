@@ -120,18 +120,28 @@ async def handle_shakti_message(
     message_type: str, 
     content: str, 
     sender_name: str,
-    whatsapp_business_id: str
+    whatsapp_business_id: str,
+    message_dict: dict = None
 ):
+    # If this is an interactive message, extract the selection ID since the webhook hasn't yet
+    if message_type == "interactive" and message_dict:
+        interactive_data = message_dict.get("interactive", {})
+        interaction_type = interactive_data.get("type")
+        if interaction_type == "list_reply":
+            content = interactive_data.get("list_reply", {}).get("id")
+        elif interaction_type == "button_reply":
+            content = interactive_data.get("button_reply", {}).get("id")
+            
     # conversation_id is usually the customer phone number in this context
     customer_phone = conversation_id
-    logger.info(f"[SHAKTI] Handling msg from {customer_phone}: {content}")
+    logger.info(f"[SHAKTI] Handling msg from {customer_phone}: type={message_type} content={content}")
     
     session = await get_session(org_id, customer_phone)
     current_state = session.get("state")
     context = session.get("context", {})
     
     # Global Keywords Override
-    text_content = content.strip().lower() if message_type == "text" else ""
+    text_content = content.strip().lower() if message_type == "text" and isinstance(content, str) else ""
     if text_content in ["hi", "hello", "hey", "menu", "start"]:
         if session.get("first_name"):
             await update_session(org_id, customer_phone, "S2_MAIN_MENU")
