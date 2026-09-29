@@ -1531,7 +1531,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         message_type=message_type,
                                         content=content,
                                         sender_name=sender_name2,
-                                        whatsapp_business_id=whatsapp_business_id
+                                        whatsapp_business_id=whatsapp_business_id,
+                                        message_dict=message
                                     )
                                     await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id, conversation_id=conversation_id)
                                     return {"status": "ok"}
