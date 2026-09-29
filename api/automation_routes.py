@@ -19,6 +19,7 @@ from services.automation_service import (
 )
 from services.entitlement_service import release_automation_publish, require_automation_publish, require_feature
 from loguru import logger
+from services.automation_capabilities import automation_capabilities
 
 db = get_mongo_db()
 async_db = get_async_mongo_db()
@@ -59,9 +60,19 @@ class CreateFlowRequest(BaseModel):
 
 
 class UpdateFlowRequest(BaseModel):
+    expected_draft_version: Optional[int] = Field(None, ge=1)
     name: Optional[str] = Field(None, min_length=3, max_length=255)
     description: Optional[str] = Field(None, max_length=500)
     flow_data: Optional[FlowDocument] = None
+
+
+class PublishFlowRequest(BaseModel):
+    expected_draft_version: Optional[int] = Field(None, ge=1)
+
+
+@router.get("/capabilities")
+async def get_capabilities(user: CurrentUser):
+    return automation_capabilities()
 
 
 # =============================================================================
@@ -234,7 +245,7 @@ async def update_flow(flow_id: str, payload: UpdateFlowRequest, user: CurrentUse
             if not is_valid:
                 raise HTTPException(status_code=400, detail=f"Invalid flow structure: {error_message}")
 
-        update_data = {}
+        update_data = {"expected_draft_version": payload.expected_draft_version}
         if payload.name is not None:
             update_data["name"] = payload.name
         if payload.description is not None:
@@ -288,7 +299,7 @@ async def delete_flow(flow_id: str, user: CurrentUser):
 # =============================================================================
 
 @router.post("/{flow_id}/publish")
-async def publish_flow(flow_id: str, user: CurrentUser):
+async def publish_flow(flow_id: str, user: CurrentUser, payload: PublishFlowRequest = PublishFlowRequest()):
     """Publish (activate) an automation flow"""
     try:
         reserved = require_automation_publish(user.org_id, flow_id, "automation")
@@ -297,7 +308,7 @@ async def publish_flow(flow_id: str, user: CurrentUser):
             raise HTTPException(status_code=400, detail="Organization ID not found")
 
         try:
-            flow = await publish_automation_flow(org_id=org_id, flow_id=flow_id)
+            flow = await publish_automation_flow(org_id=org_id, flow_id=flow_id, expected_draft_version=payload.expected_draft_version)
         finally:
             if reserved:
                 release_automation_publish(org_id, flow_id, "automation")

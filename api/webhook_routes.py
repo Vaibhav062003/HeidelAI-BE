@@ -1,3 +1,4 @@
+from services.automation_state import published_snapshot
 # Built-in Modules
 import asyncio, time, json, hmac, hashlib
 from fastapi import APIRouter, HTTPException, Response
@@ -1335,6 +1336,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                     "status": "active",
                                 },
                             ) if bound_flow_id else None
+                            if whatsapp_flow:
+                                whatsapp_flow = {**whatsapp_flow, **published_snapshot(whatsapp_flow)}
                             logger.info(
                                 f"[{org_id}] WhatsApp automation flow: "
                                 f"{'found' if whatsapp_flow else 'no active flow found'}"
@@ -3078,7 +3081,7 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 check_and_trigger_automations,
                                 org_id=org_id,
                                 platform="instagram",
-                                event_type="message_received",
+                                event_type="story_reply" if attachment_type == "story_reply" else "message_received",
                                 trigger_data={
                                     "platform": "instagram",    
                                     "platform_id": recipient_id,

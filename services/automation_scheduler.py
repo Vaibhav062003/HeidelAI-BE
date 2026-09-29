@@ -88,6 +88,7 @@ def schedule_followup(
     delay_seconds: int,
     message_config: dict,
     max_retries: int = 3,
+    *, session=None, published_version=None,
 ) -> str:
     """
     Insert a pending follow-up job into automation_scheduled_followups.
@@ -112,6 +113,7 @@ def schedule_followup(
         "schedule_id": schedule_id,
         "org_id": org_id,
         "flow_id": flow_id,
+        "published_version": published_version,
         "conversation_id": conversation_id,
         "message_config": message_config,
         "delay_seconds": delay_seconds,
@@ -127,7 +129,7 @@ def schedule_followup(
         "error": None,
     }
 
-    db[COLLECTION].insert_one(doc)
+    db[COLLECTION].insert_one(doc, session=session)
     logger.info(f"Scheduled follow-up {schedule_id} for {conversation_id} firing at {fire_at.isoformat()}")
     return schedule_id
 
@@ -136,7 +138,7 @@ def schedule_followup(
 # PUBLIC API — CANCELLATION
 # =============================================================================
 
-def cancel_flow_followups(org_id: str, flow_id: str, reason: str) -> int:
+def cancel_flow_followups(org_id: str, flow_id: str, reason: str, session=None) -> int:
     """
     Cancel all pending follow-up jobs for a given flow.
     Called on unpublish or re-publish.
@@ -159,6 +161,7 @@ def cancel_flow_followups(org_id: str, flow_id: str, reason: str) -> int:
                 "cancel_reason": reason,
             }
         },
+        session=session,
     )
 
     count = result.modified_count
@@ -373,6 +376,10 @@ async def _execute_job(job: dict) -> None:
 
     try:
         from services.entitlement_service import consume_quota_async
+        flow = await asyncio.to_thread(db[f"automation_flows_{org_id}"].find_one, {"org_id": org_id, "flow_id": job["flow_id"]})
+        if not flow or flow.get("status") != "published" or (job.get("published_version") is not None and job["published_version"] != flow.get("published_version")):
+            await asyncio.to_thread(db[COLLECTION].update_one, {"schedule_id": schedule_id}, {"$set": {"status": "cancelled", "cancel_reason": "flow_changed", "cancelled_at": datetime.now(timezone.utc)}})
+            return
         await consume_quota_async(org_id, "AUTOMATIONS", "monthly_runs", 1, f"automation-schedule:{schedule_id}")
         # Step 1: Validate conversation still exists and is open
         conv_collection = db[f"conversations_{org_id}"]

@@ -6,7 +6,10 @@ from pymongo import ReturnDocument
 from pydantic import TypeAdapter
 
 # Internal Modules
-from database import get_mongo_db, get_async_mongo_db
+from database import get_mongo_db, get_async_mongo_db, get_mongo_client
+from fastapi import HTTPException
+from services.automation_state import public_flow, version_query, draft_fields
+from services.automation_capabilities import normalize_trigger, validate_executable_flow
 from schemas.models import WhatsAppInteractiveMessage
 from services.automation_keywords import message_contains_keyword
 from services.utils import get_first_name, inject_variables, serialize_mongo
@@ -62,7 +65,7 @@ async def create_automation_flow(
 
         collection.insert_one(flow_doc)
         logger.info(f"Created automation flow: {flow_id} for org: {org_id}")
-        return serialize_mongo(flow_doc)
+        return serialize_mongo(public_flow(flow_doc))
 
     except Exception as e:
         logger.error(f"Error creating automation flow: {str(e)}")
@@ -81,7 +84,7 @@ async def list_automation_flows(org_id: str, status: Optional[str] = None) -> Li
             query["status"] = status
         flows = list(collection.find(query).sort("created_at", -1))
         logger.info(f"Listed {len(flows)} automation flows for org: {org_id}")
-        return [serialize_mongo(flow) for flow in flows]
+        return [serialize_mongo(public_flow(flow)) for flow in flows]
     except Exception as e:
         logger.error(f"Error listing automation flows: {str(e)}")
         raise
@@ -96,7 +99,7 @@ async def get_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
         collection = _automation_flows_collection(org_id)
         flow = collection.find_one({"flow_id": flow_id, "org_id": org_id})
         if flow:
-            return serialize_mongo(flow)
+            return serialize_mongo(public_flow(flow))
         return None
     except Exception as e:
         logger.error(f"Error getting automation flow: {str(e)}")
@@ -107,46 +110,20 @@ async def get_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
 # UPDATE
 # =============================================================================
 
-async def update_automation_flow(
-    org_id: str,
-    flow_id: str,
-    update_data: Dict,
-    updated_by: Optional[str] = None
-) -> Optional[Dict]:
-    try:
-        collection = _automation_flows_collection(org_id)
-
-        update_doc = {
-            "updated_at": datetime.now(timezone.utc),
-            "updated_by": updated_by,
-        }
-
-        if "name" in update_data:
-            update_doc["name"] = update_data["name"]
-        if "description" in update_data:
-            update_doc["description"] = update_data["description"]
-        if "flow_data" in update_data:
-            update_doc["flow_data"] = update_data["flow_data"]
-            collection.update_one(
-                {"flow_id": flow_id, "org_id": org_id},
-                {"$inc": {"version": 1}}
-            )
-        if "status" in update_data:
-            update_doc["status"] = update_data["status"]
-
-        flow = collection.find_one_and_update(
-            {"flow_id": flow_id, "org_id": org_id},
-            {"$set": update_doc},
-            return_document=ReturnDocument.AFTER,
-        )
-
-        if flow:
-            return serialize_mongo(flow)
-        return None
-
-    except Exception as e:
-        logger.error(f"Error updating automation flow: {str(e)}")
-        raise
+async def update_automation_flow(org_id: str, flow_id: str, update_data: Dict, updated_by: Optional[str] = None) -> Optional[Dict]:
+    collection = _automation_flows_collection(org_id)
+    def save():
+        flow = collection.find_one({"flow_id": flow_id, "org_id": org_id})
+        if not flow:
+            return None
+        query = version_query(flow, update_data.get("expected_draft_version"))
+        fields = draft_fields(flow, update_data, {"name", "description", "flow_data"})
+        fields.update(updated_at=datetime.now(timezone.utc), updated_by=updated_by)
+        result = collection.find_one_and_update(query, {"$set": fields}, return_document=ReturnDocument.AFTER)
+        if not result:
+            raise HTTPException(409, "This workflow changed. Reload before saving.")
+        return serialize_mongo(public_flow(result))
+    return await asyncio.to_thread(save)
 
 
 # =============================================================================
@@ -213,132 +190,59 @@ async def delete_automation_flow(org_id: str, flow_id: str) -> bool:
 # PUBLISH
 # =============================================================================
 
-async def publish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
-    """
-    Publish (activate) an automation flow.
+async def publish_automation_flow(org_id: str, flow_id: str, expected_draft_version: Optional[int] = None) -> Optional[Dict]:
+    from services.automation_scheduler import schedule_followup, cancel_flow_followups
+    collection = _automation_flows_collection(org_id)
 
-    google_sheet triggers      → register trigger, then immediately process all sheet rows
-    whatsapp_followup triggers → schedule a timed job via automation_scheduler
-    All other trigger types    → register in automation_triggers collection (Instagram etc.)
-    """
-    try:
-        from services.automation_scheduler import schedule_followup, cancel_flow_followups
-
-        collection = _automation_flows_collection(org_id)
-        flow = collection.find_one({"flow_id": flow_id, "org_id": org_id})
+    def publish(session):
+        flow = collection.find_one({"flow_id": flow_id, "org_id": org_id}, session=session)
         if not flow:
-            return None
-
-        flow_data = flow.get("flow_data", {})
-        triggers = flow_data.get("triggers", [])
-        if not triggers:
-            raise ValueError("Flow must have at least one trigger")
-
-        nodes = flow_data.get("nodes", {})
-        connections = flow_data.get("connections", [])
-
-        # Cancel any old pending follow-up jobs before creating new ones (re-publish safety)
-        cancel_flow_followups(org_id, flow_id, reason="republished")
-
-        # Deactivate registered triggers (instagram / tag-based / google_sheet triggers)
-        await _deactivate_flow_triggers(org_id, flow_id)
-
-        # ------------------------------------------------------------------
-        # Process each trigger
-        # ------------------------------------------------------------------
-        deferred_tasks = []
-
-        for idx, trigger_config in enumerate(triggers):
-            trigger_type = trigger_config.get("type")
-            config = trigger_config.get("config", {})
-            start_node_id = trigger_config.get("start_node_id")
-
-            if not start_node_id:
-                logger.warning(f"Trigger {idx} missing start_node_id — skipping.")
-                continue
-
-            # ---- Google Sheet trigger: register --------------------------
-            if trigger_type == "google_sheet":
-                # Returns a dict of params for process_google_sheet_trigger if valid
-                task_params = await _handle_google_sheet_trigger(
-                    org_id=org_id,
-                    flow_id=flow_id,
-                    idx=idx,
-                    config=config,
-                    start_node_id=start_node_id,
-                    nodes=nodes,
-                    connections=connections,
-                )
-                if task_params:
-                    deferred_tasks.append(task_params)
-
-            # ---- WhatsApp Follow-Up: schedule a timed job -----------------
-            elif trigger_type == "whatsapp_followup":
-                conversation_id = config.get("conversation_id")
-                if not conversation_id:
-                    logger.warning(f"whatsapp_followup trigger missing conversation_id — skipping.")
-                    continue
-
-                delay_seconds, message_config = _extract_delay_and_message(
-                    start_node_id, nodes, connections
-                )
-
-                if delay_seconds is None or message_config is None:
-                    logger.warning(
-                        f"Could not extract delay/message from flow {flow_id}. "
-                        f"Ensure a smart_delay node and a message node are connected."
-                    )
-                    continue
-
-                schedule_followup(
-                    org_id=org_id,
-                    flow_id=flow_id,
-                    conversation_id=conversation_id,
-                    delay_seconds=delay_seconds,
-                    message_config=message_config,
-                )
-                logger.success(
-                    f"Scheduled WhatsApp follow-up — flow={flow_id}, "
-                    f"conversation={conversation_id}, delay={delay_seconds}s"
-                )
-
-            # ---- All other triggers: register in automation_triggers ------
-            else:
-                await _register_single_trigger(
-                    org_id, flow_id, idx, trigger_type, config, start_node_id
-                )
-
-        # Update flow status
+            return None, []
+        query = version_query(flow, expected_draft_version)
+        data = flow.get("flow_data", {})
+        valid, error = validate_flow_structure(data)
+        if not valid:
+            raise ValueError(error)
+        kind = validate_executable_flow(data)
+        snapshot = {"name": flow.get("name"), "flow_data": data}
+        version = flow.get("version", 1)
         now = datetime.now(timezone.utc)
-        updated_flow = collection.find_one_and_update(
-            {"flow_id": flow_id, "org_id": org_id},
-            {"$set": {"status": "published", "published_at": now, "updated_at": now}},
-            return_document=ReturnDocument.AFTER,
-        )
+        result = collection.find_one_and_update(query, {"$set": {
+            "status": "published", "published_at": now, "updated_at": now,
+            "published_snapshot": snapshot, "published_version": version,
+        }}, return_document=ReturnDocument.AFTER, session=session)
+        if not result:
+            raise HTTPException(409, "This workflow changed. Reload before publishing.")
+        cancel_flow_followups(org_id, flow_id, reason="republished", session=session)
+        _deactivate_flow_triggers(org_id, flow_id, session=session)
+        trigger = data["triggers"][0]
+        config, start = trigger.get("config", {}), trigger["start_node_id"]
+        sheets = []
+        if kind == "google_sheet":
+            params = _handle_google_sheet_trigger(org_id, flow_id, 0, config, start, data["nodes"], data["connections"], session=session, published_version=version)
+            if not params:
+                raise ValueError("This Sheet workflow has no message to send.")
+            sheets.append(config["sheet_id"])
+        elif kind == "whatsapp_followup":
+            delay, content = _extract_delay_and_message(start, data["nodes"], data["connections"])
+            if delay is None or delay < 0 or not content:
+                raise ValueError("Follow-ups require a valid Delay → Message path.")
+            schedule_followup(org_id, flow_id, config["conversation_id"], delay, content, session=session, published_version=version)
+        else:
+            _register_single_trigger(org_id, flow_id, 0, kind, config, start, session=session, published_version=version)
+        return result, sheets
 
-        if updated_flow:
-            # Process existing sheet rows IMMEDIATELY after publish.
-            # Strategy: sync sheet → process via the MongoDB path (same as scheduler).
-            # This avoids a redundant direct Google API fetch and ensures consistency.
-            # NOTE: Task references are stored in a global set to prevent garbage collection
-            # from silently cancelling them (Python asyncio best practice).
-            for params in deferred_tasks:
-                sheet_id = params.get("trigger_config", {}).get("sheet_id")
-                if sheet_id:
-                    task = asyncio.create_task(
-                        _safe_immediate_sheet_processing(org_id, flow_id, sheet_id)
-                    )
-                    services.background_tasks.add(task)
-                    task.add_done_callback(services.background_tasks.discard)
-                    logger.success(f"Started immediate sheet processing for google_sheet flow {flow_id}, sheet {sheet_id}")
-
-
-            return serialize_mongo(updated_flow)
+    def commit():
+        with get_mongo_client().start_session() as session:
+            return session.with_transaction(publish)
+    result, sheets = await asyncio.to_thread(commit)
+    if not result:
         return None
-
-    except Exception as e:
-        logger.error(f"Error publishing automation flow: {str(e)}")
-        raise
+    for sheet_id in sheets:
+        task = asyncio.create_task(_safe_immediate_sheet_processing(org_id, flow_id, sheet_id))
+        services.background_tasks.add(task)
+        task.add_done_callback(services.background_tasks.discard)
+    return serialize_mongo(public_flow(result))
 
 
 async def _safe_immediate_sheet_processing(org_id: str, flow_id: str, sheet_id: str):
@@ -385,49 +289,31 @@ async def _safe_immediate_sheet_processing(org_id: str, flow_id: str, sheet_id: 
 # =============================================================================
 
 async def unpublish_automation_flow(org_id: str, flow_id: str) -> Optional[Dict]:
-    """
-    Unpublish (deactivate) an automation flow.
-    Cancels pending WhatsApp follow-up jobs and deactivates trigger registrations.
-    NOTE: For google_sheet triggers, sent records are NOT cleared so re-publish
-    won't re-message the same numbers.
-    """
-    try:
-        from services.automation_scheduler import cancel_flow_followups
-
-        collection = _automation_flows_collection(org_id)
-        flow = collection.find_one({"flow_id": flow_id, "org_id": org_id})
-        if not flow:
-            return None
-
-        # Cancel pending follow-up jobs
-        cancel_flow_followups(org_id, flow_id, reason="flow_unpublished")
-
-        # Deactivate registered triggers (instagram / tag-based / google_sheet triggers)
-        await _deactivate_flow_triggers(org_id, flow_id)
-
-        now = datetime.now(timezone.utc)
-        updated_flow = collection.find_one_and_update(
+    from services.automation_scheduler import cancel_flow_followups
+    def unpublish(session):
+        result = _automation_flows_collection(org_id).find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
-            {"$set": {"status": "draft", "unpublished_at": now, "updated_at": now}},
-            return_document=ReturnDocument.AFTER,
+            {"$set": {"status": "draft", "unpublished_at": datetime.now(timezone.utc)}},
+            return_document=ReturnDocument.AFTER, session=session,
         )
+        if result:
+            cancel_flow_followups(org_id, flow_id, "flow_unpublished", session=session)
+            _deactivate_flow_triggers(org_id, flow_id, session=session)
+        return result
+    def commit():
+        with get_mongo_client().start_session() as session:
+            return session.with_transaction(unpublish)
+    result = await asyncio.to_thread(commit)
+    return serialize_mongo(public_flow(result)) if result else None
 
-        if updated_flow:
-            logger.info(f"Unpublished automation flow: {flow_id}")
-            return serialize_mongo(updated_flow)
-        return None
 
-    except Exception as e:
-        logger.error(f"Error unpublishing automation flow: {str(e)}")
-        raise
-
-
-async def _deactivate_flow_triggers(org_id: str, flow_id: str):
+def _deactivate_flow_triggers(org_id: str, flow_id: str, session=None):
     """Deactivate trigger registrations for a flow."""
     triggers_collection = _automation_triggers_collection()
     result = triggers_collection.update_many(
         {"flow_id": flow_id, "org_id": org_id},
         {"$set": {"status": "inactive", "deactivated_at": datetime.now(timezone.utc)}},
+        session=session,
     )
     logger.info(f"Deactivated {result.modified_count} triggers for flow {flow_id}")
 
@@ -495,44 +381,7 @@ def _extract_delay_and_message(
     return delay_seconds, message_config
 
 
-def _extract_message_from_start(
-    start_node_id: str,
-    nodes: dict,
-    connections: list,
-) -> Optional[dict]:
-    """
-    Walk from start_node_id to find the first message node.
-    Used by _handle_google_sheet_trigger.
-
-    Handles both node structures the frontend may produce:
-      - node.config.content.text  (primary — used by execution engine)
-      - node.content.text         (fallback / alternate serialisation)
-    """
-    visited: set = set()
-    queue: list = [start_node_id]
-
-    while queue:
-        node_id = queue.pop(0)
-        if node_id in visited:
-            continue
-        visited.add(node_id)
-
-        node = nodes.get(node_id, {})
-        if node.get("type") == "message":
-            # Return the full content object (which contains text, template_name, etc.)
-            content = node.get("config", {}).get("content", {})
-            if not content:
-                content = node.get("content", {})
-            if content:
-                return content
-
-        next_ids = _children(node_id, connections)
-        queue.extend(next_ids)
-
-    return None
-
-
-async def _handle_google_sheet_trigger(
+def _handle_google_sheet_trigger(
     org_id: str,
     flow_id: str,
     idx: int,
@@ -540,6 +389,8 @@ async def _handle_google_sheet_trigger(
     start_node_id: str,
     nodes: dict,
     connections: list,
+    session=None,
+    published_version=None,
 ) -> Optional[dict]:
     """
     Handle a google_sheet trigger on publish:
@@ -556,8 +407,9 @@ async def _handle_google_sheet_trigger(
         )
         return None
 
-    # Get message config from the flow's message node
-    message_config = _extract_message_from_start(start_node_id, nodes, connections)
+    # Publication validates that the start step is the only message.
+    node = nodes[start_node_id]
+    message_config = node.get("config", {}).get("content") or node.get("content", {})
     if not message_config:
         logger.debug(
              "Message extraction debug for flow {}: start_node_id={}, node_count={}, connection_count={}",
@@ -589,12 +441,14 @@ async def _handle_google_sheet_trigger(
         "status": "active",
         "registered_at": datetime.now(timezone.utc),
         "last_triggered_at": None,
+        "published_version": published_version,
     }
 
     triggers_collection.update_one(
         {"trigger_id": trigger_doc["trigger_id"]},
         {"$set": trigger_doc},
         upsert=True,
+        session=session,
     )
     logger.info(f"Registered google_sheet trigger for flow {flow_id}, sheet {sheet_id}")
 
@@ -607,13 +461,15 @@ async def _handle_google_sheet_trigger(
     }
 
 
-async def _register_single_trigger(
+def _register_single_trigger(
     org_id: str,
     flow_id: str,
     idx: int,
     trigger_type: str,
     config: dict,
     start_node_id: str,
+    session=None,
+    published_version=None,
 ):
     """Register a single non-followup, non-google_sheet trigger in automation_triggers."""
     triggers_collection = _automation_triggers_collection()
@@ -643,35 +499,22 @@ async def _register_single_trigger(
         "flow_id": flow_id,
         "org_id": org_id,
         "platform": platform,
-        "trigger_type": trigger_type,
+        "trigger_type": normalize_trigger(trigger_type),
         "filters": filters,
         "start_node_id": start_node_id,
         "status": "active",
         "registered_at": datetime.now(timezone.utc),
         "last_triggered_at": None,
+        "published_version": published_version,
     }
 
     triggers_collection.update_one(
         {"trigger_id": trigger_doc["trigger_id"]},
         {"$set": trigger_doc},
         upsert=True,
+        session=session,
     )
     logger.info(f"Registered trigger: {trigger_type} for flow {flow_id}")
-
-
-async def _register_flow_triggers(org_id: str, flow_id: str, flow_data: Dict):
-    """
-    Register all non-followup triggers. Kept for backward compatibility.
-    """
-    for idx, trigger_config in enumerate(flow_data.get("triggers", [])):
-        trigger_type = trigger_config.get("type")
-        if trigger_type in ("whatsapp_followup", "google_sheet"):
-            continue
-        config = trigger_config.get("config", {})
-        start_node_id = trigger_config.get("start_node_id")
-        if not start_node_id:
-            continue
-        await _register_single_trigger(org_id, flow_id, idx, trigger_type, config, start_node_id)
 
 
 # =============================================================================

@@ -19,6 +19,7 @@ import httpx
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Tuple
 
+from services.automation_state import published_snapshot
 from database import get_mongo_db
 from loguru import logger
 import asyncio
@@ -482,7 +483,7 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
         flow_exists = await asyncio.to_thread(
             lambda fid=flow_id: db[f"automation_flows_{org_id}"].find_one(
                 {"flow_id": fid, "org_id": org_id},
-                {"status": 1, "_id": 0}
+                {"status": 1, "published_version": 1, "version": 1, "_id": 0}
             )
         )
         if not flow_exists:
@@ -494,7 +495,10 @@ async def process_new_sheet_rows(org_id: str, sheet_id: str, target_flow_id: str
             )
             continue
 
-        if flow_exists.get("status") != "published":
+        if flow_exists.get("status") != "published" or (
+            trigger.get("published_version") is not None
+            and trigger["published_version"] != flow_exists.get("published_version", flow_exists.get("version", 1))
+        ):
             # Flow is not published — skip
             logger.debug(f"[GoogleSheetAuto] Flow {flow_id} is not published (status={flow_exists.get('status')}) — skipping")
             continue
@@ -1055,12 +1059,13 @@ def _get_flow_message_config(
 
     try:
         collection = db[f"automation_flows_{org_id}"]
-        flow = collection.find_one({"flow_id": flow_id}, {"flow_data": 1})
+        flow = collection.find_one({"flow_id": flow_id}, {"flow_data": 1, "published_snapshot": 1})
         if not flow:
             return ""
 
-        nodes = flow.get("flow_data", {}).get("nodes", {})
-        connections = flow.get("flow_data", {}).get("connections", [])
+        flow_data = published_snapshot(flow).get("flow_data", {})
+        nodes = flow_data.get("nodes", {})
+        connections = flow_data.get("connections", [])
 
         visited: set = set()
         queue: list = [start_node_id]

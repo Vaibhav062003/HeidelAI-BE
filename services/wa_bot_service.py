@@ -28,11 +28,16 @@ import uuid
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timezone
 
-from database import get_async_mongo_db
+from database import get_async_mongo_db, get_async_mongo_client
+from fastapi import HTTPException
+from pydantic import TypeAdapter
+from schemas.models import WhatsAppInteractiveMessage
+from services.automation_state import WA_DRAFT_FIELDS, public_flow, version_query, draft_fields
 from services.utils import serialize_mongo
 from loguru import logger
 
 db = get_async_mongo_db()
+interactive_adapter = TypeAdapter(WhatsAppInteractiveMessage)
 
 # ─── Internal helper ──────────────────────────────────────────────────────────
 
@@ -47,12 +52,13 @@ def _normalized_phone_ids(phone_ids: List[str]) -> List[str]:
     ))
 
 
-async def _validate_publish_phone_ids(org_id: str, phone_ids: List[str]) -> List[str]:
+async def _validate_publish_phone_ids(org_id: str, phone_ids: List[str], session=None) -> List[str]:
     normalized = _normalized_phone_ids(phone_ids)
     if not normalized:
         connections = await db.whatsapp_connections.find(
             {"org_id": org_id, "is_active": {"$ne": False}},
             {"phone_id": 1, "slot": 1, "_id": 0},
+            session=session,
         ).to_list(length=2)
         if len(connections) != 1 or not connections[0].get("phone_id"):
             raise ValueError("Select at least one active WhatsApp phone number")
@@ -65,6 +71,7 @@ async def _validate_publish_phone_ids(org_id: str, phone_ids: List[str]) -> List
             "is_active": {"$ne": False},
         },
         {"phone_id": 1, "_id": 0},
+        session=session,
     ).to_list(length=len(normalized))
     found = {str(connection.get("phone_id") or "") for connection in connections}
     missing = [phone_id for phone_id in normalized if phone_id not in found]
@@ -73,92 +80,52 @@ async def _validate_publish_phone_ids(org_id: str, phone_ids: List[str]) -> List
     return normalized
 
 
-async def _clear_flow_bindings(org_id: str, flow_id: str) -> None:
+async def _clear_flow_bindings(org_id: str, flow_id: str, session=None) -> None:
     await db.whatsapp_connections.update_many(
         {"org_id": org_id, "wa_bot_flow_id": flow_id},
         {"$unset": {"wa_bot_flow_id": ""}},
+        session=session,
     )
 
 
-async def _bind_flow_to_phone_ids(org_id: str, flow_id: str, phone_ids: List[str]) -> None:
+async def _bind_flow_to_phone_ids(org_id: str, flow_id: str, phone_ids: List[str], session=None) -> None:
     previous = await db.whatsapp_connections.find(
         {"org_id": org_id, "phone_id": {"$in": phone_ids}, "wa_bot_flow_id": {"$ne": flow_id}},
         {"wa_bot_flow_id": 1, "_id": 0},
+        session=session,
     ).to_list(length=len(phone_ids))
     replaced_flow_ids = {
         str(item.get("wa_bot_flow_id")) for item in previous if item.get("wa_bot_flow_id")
     }
-    await _clear_flow_bindings(org_id, flow_id)
+    await _clear_flow_bindings(org_id, flow_id, session=session)
     await db.whatsapp_connections.update_many(
         {"org_id": org_id, "phone_id": {"$in": phone_ids}, "is_active": {"$ne": False}},
         {"$set": {"wa_bot_flow_id": flow_id}},
+        session=session,
     )
     now = datetime.now(timezone.utc)
     for replaced_flow_id in replaced_flow_ids:
         remaining = await db.whatsapp_connections.count_documents({
             "org_id": org_id, "wa_bot_flow_id": replaced_flow_id, "is_active": {"$ne": False},
-        })
+        }, session=session)
         if remaining == 0:
             await _col(org_id).update_one(
                 {"flow_id": replaced_flow_id, "org_id": org_id},
                 {"$set": {"status": "draft", "published_at": None, "updated_at": now}},
+                session=session,
             )
 
 # ─── CREATE ───────────────────────────────────────────────────────────────────
 
-async def create_wa_bot_flow(
-    org_id: str,
-    name: str,
-    payload: Dict[str, Any],
-    created_by: Optional[str] = None,
-) -> Dict:
-    try:
-        col = _col(org_id)
-        flow_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
-
-        # Strip any _id that might have leaked in
-        payload.pop("_id", None)
-        payload.pop("flow_id", None)
-
-        raw_status = payload.get("status")
-        status = raw_status if raw_status in { "draft", "active" } else "draft"
-
-        doc = {
-            **payload,                     # all flat WaBot fields from frontend
-            "flow_id":    flow_id,
-            "org_id":     org_id,
-            "name":       payload.get("name", name),
-            "status":     status,
-            "flow_type":  "wabot",
-            "created_at": now,
-            "updated_at": now,
-            "created_by": created_by,
-            "updated_by": created_by,
-            "published_at": None if payload.get("status") != "active" else now,
-            "trigger_count": 0,
-            "last_run":   None,
-        }
-
-        await col.insert_one(doc)
-        
-        # Ensure only 1 active flow per organization if creating as active
-        if status == "active":
-            await col.update_many(
-                {"org_id": org_id, "flow_id": {"$ne": flow_id}},
-                {"$set": {
-                    "status": "draft",
-                    "published_at": None,
-                    "updated_at": now,
-                }}
-            )
-            
-        logger.info(f"Created wa_bot_flow {flow_id} for org {org_id}")
-        return serialize_mongo(doc)
-
-    except Exception as e:
-        logger.error(f"create_wa_bot_flow error: {e}")
-        raise
+async def create_wa_bot_flow(org_id: str, name: str, payload: Dict[str, Any], created_by: Optional[str] = None) -> Dict:
+    now = datetime.now(timezone.utc)
+    doc = {key: value for key, value in payload.items() if key in WA_DRAFT_FIELDS}
+    doc.update(flow_id=str(uuid.uuid4()), org_id=org_id, name=payload.get("name", name),
+               status="draft", flow_type="wabot", trigger_from="webhook", trigger_event="message_received",
+               version=1, created_at=now, updated_at=now, created_by=created_by, updated_by=created_by,
+               published_at=None, trigger_count=0, last_run=None)
+    await _col(org_id).insert_one(doc)
+    return serialize_mongo(public_flow(doc))
 
 
 # ─── LIST ─────────────────────────────────────────────────────────────────────
@@ -178,7 +145,7 @@ async def list_wa_bot_flows(
 
         flows = await col.find(query).sort("created_at", -1).to_list(length=None)
         logger.info(f"Listed {len(flows)} wa_bot_flows for org {org_id}")
-        return [serialize_mongo(f) for f in flows]
+        return [serialize_mongo(public_flow(f)) for f in flows]
 
     except Exception as e:
         logger.error(f"list_wa_bot_flows error: {e}")
@@ -206,7 +173,7 @@ async def get_wa_bot_flow(org_id: str, flow_id: str) -> Optional[Dict]:
         doc = await col.find_one({"flow_id": flow_id, "org_id": org_id})
         if not doc:
             return None
-        return serialize_mongo(doc)
+        return serialize_mongo(public_flow(doc))
 
     except Exception as e:
         logger.error(f"get_wa_bot_flow error: {e}")
@@ -303,28 +270,46 @@ async def delete_wa_bot_flow(org_id: str, flow_id: str) -> bool:
 
 # ─── PUBLISH ──────────────────────────────────────────────────────────────────
 
-async def publish_wa_bot_flow(
-    org_id: str,
-    flow_id: str,
-    phone_ids: List[str],
-    updated_by: Optional[str] = None,
-) -> Optional[Dict]:
-    """
-    Set status → "active" so the webhook picks it up.
+def _validate_wa_bot_draft(flow):
+    nodes = flow.get("nodes")
+    if not str(flow.get("trigger_messages") or "").strip() or not isinstance(nodes, dict):
+        raise ValueError("Complete the WhatsApp trigger and message steps before publishing.")
+    start = flow.get("start_node_id")
+    if start and start not in nodes:
+        raise ValueError("The WhatsApp start step is missing.")
+    if not start and not flow.get("welcome_message"):
+        raise ValueError("Connect the WhatsApp trigger to a message.")
+    messages = list(nodes.values())
+    for key in ("welcome_message", "introduction_message"):
+        message = flow.get(key)
+        if message:
+            messages.append(message.get("interactive", {}) if message.get("type") == "interactive" else message)
+    for message in messages:
+        if message.get("type") == "text":
+            if not str(message.get("content") or "").strip():
+                raise ValueError("Text steps require a message.")
+            continue
+        interactive_adapter.validate_python(message)
+        if not str(message.get("body_text") or "").strip():
+            raise ValueError("Interactive steps require a message.")
+        routes = [button["reply"]["id"] for button in message.get("buttons", [])]
+        routes += [row["id"] for section in message.get("sections", []) for row in section.get("rows", [])]
+        if message.get("type") in {"button", "list"} and not routes:
+            raise ValueError("Interactive steps require buttons or list rows.")
+        if any(route not in nodes for route in routes):
+            raise ValueError("Connect every WhatsApp button and list row to a step.")
 
-    The webhook query is:
-        db[f"wa_bot_flows_{org_id}"].find_one({
-            "trigger_from":  "webhook",
-            "trigger_event": "message_received",
-            "status":        "active",
-        })
 
-    We defensively set trigger_from and trigger_event here so the webhook
-    query always matches, even if those fields were somehow lost during
-    an update or manual DB edit.
-    """
-    try:
-        col = _col(org_id)
+async def publish_wa_bot_flow(org_id: str, flow_id: str, phone_ids: List[str], updated_by: Optional[str] = None, expected_draft_version: Optional[int] = None) -> Optional[Dict]:
+    async def publish(session):
+        flow = await _col(org_id).find_one({"flow_id": flow_id, "org_id": org_id}, session=session)
+        if not flow:
+            return None
+        query = version_query(flow, expected_draft_version)
+        _validate_wa_bot_draft(flow)
+        normalized = await _validate_publish_phone_ids(org_id, phone_ids, session=session)
+        # Snapshot the current draft, rather than a previous published snapshot.
+        snapshot = {key: flow[key] for key in WA_DRAFT_FIELDS if key in flow}
         now = datetime.now(timezone.utc)
 
         existing = await col.find_one({"flow_id": flow_id, "org_id": org_id})
@@ -357,52 +342,29 @@ async def publish_wa_bot_flow(
         )
 
         if not result:
-            await _clear_flow_bindings(org_id, flow_id)
-            return None
-
-        logger.info(f"Published wa_bot_flow {flow_id} for org {org_id}")
-        return serialize_mongo(result)
-
-    except Exception as e:
-        logger.error(f"publish_wa_bot_flow error: {e}")
-        raise
+            raise HTTPException(409, "This workflow changed. Reload before publishing.")
+        await _bind_flow_to_phone_ids(org_id, flow_id, normalized, session=session)
+        return result
+    async with await get_async_mongo_client().start_session() as session:
+        result = await session.with_transaction(publish)
+    return serialize_mongo(public_flow(result)) if result else None
 
 
 # ─── UNPUBLISH ────────────────────────────────────────────────────────────────
 
-async def unpublish_wa_bot_flow(
-    org_id: str,
-    flow_id: str,
-    updated_by: Optional[str] = None,
-) -> Optional[Dict]:
-    """
-    Revert to draft so the webhook no longer picks up this flow.
-    """
-    try:
-        col = _col(org_id)
-        now = datetime.now(timezone.utc)
-
-        result = await col.find_one_and_update(
+async def unpublish_wa_bot_flow(org_id: str, flow_id: str, updated_by: Optional[str] = None) -> Optional[Dict]:
+    async def unpublish(session):
+        result = await _col(org_id).find_one_and_update(
             {"flow_id": flow_id, "org_id": org_id},
-            {"$set": {
-                "status":       "draft",
-                "published_at": None,
-                "updated_at":   now,
-                "updated_by":   updated_by,
-            }},
-            return_document=True,
+            {"$set": {"status": "draft", "published_at": None, "updated_at": datetime.now(timezone.utc), "updated_by": updated_by}},
+            return_document=True, session=session,
         )
-
-        if not result:
-            return None
-
-        await _clear_flow_bindings(org_id, flow_id)
-        logger.info(f"Unpublished wa_bot_flow {flow_id} for org {org_id}")
-        return serialize_mongo(result)
-
-    except Exception as e:
-        logger.error(f"unpublish_wa_bot_flow error: {e}")
-        raise
+        if result:
+            await _clear_flow_bindings(org_id, flow_id, session=session)
+        return result
+    async with await get_async_mongo_client().start_session() as session:
+        result = await session.with_transaction(unpublish)
+    return serialize_mongo(public_flow(result)) if result else None
 
 
 # ─── DUPLICATE ────────────────────────────────────────────────────────────────
@@ -433,7 +395,7 @@ async def duplicate_wa_bot_flow(
         skip_keys = {
             "_id", "flow_id", "org_id", "created_at", "updated_at",
             "created_by", "updated_by", "published_at", "trigger_count",
-            "last_run", "phone_ids", "wa_bot_flow_id",
+            "last_run", "phone_ids", "wa_bot_flow_id", "version", "draft_version", "published_snapshot", "published_version",
         }
         content = {k: v for k, v in source.items() if k not in skip_keys}
 
@@ -453,11 +415,12 @@ async def duplicate_wa_bot_flow(
             "published_at":  None,
             "trigger_count": 0,
             "last_run":      None,
+            "version":       1,
         }
 
         await col.insert_one(doc)
         logger.info(f"Duplicated wa_bot_flow {flow_id} → {new_flow_id} for org {org_id}")
-        return serialize_mongo(doc)
+        return serialize_mongo(public_flow(doc))
 
     except Exception as e:
         logger.error(f"duplicate_wa_bot_flow error: {e}")

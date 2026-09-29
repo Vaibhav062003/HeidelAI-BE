@@ -275,6 +275,10 @@ def _queue_filter_conditions(
     status_filter: Optional[str],
     assigned_agent_id: Optional[str],
     team_id: Optional[str] = None,
+    reply_window_under_minutes: Optional[int] = None,
+    ad_pricing_active: bool = False,
+    ad_pricing_under_minutes: Optional[int] = None,
+    now: Optional[datetime] = None,
 ) -> List[Dict]:
     conditions: List[Dict] = []
     if active_tab == "mine" and current_user_id:
@@ -351,6 +355,16 @@ def _queue_filter_conditions(
             {"assigned_agent.id": assigned_agent_id},
             {"assigned_agent_id": assigned_agent_id},
         ]})
+    now = now or datetime.now(timezone.utc)
+    if reply_window_under_minutes is not None:
+        conditions.append({"reply_window_ends_at": {
+            "$type": "date", "$lt": now + timedelta(minutes=reply_window_under_minutes),
+        }})
+    if ad_pricing_active or ad_pricing_under_minutes is not None:
+        expiry = {"$type": "date", "$gt": now}
+        if ad_pricing_under_minutes is not None:
+            expiry["$lt"] = now + timedelta(minutes=ad_pricing_under_minutes)
+        conditions.extend([{"platform": "whatsapp"}, {"free_entry_window_ends_at": expiry}])
     return conditions
 
 
@@ -382,6 +396,9 @@ async def search_conversations(
     current_user_role: str = "org:member",
     team_id: Optional[str] = None,
     business_phone_id: Optional[str] = None,
+    reply_window_under_minutes: Optional[int] = None,
+    ad_pricing_active: bool = False,
+    ad_pricing_under_minutes: Optional[int] = None,
 ) -> Dict:
     clean_query = query.strip()
     if len(clean_query) < 2:
@@ -401,7 +418,10 @@ async def search_conversations(
         conditions.append(await _business_phone_scope(org_id, business_phone_id))
 
     conditions.extend(_queue_filter_conditions(
-        active_tab, current_user_id, attention, handling, status_filter, assigned_agent_id, team_id
+        active_tab, current_user_id, attention, handling, status_filter, assigned_agent_id, team_id,
+        reply_window_under_minutes=reply_window_under_minutes,
+        ad_pricing_active=ad_pricing_active,
+        ad_pricing_under_minutes=ad_pricing_under_minutes,
     ))
 
     if focus_group:
@@ -623,6 +643,9 @@ async def fetch_conversations_new(
     current_user_role: str = "org:member",
     team_id: Optional[str] = None,
     business_phone_id: Optional[str] = None,
+    reply_window_under_minutes: Optional[int] = None,
+    ad_pricing_active: bool = False,
+    ad_pricing_under_minutes: Optional[int] = None,
 ) -> object:
     start_time = time.time()
     async_db = get_async_mongo_db()
@@ -660,6 +683,9 @@ async def fetch_conversations_new(
         status_filter,
         assigned_agent_id,
         team_id,
+        reply_window_under_minutes=reply_window_under_minutes,
+        ad_pricing_active=ad_pricing_active,
+        ad_pricing_under_minutes=ad_pricing_under_minutes,
     ))
 
     if focus_group:
