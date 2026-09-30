@@ -3202,7 +3202,7 @@ def _persist_bulk_send_batch(
             "conversation_id": conversation_id, "business_phone_id": phone_id,
             "content": content, "type": "text" if message_text else "template",
             "payload": None if message_text else {
-                "name": template_name, "language": {"code": language_code}, "components": components,
+                "name": template_name, "language": {"code": language_code}, "components": entry.get("components") or components,
             },
             "sender_id": phone, "sender_name": "AI", "role": MessageRole.AI,
             "timestamp": now, "status": "sent", "mode": "reply", "context": None, "context_type": None,
@@ -3222,6 +3222,8 @@ async def run_bulk_send_job(
     delay_seconds: float = 8.0,
     max_concurrent: int = 50,
     message_text: Optional[str] = None,
+    personalize_name: bool = False,
+    fallback_name: Optional[str] = "Colleagues/seniors",
 ) -> None:
     """
     Background worker: sends WhatsApp templates using a bounded worker queue,
@@ -3300,8 +3302,32 @@ async def run_bulk_send_job(
                 "name": template_name,
                 "language": {"code": language_code},
             }
-            if components:
-                template_payload["components"] = components
+            
+            final_components = None
+            if components or personalize_name:
+                import copy, re
+                final_components = copy.deepcopy(components) if components else []
+                
+                if personalize_name:
+                    raw_name = getattr(recipient, "name", None) or fallback_name or ""
+                    clean_name = re.sub(r'[\r\n\t]+', ' ', str(raw_name)).strip()
+                    clean_name = re.sub(r'\s{2,}', ' ', clean_name)
+                    if not clean_name or clean_name.isdigit():
+                        clean_name = fallback_name or "Colleague"
+                    clean_name = clean_name[:60]
+                    
+                    body_component = next((c for c in final_components if c.get("type", "").lower() == "body"), None)
+                    if body_component:
+                        params = body_component.setdefault("parameters", [])
+                        params.insert(0, {"type": "text", "text": clean_name})
+                    else:
+                        final_components.append({
+                            "type": "body",
+                            "parameters": [{"type": "text", "text": clean_name}]
+                        })
+
+            if final_components:
+                template_payload["components"] = final_components
 
             payload = {
                 "messaging_product": "whatsapp",
@@ -3325,7 +3351,8 @@ async def run_bulk_send_job(
                     "phone_number": phone_number,
                     "status": "sent",
                     "message_id": message_id,
-                    "created_at": datetime.now(timezone.utc)
+                    "created_at": datetime.now(timezone.utc),
+                    "components": final_components if personalize_name else None
                 }
                 update_fields = {"$inc": {"sent": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}}
             else:

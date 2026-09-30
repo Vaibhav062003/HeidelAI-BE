@@ -345,6 +345,7 @@ WhatsAppInteractiveMessage = Annotated[
 
 class BulkRecipient(BaseModel):
     phone_number: str = Field(..., pattern=r"^\d{7,15}$")  # E.164 digits only, 7-15 chars
+    name: Optional[str] = None  # Optional name for template personalization
 
 class BulkMessageRequest(BaseModel):
     template_name: str = Field(..., min_length=1)       # Must be an APPROVED WhatsApp template
@@ -357,3 +358,5 @@ class BulkMessageRequest(BaseModel):
     components: Optional[List[Dict[str, Any]]] = None  # Same for all recipients (header, body, etc.)
     phone_number_id: Optional[str] = Field(default=None, max_length=128)
     delay_seconds: float = Field(default=8.0, ge=8.0)  # Seconds to wait between each batch of sends (applied per batch, not per recipient)
+    personalize_name: bool = Field(default=False)  # If true, injects the recipient's name as a parameter
+    fallback_name: Optional[str] = Field(default="Colleagues/seniors", max_length=60)

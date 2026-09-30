@@ -2709,6 +2709,25 @@ async def bulk_send_whatsapp_message(
             phone = "".join(character for character in recipient.phone_number if character.isdigit())
             unique_recipients[phone] = recipient.model_copy(update={"phone_number": phone})
         recipients = list(unique_recipients.values())
+        
+        # Batch lookup names if personalize_name is true
+        if req.personalize_name:
+            phones_missing_names = [r.phone_number for r in recipients if not r.name]
+            if phones_missing_names:
+                try:
+                    contacts_cursor = db[f"contacts_{org_id}"].find(
+                        {"phone_number": {"$in": phones_missing_names}},
+                        {"phone_number": 1, "full_name": 1, "_id": 0}
+                    )
+                    contact_docs = await asyncio.to_thread(list, contacts_cursor)
+                    contact_map = {doc["phone_number"]: doc.get("full_name") for doc in contact_docs}
+                    
+                    for r in recipients:
+                        if not r.name and r.phone_number in contact_map and contact_map[r.phone_number]:
+                            r.name = contact_map[r.phone_number]
+                except Exception as e:
+                    logger.error(f"Bulk WA | Failed to batch lookup names for org={org_id}: {e}")
+                    
         suppressed = await asyncio.to_thread(
             get_broadcast_suppressed_phone_keys,
             org_id,
@@ -2783,6 +2802,8 @@ async def bulk_send_whatsapp_message(
             recipients=recipients,
             components=req.components,
             delay_seconds=req.delay_seconds,
+            personalize_name=req.personalize_name,
+            fallback_name=req.fallback_name,
             # max_concurrent=20, # Optional: can be passed if needed
         )
 
