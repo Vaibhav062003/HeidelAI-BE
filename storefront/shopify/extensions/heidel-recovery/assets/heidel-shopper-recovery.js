@@ -178,7 +178,7 @@
         await request(JSON.stringify({channel: control.name, granted: control.checked}), 'POST');
         dirty.delete(control.name);
       }
-      status.textContent = 'Preferences saved. An earlier STOP or email unsubscribe remains in effect.';
+      status.textContent = 'Preferences saved. An earlier STOP remains in effect.';
     } catch (error) { status.textContent = error.message; }
     finally { button.disabled = false; controls.forEach(control => { control.disabled = false; }); }
   });

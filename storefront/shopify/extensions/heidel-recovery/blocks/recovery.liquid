@@ -9,14 +9,13 @@
       <fieldset>
         <legend>Store offers and updates</legend>
         <label><input type="checkbox" name="whatsapp"> Send offers by WhatsApp to my store account phone. I can reply STOP.</label>
-        <label><input type="checkbox" name="email"> Send offers and cart reminders to my store account email. Every email has an unsubscribe link.</label>
       </fieldset>
       <button type="submit">Save preferences</button>
       <p role="status" aria-live="polite"></p>
     </form>
     <p><a href="{{ routes.account_url }}">Update my account details</a></p>
   {% else %}
-    <p>Sign in to choose email or WhatsApp updates and cart reminders.</p>
+    <p>Sign in to choose WhatsApp updates and cart reminders.</p>
     <a href="{{ routes.account_login_url }}">Sign in to save preferences</a>
   {% endif %}
   <p><a href="{{ shop.privacy_policy.url }}">Privacy policy</a></p>
