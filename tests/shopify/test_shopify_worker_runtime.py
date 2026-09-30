@@ -234,7 +234,10 @@ class FakeCollection:
             apply_update(candidates[0], update)
             return copy.deepcopy(candidates[0])
         if upsert:
+            if any(item.get("_id") == query.get("_id") for item in self.documents) and query.get("_id") is not None:
+                raise sys.modules["pymongo.errors"].DuplicateKeyError("Duplicate _id")
             await self.update_one(query, update, upsert=True)
+            return copy.deepcopy(self.documents[-1])
         return None
 
     async def find_one(self, query, projection=None, sort=None):
@@ -326,6 +329,7 @@ def checkout(identifier: str, **overrides):
         "provider_id": identifier,
         "phone": "+14155550100",
         "customer_name": "Customer",
+        "whatsapp_consent": "SUBSCRIBED",
         "products": [{"name": "Board", "quantity": 1}],
         "recovery_url": "https://shop.test/recover/token",
         "record_status": "abandoned",

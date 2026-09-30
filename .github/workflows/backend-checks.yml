@@ -94,4 +94,6 @@ jobs:
           python test_release_messaging.py
           python test_release_commerce.py
           python tests/shopify/test_shopify_worker_runtime.py
+          python tests/shopify/test_commerce_growth.py
+          node tests/shopify/test_growth_embed.cjs
           python -m py_compile api/*.py services/*.py schemas/*.py

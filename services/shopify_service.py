@@ -129,6 +129,7 @@ query ShopifyOrders($first: Int!, $after: String, $query: String!, $sortKey: Ord
         nodes { id name quantity originalTotalSet { shopMoney { amount currencyCode } } }
       }
       totalPriceSet { shopMoney { amount currencyCode } }
+      netPaymentSet { shopMoney { amount currencyCode } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -148,12 +149,40 @@ WEBHOOK_TOPICS = (
     "CHECKOUTS_CREATE", "CHECKOUTS_UPDATE", "CHECKOUTS_DELETE",
     "ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_FULFILLED", "ORDERS_CANCELLED", "ORDERS_DELETE",
     "FULFILLMENTS_CREATE",
+    "REFUNDS_CREATE",
     "CUSTOMERS_UPDATE", "APP_UNINSTALLED",
 )
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def reserve_marketing_contact(org_id: str, channel: str, address: str, owner: str) -> bool:
+    """One atomic daily allowance shared by cart recovery and purchase campaigns."""
+    key = f"{org_id}:{channel}:{hashlib.sha256(address.encode()).hexdigest()}"
+    now = utcnow()
+    try:
+        return bool(await db.commerce_contact_limits.find_one_and_update(
+            {"_id": key, "$or": [{"next_allowed_at": {"$lte": now}}, {"next_allowed_at": {"$exists": False}}]},
+            {"$set": {"org_id": org_id, "next_allowed_at": now + timedelta(hours=24), "owner": owner}},
+            upsert=True, return_document=ReturnDocument.AFTER))
+    except DuplicateKeyError:
+        return False
+
+
+async def recovery_permission(checkout: dict) -> bool:
+    if checkout.get("whatsapp_consent") == "SUBSCRIBED":
+        return True
+    customer_id = checkout.get("customer_id")
+    if not customer_id:
+        return False
+    phone = _phone_key(checkout.get("phone"))
+    org_id = checkout["org_id"]
+    marketing = await db.commerce_marketing_consents.find_one({"_id": f"{org_id}:{customer_id}:whatsapp"})
+    cart = await db.shopify_storefront_consents.find_one({"_id": f"{org_id}:{customer_id}"})
+    return bool((marketing and marketing.get("granted") and marketing.get("address_key") == phone)
+                or (cart and cart.get("granted") and cart.get("phone_key") == phone))
 
 
 def _iso_utc(value: datetime) -> str:
@@ -537,6 +566,12 @@ def _checkout_operational_fields(checkout: dict, now: datetime | None = None) ->
 
 
 async def ensure_shopify_indexes() -> None:
+    await db.commerce_campaigns.create_index([("status", 1), ("scheduled_for", 1)])
+    await db.commerce_campaigns.create_index([("org_id", 1), ("created_at", -1)])
+    await db.commerce_marketing_consents.create_index([("org_id", 1), ("customer_id", 1)])
+    await db.commerce_email_sends.create_index([("org_id", 1), ("sent_at", -1)])
+    await db.commerce_email_sends.create_index("unsubscribe_hash", unique=True, sparse=True)
+    await db.commerce_knowledge_sources.create_index([("org_id", 1), ("source_id", 1)], unique=True)
     await db.shopify_oauth_states.create_index("expires_at", expireAfterSeconds=0)
     await db.shopify_connections.create_index("org_id", unique=True)
     await db.shopify_connections.create_index("shop", unique=True, sparse=True)
@@ -811,6 +846,7 @@ def _order_from_graphql(org_id: str, shop: str, node: dict) -> dict:
         "order_url": f"https://{shop}/admin/orders/{provider_id.rsplit('/', 1)[-1]}",
         "customer_id": customer.get("id"), "customer_name": _name(customer), "phone": phone,
         "products": items, "total": _money(node.get("totalPriceSet")),
+        "net_payment": {"amount": str((node["netPaymentSet"].get("shopMoney") or {}).get("amount", "0")), "currency": (node["netPaymentSet"].get("shopMoney") or {}).get("currencyCode", "")} if node.get("netPaymentSet") else None,
         "payment_status": node.get("displayFinancialStatus") or "", "fulfillment_status": node.get("displayFulfillmentStatus") or "",
         "cancelled_at": _parse_datetime(node.get("cancelledAt")), "record_status": "active",
         "created_at": created, "provider_created_at": created,
@@ -1286,6 +1322,8 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
             customer_id = str(payload.get("customer", {}).get("id") or payload.get("customer_id") or "")
             customer_ids = [customer_id, f"gid://shopify/Customer/{customer_id}"]
             await db.shopify_storefront_consents.delete_many({"org_id": org_id, "customer_id": {"$in": customer_ids}})
+            from services.shopify_growth import redact_customer
+            await redact_customer(org_id, customer_ids)
             order_ids = await db.shopify_orders.distinct("provider_id", {"org_id": org_id, "customer_id": {"$in": customer_ids}})
             await db.shopify_checkouts.delete_many({"org_id": org_id, "customer_id": {"$in": [customer_id, f"gid://shopify/Customer/{customer_id}"]}})
             await db.shopify_orders.delete_many({"org_id": org_id, "customer_id": {"$in": [customer_id, f"gid://shopify/Customer/{customer_id}"]}})
@@ -1293,6 +1331,12 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
                 await db.shopify_order_notifications.delete_many({"org_id": org_id, "order_provider_id": {"$in": order_ids}})
         return
     if topic in {"customers/data_request"}:
+        return
+    if topic == "refunds/create":
+        provider_id = _provider_gid("Order", payload.get("order_id"))
+        await db.shopify_orders.update_one({"org_id": org_id, "provider_id": provider_id},
+                                          {"$set": {"net_payment": None, "payment_status": "REFUND_SYNC_PENDING"}})
+        await request_sync(org_id)
         return
     if topic == "fulfillments/create":
         if not payload.get("order_id"):
@@ -1484,6 +1528,23 @@ def _checkout_from_webhook(org_id: str, shop: str, payload: dict, connection: di
     }
 
 
+def _webhook_net_payment(payload: dict) -> dict | None:
+    from decimal import Decimal, InvalidOperation
+    status = str(payload.get("financial_status") or "").upper()
+    if status not in {"PAID", "PARTIALLY_REFUNDED", "REFUNDED"}:
+        return None
+    try:
+        total = Decimal(str(payload.get("total_price") or "0"))
+        refunds = sum((Decimal(str(tx.get("amount") or "0")) for refund in payload.get("refunds") or []
+                       for tx in refund.get("transactions") or [] if tx.get("kind") == "refund" and tx.get("status") == "success"), Decimal(0))
+        if status == "PARTIALLY_REFUNDED" and not refunds:
+            return None
+        net = Decimal(0) if status == "REFUNDED" else max(Decimal(0), total - refunds)
+        return {"amount": str(net), "currency": payload.get("currency") or ""} if net.is_finite() else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
 def _order_from_webhook(org_id: str, shop: str, payload: dict) -> dict:
     customer = payload.get("customer") or {}
     shipping_address = payload.get("shipping_address") or {}
@@ -1504,6 +1565,7 @@ def _order_from_webhook(org_id: str, shop: str, payload: dict) -> dict:
         "customer_id": _provider_gid("Customer", customer.get("admin_graphql_api_id") or customer.get("id")) if customer.get("id") or customer.get("admin_graphql_api_id") else "",
         "customer_name": " ".join(part for part in (customer.get("first_name") or address.get("first_name"), customer.get("last_name") or address.get("last_name")) if part).strip(),
         "phone": phone, "products": items, "total": {"amount": float(payload.get("total_price") or 0), "currency": payload.get("currency") or ""},
+        "net_payment": _webhook_net_payment(payload),
         "payment_status": str(payload.get("financial_status") or "").upper(), "fulfillment_status": str(payload.get("fulfillment_status") or "UNFULFILLED").upper(),
         "cancelled_at": _parse_datetime(payload.get("cancelled_at")), "record_status": "active",
         "created_at": created, "provider_created_at": created,
@@ -1692,6 +1754,10 @@ def _template_compatible(template: dict, purpose: str = "cart") -> bool:
     if str(template.get("status") or "").upper() != "APPROVED" or str(template.get("category") or "").upper() != expected_category:
         return False
     components = template.get("components") or []
+    if purpose == "campaign":
+        return (bool(components) and any(str(part.get("type")).upper() == "BODY" and part.get("text") for part in components)
+                and not any("{{" in json.dumps(part) or (str(part.get("type")).upper() == "HEADER" and part.get("format") != "TEXT") for part in components)
+                and not any(button.get("type") not in {"URL", "PHONE_NUMBER", "QUICK_REPLY"} for part in components for button in part.get("buttons") or []))
     bodies = [part for part in components if str(part.get("type") or "").upper() == "BODY"]
     footers = [part for part in components if str(part.get("type") or "").upper() == "FOOTER"]
     if (
@@ -1847,6 +1913,8 @@ async def _finish_shopify_disconnect(org_id: str, *, provider_uninstall: bool = 
     await db.shopify_checkouts.delete_many({"org_id": org_id})
     await db.shopify_storefront_consents.delete_many({"org_id": org_id})
     await db.shopify_orders.delete_many({"org_id": org_id})
+    from services.shopify_growth import remove_store_data
+    await remove_store_data(org_id)
     await db.shopify_order_notifications.delete_many({"org_id": org_id})
     await _commerce_event(org_id, "connection", org_id)
 
@@ -1877,12 +1945,12 @@ async def commerce_summary(org_id: str) -> dict:
     now = utcnow()
     empty_counts = {
         "carts": 0, "orders": 0, "pending": 0, "scheduled": 0, "overdue": 0,
-        "processing": 0, "failed": 0, "sent": 0, "delivery_unknown": 0,
+        "processing": 0, "failed": 0, "sent": 0, "delivery_unknown": 0, "permission_missing": 0,
     }
     if not connection.get("connected"):
         return {"connected": False, "server_time": _iso_utc(now), "counts": empty_counts, "connection": connection}
     overdue_before = now - timedelta(seconds=OVERDUE_GRACE_SECONDS)
-    carts, orders, pending, scheduled, overdue, processing, failed, sent, unknown, heartbeat = await asyncio.gather(
+    carts, orders, pending, scheduled, overdue, processing, failed, sent, unknown, permission_missing, heartbeat = await asyncio.gather(
         db.shopify_checkouts.count_documents({"org_id": org_id}),
         db.shopify_orders.count_documents({"org_id": org_id, "record_status": {"$ne": "deleted"}}),
         db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}}),
@@ -1892,6 +1960,7 @@ async def commerce_summary(org_id: str) -> dict:
         db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": {"$in": ["failed", "configuration_failure", "phone_missing"]}}),
         db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": "sent"}),
         db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": "delivery_unknown"}),
+        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": "permission_missing"}),
         db.shopify_worker_heartbeats.find_one({"_id": "recovery"}),
     )
     heartbeat = heartbeat or {}
@@ -1906,7 +1975,7 @@ async def commerce_summary(org_id: str) -> dict:
     return {
         "connected": True,
         "server_time": _iso_utc(now),
-        "counts": {"carts": carts, "orders": orders, "pending": pending, "scheduled": scheduled, "overdue": overdue, "processing": processing, "failed": failed, "sent": sent, "delivery_unknown": unknown},
+        "counts": {"carts": carts, "orders": orders, "pending": pending, "scheduled": scheduled, "overdue": overdue, "processing": processing, "failed": failed, "sent": sent, "delivery_unknown": unknown, "permission_missing": permission_missing},
         "recovery_worker": worker,
         "connection": connection,
     }
@@ -2427,6 +2496,9 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         if opted_out:
             await _fail_claim(checkout, token, "opted_out", "customer_opt_out")
             return
+        if not await recovery_permission(current):
+            await _fail_claim(checkout, token, "permission_missing", "marketing_permission_missing")
+            return
         latest_current = await db.shopify_checkouts.find_one(
             {"org_id": org_id, "phone": current.get("phone")},
             sort=[("provider_updated_at", -1), ("provider_created_at", -1), ("provider_id", -1)],
@@ -2442,6 +2514,9 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
             "send_whatsapp_id": wa["wa_id"], "send_phone_id": wa["phone_id"],
             "send_template_name": template["name"], "send_template_language": template["language"],
         }
+        if not await reserve_marketing_contact(org_id, "whatsapp", phone.lstrip("+"), f"recovery:{checkout['provider_id']}"):
+            await _defer_claim(checkout, token, utcnow() + timedelta(hours=24), "phone_frequency_cap")
+            return
         started = await db.shopify_checkouts.find_one_and_update(
             {
                 "_id": checkout["_id"], "claim_token": token, "reminder_status": "sending", "provider_started_at": {"$exists": False},

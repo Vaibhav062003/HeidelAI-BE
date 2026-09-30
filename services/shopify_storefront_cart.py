@@ -157,6 +157,7 @@ async def capture_cart(query: str, raw: bytes) -> dict:
         if customer.get("id") != customer_id:
             raise HTTPException(422, "Shopify customer could not be verified")
         phone = s.normalize_phone((customer.get("defaultPhoneNumber") or {}).get("phoneNumber"))
+        await s.db.shopify_storefront_consents.update_one(consent_key, {"$set": {"phone_key": s._phone_key(phone)}})
         variants = {node["id"]: node for node in data.get("nodes", []) if node}
         products = []
         for item in payload["items"]:

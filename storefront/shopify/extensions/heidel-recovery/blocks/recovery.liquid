@@ -1,0 +1,39 @@
+<details id="heidel-shopper-preferences" class="heidel-shopper-preferences">
+  <summary>{{ block.settings.heading | escape }}</summary>
+  {% if customer %}
+    <div id="heidel-cart-recovery" data-customer="{{ customer.id }}" data-proxy="/apps/heidelai/cart">
+      <label><input type="checkbox" id="heidel-cart-consent"> Send me WhatsApp reminders about items I leave in my cart, using my store account phone. I can reply STOP to opt out.</label>
+      <p id="heidel-cart-status" role="status" aria-live="polite"></p>
+    </div>
+    <form id="heidel-marketing-consent" data-proxy="/apps/heidelai/consent">
+      <fieldset>
+        <legend>Store offers and updates</legend>
+        <label><input type="checkbox" name="whatsapp"> Send offers by WhatsApp to my store account phone. I can reply STOP.</label>
+        <label><input type="checkbox" name="email"> Send offers and cart reminders to my store account email. Every email has an unsubscribe link.</label>
+      </fieldset>
+      <button type="submit">Save preferences</button>
+      <p role="status" aria-live="polite"></p>
+    </form>
+    <p><a href="{{ routes.account_url }}">Update my account details</a></p>
+  {% else %}
+    <p>Sign in to choose email or WhatsApp updates and cart reminders.</p>
+    <a href="{{ routes.account_login_url }}">Sign in to save preferences</a>
+  {% endif %}
+  <p><a href="{{ shop.privacy_policy.url }}">Privacy policy</a></p>
+</details>
+{% style %}
+  .heidel-shopper-preferences { position: fixed; bottom: 16px; right: 16px; z-index: 100; width: min(340px, calc(100vw - 32px)); max-height: calc(100vh - 32px); overflow: auto; padding: 16px; border: 1px solid #ddd; border-radius: 12px; background: white; color: #222; font: 14px/1.5 system-ui, sans-serif; box-shadow: 0 4px 20px #0001; }
+  .heidel-shopper-preferences summary { cursor: pointer; font-weight: 600; }
+  .heidel-shopper-preferences label { display: block; margin: 12px 0; }
+  .heidel-shopper-preferences input { margin-right: 8px; }
+  .heidel-shopper-preferences fieldset { border: 0; padding: 0; }
+  .heidel-shopper-preferences button { padding: 8px 12px; cursor: pointer; }
+{% endstyle %}
+{% schema %}
+{
+  "name": "HeidelAI shopper recovery",
+  "target": "body",
+  "javascript": "heidel-shopper-recovery.js",
+  "settings": [{ "type": "text", "id": "heading", "label": "Heading", "default": "Cart reminders & store updates" }]
+}
+{% endschema %}
