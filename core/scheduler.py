@@ -150,7 +150,7 @@ def start_scheduler():
     from services.sales_offer_service import process_pending_sales_offer_audits
     from services.tally_service import check_tally_contact_sync_health, cleanup_expired_tally_pdfs, process_tally_payment_reminders, reconcile_stale_tally_jobs
     from services.shopify_service import process_shopify_reminders, process_shopify_syncs
-    from services.shopify_growth import process_campaigns, process_email_recovery, process_email_statuses
+    from services.shopify_growth import process_campaigns
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(process_time_based_tasks, "interval", hours=6, next_run_time=datetime.now(timezone.utc))
@@ -173,8 +173,6 @@ def start_scheduler():
     scheduler.add_job(process_shopify_reminders, "interval", seconds=30, next_run_time=datetime.now(timezone.utc), max_instances=1, coalesce=True)
     scheduler.add_job(process_shopify_syncs, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_campaigns, "interval", seconds=30, max_instances=1, coalesce=True)
-    scheduler.add_job(process_email_recovery, "interval", minutes=1, max_instances=1, coalesce=True)
-    scheduler.add_job(process_email_statuses, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(process_pending_pricing_escalations, "interval", minutes=1, max_instances=1, coalesce=True)
     scheduler.add_job(reconcile_active_product_sheets, "interval", minutes=15, max_instances=1, coalesce=True)
     # OOS: expire stale requests and escalate (check every hour)

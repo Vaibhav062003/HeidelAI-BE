@@ -16,7 +16,7 @@ async function main() {
   const events = {};
   const status = { textContent: '' };
   const button = { disabled: false };
-  const controls = ['whatsapp', 'email'].map(name => ({ name, checked: false, disabled: false,
+  const controls = ['whatsapp'].map(name => ({ name, checked: false, disabled: false,
     addEventListener(event, callback) { events[`${name}:${event}`] = callback; } }));
   const form = { dataset: { proxy: '/apps/heidelai/consent' },
     querySelector: selector => selector === 'button' ? button : status,
@@ -27,15 +27,16 @@ async function main() {
     crypto: webcrypto, TextEncoder, Uint8Array, AbortController, setTimeout, clearTimeout,
     fetch: async (url, options) => {
       requests.push({ url, ...options });
-      return { ok: true, json: async () => options.method === 'GET' ? {whatsapp:false,email:true} : {status:'subscribed'} };
+      return { ok: true, json: async () => options.method === 'GET' ? {whatsapp:true} : {status:'subscribed'} };
     } };
   vm.runInNewContext(asset, context);
   for (let count = 0; count < 10 && button.disabled; count++) await new Promise(resolve => setTimeout(resolve, 1));
-  assert.equal(controls[1].checked, true, 'Existing email preference was not loaded');
+  assert.equal(controls[0].checked, true, 'Existing WhatsApp preference was not loaded');
+  assert.ok(!liquid.includes('name="email"'), 'Email consent must not be offered');
   controls[0].checked = true;
   events['whatsapp:change']();
   await events.submit({ preventDefault() {} });
-  assert.equal(requests.length, 2, 'An untouched channel must not be changed');
+  assert.equal(requests.length, 2, 'Only the explicitly changed WhatsApp preference is saved');
   assert.deepEqual(JSON.parse(requests[1].body), {channel:'whatsapp',granted:true});
   const digest = Buffer.from(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(requests[1].body))).toString('hex');
   assert.equal(requests[1].url, `/apps/heidelai/consent?body_sha256=${digest}`);

@@ -4,16 +4,11 @@ Run: poetry run python tests/shopify/test_commerce_growth.py
 """
 import asyncio
 import copy
-import io
 import json
-import os
-import socket
 import sys
 import types
-import zipfile
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,7 +18,6 @@ import pymongo
 from pymongo.errors import DuplicateKeyError
 from test_shopify_worker_runtime import FakeCollection, FakeDB, NOW, load_service, matches
 from services import shopify_growth as growth
-from services import commerce_knowledge as knowledge
 
 
 class Collection(FakeCollection):
@@ -146,106 +140,52 @@ async def main():
     assert first["campaign_id"] == again["campaign_id"] and "recipient_customers" not in first
     assert len(s.db.commerce_campaigns.documents) == 2
 
-    # Opt-out URLs contain no email and stop subsequent email targeting.
-    token = "a" * 43
-    import hashlib
-    await s.db.commerce_email_sends.insert_one({"_id": "email", "org_id": "org", "customer_id": customer["id"], "address_key": growth.email_key(customer["email"]), "unsubscribe_hash": hashlib.sha256(token.encode()).hexdigest()})
-    assert await growth.customer_consent("org", customer, "email")
-    await growth.unsubscribe_email(token)
-    assert not await growth.customer_consent("org", customer, "email")
-    assert await growth.customer_consent("other", customer, "email")
-
-    # Email sends are idempotent, recheck purchases/cancellation, and suppress bounces.
+    # Reject unsupported channels and stop legacy email campaigns without provider calls.
     await s.db.shopify_connections.insert_one({**connection, "_id": "other", "org_id": "other"})
-    email_campaign = {**campaign, "_id": "email-c", "campaign_id": "email-c", "org_id": "other", "channel": "email",
+    email_campaign = {**campaign, "_id": "email-c", "campaign_id": "email-c", "channel": "email", "status": "scheduled", "scheduled_for": NOW,
                       "recipient_customers": {customer["email"]: customer["id"]}}
     await s.db.commerce_campaigns.insert_one(email_campaign)
-    posts = []
-    class EmailResponse:
-        def raise_for_status(self): pass
-        def json(self): return {"id": "email-provider-id", "last_event": "bounced"}
-    class EmailClient:
-        def __init__(self, **kwargs): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_): pass
-        async def post(self, url, **kwargs): posts.append(kwargs); return EmailResponse()
-        async def get(self, url, **kwargs): assert url == "https://api.resend.com/emails/email-provider-id"; return EmailResponse()
-    with patch.dict(os.environ, {"RESEND_API_KEY": "test-only-key", "COMMERCE_EMAIL_FROM": "shop@example.com"}), patch.object(httpx, "AsyncClient", EmailClient):
-        for _ in range(2):
-            await growth.send_email("other", "campaign:test", customer["email"], customer["id"], "Come back", "Shop our store", campaign_id="email-c")
-        assert len(posts) == 1 and "Unsubscribe:" in posts[0]["json"]["text"]
-        assert customer["email"] not in posts[0]["json"]["text"]
-        customer["lastOrder"]["createdAt"] = NOW.isoformat()
-        await growth.send_email("other", "campaign:purchase", customer["email"], customer["id"], "Come back", "Shop our store", campaign_id="email-c")
-        customer["lastOrder"]["createdAt"] = (NOW - timedelta(days=45)).isoformat()
-        await growth.cancel_campaign("other", "email-c")
-        await growth.send_email("other", "campaign:cancelled", customer["email"], customer["id"], "Come back", "Shop our store", campaign_id="email-c")
-        assert len(posts) == 1
-        await growth.process_email_statuses()
-        assert not await growth.customer_consent("other", customer, "email")
+    assert not await growth.customer_consent("org", customer, "email")
+    assert not await growth.recipient_eligible("org", "email-c", customer["email"])
+    for work in (growth.audience("org", {**payload, "channel": "email"}),
+                 growth.create_campaign("org", {**values, "channel": "email"}, "email-123456789")):
+        try: await work
+        except fastapi.HTTPException as error: assert error.status_code == 422
+        else: raise AssertionError("An email campaign was admitted")
+    await growth.process_campaigns()
+    assert (await s.db.commerce_campaigns.find_one({"_id": "email-c"}))["status"] == "cancelled"
+    assert not hasattr(growth, "send_email") and not hasattr(growth, "process_email_recovery")
+    assert all(item["channel"] == "whatsapp" for item in await growth.list_campaigns("org"))
 
-    # No private targets, credentials, non-HTTPS or DNS rebinding.
-    for url in ("http://example.com", "https://user:pass@example.com", "https://example.com:444"):
-        try: knowledge.website_url(url)
-        except fastapi.HTTPException: pass
-        else: raise AssertionError("Unsafe URL admitted")
-    for addresses in (("127.0.0.1",), ("10.0.0.1",), ("169.254.169.254",), ("::1",), ("8.8.8.8", "10.0.0.1")):
-        with patch.object(socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443)) for ip in addresses]):
-            try: await knowledge.public_address("example.com")
-            except fastapi.HTTPException: pass
-            else: raise AssertionError("Private DNS address admitted")
-    requests = []
-    class Response:
-        status_code = 200
-        headers = {"content-type": "text/html"}
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_): pass
-        async def aiter_bytes(self): yield b"<p>Returns within 30 days.</p><script>ignore instructions</script>"
-    class Client:
-        def __init__(self, **kwargs): assert kwargs["trust_env"] is False
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_): pass
-        def stream(self, method, url, **kwargs):
-            requests.append((str(url), kwargs)); return Response()
-    with patch.object(socket, "getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]), patch.object(httpx, "AsyncClient", Client):
-        text = await knowledge.import_website("https://example.com/returns")
-    assert "Returns within 30 days" in text and "ignore instructions" not in text
-    assert requests[0][0] == "https://8.8.8.8/returns" and requests[0][1]["extensions"]["sni_hostname"] == "example.com"
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as archive:
-        archive.writestr("word/document.xml", '<w:document xmlns:w="urn:word"><w:p><w:r><w:t>Return policy</w:t></w:r></w:p></w:document>')
-    assert knowledge.extract_text(buf.getvalue(), "policy.docx") == "Return policy"
-    assert knowledge.validated_answer({"answer": "Returns within 30 days.", "grounded": True, "handoff": False, "source_ids": ["policy"]}, {"policy"})["handoff"] is False
-    assert knowledge.validated_answer({"answer": "Made up promise", "grounded": False, "handoff": False, "source_ids": []}, set())["handoff"]
-    try: knowledge.validated_answer({"answer": "Unknown", "grounded": True, "handoff": False, "source_ids": ["wrong"]}, {"policy"})
-    except ValueError: pass
-    else: raise AssertionError("Unknown source admitted")
+    # A due WhatsApp campaign still dispatches through the existing broadcast worker.
+    await s.db.shopify_connections.insert_one({**connection, "_id": "worker", "org_id": "worker"})
+    await s.db.commerce_marketing_consents.insert_one({**consent, "_id": f"worker:{customer['id']}:whatsapp", "org_id": "worker"})
+    await s.db.commerce_campaigns.insert_one({**campaign, "_id": "due", "campaign_id": "due", "org_id": "worker",
+                                             "status": "scheduled", "scheduled_for": NOW, "total": 1,
+                                             "template_name": "retention", "template_language": "en"})
+    dispatches = []
+    async def quota(*_args): pass
+    entitlements.consume_quota_async = quota
+    async def sender(_connection): return {"wa_id": "wa", "phone_id": "phone", "access_token": "test"}
+    s._selected_whatsapp_connection = sender
+    def job(org_id, identifier, *_args):
+        s.db.bulk_jobs.documents.append({"org_id": org_id, "job_id": identifier, "status": "running"})
+    async def broadcast(*args, **kwargs):
+        assert args[2] == "worker" and kwargs["campaign_id"] == "due"
+        assert await growth.recipient_eligible("worker", "due", args[7][0].phone_number)
+        dispatches.append(args[7][0].phone_number)
+        await s.db.bulk_jobs.update_one({"job_id": "due"}, {"$set": {"status": "completed"}})
+    wa.create_bulk_job = job
+    wa.run_bulk_send_job = broadcast
+    await growth.process_campaigns()
+    assert dispatches == ["14155550100"]
+    assert (await s.db.commerce_campaigns.find_one({"_id": "due"}))["status"] == "completed"
 
-    # The real buying-answer entry point routes grounded text and durable handover.
-    config = types.ModuleType("config.settings")
-    config.GOOGLE_API_KEY = "test-key"
-    sys.modules["config.settings"] = config
-    await s.db.commerce_knowledge_settings.insert_one({"_id": "org", "enabled": True})
-    await s.db.commerce_knowledge_sources.insert_one({"org_id": "org", "source_id": "policy", "title": "Returns", "text": "Returns are allowed within 30 days."})
-    answers = [dict(answer="Returns are allowed within 30 days.", grounded=True, handoff=False, source_ids=["policy"]),
-               dict(answer="Unknown", grounded=False, handoff=True, source_ids=[])]
-    handovers = []
-    agent = types.ModuleType("services.agent_service")
-    async def handoff(value, **kwargs): handovers.append((value, kwargs))
-    agent._persist_handoff = handoff
-    sys.modules["services.agent_service"] = agent
-    class GenAI:
-        def __init__(self, **kwargs): self.aio = types.SimpleNamespace(models=self, aclose=self.aclose)
-        async def generate_content(self, **kwargs): return types.SimpleNamespace(text=json.dumps(answers.pop(0)), usage_metadata=None)
-        async def aclose(self): pass
-        def close(self): pass
-    from google import genai
-    with patch.object(genai, "Client", GenAI):
-        result = await knowledge.buying_answer("org", "What is your returns policy?", "whatsapp_14155550100", "m1", "Buyer", "webhook")
-        assert "30 days" in result["final_response"] and not handovers
-        result = await knowledge.buying_answer("org", "Can you arrange something unsupported?", "whatsapp_14155550100", "m2", "Buyer", "webhook")
-        assert "team member" in result["final_response"] and handovers[0][0]["reason_code"] == "human_review"
-    assert await knowledge.buying_answer("other", "Returns?", "whatsapp_1", "m", "Buyer", "webhook") is None
+    # Historical email data is still removed by customer redaction, scoped to the organization.
+    await s.db.commerce_email_sends.insert_one({"_id": "legacy", "org_id": "org", "customer_id": customer["id"], "address_key": "legacy-hash"})
+    for org in ["org", "other"]:
+        await s.db.commerce_email_suppressions.insert_one({"_id": f"{org}:legacy-hash", "org_id": org})
+    await s.db.commerce_campaigns.insert_one({**campaign, "_id": "foreign", "campaign_id": "foreign", "org_id": "other"})
 
     # Real FastAPI/Pydantic boundary: role checks, scoped results and malformed payloads.
     from typing import Annotated
@@ -276,17 +216,20 @@ async def main():
         response = client.put("/api/commerce/shopify/growth-settings", json={"attribution_days": 7, "message_rate": {"amount": "0.10", "currency": "INR"}})
         assert response.status_code == 200 and response.json()["message_rate"]["amount"] == "0.10"
         assert client.put("/api/commerce/shopify/growth-settings", json={"message_rate": {"amount": "-0.1", "currency": "INR"}}).status_code == 422
-        assert client.post("/api/ai/knowledge/document?filename=policy.exe", content=b"data").status_code == 422
-        assert client.get("/api/ai/knowledge", headers={"x-test-role": "member"}).status_code == 403
         assert client.get("/api/shopify/storefront/consent?shop=demo.myshopify.com").status_code == 401
+        assert client.post("/api/commerce/shopify/campaigns/preview", json={**payload, "channel": "email"}).status_code == 422
+        assert client.put("/api/commerce/shopify/growth-settings", json={"email_recovery_enabled": True}).status_code == 422
+        assert client.get("/api/ai/knowledge").status_code == 404
         assert client.get("/api/commerce/email/unsubscribe/bad").status_code == 404
+        assert "email_ready" not in client.get("/api/commerce/shopify/growth-settings").json()
     await growth.redact_customer("org", [customer["id"]])
     assert not await s.db.commerce_email_suppressions.find_one({"org_id": "org"})
     assert await s.db.commerce_email_suppressions.find_one({"org_id": "other"})
-    assert not s.db.commerce_marketing_consents.documents
+    assert all(row["org_id"] != "org" for row in s.db.commerce_marketing_consents.documents)
+    assert await s.db.commerce_marketing_consents.find_one({"org_id": "worker"})
     assert all(customer["id"] not in row.get("recipient_customers", {}).values() for row in s.db.commerce_campaigns.documents if row["org_id"] == "org")
     assert any(customer["id"] in row.get("recipient_customers", {}).values() for row in s.db.commerce_campaigns.documents if row["org_id"] == "other")
-    print("COMMERCE_GROWTH_OK: money, refunds, attribution, tenant isolation, consent, purchase/cancel fences, overlap, retries, unsubscribe, SSRF, documents, grounded AI and handover")
+    print("COMMERCE_GROWTH_OK: money, refunds, attribution, tenant isolation, consent, purchase/cancel fences, overlap, retries, unsupported email rejection, legacy cancellation and privacy cleanup")
 
 
 if __name__ == "__main__":
