@@ -85,3 +85,9 @@ python3 tests/shopify/test_shopify_worker_runtime.py
 node tests/shopify/test_storefront_capture.cjs
 node --check storefront/shopify/heidel-cart-recovery.js
 ```
+
+## Native theme app embed and commerce growth
+
+The `extensions/heidel-recovery` directory packages the existing cart client as a Shopify theme app embed, with separate authenticated WhatsApp and email marketing preferences. Copy it into the Shopify app project, deploy the extension, and enable the embed in the theme editor. Remove the manual snippet first. The existing signed `/apps/heidelai` proxy must forward to `/api/shopify/storefront`; the extension uses `/cart` and `/consent` underneath it.
+
+Growth routes add sales attribution, purchase campaigns and opt-in buying knowledge. Email uses server-side `RESEND_API_KEY`, `COMMERCE_EMAIL_FROM` and `SHOPIFY_PUBLIC_BASE_URL`. Knowledge uses `GOOGLE_API_KEY` and optional `COMMERCE_AI_MODEL`. All new automations start disabled until configured. Run `poetry run python tests/shopify/test_commerce_growth.py` before rollout.

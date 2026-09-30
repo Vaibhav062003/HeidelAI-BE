@@ -283,6 +283,11 @@ async def send_to_agent(
         except Exception as exc:
             raise AIProviderUnavailable("unexpected_error") from exc
 
+    from services.commerce_knowledge import buying_answer
+    buying_result = await buying_answer(org_id, user_input, conversation_id, message_id, customer_name, source)
+    if buying_result is not None:
+        return buying_result
+
     from services.sales_learning_service import get_sales_guidance, record_customer_response
     channel = "instagram" if conversation_id.startswith("instagram_") else "whatsapp"
 

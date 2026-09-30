@@ -3224,6 +3224,7 @@ async def run_bulk_send_job(
     message_text: Optional[str] = None,
     personalize_name: bool = False,
     fallback_name: Optional[str] = "Colleagues/seniors",
+    campaign_id: Optional[str] = None,
 ) -> None:
     """
     Background worker: sends WhatsApp templates using a bounded worker queue,
@@ -3286,6 +3287,15 @@ async def run_bulk_send_job(
     async def send_to_recipient(index, recipient, client):
         phone_number = recipient.phone_number
         masked_phone = mask_phone(phone_number)
+        if campaign_id:
+            from services.shopify_growth import recipient_eligible
+            try:
+                eligible = await recipient_eligible(org_id, campaign_id, phone_number)
+            except Exception:
+                eligible = False
+            if not eligible:
+                return ({"job_id": job_id, "phone_number": phone_number, "status": "skipped",
+                         "error": "Purchase, consent, cancellation or contact limit changed", "created_at": datetime.now(timezone.utc)}, {})
         
         if message_text:
             # Plain-text mode (used by Google Sheet automations)

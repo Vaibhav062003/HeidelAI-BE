@@ -152,6 +152,11 @@ def _load_agent_service():
     sales_learning.get_sales_guidance = get_sales_guidance
     sales_learning.record_customer_response = record_customer_response
     sales_workflow.automatic_purchase = automatic_purchase
+    knowledge = types.ModuleType("services.commerce_knowledge")
+    async def buying_answer(*_args, **_kwargs):
+        return None  # This fixture has no Shopify buying-answer configuration.
+    knowledge.buying_answer = buying_answer
+    sys.modules["services.commerce_knowledge"] = knowledge
     sys.modules["loguru"] = loguru
     sys.modules["config"] = config
     sys.modules["config.settings"] = settings
