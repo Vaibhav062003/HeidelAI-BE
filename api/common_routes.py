@@ -50,6 +50,8 @@ from services.contacts_service import (
     get_labels_from_org_metadata,
     get_unread_counts_by_labels,
     process_bulk_wa_contact_upload,
+    sync_vcf_contacts_for_org,
+    broadcast_vcf_contact_sync,
     get_uploaded_contacts_paginated,
     get_upload_batches,
     delete_uploaded_contact,
@@ -975,6 +977,8 @@ async def bulk_upload_whatsapp_contacts(
             )
         )
 
+        await broadcast_vcf_contact_sync(org_id, stats.pop("_updated_conversation_ids", []))
+
         return {
             "message": f"Successfully processed {file.filename}",
             "data": stats
@@ -987,6 +991,18 @@ async def bulk_upload_whatsapp_contacts(
     except Exception as e:
         logger.error(f"Bulk upload failed: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error during processing.")
+
+
+@router.post("/api/contacts/vcf-inbox-repair")
+@limiter.limit("5/minute")
+async def repair_vcf_inbox_contacts(request: Request, user: CurrentUser, org_id: str = Query(..., min_length=1), apply: bool = False):
+    """Admin-only repair, scoped to the authenticated organization; dry-run by default."""
+    await admin_required(user)
+    if not user.org_id or org_id != user.org_id:
+        raise HTTPException(status_code=403, detail="Repair must target your active organization.")
+    report = await asyncio.to_thread(sync_vcf_contacts_for_org, org_id, apply=apply)
+    await broadcast_vcf_contact_sync(org_id, report.pop("updated_conversation_ids"))
+    return {"org_id": org_id, "apply": apply, **report}
 
 
 @router.get("/api/contacts/uploaded")

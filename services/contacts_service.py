@@ -15,8 +15,8 @@ from core.services import services
 from database import get_mongo_db, get_mongo_client
 from loguru import logger
 from services.feature_flags import tally_enabled
-from services.websocket_service import broadcast_on_stats_update
-from services.utils import name_search_prefixes, normalize_phone
+from services.websocket_service import broadcast_on_stats_update, broadcast_org_ws
+from services.utils import name_search_prefixes, normalize_phone, serialize_mongo
 from services.whatsapp_connection_service import whatsapp_conversation_scope
 
 db = get_mongo_db()
@@ -569,6 +569,116 @@ def get_org_default_country_code(org_id: str) -> str:
     return "91"
 
 
+def _vcf_contact_sync_plan(contact: dict, conversations: list[dict]) -> dict:
+    ids = sorted({row["conversation_id"] for row in conversations})
+    contact_changes = {}
+    if ids:
+        def activity(row):
+            value = row.get("last_message_timestamp")
+            if isinstance(value, datetime):
+                value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+                return value.timestamp(), row["conversation_id"]
+            return float("-inf"), row["conversation_id"]
+
+        selected = contact.get("conversation_id")
+        if selected not in ids:
+            selected = max(conversations, key=activity)["conversation_id"]
+        for key, value in {"conversation_id": selected, "conversation_ids": ids}.items():
+            if contact.get(key) != value:
+                contact_changes[key] = value
+
+    names = {"customer_name": contact["full_name"], "customer_name_prefixes": name_search_prefixes(contact["full_name"])}
+    changes = [
+        {"conversation_id": row["conversation_id"], "before": {key: row.get(key) for key in names}, "after": names}
+        for row in conversations if any(row.get(key) != value for key, value in names.items())
+    ]
+    if contact_changes or changes:
+        contact_changes["updated_at"] = datetime.now(timezone.utc)
+    return {
+        "contact_id": str(contact["_id"]), "phone_number": contact["phone_number"],
+        "contact_before": {key: contact.get(key) for key in contact_changes},
+        "contact_after": contact_changes, "conversations": changes,
+        "conversation_ids": ids,
+    }
+
+
+def sync_vcf_contacts_for_org(org_id: str, *, batch_id: str | None = None, apply: bool = False) -> dict:
+    """Plan or apply contact-name/link repairs; each applied contact is transactional."""
+    contacts = db[f"contacts_{org_id}"]
+    conversations = db[f"conversations_{org_id}"]
+    query = {"name_locked_by_vcf": True, "deleted_at": {"$exists": False}}
+    if batch_id:
+        query["upload_metadata.batch_id"] = batch_id
+    report = {"changes": [], "errors": [], "updated_conversation_ids": []}
+    candidates = list(contacts.find(query))
+
+    for candidate in candidates:
+        def sync(session=None):
+            guard = {
+                "_id": candidate["_id"], "phone_number": candidate.get("phone_number"),
+                "full_name": candidate.get("full_name"), "updated_at": candidate.get("updated_at"),
+                "name_locked_by_vcf": True, "deleted_at": {"$exists": False},
+            }
+            current = contacts.find_one(guard, session=session)
+            if not current or not current.get("full_name"):
+                raise ValueError("Contact changed or has no saved name; rerun the repair.")
+            duplicates = contacts.find({"phone_number": current["phone_number"], "deleted_at": {"$exists": False}}, session=session)
+            if any(row.get("full_name") != current["full_name"] for row in duplicates):
+                raise ValueError("Duplicate contacts have conflicting names; resolve them before repair.")
+            phone = normalize_phone(current["phone_number"], is_canonical=True)
+            if not phone:
+                raise ValueError("Contact has no valid customer phone.")
+            rows = list(conversations.find({"platform": "whatsapp", "customer_id": phone}, session=session))
+            plan = _vcf_contact_sync_plan(current, rows)
+            if apply and (plan["contact_after"] or plan["conversations"]):
+                # A real contact write holds the transaction lock against concurrent name edits.
+                result = contacts.update_one(guard, {"$set": plan["contact_after"]}, session=session)
+                if result.matched_count != 1:
+                    raise ValueError("Contact changed; rerun the repair.")
+                changes = {change["conversation_id"]: change["after"] for change in plan["conversations"]}
+                operations = [
+                    UpdateOne({"_id": row["_id"], "platform": "whatsapp", "customer_id": phone}, {"$set": changes[row["conversation_id"]]})
+                    for row in rows if row["conversation_id"] in changes
+                ]
+                if operations:
+                    result = conversations.bulk_write(operations, ordered=False, session=session)
+                    if result.matched_count != len(operations):
+                        raise ValueError("Conversation changed; rerun the repair.")
+            return plan
+
+        try:
+            if apply:
+                # ponytail: per-contact transactions; batch transactions if large imports dominate latency.
+                with get_mongo_client().start_session() as session:
+                    plan = session.with_transaction(sync)
+            else:
+                plan = sync()
+            if plan["contact_after"] or plan["conversations"]:
+                report["changes"].append(plan)
+                if apply:
+                    report["updated_conversation_ids"].extend(plan["conversation_ids"])
+        except Exception as error:
+            logger.error(f"VCF inbox sync failed for contact {candidate['_id']}: {error}")
+            report["errors"].append({"contact_id": str(candidate["_id"]), "reason": str(error)})
+
+    report["updated_conversation_ids"] = sorted(set(report["updated_conversation_ids"]))
+    return report
+
+
+async def broadcast_vcf_contact_sync(org_id: str, conversation_ids: list[str]):
+    if not conversation_ids:
+        return
+    try:
+        rows = await asyncio.to_thread(lambda: list(db[f"conversations_{org_id}"].find({"conversation_id": {"$in": conversation_ids}}, {"_id": 0})))
+        for row in rows:
+            await broadcast_org_ws(org_id, "conversation_updated", {
+                "conversation_id": row["conversation_id"], "reason": "contact_name_updated",
+                "conversation": serialize_mongo(row),
+            })
+    except Exception as error:
+        logger.error(f"VCF inbox notification failed for org {org_id}: {error}")
+
+
 def process_bulk_wa_contact_upload(
     org_id: str,
     file_content: bytes,
@@ -669,7 +779,6 @@ def process_bulk_wa_contact_upload(
 
     processed_in_batch = set()
     bulk_ops: list[UpdateOne] = []
-    conversation_bulk_ops: list[UpdateOne] = []
     skipped_records: list[dict] = []
     success_count = 0
 
@@ -776,17 +885,6 @@ def process_bulk_wa_contact_upload(
                 # (same field cannot be in both $set and $setOnInsert)
                 contact_on_insert.pop("full_name", None)
                 
-                # Update conversation document so UI conversation list shows new name immediately
-                conversation_bulk_ops.append(
-                    UpdateOne(
-                        {"conversation_id": conversation_id},
-                        {"$set": {
-                            "customer_name": full_name,
-                            "customer_name_prefixes": name_search_prefixes(full_name),
-                        }}
-                    )
-                )
-
             update_doc: dict = {
                 "$set": set_fields,
                 "$setOnInsert": contact_on_insert,
@@ -826,12 +924,14 @@ def process_bulk_wa_contact_upload(
         
         success_count = newly_added + matched_count
 
-    # Execute conversation name updates if any VCF contacts were updated
-    if conversation_bulk_ops:
+    sync_report = {"errors": [], "updated_conversation_ids": []}
+    if source_type == "vcf" and success_count:
         try:
-            db[f"conversations_{org_id}"].bulk_write(conversation_bulk_ops, ordered=False)
-        except Exception as e:
-            logger.error(f"Error updating conversation names from VCF upload: {e}")
+            # Batch metadata selects only contacts whose upload write actually succeeded.
+            sync_report = sync_vcf_contacts_for_org(org_id, batch_id=batch_id, apply=True)
+        except Exception as error:
+            logger.error(f"VCF inbox synchronization failed for batch {batch_id}: {error}")
+            sync_report["errors"] = [{"reason": str(error)}] * success_count
 
     # ── 5. Persist batch metadata ─────────────────────────────────────────────
     batch_doc = {
@@ -857,6 +957,11 @@ def process_bulk_wa_contact_upload(
         "merged_existing": matched_count,
         "skipped_invalid_rows": len(skipped_records),
         "skipped_records": skipped_records,
+        **({"inbox_sync": {
+            "status": "partial" if sync_report["errors"] else "synced",
+            "failed_contacts": len(sync_report["errors"]),
+        }} if source_type == "vcf" else {}),
+        "_updated_conversation_ids": sync_report["updated_conversation_ids"],
     }
 
 
