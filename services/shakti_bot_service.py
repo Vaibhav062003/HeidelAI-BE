@@ -79,10 +79,12 @@ BIKES = {
 }
 
 OUTLETS = [
-    {"id": "out_ravet",   "title": "Ravet Showroom",     "desc": "Survey No 288, Pune Bhir Plaza", "url": "https://maps.google.com/?q=Ravet+Jawa+Yezdi"},
-    {"id": "out_pimpri",  "title": "Pimpri Chinchwad",   "desc": "Kasarwadi, Pune",                 "url": "https://maps.google.com/?q=Pimpri+Jawa+Yezdi"},
-    {"id": "out_mundhwa", "title": "Mundhwa / Kharadi",  "desc": "S.No.1, Nyati, Pune",              "url": "https://maps.google.com/?q=Mundhwa+Jawa"},
-    {"id": "out_baner",   "title": "Baner",              "desc": "GP Citi Capital, Pune",             "url": "https://maps.google.com/?q=Baner+Jawa"},
+    {"id": "out_baner", "title": "Baner", "desc": "Baner, Pune", "url": "https://maps.google.com/?q=Jawa+Yezdi+Baner+Pune"},
+    {"id": "out_wakad", "title": "Wakad", "desc": "Wakad, Pune", "url": "https://maps.google.com/?q=Jawa+Yezdi+Wakad+Pune"},
+    {"id": "out_chinchwad", "title": "Chinchwad", "desc": "Chinchwad, Pune", "url": "https://maps.google.com/?q=Jawa+Yezdi+Chinchwad+Pune"},
+    {"id": "out_ravet", "title": "Ravet", "desc": "Survey No 288, Pune Bhir Plaza", "url": "https://maps.google.com/?q=Jawa+Yezdi+Ravet+Pune"},
+    {"id": "out_sinhagad", "title": "Sinhagad Road", "desc": "Sinhagad Road, Pune", "url": "https://maps.google.com/?q=Jawa+Yezdi+Sinhagad+Road+Pune"},
+    {"id": "out_goa", "title": "Goa", "desc": "Goa Showroom", "url": "https://maps.google.com/?q=Jawa+Yezdi+Goa"}
 ]
 
 FAQS = [
