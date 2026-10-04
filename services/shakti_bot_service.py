@@ -322,7 +322,7 @@ async def _send_main_menu(org_id, wa_id, cid, name):
             "title": "Main Menu",
             "rows": [
                 {"id": "menu_browse",    "title": "Browse Bikes"},
-                {"id": "menu_dealer",    "title": "Find a Dealer"},
+                {"id": "menu_dealer",    "title": "Find a Showroom"},
                 {"id": "menu_test_ride", "title": "Book a Test Ride"},
                 {"id": "menu_service",   "title": "Book a Service"},
                 {"id": "menu_faqs",      "title": "FAQs & Policies"},
@@ -369,7 +369,7 @@ async def _send_model_detail(org_id, wa_id, cid, model_id, brand):
         "body_text": f"*{bike['title']}*\n\nGreat choice! What would you like to do next?",
         "buttons": [
             {"type": "reply", "reply": {"id": "act_test_ride", "title": "Book Test Ride"}},
-            {"type": "reply", "reply": {"id": "act_dealer",    "title": "Find Dealer"}},
+            {"type": "reply", "reply": {"id": "act_dealer",    "title": "Find Showroom"}},
             {"type": "reply", "reply": {"id": "act_menu",      "title": "Back to Menu"}},
         ],
     }
