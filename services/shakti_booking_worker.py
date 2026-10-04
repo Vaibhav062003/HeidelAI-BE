@@ -261,10 +261,7 @@ async def process_shakti_bookings(org_id: str, sheet_id: str):
         logger.info(f"[ShaktiBooking] Sheet column headers: {list(first_row_data.keys())}")
 
         # ── Get WhatsApp connection once ─────────────────────────────
-        wa_connection = await asyncio.to_thread(_get_wa_connection, SHAKTI_ORG_ID)
-        if not wa_connection:
-            logger.error(f"[ShaktiBooking] No WhatsApp connection for org {SHAKTI_ORG_ID}")
-            return
+        
 
         sent_count    = 0
         skipped_count = 0
@@ -342,6 +339,22 @@ async def process_shakti_bookings(org_id: str, sheet_id: str):
                         org_id, phone, "skipped_no_session", sheet_id,
                         row_number, booking_type, customer_name,
                     )
+                    skipped_count += 1
+                    continue
+
+                cid = session_doc.get("conversation_id", "")
+                business_phone_id = None
+                if cid.startswith("whatsapp_"):
+                    parts = cid.split("_")
+                    if len(parts) >= 3:
+                        business_phone_id = parts[1]
+                
+                from services.wa_service import resolve_outbound_whatsapp_connection
+                wa_connection = await asyncio.to_thread(
+                    resolve_outbound_whatsapp_connection, org_id, None, business_phone_id
+                )
+                if not wa_connection:
+                    logger.error(f"[ShaktiBooking] Could not resolve connection for phone_id {business_phone_id}. Fallback failed.")
                     skipped_count += 1
                     continue
 

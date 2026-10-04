@@ -343,6 +343,16 @@ async def _send_test_ride_cta(org_id, wa_id, cid):
         "url": "https://docs.google.com/forms/d/e/1FAIpQLSc10b6GwCw8NsrqX6DY1PtL9AIdE8XDV_SJa_f7Ji_8IZEkZQ/viewform?usp=publish-editor",
     }
     await _send_interactive(org_id, wa_id, cid, payload)
+    await asyncio.sleep(1)
+    back = {
+        "type": "button",
+        "body_text": "Need anything else?",
+        "buttons": [
+            {"type": "reply", "reply": {"id": "act_menu", "title": "Main Menu"}},
+            {"type": "reply", "reply": {"id": "act_end", "title": "End Chat"}}
+        ]
+    }
+    await _send_interactive(org_id, wa_id, cid, back)
 
 
 async def _send_service_cta(org_id, wa_id, cid):
@@ -353,6 +363,16 @@ async def _send_service_cta(org_id, wa_id, cid):
         "url": "https://docs.google.com/forms/d/e/1FAIpQLSeF91ySQvpjxaQqjywzvIcuJ9aagDE_Q91oEiuOXdbIzbhjZg/viewform?usp=publish-editor",
     }
     await _send_interactive(org_id, wa_id, cid, payload)
+    await asyncio.sleep(1)
+    back = {
+        "type": "button",
+        "body_text": "Need anything else?",
+        "buttons": [
+            {"type": "reply", "reply": {"id": "act_menu", "title": "Main Menu"}},
+            {"type": "reply", "reply": {"id": "act_end", "title": "End Chat"}}
+        ]
+    }
+    await _send_interactive(org_id, wa_id, cid, back)
 
 
 async def _send_outlets(org_id, wa_id, cid):
@@ -371,7 +391,7 @@ async def _send_outlet_detail(org_id, wa_id, cid, outlet_id):
     payload = {
         "type": "cta_url",
         "body_text": f"*{outlet['title']}*\n{outlet['desc']}",
-        "cta_label": "Get Directions",
+        "button_text": "Get Directions",
         "url": outlet["url"],
     }
     await _send_interactive(org_id, wa_id, cid, payload)
@@ -379,7 +399,7 @@ async def _send_outlet_detail(org_id, wa_id, cid, outlet_id):
     back = {
         "type": "button",
         "body_text": "Need anything else?",
-        "buttons": [{"type": "reply", "reply": {"id": "act_menu", "title": "Back to Menu"}}],
+        "buttons": [{"type": "reply", "reply": {"id": "act_menu", "title": "Back to Menu"}}, {"type": "reply", "reply": {"id": "act_end", "title": "End Chat"}}],
     }
     await _send_interactive(org_id, wa_id, cid, back)
 
@@ -511,7 +531,7 @@ async def handle_shakti_message(
 
     # ── Terminal states: only reactivate on trigger keywords ───────────
     if current_state in ("S_ENDED", "S8_AGENT"):
-        if text_content in TRIGGER_KEYWORDS:
+        if text_content in TRIGGER_KEYWORDS or interactive_id == "act_menu":
             if first_name:
                 await _update_session(org_id, customer_phone, "S2_MAIN_MENU",
                                       context={}, conversation_id=cid)
@@ -542,6 +562,12 @@ async def handle_shakti_message(
                      {"keyword": text_content})
         return True
 
+
+    if interactive_id == "act_end" or "end chat" in text_content:
+        await _update_session(org_id, customer_phone, "S_ENDED", ctx, conversation_id=cid)
+        await _send_text(org_id, wa_id, cid, "Thanks for chatting with Shakti Motors! Have a great day.")
+        await _audit(org_id, customer_phone, wa_message_id, "ended_chat", current_state, "S_ENDED")
+        return True
     if text_content in AGENT_KEYWORDS:
         await _update_session(org_id, customer_phone, "S8_AGENT", ctx, conversation_id=cid)
         await _send_text(org_id, wa_id, cid,
