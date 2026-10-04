@@ -33,6 +33,7 @@ State Machine:
 """
 
 import asyncio
+import string
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
@@ -46,7 +47,7 @@ from database import get_async_mongo_db
 SHAKTI_ENABLED = True          # Kill switch — set to False to disable instantly
 SHAKTI_ORG_ID = "org_2zV2OOhodLocEnTybzR8t9MIYCE"
 
-TRIGGER_KEYWORDS = frozenset({"hi", "hello", "hey", "menu", "start"})
+TRIGGER_KEYWORDS = frozenset({"hi", "hello", "hey", "menu", "start", "hii", "hiii", "heyy", "heya", "namaste"})
 AGENT_KEYWORDS   = frozenset({"agent", "human", "talk to a person", "help"})
 
 SESSION_TTL_HOURS = 24
@@ -117,6 +118,13 @@ def _get_interactive_adapter():
 # ═══════════════════════════════════════════════════════════════════════
 # 4. DATABASE HELPERS
 # ═══════════════════════════════════════════════════════════════════════
+
+
+def _matches_trigger(text: str) -> bool:
+    if not text: return False
+    clean = str(text).lower().translate(str.maketrans('', '', string.punctuation)).strip()
+    words = clean.split()
+    return any(w in TRIGGER_KEYWORDS for w in words)
 
 def _extract_phone(conversation_id: str) -> str:
     """Extract customer phone from conversation_id.
@@ -544,7 +552,18 @@ async def handle_shakti_message(
 
     # ── No session exists ──────────────────────────────────────────────
     if not session:
-        if text_content in TRIGGER_KEYWORDS:
+        if _matches_trigger(text_content):
+            from services.wa_service import create_or_update_whatsapp_conversation
+            await create_or_update_whatsapp_conversation(
+                org_id=org_id,
+                recipient_id=wa_id,
+                customer_phone_no=customer_phone,
+                customer_name=sender_name,
+                last_message=text_content,
+                last_sender="customer",
+                mode="reply",
+                business_phone_id=wa_id
+            )
             await _create_session(org_id, customer_phone, conversation_id)
             await _send_welcome(org_id, wa_id, cid)
             await _audit(org_id, customer_phone, wa_message_id,
@@ -567,7 +586,7 @@ async def handle_shakti_message(
 
     # ── Terminal states: only reactivate on trigger keywords ───────────
     if current_state in ("S_ENDED", "S8_AGENT"):
-        if text_content in TRIGGER_KEYWORDS or interactive_id == "act_menu":
+        if _matches_trigger(text_content) or interactive_id == "act_menu":
             if first_name:
                 await _update_session(org_id, customer_phone, "S2_MAIN_MENU",
                                       context={}, conversation_id=cid)
@@ -584,7 +603,7 @@ async def handle_shakti_message(
         return False   # Terminal state, not a keyword → fall through
 
     # ── Global keyword overrides (active sessions) ────────────────────
-    if text_content in TRIGGER_KEYWORDS:
+    if _matches_trigger(text_content):
         if first_name:
             await _update_session(org_id, customer_phone, "S2_MAIN_MENU",
                                   context={}, conversation_id=cid)
