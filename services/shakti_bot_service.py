@@ -261,6 +261,29 @@ async def _send_interactive(org_id: str, wa_id: str, conversation_id: str, paylo
 # 6. RESPONSE GENERATORS
 # ═══════════════════════════════════════════════════════════════════════
 
+
+async def _send_image(org_id: str, wa_id: str, conversation_id: str, media_url: str):
+    """Send an image to the user."""
+    try:
+        from services.wa_service import send_wa_media_message
+        customer_phone = _extract_phone(conversation_id)
+        if not customer_phone: return
+        await send_wa_media_message(
+            recipient_id=customer_phone,
+            media_url=media_url,
+            media_type="image",
+            wa_id=wa_id,
+            content=None,
+            org_id=org_id,
+            temp_id=None,
+            mode="reply",
+            context_type=None,
+            context=None,
+            conversation_id=conversation_id,
+        )
+    except Exception as e:
+        logger.error(f"[SHAKTI] Failed to send image to {conversation_id}: {e}")
+
 async def _send_welcome(org_id, wa_id, cid):
     text = (
         "Hi! I'm Vela, Shakti Motors' assistant — here to help with "
@@ -271,6 +294,11 @@ async def _send_welcome(org_id, wa_id, cid):
 
 async def _send_main_menu(org_id, wa_id, cid, name):
     greeting = f"Nice to meet you, {name}!" if name and name.lower() != "skip" else "Welcome!"
+    
+    img_url = "https://raw.githubusercontent.com/egenie4u/chatbot_prod/dev/assets/shakti_welcome.jpg"
+    await _send_image(org_id, wa_id, cid, img_url)
+    await asyncio.sleep(1)
+    
     payload = {
         "type": "list",
         "body_text": f"{greeting} What can I help with today?",
@@ -306,7 +334,7 @@ async def _send_brand_selection(org_id, wa_id, cid):
 async def _send_models(org_id, wa_id, cid, brand):
     brand_bikes = BIKES.get(brand, BIKES["jawa"])
     rows = [
-        {"id": f"model_{b['id']}", "title": b["title"], "description": f"From {b['price']} ex-showroom"}
+        {"id": f"model_{b['id']}", "title": b["title"], "description": "Explore features and book a ride"}
         for b in brand_bikes
     ]
     payload = {
@@ -323,7 +351,7 @@ async def _send_model_detail(org_id, wa_id, cid, model_id, brand):
     bike = next((b for b in brand_bikes if b["id"] == model_id), brand_bikes[0])
     payload = {
         "type": "button",
-        "body_text": f"*{bike['title']}*\nStarts from {bike['price']} (ex-showroom)\n\nExact on-road price depends on your city.",
+        "body_text": f"*{bike['title']}*\n\nGreat choice! What would you like to do next?",
         "buttons": [
             {"type": "reply", "reply": {"id": "act_test_ride", "title": "Book Test Ride"}},
             {"type": "reply", "reply": {"id": "act_dealer",    "title": "Find Dealer"}},
