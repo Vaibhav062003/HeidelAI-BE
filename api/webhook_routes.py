@@ -1522,9 +1522,29 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                 }
                                 store_contact_background(background_tasks, org_id, "whatsapp", contact_data)
 
-
-
-                                #  Don't execute for heidel_ai as it is not on whatsapp flow yet but has AI
+                                # --- SHAKTI MOTORS CUSTOM BOT INTERCEPTOR ---
+                                # Wrapped in try/except: if the Shakti bot crashes,
+                                # we fall through to normal AI/automation — never break the webhook.
+                                try:
+                                    from services.shakti_bot_service import handle_shakti_message, SHAKTI_ORG_ID
+                                    if org_id == SHAKTI_ORG_ID:
+                                        shakti_handled = await handle_shakti_message(
+                                            org_id=org_id,
+                                            conversation_id=conversation_id,
+                                            message_type=message_type,
+                                            content=content,
+                                            sender_name=sender_name2,
+                                            whatsapp_business_id=whatsapp_business_id,
+                                            wa_message_id=wa_message_id,
+                                            message_dict=message,
+                                        )
+                                        if shakti_handled:
+                                            await read_message_and_typing_indicator(whatsapp_id=whatsapp_business_id, message_id=message_id, conversation_id=conversation_id)
+                                            return {"status": "ok"}
+                                        # else: bot didn't handle it — fall through to normal flow
+                                except Exception as _shakti_err:
+                                    logger.error(f"[SHAKTI] Interceptor error (falling through): {_shakti_err}")
+                                # --------------------------------------------
 
                                     # Execute the WhatsApp Automation Flow first (if it exists)
                                     # Runs on all environments and regardless of AI toggle
