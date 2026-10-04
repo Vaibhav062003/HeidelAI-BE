@@ -559,6 +559,13 @@ async def handle_shakti_message(
     ctx           = session.get("context", {})
     first_name    = session.get("first_name", "")
 
+
+    if interactive_id == "act_end" or "end chat" in text_content:
+        await _update_session(org_id, customer_phone, "S_ENDED", ctx, conversation_id=cid)
+        await _send_text(org_id, wa_id, cid, "Thanks for chatting with Shakti Motors! Have a great day.")
+        await _audit(org_id, customer_phone, wa_message_id, "ended_chat", current_state, "S_ENDED")
+        return True
+
     # ── Terminal states: only reactivate on trigger keywords ───────────
     if current_state in ("S_ENDED", "S8_AGENT"):
         if text_content in TRIGGER_KEYWORDS or interactive_id == "act_menu":
@@ -592,12 +599,6 @@ async def handle_shakti_message(
                      {"keyword": text_content})
         return True
 
-
-    if interactive_id == "act_end" or "end chat" in text_content:
-        await _update_session(org_id, customer_phone, "S_ENDED", ctx, conversation_id=cid)
-        await _send_text(org_id, wa_id, cid, "Thanks for chatting with Shakti Motors! Have a great day.")
-        await _audit(org_id, customer_phone, wa_message_id, "ended_chat", current_state, "S_ENDED")
-        return True
     if text_content in AGENT_KEYWORDS:
         await _update_session(org_id, customer_phone, "S8_AGENT", ctx, conversation_id=cid)
         await _send_text(org_id, wa_id, cid,
