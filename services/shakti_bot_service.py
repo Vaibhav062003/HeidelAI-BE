@@ -454,16 +454,37 @@ async def handle_shakti_message(
                 interactive_id = idata.get("list_reply", {}).get("id", "")
             elif itype == "button_reply":
                 interactive_id = idata.get("button_reply", {}).get("id", "")
+            logger.info(f"[SHAKTI] Interactive extraction: itype={itype}, interactive_id={interactive_id}")
+        except Exception as _extract_err:
+            logger.error(f"[SHAKTI] Interactive extraction failed: {_extract_err}")
+
+    # Also handle WhatsApp "button" type replies (quick reply buttons)
+    if message_type == "button" and message_dict:
+        try:
+            btn_payload = message_dict.get("button", {}).get("payload", "")
+            btn_text = message_dict.get("button", {}).get("text", "")
+            logger.info(f"[SHAKTI] Button type detected: payload={btn_payload}, text={btn_text}")
+            # Use payload as interactive_id if it matches our button IDs
+            if btn_payload:
+                interactive_id = btn_payload
         except Exception:
             pass
 
     # ── Normalize text ─────────────────────────────────────────────────
     text_content = ""
-    if message_type == "text" and isinstance(content, str):
+    if isinstance(content, str):
         text_content = content.strip().lower()
 
     # Unified input for logging
     input_str = interactive_id or text_content or content or ""
+
+    # Debug log for ALL incoming Shakti messages
+    logger.info(
+        f"[SHAKTI] Incoming: phone={customer_phone}, "
+        f"message_type={message_type}, interactive_id='{interactive_id}', "
+        f"text_content='{text_content}', content='{str(content)[:80]}', "
+        f"message_dict_keys={list(message_dict.keys()) if message_dict else None}"
+    )
 
     # Shorthand
     wa_id = whatsapp_business_id
@@ -534,6 +555,11 @@ async def handle_shakti_message(
     new_state = current_state
     handled   = False
 
+    logger.info(
+        f"[SHAKTI] State machine: state={current_state}, "
+        f"interactive_id='{interactive_id}', text_content='{text_content}'"
+    )
+
     if current_state == "S1_WELCOME":
         if message_type == "text" and text_content:
             name = text_content.title() if len(text_content) < 30 else sender_name
@@ -545,33 +571,33 @@ async def handle_shakti_message(
             handled = True
 
     elif current_state == "S2_MAIN_MENU":
-        if interactive_id == "menu_browse":
+        if interactive_id == "menu_browse" or "browse" in text_content or "bikes" in text_content:
             new_state = "S3A_BRAND"
             await _send_brand_selection(org_id, wa_id, cid)
             handled = True
-        elif interactive_id == "menu_dealer":
+        elif interactive_id == "menu_dealer" or "dealer" in text_content or "find" in text_content:
             new_state = "S4A_ASK_PINCODE"
             ctx["next_action"] = "dealer"
             await _send_text(org_id, wa_id, cid,
                              "Great! Could you please share your 6-digit Pincode or City name so I can locate the nearest showroom?")
             handled = True
-        elif interactive_id == "menu_test_ride":
+        elif interactive_id == "menu_test_ride" or "test ride" in text_content:
             new_state = "S4A_ASK_PINCODE"
             ctx["next_action"] = "test_ride"
             await _send_text(org_id, wa_id, cid,
                              "Great! Could you please share your 6-digit Pincode or City name so we can find the nearest showroom for your test ride?")
             handled = True
-        elif interactive_id == "menu_service":
+        elif interactive_id == "menu_service" or "service" in text_content:
             new_state = "S4A_ASK_PINCODE"
             ctx["next_action"] = "service"
             await _send_text(org_id, wa_id, cid,
                              "Sure! Could you please share your 6-digit Pincode or City name so we can find the nearest service center?")
             handled = True
-        elif interactive_id == "menu_faqs":
+        elif interactive_id == "menu_faqs" or "faq" in text_content or "policies" in text_content:
             new_state = "S7A_FAQ"
             await _send_faqs(org_id, wa_id, cid)
             handled = True
-        elif interactive_id == "menu_agent":
+        elif interactive_id == "menu_agent" or any(k in text_content for k in AGENT_KEYWORDS):
             new_state = "S8_AGENT"
             await _send_text(org_id, wa_id, cid,
                              "I'll connect you with our team — someone will reply here shortly.")
@@ -584,6 +610,21 @@ async def handle_shakti_message(
             new_state = "S3B_MODELS"
             await _send_models(org_id, wa_id, cid, brand)
             handled = True
+        elif "jawa" in text_content:
+            ctx["brand"] = "jawa"
+            new_state = "S3B_MODELS"
+            await _send_models(org_id, wa_id, cid, "jawa")
+            handled = True
+        elif "yezdi" in text_content:
+            ctx["brand"] = "yezdi"
+            new_state = "S3B_MODELS"
+            await _send_models(org_id, wa_id, cid, "yezdi")
+            handled = True
+        elif "bsa" in text_content:
+            ctx["brand"] = "bsa"
+            new_state = "S3B_MODELS"
+            await _send_models(org_id, wa_id, cid, "bsa")
+            handled = True
 
     elif current_state == "S3B_MODELS":
         if interactive_id.startswith("model_"):
@@ -594,17 +635,17 @@ async def handle_shakti_message(
             handled = True
 
     elif current_state == "S3C_DETAIL":
-        if interactive_id == "act_test_ride":
+        if interactive_id == "act_test_ride" or "test ride" in text_content:
             new_state = "S_ENDED"
             await _send_test_ride_cta(org_id, wa_id, cid)
             handled = True
-        elif interactive_id == "act_dealer":
+        elif interactive_id == "act_dealer" or "dealer" in text_content:
             new_state = "S4A_ASK_PINCODE"
             ctx["next_action"] = "dealer"
             await _send_text(org_id, wa_id, cid,
                              "Great! Could you please share your 6-digit Pincode or City name so I can locate the nearest showroom?")
             handled = True
-        elif interactive_id == "act_menu":
+        elif interactive_id == "act_menu" or "menu" in text_content or "back" in text_content:
             new_state = "S2_MAIN_MENU"
             await _send_main_menu(org_id, wa_id, cid, first_name)
             handled = True
