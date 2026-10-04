@@ -576,22 +576,16 @@ async def handle_shakti_message(
             await _send_brand_selection(org_id, wa_id, cid)
             handled = True
         elif interactive_id == "menu_dealer" or "dealer" in text_content or "find" in text_content:
-            new_state = "S4A_ASK_PINCODE"
-            ctx["next_action"] = "dealer"
-            await _send_text(org_id, wa_id, cid,
-                             "Great! Could you please share your 6-digit Pincode or City name so I can locate the nearest showroom?")
+            new_state = "S4B_OUTLETS"
+            await _send_outlets(org_id, wa_id, cid)
             handled = True
         elif interactive_id == "menu_test_ride" or "test ride" in text_content:
-            new_state = "S4A_ASK_PINCODE"
-            ctx["next_action"] = "test_ride"
-            await _send_text(org_id, wa_id, cid,
-                             "Great! Could you please share your 6-digit Pincode or City name so we can find the nearest showroom for your test ride?")
+            new_state = "S_ENDED"
+            await _send_test_ride_cta(org_id, wa_id, cid)
             handled = True
         elif interactive_id == "menu_service" or "service" in text_content:
-            new_state = "S4A_ASK_PINCODE"
-            ctx["next_action"] = "service"
-            await _send_text(org_id, wa_id, cid,
-                             "Sure! Could you please share your 6-digit Pincode or City name so we can find the nearest service center?")
+            new_state = "S_ENDED"
+            await _send_service_cta(org_id, wa_id, cid)
             handled = True
         elif interactive_id == "menu_faqs" or "faq" in text_content or "policies" in text_content:
             new_state = "S7A_FAQ"
@@ -640,29 +634,12 @@ async def handle_shakti_message(
             await _send_test_ride_cta(org_id, wa_id, cid)
             handled = True
         elif interactive_id == "act_dealer" or "dealer" in text_content:
-            new_state = "S4A_ASK_PINCODE"
-            ctx["next_action"] = "dealer"
-            await _send_text(org_id, wa_id, cid,
-                             "Great! Could you please share your 6-digit Pincode or City name so I can locate the nearest showroom?")
+            new_state = "S4B_OUTLETS"
+            await _send_outlets(org_id, wa_id, cid)
             handled = True
         elif interactive_id == "act_menu" or "menu" in text_content or "back" in text_content:
             new_state = "S2_MAIN_MENU"
             await _send_main_menu(org_id, wa_id, cid, first_name)
-            handled = True
-
-    elif current_state == "S4A_ASK_PINCODE":
-        if message_type == "text" and text_content:
-            ctx["location"] = text_content
-            next_act = ctx.get("next_action")
-            if next_act == "test_ride":
-                new_state = "S_ENDED"
-                await _send_test_ride_cta(org_id, wa_id, cid)
-            elif next_act == "service":
-                new_state = "S_ENDED"
-                await _send_service_cta(org_id, wa_id, cid)
-            else:
-                new_state = "S4B_OUTLETS"
-                await _send_outlets(org_id, wa_id, cid)
             handled = True
 
     elif current_state == "S4B_OUTLETS":
