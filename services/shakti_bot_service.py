@@ -297,7 +297,7 @@ async def _send_welcome(org_id, wa_id, cid):
 async def _send_main_menu(org_id, wa_id, cid, name):
     greeting = f"Nice to meet you, {name}!" if name and name.lower() != "skip" else "Welcome!"
     
-    img_url = "https://raw.githubusercontent.com/egenie4u/chatbot_prod/dev/assets/shakti_welcome.jpg"
+    img_url = "https://res.cloudinary.com/djpc5zfgz/image/upload/v1791111128/whatsapp_media/org_2zV2OOhodLocEnTybzR8t9MIYCE/user/d5a6853c277e4f4989ba593aa056c2c1-shakti_welcome.jpg"
     await _send_image(org_id, wa_id, cid, img_url)
     await asyncio.sleep(1)
     
