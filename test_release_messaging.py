@@ -288,7 +288,7 @@ class MessagingTests(unittest.IsolatedAsyncioTestCase):
             run_bulk_send_job=object())
         req = SimpleNamespace(recipients=[Recipient()], phone_number_id="phone-B", template_name="demo",
                               language_code="en", components=[], delay_seconds=0,
-                              personalize_name=False, fallback_name="Colleagues/seniors")
+                              personalize_name=False, fallback_name=None)
         with patch.dict("sys.modules", {"services.entitlement_service": entitlement}):
             response = await scope["bulk_send_whatsapp_message"](None, req,
                 SimpleNamespace(add_task=lambda task, **kwargs: jobs.append(kwargs)), SimpleNamespace(org_id="org"))
