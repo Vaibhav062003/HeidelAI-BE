@@ -339,7 +339,7 @@ async def _send_test_ride_cta(org_id, wa_id, cid):
     payload = {
         "type": "cta_url",
         "body_text": "Let's get your test ride booked. Fill out this quick form and our team will confirm your slot.",
-        "cta_label": "Book Test Ride",
+        "button_text": "Book Test Ride",
         "url": "https://docs.google.com/forms/d/e/1FAIpQLSc10b6GwCw8NsrqX6DY1PtL9AIdE8XDV_SJa_f7Ji_8IZEkZQ/viewform?usp=publish-editor",
     }
     await _send_interactive(org_id, wa_id, cid, payload)
@@ -349,7 +349,7 @@ async def _send_service_cta(org_id, wa_id, cid):
     payload = {
         "type": "cta_url",
         "body_text": "Need a service? Schedule an appointment at any of our outlets.",
-        "cta_label": "Book Service",
+        "button_text": "Book Service",
         "url": "https://docs.google.com/forms/d/e/1FAIpQLSeF91ySQvpjxaQqjywzvIcuJ9aagDE_Q91oEiuOXdbIzbhjZg/viewform?usp=publish-editor",
     }
     await _send_interactive(org_id, wa_id, cid, payload)
