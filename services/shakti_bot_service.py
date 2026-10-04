@@ -47,7 +47,12 @@ from database import get_async_mongo_db
 SHAKTI_ENABLED = True          # Kill switch — set to False to disable instantly
 SHAKTI_ORG_ID = "org_2zV2OOhodLocEnTybzR8t9MIYCE"
 
-TRIGGER_KEYWORDS = frozenset({"hi", "hello", "hey", "menu", "start", "hii", "hiii", "heyy", "heya", "namaste"})
+TRIGGER_KEYWORDS = frozenset({
+    "hi", "hello", "hey", "menu", "start", 
+    "hii", "hiii", "heyy", "heya", "namaste",
+    "hi there", "hello there", "hey there",
+    "main menu", "show menu", "options", "bot"
+})
 AGENT_KEYWORDS   = frozenset({"agent", "human", "talk to a person", "help"})
 
 SESSION_TTL_HOURS = 24
@@ -123,8 +128,8 @@ def _get_interactive_adapter():
 def _matches_trigger(text: str) -> bool:
     if not text: return False
     clean = str(text).lower().translate(str.maketrans('', '', string.punctuation)).strip()
-    words = clean.split()
-    return any(w in TRIGGER_KEYWORDS for w in words)
+    # The entire cleaned message must match a keyword (no partial sentence triggers)
+    return clean in TRIGGER_KEYWORDS
 
 def _extract_phone(conversation_id: str) -> str:
     """Extract customer phone from conversation_id.
