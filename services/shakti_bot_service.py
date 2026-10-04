@@ -360,8 +360,7 @@ async def _send_model_detail(org_id, wa_id, cid, model_id, brand):
             {"type": "reply", "reply": {"id": "act_menu",      "title": "Back to Menu"}},
         ],
     }
-    if bike.get("img"):
-        payload["header"] = {"type": "image", "image": {"link": bike["img"]}}
+    # Removed image header to prevent Meta API blocking on mock URLs
     await _send_interactive(org_id, wa_id, cid, payload)
 
 
