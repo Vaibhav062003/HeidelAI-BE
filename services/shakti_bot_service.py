@@ -143,6 +143,58 @@ def _extract_phone(conversation_id: str) -> str:
     return parts[-1] if len(parts) >= 3 else ""
 
 
+def _extract_business_phone_id(conversation_id: str) -> str:
+    """Extract business_phone_id from conversation_id.
+
+    Format: whatsapp_{business_phone_id}_{customer_phone}
+    Example: whatsapp_1248072875064563_918421264032 → 1248072875064563
+    """
+    if not conversation_id or not conversation_id.startswith("whatsapp_"):
+        return ""
+    parts = conversation_id.split("_")
+    return parts[1] if len(parts) >= 3 else ""
+
+
+async def _ensure_conversation_exists(
+    org_id: str, conversation_id: str, wa_id: str,
+    customer_phone: str, sender_name: str, text_content: str,
+):
+    """Ensure a WhatsApp conversation doc exists in the DB.
+
+    Both send_whatsapp_message and send_interactive_whatsapp_message
+    require a conversation document to exist. For first-time customers,
+    this document doesn't exist yet because the Shakti interceptor runs
+    before the normal webhook creates it.
+    """
+    try:
+        from database import get_mongo_db
+        import asyncio
+        db = get_mongo_db()
+        existing = await asyncio.to_thread(
+            db[f"conversations_{org_id}"].find_one,
+            {"conversation_id": conversation_id},
+            {"_id": 1},
+        )
+        if existing:
+            return  # Already exists, nothing to do
+
+        business_phone_id = _extract_business_phone_id(conversation_id)
+        from services.wa_service import create_or_update_whatsapp_conversation
+        await create_or_update_whatsapp_conversation(
+            org_id=org_id,
+            recipient_id=wa_id,
+            customer_phone_no=customer_phone,
+            customer_name=sender_name,
+            last_message=text_content or "Hi",
+            last_sender="customer",
+            mode="reply",
+            business_phone_id=business_phone_id or None,
+        )
+        logger.info(f"[SHAKTI] Created conversation for new customer {customer_phone}")
+    except Exception as e:
+        logger.error(f"[SHAKTI] Failed to ensure conversation exists: {e}")
+
+
 async def _audit(org_id, phone, wa_message_id, action, from_state, to_state, details=None):
     """Write an audit record. Never raises — failures are logged and swallowed."""
     doc = {
@@ -552,23 +604,21 @@ async def handle_shakti_message(
     wa_id = whatsapp_business_id
     cid   = conversation_id
 
+    # ── Ensure conversation document exists in DB ─────────────────────
+    # Both send_whatsapp_message and send_interactive_whatsapp_message
+    # require a conversation doc. For first-time customers, the Shakti
+    # interceptor runs before the webhook creates it, so we must create
+    # it here.
+    await _ensure_conversation_exists(
+        org_id, cid, wa_id, customer_phone, sender_name, text_content,
+    )
+
     # ── Get session ────────────────────────────────────────────────────
     session = await _get_session(org_id, customer_phone)
 
     # ── No session exists ──────────────────────────────────────────────
     if not session:
         if _matches_trigger(text_content):
-            from services.wa_service import create_or_update_whatsapp_conversation
-            await create_or_update_whatsapp_conversation(
-                org_id=org_id,
-                recipient_id=wa_id,
-                customer_phone_no=customer_phone,
-                customer_name=sender_name,
-                last_message=text_content,
-                last_sender="customer",
-                mode="reply",
-                business_phone_id=wa_id
-            )
             await _create_session(org_id, customer_phone, conversation_id)
             await _send_welcome(org_id, wa_id, cid)
             await _audit(org_id, customer_phone, wa_message_id,
