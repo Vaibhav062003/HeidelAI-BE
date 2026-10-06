@@ -727,10 +727,11 @@ async def test_acceptance_precedes_inbox_and_reconciles_once(service):
     assert posts == 1
 
 
-async def test_order_event_sends_approved_template_once(service, parameter_count=3):
+async def test_order_event_sends_approved_template_once(service, parameter_count=3, event="received"):
     job = {
         "_id": "order-job", "org_id": "org", "order_provider_id": "gid://shopify/Order/1",
-        "event": "received", "event_at": NOW, "status": "sending", "claim_token": "claim",
+        "event": event, "event_at": NOW, "status": "sending", "claim_token": "claim",
+        **({"tracking": {"company": "Blue Dart", "number": "123456789", "url": "https://track.example/123456789"}} if event == "shipped" else {}),
     }
     notifications = FakeCollection([job])
     service.db = FakeDB(
@@ -743,7 +744,7 @@ async def test_order_event_sends_approved_template_once(service, parameter_count
         shopify_connections=FakeCollection([{
             "org_id": "org", "status": "connected", "order_notifications_enabled": True,
             "whatsapp_id": "waba", "whatsapp_phone_id": "phone",
-            "order_templates": {"received": {"name": "order_received", "language": "en", "status": "APPROVED", "parameter_count": parameter_count}},
+            "order_templates": {event: {"name": f"order_{event}", "language": "en", "status": "APPROVED", "parameter_count": parameter_count}},
         }]),
         whatsapp_connections=FakeCollection([{"_id": "wa", "org_id": "org", "wa_id": "waba", "phone_id": "phone", "is_active": True}]),
     )
@@ -780,8 +781,42 @@ async def test_order_event_sends_approved_template_once(service, parameter_count
     assert stored["status"] == "sent", stored
     assert stored["provider_message_id"] == "wamid.order.1"
     assert len(posts) == 1
-    assert posts[0]["template"]["name"] == "order_received"
-    assert [item["text"] for item in posts[0]["template"]["components"][0]["parameters"]] == (["#1001"] if parameter_count == 1 else ["Customer", "#1001", "Board x 2"])
+    assert posts[0]["template"]["name"] == f"order_{event}"
+    expected = ["#1001", "Blue Dart: 123456789 | Track: https://track.example/123456789"] if event == "shipped" else ["#1001"] if parameter_count == 1 else ["Customer", "#1001", "Board x 2"]
+    assert [item["text"] for item in posts[0]["template"]["components"][0]["parameters"]] == expected
+
+
+async def test_shipped_waits_for_tracking_update(service):
+    class Notifications(FakeCollection):
+        async def insert_one(self, document):
+            if self.documents:
+                raise service.DuplicateKeyError("already queued")
+            self.documents.append(copy.deepcopy(document))
+
+    notifications = Notifications()
+    orders = FakeCollection([{"org_id": "org", "provider_id": "gid://shopify/Order/1"}])
+    service.db = FakeDB(shopify_order_notifications=notifications, shopify_orders=orders)
+    service._commerce_event = async_noop
+    connection = {"org_id": "org", "shop": "example.myshopify.com", "order_notifications_enabled": True,
+                  "order_templates": {"shipped": {"status": "APPROVED", "parameter_count": 2}}}
+    await service._apply_webhook(connection, "fulfillments/create", {"order_id": 1}, NOW)
+    assert not notifications.documents
+    connection["order_templates"]["shipped"]["parameter_count"] = 3
+    await service._apply_webhook(connection, "fulfillments/update", {"order_id": 1, "tracking_number": "123456789"}, NOW)
+    assert not notifications.documents
+    connection["order_templates"]["shipped"]["parameter_count"] = 2
+    await service._apply_webhook(connection, "fulfillments/update", {
+        "order_id": 1, "tracking_company": "Blue Dart", "tracking_number": "123456789",
+        "tracking_url": "https://track.example/123456789",
+    }, NOW)
+    assert len(notifications.documents) == 1
+    assert notifications.documents[0]["tracking"]["number"] == "123456789"
+    assert orders.documents[0]["tracking"]["company"] == "Blue Dart"
+    await service._apply_webhook(connection, "fulfillments/update", {
+        "order_id": 1, "tracking_company": "Blue Dart", "tracking_number": "987654321",
+    }, NOW)
+    assert len(notifications.documents) == 1
+    assert notifications.documents[0]["tracking"]["number"] == "987654321"
 
 
 async def test_immediate_meta_rejection_is_visible_and_retried(service):
@@ -911,6 +946,8 @@ def test_delays_and_product_summary(service):
         "orders/create": "received", "fulfillments/create": "shipped",
         "orders/fulfilled": "fulfilled", "orders/cancelled": "cancelled",
     }
+    assert "FULFILLMENTS_UPDATE" in service.WEBHOOK_TOPICS
+    assert service._tracking_details({"company": "Blue Dart", "number": "123456789", "url": ""}) == "Blue Dart: 123456789"
     compliant_template = {
         "status": "APPROVED", "category": "UTILITY",
         "components": [
@@ -922,6 +959,8 @@ def test_delays_and_product_summary(service):
     order_id_template = {**compliant_template, "components": [{"type": "BODY", "text": "Order {{1}} has been received."}, compliant_template["components"][1]]}
     assert service._template_compatible(order_id_template, "order")
     assert service._template_parameter_count(order_id_template) == 1
+    tracking_template = {**compliant_template, "components": [{"type": "BODY", "text": "Order {{1}} tracking: {{2}}."}, compliant_template["components"][1]]}
+    assert service._template_compatible(tracking_template, "order")
     assert not service._template_compatible(order_id_template, "cart")
     assert not service._template_compatible({**compliant_template, "components": compliant_template["components"][:1]}, "order")
     assert not service._template_compatible({
@@ -933,14 +972,14 @@ def test_delays_and_product_summary(service):
     }, "order")
     for event in ("abandoned_cart", "received", "shipped", "fulfilled", "cancelled"):
         payload = service._default_template_payload(event)
-        assert payload["name"].endswith("_v3")
+        assert payload["name"].endswith("_v4" if event == "shipped" else "_v3")
         assert payload["category"] == ("MARKETING" if event == "abandoned_cart" else "UTILITY")
         assert [component["type"] for component in payload["components"]] == ["BODY", "FOOTER"]
         assert payload["components"][1]["text"] == service.SHOPIFY_TEMPLATE_FOOTER
         assert not re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", payload["components"][0]["text"])
         examples = payload["components"][0]["example"]["body_text"][0]
-        assert len(examples) == 3 and all(examples)
-        assert examples[2].startswith("https://") if event == "abandoned_cart" else examples[1].startswith("#")
+        assert len(examples) == (2 if event == "shipped" else 3) and all(examples)
+        assert examples[2].startswith("https://") if event == "abandoned_cart" else examples[0].startswith("#") if event == "shipped" else examples[1].startswith("#")
     summary = service._product_summary([
         {"name": "Board", "quantity": 6},
         {"name": "Wax", "quantity": 1},
@@ -969,6 +1008,8 @@ async def main():
     await test_acceptance_precedes_inbox_and_reconciles_once(load_service())
     await test_order_event_sends_approved_template_once(load_service())
     await test_order_event_sends_approved_template_once(load_service(), parameter_count=1)
+    await test_order_event_sends_approved_template_once(load_service(), parameter_count=2, event="shipped")
+    await test_shipped_waits_for_tracking_update(load_service())
     await test_immediate_meta_rejection_is_visible_and_retried(load_service())
     await test_async_meta_failure_keeps_terminal_reason(load_service())
     await test_late_failure_does_not_regress_delivered_notification(load_service())
