@@ -154,7 +154,7 @@ mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: String!) {
 WEBHOOK_TOPICS = (
     "CHECKOUTS_CREATE", "CHECKOUTS_UPDATE", "CHECKOUTS_DELETE",
     "ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_FULFILLED", "ORDERS_CANCELLED", "ORDERS_DELETE",
-    "FULFILLMENTS_CREATE",
+    "FULFILLMENTS_CREATE", "FULFILLMENTS_UPDATE",
     "REFUNDS_CREATE",
     "CUSTOMERS_UPDATE", "APP_UNINSTALLED",
 )
@@ -1377,9 +1377,11 @@ async def process_webhook(raw_body: bytes, headers: dict[str, str]) -> str:
         raise
 
 
-async def _queue_order_notification(connection: dict, event: str, order_provider_id: str, event_time: datetime) -> None:
+async def _queue_order_notification(connection: dict, event: str, order_provider_id: str, event_time: datetime, tracking: dict | None = None) -> None:
     template = (connection.get("order_templates") or {}).get(event) or {}
     if not connection.get("order_notifications_enabled") or template.get("status") != "APPROVED":
+        return
+    if event == "shipped" and (template.get("parameter_count") != 2 or not tracking or not tracking.get("number")):
         return
     now = utcnow()
     try:
@@ -1387,10 +1389,16 @@ async def _queue_order_notification(connection: dict, event: str, order_provider
             "org_id": connection["org_id"], "shop": connection["shop"],
             "order_provider_id": order_provider_id, "event": event,
             "status": "pending", "due_at": now, "event_at": event_time,
+            **({"tracking": tracking} if tracking else {}),
             "attempt_count": 0, "created_at": now, "updated_at": now,
         })
     except DuplicateKeyError:
-        pass
+        if tracking:
+            await db.shopify_order_notifications.update_one(
+                {"org_id": connection["org_id"], "order_provider_id": order_provider_id,
+                 "event": event, "status": {"$in": ["pending", "retryable"]}},
+                {"$set": {"tracking": tracking, "updated_at": now}},
+            )
 
 
 async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time: datetime) -> None:
@@ -1421,15 +1429,20 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
                                           {"$set": {"net_payment": None, "payment_status": "REFUND_SYNC_PENDING"}})
         await request_sync(org_id)
         return
-    if topic == "fulfillments/create":
+    if topic in {"fulfillments/create", "fulfillments/update"}:
         if not payload.get("order_id"):
             return
         order_provider_id = _provider_gid("Order", payload["order_id"])
+        tracking = {
+            "number": str(payload.get("tracking_number") or next(iter(payload.get("tracking_numbers") or []), "")).strip(),
+            "company": str(payload.get("tracking_company") or "").strip(),
+            "url": str(payload.get("tracking_url") or next(iter(payload.get("tracking_urls") or []), "")).strip(),
+        }
         await db.shopify_orders.update_one(
             {"org_id": org_id, "provider_id": order_provider_id},
-            {"$set": {"latest_fulfillment_at": event_time, "status_updated_at": utcnow()}},
+            {"$set": {"latest_fulfillment_at": event_time, "status_updated_at": utcnow(), **({"tracking": tracking} if tracking["number"] else {})}},
         )
-        await _queue_order_notification(connection, "shipped", order_provider_id, event_time)
+        await _queue_order_notification(connection, "shipped", order_provider_id, event_time, tracking)
         await _commerce_event(org_id, "order", order_provider_id)
         return
     if topic.startswith("orders/"):
@@ -1753,7 +1766,7 @@ async def list_compatible_templates(
         if event not in ORDER_EVENTS or not selected.get("name"):
             continue
         current = next((item for item in templates if item.get("name") == selected.get("name") and item.get("language") == selected.get("language")), None)
-        compatible = bool(current and _template_compatible(current, "order"))
+        compatible = bool(current and _template_compatible(current, "order") and (event != "shipped" or _template_parameter_count(current) == 2))
         updates[f"order_templates.{event}.status"] = "APPROVED" if compatible else "INCOMPATIBLE"
         updates[f"order_templates.{event}.parameter_count"] = _template_parameter_count(current) if compatible else 0
     if updates:
@@ -1811,7 +1824,7 @@ def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGU
     definitions = {
         "abandoned_cart": ("heidelai_abandoned_cart_v3", "MARKETING", "Hello {{1}}! It looks like these items are still waiting in your cart: {{2}}. You can complete your purchase using this secure checkout link: {{3}}. We are here if you need any help."),
         "received": ("heidelai_order_received_v3", "UTILITY", "Hello {{1}}! We have received your order {{2}}, which includes {{3}}. Our team is reviewing it, and we will keep you updated as the status changes."),
-        "shipped": ("heidelai_order_shipped_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been shipped. We will share another update when delivery information is available."),
+        "shipped": ("heidelai_order_shipped_v4", "UTILITY", "Your order {{1}} has shipped. Tracking details: {{2}}. Thank you for shopping with us."),
         "fulfilled": ("heidelai_order_fulfilled_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been fulfilled. We hope everything arrived as expected. Please contact our support team if you need any help."),
         "cancelled": ("heidelai_order_cancelled_v3", "UTILITY", "Hello {{1}}! Your order {{2}}, containing {{3}}, has been cancelled. If you did not request this or need assistance, please contact our support team."),
     }
@@ -1821,6 +1834,11 @@ def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGU
     normalized_language = str(language or DEFAULT_TEMPLATE_LANGUAGE).strip()
     if normalized_language.lower() == "en":
         normalized_language = DEFAULT_TEMPLATE_LANGUAGE
+    example = (
+        ["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"] if event == "abandoned_cart"
+        else ["#1001", "Blue Dart, tracking number 123456789"] if event == "shipped"
+        else ["Aarav", "#1001", "Laptop stand, keyboard"]
+    )
     return {
         "name": name,
         "language": normalized_language,
@@ -1829,7 +1847,7 @@ def _default_template_payload(event: str, language: str = DEFAULT_TEMPLATE_LANGU
             {
                 "type": "BODY",
                 "text": text,
-                "example": {"body_text": [["Aarav", "#1001", "Laptop stand, keyboard"]] if event != "abandoned_cart" else [["Aarav", "Laptop stand, keyboard", "https://example.myshopify.com/checkouts/example"]]},
+                "example": {"body_text": [example]},
             },
             {"type": "FOOTER", "text": SHOPIFY_TEMPLATE_FOOTER},
         ],
@@ -1895,7 +1913,7 @@ def _template_compatible(template: dict, purpose: str = "cart") -> bool:
     if re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", body_text):
         return False
     placeholders = re.findall(r"{{\s*(\d+)\s*}}", body_text)
-    return sorted(placeholders) in (["1"], ["1", "2", "3"]) if purpose == "order" else sorted(placeholders) == ["1", "2", "3"]
+    return sorted(placeholders) in (["1"], ["1", "2"], ["1", "2", "3"]) if purpose == "order" else sorted(placeholders) == ["1", "2", "3"]
 
 
 async def update_settings(org_id: str, settings: dict) -> dict:
@@ -1939,7 +1957,9 @@ async def update_settings(org_id: str, settings: dict) -> dict:
         if name:
             order_templates[event] = {"name": name, "language": language, "status": "APPROVED" if (name, language) in approved_utility else "INCOMPATIBLE", "parameter_count": approved_utility.get((name, language), 0)}
     if order_enabled and (not phone_id or len(order_templates) != len(ORDER_EVENTS) or any(item["status"] != "APPROVED" for item in order_templates.values())):
-        raise HTTPException(status_code=409, detail="Choose four approved one- or three-variable Utility templates for Shopify order updates")
+        raise HTTPException(status_code=409, detail="Choose four approved Utility templates for Shopify order updates")
+    if order_enabled and order_templates["shipped"]["parameter_count"] != 2:
+        raise HTTPException(status_code=409, detail="Choose an approved two-variable shipped template: order number and tracking details")
     settings_update = {
         "whatsapp_id": wa_id or None, "whatsapp_phone_id": phone_id or None, "template_name": template_name or None, "template_language": template_language,
         "template_status": "APPROVED" if selected else None, "reminder_delay_minutes": delay,
@@ -2881,6 +2901,9 @@ async def _send_order_notification(job: dict, token: str) -> None:
         if not connection or template.get("status") != "APPROVED" or not template.get("name") or not template.get("language"):
             await _finish_order_notification(job, token, "configuration_failure", "order_template_unavailable")
             return
+        if event == "shipped" and template.get("parameter_count") != 2:
+            await _finish_order_notification(job, token, "configuration_failure", "tracking_template_required")
+            return
         earlier = await db.shopify_order_notifications.find_one({
             "org_id": org_id, "order_provider_id": job["order_provider_id"], "event_at": {"$lt": job["event_at"]},
             "status": {"$in": ["pending", "retryable", "sending"]}, "_id": {"$ne": job["_id"]},
@@ -2918,9 +2941,21 @@ async def _send_order_notification(job: dict, token: str) -> None:
         first_name = str(order.get("customer_name") or "").split(" ", 1)[0][:80] or "there"
         order_number = str(order.get("order_number") or "Order")[:80]
         product_summary = _product_summary(order.get("products") or [])
-        if not product_summary and template.get("parameter_count") != 1:
+        parameter_count = template.get("parameter_count") or 3
+        if event == "shipped" and not (job.get("tracking") or {}).get("number"):
+            await _finish_order_notification(job, token, "failed", "tracking_unavailable")
+            return
+        if not product_summary and parameter_count == 3:
             await _finish_order_notification(job, token, "failed", "order_content_unavailable")
             return
+        if event == "shipped":
+            parameters = (order_number, _tracking_details(job["tracking"]))
+        elif parameter_count == 1:
+            parameters = (order_number,)
+        elif parameter_count == 2:
+            parameters = (first_name, order_number)
+        else:
+            parameters = (first_name, order_number, product_summary)
         if await _is_whatsapp_suppressed(org_id, phone):
             await _finish_order_notification(job, token, "opted_out", "customer_opt_out")
             return
@@ -2939,7 +2974,7 @@ async def _send_order_notification(job: dict, token: str) -> None:
             "messaging_product": "whatsapp", "to": phone.lstrip("+"), "type": "template",
             "template": {
                 "name": template["name"], "language": {"code": template["language"]},
-                "components": [{"type": "body", "parameters": [{"type": "text", "text": value} for value in ((order_number,) if template.get("parameter_count") == 1 else (first_name, order_number, product_summary))]}],
+                "components": [{"type": "body", "parameters": [{"type": "text", "text": value} for value in parameters]}],
             },
         }
         try:
@@ -3010,7 +3045,13 @@ async def _send_order_notification(job: dict, token: str) -> None:
         await _finish_order_notification(job, token, "failed", "pre_provider_failure", retry=int(job.get("pre_provider_attempts") or 0) < 3)
 
 
-def _order_message_content(order: dict, event: str) -> str:
+def _tracking_details(tracking: dict) -> str:
+    details = f"{tracking['company']}: {tracking['number']}" if tracking.get("company") else f"Tracking number: {tracking['number']}"
+    url = str(tracking.get("url") or "")
+    return (f"{details} | Track: {url}" if url.startswith("https://") else details)[:1000]
+
+
+def _order_message_content(order: dict, event: str, tracking: dict | None = None) -> str:
     event_text = {
         "received": "we received order {order} for {products}.",
         "shipped": "order {order} for {products} has shipped.",
@@ -3018,7 +3059,8 @@ def _order_message_content(order: dict, event: str) -> str:
         "cancelled": "order {order} for {products} has been cancelled.",
     }[event]
     name = str(order.get("customer_name") or "there").split(" ", 1)[0]
-    return f"Hi {name}, {event_text.format(order=order.get('order_number') or 'Order', products=_product_summary(order.get('products') or []))}"
+    content = f"Hi {name}, {event_text.format(order=order.get('order_number') or 'Order', products=_product_summary(order.get('products') or []))}"
+    return f"{content} Tracking details: {_tracking_details(tracking)}" if event == "shipped" and tracking and tracking.get("number") else content
 
 
 def _checkout_message_content(checkout: dict) -> str:
@@ -3036,7 +3078,7 @@ async def _reconcile_order_notification(job: dict) -> None:
         whatsapp_id = job.get("send_whatsapp_id")
         if not order or not phone or not whatsapp_id:
             raise RuntimeError("inbox_identity_unavailable")
-        content = _order_message_content(order, job["event"])
+        content = _order_message_content(order, job["event"], job.get("tracking"))
         if not sync_db[f"messages_{job['org_id']}"].find_one({"message_id": message_id}, {"_id": 1}):
             conversation_id = await create_or_update_whatsapp_conversation(
                 org_id=job["org_id"], recipient_id=whatsapp_id, customer_phone_no=phone,
@@ -3078,7 +3120,7 @@ async def _reconcile_order_failure(job: dict) -> None:
         whatsapp_id = job.get("send_whatsapp_id")
         if not order or not phone or not whatsapp_id:
             raise RuntimeError("inbox_identity_unavailable")
-        content = _order_message_content(order, job["event"])
+        content = _order_message_content(order, job["event"], job.get("tracking"))
         messages = sync_db[f"messages_{job['org_id']}"]
         if messages.find_one({"message_id": message_id}, {"_id": 1}):
             messages.update_one(
