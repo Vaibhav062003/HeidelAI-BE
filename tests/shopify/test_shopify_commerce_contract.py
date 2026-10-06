@@ -197,7 +197,7 @@ def main():
     ):
         assert required in SERVICE, f"missing boundary: {required}"
     assert 'consent != "SUBSCRIBED"' not in SERVICE
-    assert 'API_VERSION = "2025-10"' in SERVICE
+    assert 'API_VERSION = "2026-10"' in SERVICE
     assert 'filter_field = "created_at" if kind == "checkouts"' in SERVICE
     assert 'mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: String!)' in SERVICE
     assert 'data = await _graphql(connection, CHECKOUT_NODE_QUERY' in SERVICE
