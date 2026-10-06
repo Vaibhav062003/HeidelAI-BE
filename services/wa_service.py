@@ -3313,10 +3313,14 @@ async def run_bulk_send_job(
                 "language": {"code": language_code},
             }
             
+            recipient_parts = components
+            if campaign_id:
+                from services.shopify_growth import recipient_components
+                recipient_parts = await recipient_components(org_id, campaign_id, phone_number) or components
             final_components = None
-            if components or personalize_name:
+            if recipient_parts or personalize_name:
                 import copy, re
-                final_components = copy.deepcopy(components) if components else []
+                final_components = copy.deepcopy(recipient_parts) if recipient_parts else []
                 
                 if personalize_name:
                     raw_name = getattr(recipient, "name", None) or fallback_name or ""

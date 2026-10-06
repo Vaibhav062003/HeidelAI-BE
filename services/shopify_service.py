@@ -78,13 +78,14 @@ query ShopifyCheckouts($first: Int!, $after: String, $query: String!, $sortKey: 
     nodes {
       id abandonedCheckoutUrl createdAt updatedAt completedAt
       customer {
-        id firstName lastName
+        id firstName lastName numberOfOrders
         defaultPhoneNumber { phoneNumber }
       }
       shippingAddress { phone }
       billingAddress { phone }
-      lineItems(first: 50) {
-        nodes { id title quantity originalTotalPriceSet { shopMoney { amount currencyCode } } }
+      lineItems(first: 10) {
+        nodes { id title quantity sku product { id } variant { id } originalTotalPriceSet { shopMoney { amount currencyCode } } discountedTotalPriceWithCodeDiscount { shopMoney { amount currencyCode } } }
+        pageInfo { hasNextPage endCursor }
       }
       totalPriceSet { shopMoney { amount currencyCode } }
     }
@@ -99,13 +100,14 @@ query ShopifyCheckout($id: ID!) {
     ... on AbandonedCheckout {
       id abandonedCheckoutUrl createdAt updatedAt completedAt
       customer {
-        id firstName lastName
+        id firstName lastName numberOfOrders
         defaultPhoneNumber { phoneNumber }
       }
       shippingAddress { phone }
       billingAddress { phone }
-      lineItems(first: 50) {
-        nodes { id title quantity originalTotalPriceSet { shopMoney { amount currencyCode } } }
+      lineItems(first: 10) {
+        nodes { id title quantity sku product { id } variant { id } originalTotalPriceSet { shopMoney { amount currencyCode } } discountedTotalPriceWithCodeDiscount { shopMoney { amount currencyCode } } }
+        pageInfo { hasNextPage endCursor }
       }
       totalPriceSet { shopMoney { amount currencyCode } }
     }
@@ -120,16 +122,20 @@ query ShopifyOrders($first: Int!, $after: String, $query: String!, $sortKey: Ord
       id name createdAt updatedAt cancelledAt
       displayFinancialStatus displayFulfillmentStatus
       customer {
-        id firstName lastName
+        id firstName lastName numberOfOrders
         defaultPhoneNumber { phoneNumber }
       }
       shippingAddress { phone }
       billingAddress { phone }
-      lineItems(first: 50) {
-        nodes { id name quantity originalTotalSet { shopMoney { amount currencyCode } } }
+      lineItems(first: 10) {
+        nodes { id name quantity sku product { id } variant { id } originalTotalSet { shopMoney { amount currencyCode } } discountedTotalSet { shopMoney { amount currencyCode } } }
+        pageInfo { hasNextPage endCursor }
       }
       totalPriceSet { shopMoney { amount currencyCode } }
       netPaymentSet { shopMoney { amount currencyCode } }
+      customerJourneySummary { customerOrderIndex }
+      transactions(first: 250) { id kind status processedAt amountSet { shopMoney { amount currencyCode } } }
+      refunds { id refundLineItems(first: 10) { nodes { quantity subtotalSet { shopMoney { amount currencyCode } } lineItem { id } } pageInfo { hasNextPage endCursor } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -494,6 +500,7 @@ def _safe_document(document: dict | None, *, include_url: bool = False) -> dict 
         return None
     internal = {
         "_id", "access_token", "refresh_token", "claim_token", "claim_expires_at", "claimed_at",
+        "recovery_journey_id", "receipt_tracking_version", "attempt_registered", "receipt_reconciled_at", "send_message_rate", "payment_transactions",
         "customer_id", "checkout_token", "cart_token", "provider_message_id", "provider_started_at", "provider_accepted_at",
         "consent_updated_at", "attempts", "pre_provider_attempts", "shop", "send_whatsapp_id", "send_phone_id",
         "send_template_name", "send_template_language", "inbox_sync_status", "inbox_next_attempt_at", "inbox_attempts",
@@ -566,6 +573,19 @@ def _checkout_operational_fields(checkout: dict, now: datetime | None = None) ->
 
 
 async def ensure_shopify_indexes() -> None:
+    await db.commerce_delivery_receipts.create_index([("org_id", 1), ("message_id", 1)])
+    await db.commerce_delivery_receipts.create_index("received_at", expireAfterSeconds=400 * 86400)
+    await db.commerce_retargeting_jobs.create_index([("status", 1), ("updated_at", 1)])
+    await db.commerce_retargeting_jobs.create_index([("org_id", 1), ("created_at", -1)])
+    await db.commerce_message_attempts.create_index([("org_id", 1), ("accepted_at", 1)])
+    await db.commerce_experiments.create_index("org_id", unique=True, partialFilterExpression={"status": "running"})
+    await db.commerce_experiment_assignments.create_index([("org_id", 1), ("customer_id", 1), ("outcome_ends_at", 1)])
+    await db.commerce_tracked_links.create_index("token", unique=True)
+    await db.commerce_tracked_links.create_index("expires_at", expireAfterSeconds=0)
+    await db.commerce_pixel_events.create_index([("org_id", 1), ("received_at", 1)])
+    await db.commerce_pixel_events.create_index("received_at", expireAfterSeconds=400 * 86400)
+    await db.commerce_pixel_installations.create_index("token", unique=True)
+    await db.commerce_weekly_reports.create_index([("org_id", 1), ("created_at", -1)])
     await db.commerce_campaigns.create_index([("status", 1), ("scheduled_for", 1)])
     await db.commerce_campaigns.create_index([("org_id", 1), ("created_at", -1)])
     await db.commerce_marketing_consents.create_index([("org_id", 1), ("customer_id", 1)])
@@ -610,7 +630,7 @@ def _require_configuration() -> None:
         raise HTTPException(status_code=503, detail="Shopify public URL must use HTTPS")
 
 
-async def create_oauth_url(org_id: str, user_id: str, shop_value: str) -> str:
+async def create_oauth_url(org_id: str, user_id: str, shop_value: str, *, analytics: bool = False) -> str:
     _require_configuration()
     shop = normalize_shop(shop_value)
     current = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected"}, {"shop": 1})
@@ -628,7 +648,7 @@ async def create_oauth_url(org_id: str, user_id: str, shop_value: str) -> str:
         "expires_at": now + timedelta(minutes=OAUTH_TTL_MINUTES),
     })
     callback = f"{SHOPIFY_PUBLIC_BASE_URL}/api/integrations/shopify/oauth/callback"
-    return f"https://{shop}/admin/oauth/authorize?{urlencode({'client_id': SHOPIFY_CLIENT_ID, 'scope': OAUTH_SCOPES, 'redirect_uri': callback, 'state': token})}"
+    return f"https://{shop}/admin/oauth/authorize?{urlencode({'client_id': SHOPIFY_CLIENT_ID, 'scope': OAUTH_SCOPES + (',write_pixels,read_customer_events' if analytics else ''), 'redirect_uri': callback, 'state': token})}"
 
 
 def verify_callback_hmac(params: dict[str, str]) -> None:
@@ -799,6 +819,58 @@ async def _register_webhooks(connection: dict) -> None:
         await db.shopify_connections.update_one({"org_id": connection["org_id"]}, {"$set": {"webhook_error": None, "updated_at": utcnow()}})
 
 
+def _report_product(item: dict, *, checkout: bool = False) -> dict:
+    key = "discountedTotalPriceWithCodeDiscount" if checkout else "discountedTotalSet"
+    value = item.get(key) or item.get("originalTotalPriceSet" if checkout else "originalTotalSet")
+    bag = (value or {}).get("shopMoney") or {}
+    return {"id": item.get("id"), "product_id": (item.get("product") or {}).get("id"), "variant_id": (item.get("variant") or {}).get("id"),
+            "sku": item.get("sku"), "name": item.get("title") or item.get("name") or "Product", "quantity": int(item.get("quantity") or 0),
+            "total": {"amount": str(bag.get("amount", "0")), "currency": bag.get("currencyCode", "")} if value else None}
+
+
+async def _complete_line_items(connection: dict, node: dict, checkout: bool) -> dict:
+    fields = CART_REPORT_FIELDS if checkout else ORDER_REPORT_FIELDS
+    kind = "AbandonedCheckout" if checkout else "Order"
+    lines = node.get("lineItems") or {}
+    nodes = list(lines.get("nodes") or [])
+    info = lines.get("pageInfo") or {}
+    while info.get("hasNextPage"):
+        cursor = info.get("endCursor")
+        if not cursor:
+            raise HTTPException(502, "Shopify line-item cursor unavailable")
+        query = "query ReportLines($id: ID!, $after: String) { node(id: $id) { ... on " + kind + " { lineItems(first: 100, after: $after) { nodes { " + fields + " } pageInfo { hasNextPage endCursor } } } } }"
+        data = await _graphql(connection, query, {"id": node["id"], "after": cursor})
+        page = (data.get("node") or {}).get("lineItems")
+        if not page:
+            raise HTTPException(502, "Shopify line items unavailable")
+        nodes.extend(page.get("nodes") or [])
+        info = page.get("pageInfo") or {}
+        if info.get("hasNextPage") and info.get("endCursor") == cursor:
+            raise HTTPException(502, "Shopify repeated a line-item cursor")
+    if not checkout:
+        for refund in node.get("refunds") or []:
+            refund_lines = refund.get("refundLineItems") or {}
+            refund_nodes = list(refund_lines.get("nodes") or [])
+            refund_info = refund_lines.get("pageInfo") or {}
+            while refund_info.get("hasNextPage"):
+                refund_cursor = refund_info.get("endCursor")
+                if not refund_cursor:
+                    raise HTTPException(502, "Shopify refund cursor unavailable")
+                query = "query ReportRefundLines($id: ID!, $after: String) { node(id: $id) { ... on Refund { refundLineItems(first: 100, after: $after) { nodes { quantity subtotalSet { shopMoney { amount currencyCode } } lineItem { id } } pageInfo { hasNextPage endCursor } } } } }"
+                data = await _graphql(connection, query, {"id": refund["id"], "after": refund_cursor})
+                page = (data.get("node") or {}).get("refundLineItems")
+                if not page or (page.get("pageInfo", {}).get("hasNextPage") and page.get("pageInfo", {}).get("endCursor") == refund_cursor):
+                    raise HTTPException(502, "Shopify refund lines unavailable")
+                refund_nodes.extend(page.get("nodes") or [])
+                refund_info = page.get("pageInfo") or {}
+            refund["refundLineItems"] = {"nodes": refund_nodes, "pageInfo": refund_info}
+    return {**node, "lineItems": {"nodes": nodes, "pageInfo": info}}
+
+
+CART_REPORT_FIELDS = 'id title quantity sku product { id } variant { id } originalTotalPriceSet { shopMoney { amount currencyCode } } discountedTotalPriceWithCodeDiscount { shopMoney { amount currencyCode } }'
+ORDER_REPORT_FIELDS = 'id name quantity sku product { id } variant { id } originalTotalSet { shopMoney { amount currencyCode } } discountedTotalSet { shopMoney { amount currencyCode } }'
+
+
 def _checkout_from_graphql(org_id: str, shop: str, node: dict, historical: bool, delay_minutes: int = 30) -> dict:
     customer = node.get("customer") or {}
     phone, consent, consent_at = _record_phone_and_consent(
@@ -806,7 +878,7 @@ def _checkout_from_graphql(org_id: str, shop: str, node: dict, historical: bool,
     )
     items = []
     for item in ((node.get("lineItems") or {}).get("nodes") or []):
-        items.append({"id": item.get("id"), "name": item.get("title") or "Product", "quantity": int(item.get("quantity") or 0), "total": _money(item.get("originalTotalPriceSet"))})
+        items.append(_report_product(item, checkout=True))
     updated = _parse_datetime(node.get("updatedAt")) or utcnow()
     created = _parse_datetime(node.get("createdAt")) or updated
     recovery_url = str(node.get("abandonedCheckoutUrl") or "")
@@ -834,7 +906,14 @@ def _order_from_graphql(org_id: str, shop: str, node: dict) -> dict:
     )
     items = []
     for item in ((node.get("lineItems") or {}).get("nodes") or []):
-        items.append({"id": item.get("id"), "name": item.get("name") or "Product", "quantity": int(item.get("quantity") or 0), "total": _money(item.get("originalTotalSet"))})
+        items.append(_report_product(item))
+    from decimal import Decimal
+    for product in items:
+        refund_lines = [line for refund in node.get("refunds") or [] for line in (refund.get("refundLineItems") or {}).get("nodes") or [] if (line.get("lineItem") or {}).get("id") == product.get("id")]
+        product["refunded_quantity"] = sum(int(line.get("quantity") or 0) for line in refund_lines)
+        if refund_lines:
+            money_rows = [(line.get("subtotalSet") or {}).get("shopMoney") or {} for line in refund_lines]
+            product["refunded_total"] = {"amount": str(sum((Decimal(str(row.get("amount") or 0)) for row in money_rows), Decimal(0))), "currency": money_rows[0].get("currencyCode", "")}
     provider_id = str(node.get("id"))
     created = _parse_datetime(node.get("createdAt")) or utcnow()
     updated = _parse_datetime(node.get("updatedAt")) or created
@@ -843,6 +922,12 @@ def _order_from_graphql(org_id: str, shop: str, node: dict) -> dict:
         "order_url": f"https://{shop}/admin/orders/{provider_id.rsplit('/', 1)[-1]}",
         "customer_id": customer.get("id"), "customer_name": _name(customer), "phone": phone,
         "products": items, "total": _money(node.get("totalPriceSet")),
+        "customer_order_count": int(customer.get("numberOfOrders") or 0) or None,
+        "customer_order_count_at_purchase": (node.get("customerJourneySummary") or {}).get("customerOrderIndex"),
+        "paid_at": min((_parse_datetime(tx.get("processedAt")) for tx in node.get("transactions") or [] if tx.get("status") == "SUCCESS" and tx.get("kind") in {"SALE", "CAPTURE"} and _parse_datetime(tx.get("processedAt"))), default=None),
+        "payment_transactions": [{"kind": tx.get("kind"), "status": tx.get("status"), "processed_at": tx.get("processedAt"), "amount": (tx.get("amountSet") or {}).get("shopMoney")} for tx in node.get("transactions") or []],
+        "line_items_incomplete": bool((node.get("lineItems", {}).get("pageInfo") or {}).get("hasNextPage")),
+        "refund_lines_incomplete": any((refund.get("refundLineItems", {}).get("pageInfo") or {}).get("hasNextPage") for refund in node.get("refunds") or []),
         "net_payment": {"amount": str((node["netPaymentSet"].get("shopMoney") or {}).get("amount", "0")), "currency": (node["netPaymentSet"].get("shopMoney") or {}).get("currencyCode", "")} if node.get("netPaymentSet") else None,
         "payment_status": node.get("displayFinancialStatus") or "", "fulfillment_status": node.get("displayFulfillmentStatus") or "",
         "cancelled_at": _parse_datetime(node.get("cancelledAt")), "record_status": "active",
@@ -1137,10 +1222,11 @@ async def sync_shopify_org(org_id: str) -> None:
             cutoff = resource_cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
             sort_key = "CREATED_AT" if filter_field == "created_at" else "UPDATED_AT"
             while True:
-                data = await _graphql(connection, query, {"first": 50, "after": cursor, "query": f"{filter_field}:>={cutoff}", "sortKey": sort_key}, timeout=30)
+                data = await _graphql(connection, query, {"first": 10, "after": cursor, "query": f"{filter_field}:>={cutoff}", "sortKey": sort_key}, timeout=30)
                 page = data.get(root) or {}
                 nodes = page.get("nodes") or []
                 for node in nodes:
+                    node = await _complete_line_items(connection, node, kind == "checkouts")
                     if kind == "checkouts":
                         updated = _parse_datetime(node.get("updatedAt")) or utcnow()
                         activity_time = _recovery_activity_time(updated, activation) if connection.get("automation_enabled") else None
@@ -1377,6 +1463,7 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
         # cart; the existing abandoned-checkout lifecycle owns it from here.
         cart_token = str(payload.get("cart_token") or "").split("?", 1)[0]
         if cart_token:
+            await db.shopify_checkouts.update_many({"org_id": org_id, "source": "storefront_cart", "checkout_token": cart_token}, {"$set": {"storefront_checkout_started": True}})
             await db.shopify_checkouts.update_many(
                 {"org_id": org_id, "source": "storefront_cart", "checkout_token": cart_token,
                  "provider_started_at": {"$exists": False}},
@@ -1491,6 +1578,20 @@ def _provider_gid(kind: str, value: Any) -> str:
     return text if text.startswith("gid://") else f"gid://shopify/{kind}/{text}"
 
 
+def _webhook_report_product(item: dict, currency: str) -> dict:
+    from decimal import Decimal, InvalidOperation
+    quantity = int(item.get("quantity") or 0)
+    try:
+        value = Decimal(str(item["line_price"])) if item.get("line_price") is not None else Decimal(str(item.get("price") or 0))*quantity-Decimal(str(item.get("total_discount") or 0))
+        amount = str(max(Decimal(0), value)) if value.is_finite() else None
+    except (InvalidOperation, ValueError, TypeError):
+        amount = None
+    return {"id": str(item.get("admin_graphql_api_id") or item.get("id") or ""), "name": item.get("title") or item.get("name") or "Product", "quantity": quantity,
+            "product_id": _provider_gid("Product", item["product_id"]) if item.get("product_id") else None,
+            "variant_id": _provider_gid("ProductVariant", item["variant_id"]) if item.get("variant_id") else None, "sku": item.get("sku"),
+            "total": {"amount": amount, "currency": currency} if amount is not None else None}
+
+
 def _checkout_from_webhook(org_id: str, shop: str, payload: dict, connection: dict) -> dict:
     customer = payload.get("customer") or {}
     shipping_address = payload.get("shipping_address") or {}
@@ -1501,7 +1602,7 @@ def _checkout_from_webhook(org_id: str, shop: str, payload: dict, connection: di
     )
     items = []
     for item in payload.get("line_items") or []:
-        items.append({"id": str(item.get("admin_graphql_api_id") or item.get("id") or ""), "name": item.get("title") or item.get("name") or "Product", "quantity": int(item.get("quantity") or 0), "total": {"amount": float(item.get("line_price") or item.get("price") or 0), "currency": payload.get("currency") or ""}})
+        items.append(_webhook_report_product(item, payload.get("currency") or ""))
     updated = _parse_datetime(payload.get("updated_at")) or utcnow()
     customer_id = _provider_gid("Customer", customer.get("admin_graphql_api_id") or customer.get("id")) if customer.get("id") or customer.get("admin_graphql_api_id") else ""
     activation = _parse_datetime(connection.get("automation_enabled_at"))
@@ -1512,6 +1613,7 @@ def _checkout_from_webhook(org_id: str, shop: str, payload: dict, connection: di
     return {
         "org_id": org_id, "shop": shop,
         "provider_id": _provider_gid("AbandonedCheckout", payload.get("admin_graphql_api_id") or payload.get("id") or payload.get("token")),
+        "recovery_journey_id": str(payload.get("cart_token") or payload.get("token") or payload.get("id") or "").split("?", 1)[0],
         "checkout_token": str(payload.get("token") or payload.get("id") or ""),
         "customer_id": customer_id,
         "customer_name": " ".join(part for part in (customer.get("first_name") or address.get("first_name"), customer.get("last_name") or address.get("last_name")) if part).strip(),
@@ -1550,7 +1652,7 @@ def _order_from_webhook(org_id: str, shop: str, payload: dict) -> dict:
     phone, _, _ = _record_phone_and_consent(
         customer, shipping_address, billing_address, payload.get("phone"),
     )
-    items = [{"id": str(item.get("admin_graphql_api_id") or item.get("id") or ""), "name": item.get("name") or item.get("title") or "Product", "quantity": int(item.get("quantity") or 0), "total": {"amount": float(item.get("price") or 0) * int(item.get("quantity") or 0), "currency": payload.get("currency") or ""}} for item in payload.get("line_items") or []]
+    items = [_webhook_report_product(item, payload.get("currency") or "") for item in payload.get("line_items") or []]
     provider_id = _provider_gid("Order", payload.get("admin_graphql_api_id") or payload.get("id"))
     created = _parse_datetime(payload.get("created_at")) or utcnow()
     updated = _parse_datetime(payload.get("updated_at")) or created
@@ -1563,6 +1665,9 @@ def _order_from_webhook(org_id: str, shop: str, payload: dict) -> dict:
         "customer_name": " ".join(part for part in (customer.get("first_name") or address.get("first_name"), customer.get("last_name") or address.get("last_name")) if part).strip(),
         "phone": phone, "products": items, "total": {"amount": float(payload.get("total_price") or 0), "currency": payload.get("currency") or ""},
         "net_payment": _webhook_net_payment(payload),
+        "customer_order_count": int(customer.get("orders_count") or 0) or None,
+        "payment_transactions": [{"kind": str(tx.get("kind") or "").upper(), "status": str(tx.get("status") or "").upper(), "processed_at": tx.get("processed_at"), "amount": {"amount": tx.get("amount"), "currencyCode": tx.get("currency") or payload.get("currency")}} for tx in payload.get("transactions") or []],
+        "paid_at": min((_parse_datetime(tx.get("processed_at")) for tx in payload.get("transactions") or [] if tx.get("status") == "success" and tx.get("kind") in {"sale", "capture"} and _parse_datetime(tx.get("processed_at"))), default=None),
         "payment_status": str(payload.get("financial_status") or "").upper(), "fulfillment_status": str(payload.get("fulfillment_status") or "UNFULFILLED").upper(),
         "cancelled_at": _parse_datetime(payload.get("cancelled_at")), "record_status": "active",
         "created_at": created, "provider_created_at": created,
@@ -1656,7 +1761,7 @@ async def list_compatible_templates(
             {"$set": updates},
         )
     return [
-        {"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category")}
+        {"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category"), **({"tracking_button_index": _campaign_tracking_button(item)} if purpose == "campaign" else {})}
         for item in templates if _template_compatible(item, purpose)
     ]
 
@@ -1746,15 +1851,30 @@ def _meta_template_error(response) -> dict:
     }
 
 
+def _campaign_tracking_button(template: dict) -> int | None:
+    buttons = [button for part in template.get("components") or [] for button in part.get("buttons") or []]
+    dynamic = [(index, button) for index, button in enumerate(buttons) if "{{" in json.dumps(button)]
+    if len(dynamic) != 1:
+        return None
+    index, button = dynamic[0]
+    expected = SHOPIFY_PUBLIC_BASE_URL.rstrip("/") + "/api/commerce/shopify/link/{{1}}"
+    return index if button.get("type") == "URL" and button.get("url") == expected and "{{" not in str(button.get("text", "")) else None
+
+
 def _template_compatible(template: dict, purpose: str = "cart") -> bool:
     expected_category = "UTILITY" if purpose == "order" else "MARKETING"
     if str(template.get("status") or "").upper() != "APPROVED" or str(template.get("category") or "").upper() != expected_category:
         return False
     components = template.get("components") or []
     if purpose == "campaign":
-        return (bool(components) and any(str(part.get("type")).upper() == "BODY" and part.get("text") for part in components)
-                and not any("{{" in json.dumps(part) or (str(part.get("type")).upper() == "HEADER" and part.get("format") != "TEXT") for part in components)
-                and not any(button.get("type") not in {"URL", "PHONE_NUMBER", "QUICK_REPLY"} for part in components for button in part.get("buttons") or []))
+        track_index = _campaign_tracking_button(template)
+        cleaned = json.loads(json.dumps(components))
+        if track_index is not None:
+            buttons = [button for part in cleaned for button in part.get("buttons") or []]
+            buttons[track_index]["url"] = buttons[track_index]["url"].replace("{{1}}", "example")
+        return (bool(cleaned) and any(str(part.get("type")).upper() == "BODY" and part.get("text") for part in cleaned)
+                and not any("{{" in json.dumps(part) or (str(part.get("type")).upper() == "HEADER" and part.get("format") != "TEXT") for part in cleaned)
+                and not any(button.get("type") not in {"URL", "PHONE_NUMBER", "QUICK_REPLY"} for part in cleaned for button in part.get("buttons") or []))
     bodies = [part for part in components if str(part.get("type") or "").upper() == "BODY"]
     footers = [part for part in components if str(part.get("type") or "").upper() == "FOOTER"]
     if (
@@ -2082,6 +2202,10 @@ async def list_records(org_id: str, record_type: str, *, status: str = "", searc
     for item, conversation_id in zip(items, conversation_ids):
         safe = _safe_document(item, include_url=True)
         safe["conversation_id"] = conversation_id
+        if record_type == "checkout":
+            job = await db.commerce_retargeting_jobs.find_one({"org_id": org_id, "checkout_id": item["provider_id"]})
+            if job:
+                safe["followup"] = {key: _iso_utc(job[key]) if isinstance(job.get(key), datetime) else job.get(key) for key in ("status", "branch", "reason", "due_at", "delivery_status", "delivered_at", "read_at", "provider_accepted_at")}
         safe_items.append(safe)
     return {"items": safe_items, "next_cursor": next_cursor}
 
@@ -2095,7 +2219,12 @@ async def conversation_activity(org_id: str, conversation_id: str) -> dict:
         return {"checkout": None, "orders": []}
     checkout = await db.shopify_checkouts.find_one({"org_id": org_id, "phone": {"$in": phones}, "record_status": "abandoned"}, sort=[("provider_updated_at", -1), ("provider_id", -1)])
     orders = await db.shopify_orders.find({"org_id": org_id, "phone": {"$in": phones}, "record_status": {"$ne": "deleted"}}).sort("created_at", -1).limit(3).to_list(length=3)
-    return {"checkout": _safe_document(checkout, include_url=True), "orders": [_safe_document(item) for item in orders]}
+    safe_checkout = _safe_document(checkout, include_url=True)
+    if safe_checkout:
+        job = await db.commerce_retargeting_jobs.find_one({"org_id": org_id, "checkout_id": checkout["provider_id"]})
+        if job:
+            safe_checkout["followup"] = {key: _iso_utc(job[key]) if isinstance(job.get(key), datetime) else job.get(key) for key in ("status", "branch", "reason", "due_at", "delivery_status", "delivered_at", "read_at")}
+    return {"checkout": safe_checkout, "orders": [_safe_document(item) for item in orders]}
 
 
 async def retry_checkout_reminder(org_id: str, provider_id: str) -> dict:
@@ -2474,6 +2603,8 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         if not values[1] or not values[2].startswith("https://"):
             await _fail_claim(checkout, token, "configuration_failure", "checkout_content_unavailable")
             return
+        from services.shopify_reporting import tracked_link
+        values[2] = await tracked_link(org_id, connection["shop"], "recovery", checkout["provider_id"], values[2], checkout.get("customer_id"))
         body = {
             "messaging_product": "whatsapp", "to": phone.lstrip("+"), "type": "template",
             "template": {"name": template["name"], "language": {"code": template["language"]}, "components": [{"type": "body", "parameters": [{"type": "text", "text": value} for value in values]}]},
@@ -2507,6 +2638,12 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
             due = _reminder_due(current.get("provider_updated_at"), int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES))
             await _defer_claim(checkout, token, due, "checkout_changed")
             return
+        from services.shopify_reporting import enroll
+        if await enroll(org_id, current):
+            await _fail_claim(checkout, token, "cancelled", "experiment_control")
+            return
+        from services.shopify_growth import settings as growth_settings
+        message_rate = (await growth_settings(org_id)).get("message_rate")
         frozen = {
             "send_whatsapp_id": wa["wa_id"], "send_phone_id": wa["phone_id"],
             "send_template_name": template["name"], "send_template_language": template["language"],
@@ -2520,7 +2657,7 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
                 "record_status": "abandoned", "completed_at": None, "provider_updated_at": checkout.get("provider_updated_at"),
                 "phone": checkout.get("phone"), "recovery_url": checkout.get("recovery_url"),
             },
-            {"$set": {"provider_started_at": utcnow(), **frozen}},
+            {"$set": {"provider_started_at": utcnow(), "receipt_tracking_version": 1, "send_message_rate": message_rate, **frozen}, "$unset": {"attempt_registered": ""}},
             return_document=ReturnDocument.AFTER,
         )
         if not started:
@@ -2579,6 +2716,11 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
                     raise
                 await asyncio.sleep(0.25 * (attempt + 1))
         if accepted:
+            try:
+                from services.shopify_retargeting import register_original
+                await register_original(__import__(__name__, fromlist=["*"]), accepted)
+            except Exception as exc:
+                logger.warning("Shopify original attempt registration deferred: {}", type(exc).__name__)
             await _commerce_event(org_id, "checkout", checkout["provider_id"])
     except HTTPException as exc:
         if provider_started:
@@ -3084,12 +3226,16 @@ async def update_shopify_reminder_delivery(
     message_id: str,
     status: str,
     delivery_error: dict[str, Any] | None = None,
+    provider_timestamp: Any = None,
 ) -> dict[str, Any] | None:
     delivery_status = str(status or "").lower()
     rank = {"accepted": 0, "sent": 1, "delivered": 2, "read": 3, "failed": 4}.get(delivery_status)
     if rank is None:
         return None
     now = utcnow()
+    from services.shopify_retargeting import record_receipt, receipt_time
+    await record_receipt(db, org_id, message_id, delivery_status, provider_timestamp, now, delivery_error)
+    event_at = receipt_time(provider_timestamp, now) or now
     if delivery_status == "failed":
         delivery_error = delivery_error or normalize_whatsapp_delivery_error({}, stage="delivery")
         failure_rank_filter = {"$or": [{"delivery_rank": {"$lt": 2}}, {"delivery_rank": {"$exists": False}}]}
@@ -3168,7 +3314,7 @@ async def update_shopify_reminder_delivery(
     }
     if delivery_status in {"sent", "delivered", "read"}:
         update["reminder_status"] = "sent"
-        update[f"{delivery_status}_at"] = now
+        update[f"{delivery_status}_at"] = event_at
     rank_filter = {"$or": [{"delivery_rank": {"$lt": rank}}, {"delivery_rank": {"$exists": False}}]}
     checkout = await db.shopify_checkouts.find_one_and_update(
         {"org_id": org_id, "provider_message_id": message_id, **rank_filter},
@@ -3179,7 +3325,7 @@ async def update_shopify_reminder_delivery(
         await _commerce_event(org_id, "checkout", checkout["provider_id"])
         return None
     order_update = {"delivery_status": delivery_status, "delivery_rank": rank, "updated_at": now}
-    order_update[f"{delivery_status}_at"] = now
+    order_update[f"{delivery_status}_at"] = event_at
     notification = await db.shopify_order_notifications.find_one_and_update(
         {"org_id": org_id, "provider_message_id": message_id, **rank_filter},
         {"$set": order_update}, return_document=ReturnDocument.AFTER,
