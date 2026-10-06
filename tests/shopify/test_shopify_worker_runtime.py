@@ -727,7 +727,7 @@ async def test_acceptance_precedes_inbox_and_reconciles_once(service):
     assert posts == 1
 
 
-async def test_order_event_sends_approved_template_once(service):
+async def test_order_event_sends_approved_template_once(service, parameter_count=3):
     job = {
         "_id": "order-job", "org_id": "org", "order_provider_id": "gid://shopify/Order/1",
         "event": "received", "event_at": NOW, "status": "sending", "claim_token": "claim",
@@ -738,12 +738,12 @@ async def test_order_event_sends_approved_template_once(service):
         shopify_orders=FakeCollection([{
             "_id": "order", "org_id": "org", "provider_id": job["order_provider_id"], "record_status": "active",
             "phone": "+14155550100", "customer_name": "Customer", "order_number": "#1001",
-            "products": [{"name": "Board", "quantity": 2}],
+            "products": [{"name": "Board", "quantity": 2}] if parameter_count == 3 else [],
         }]),
         shopify_connections=FakeCollection([{
             "org_id": "org", "status": "connected", "order_notifications_enabled": True,
             "whatsapp_id": "waba", "whatsapp_phone_id": "phone",
-            "order_templates": {"received": {"name": "order_received", "language": "en", "status": "APPROVED"}},
+            "order_templates": {"received": {"name": "order_received", "language": "en", "status": "APPROVED", "parameter_count": parameter_count}},
         }]),
         whatsapp_connections=FakeCollection([{"_id": "wa", "org_id": "org", "wa_id": "waba", "phone_id": "phone", "is_active": True}]),
     )
@@ -781,7 +781,7 @@ async def test_order_event_sends_approved_template_once(service):
     assert stored["provider_message_id"] == "wamid.order.1"
     assert len(posts) == 1
     assert posts[0]["template"]["name"] == "order_received"
-    assert [item["text"] for item in posts[0]["template"]["components"][0]["parameters"]] == ["Customer", "#1001", "Board x 2"]
+    assert [item["text"] for item in posts[0]["template"]["components"][0]["parameters"]] == (["#1001"] if parameter_count == 1 else ["Customer", "#1001", "Board x 2"])
 
 
 async def test_immediate_meta_rejection_is_visible_and_retried(service):
@@ -919,6 +919,10 @@ def test_delays_and_product_summary(service):
         ],
     }
     assert service._template_compatible(compliant_template, "order")
+    order_id_template = {**compliant_template, "components": [{"type": "BODY", "text": "Order {{1}} has been received."}, compliant_template["components"][1]]}
+    assert service._template_compatible(order_id_template, "order")
+    assert service._template_parameter_count(order_id_template) == 1
+    assert not service._template_compatible(order_id_template, "cart")
     assert not service._template_compatible({**compliant_template, "components": compliant_template["components"][:1]}, "order")
     assert not service._template_compatible({
         **compliant_template,
@@ -964,6 +968,7 @@ async def main():
     await test_provider_fence_timeout_is_unknown_and_not_retried(load_service())
     await test_acceptance_precedes_inbox_and_reconciles_once(load_service())
     await test_order_event_sends_approved_template_once(load_service())
+    await test_order_event_sends_approved_template_once(load_service(), parameter_count=1)
     await test_immediate_meta_rejection_is_visible_and_retried(load_service())
     await test_async_meta_failure_keeps_terminal_reason(load_service())
     await test_late_failure_does_not_regress_delivered_notification(load_service())
