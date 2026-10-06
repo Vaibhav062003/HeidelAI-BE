@@ -1,0 +1,20 @@
+name = "HeidelAI owner reporting"
+type = "web_pixel_extension"
+runtime_context = "strict"
+
+[customer_privacy]
+analytics = true
+marketing = false
+preferences = false
+sale_of_data = "disabled"
+
+[settings]
+type = "object"
+
+[settings.fields.collectorUrl]
+name = "Collector URL"
+type = "single_line_text_field"
+
+[settings.fields.installationToken]
+name = "Installation token"
+type = "single_line_text_field"

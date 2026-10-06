@@ -14,7 +14,7 @@ CUSTOMER_VARIANTS_QUERY = """
 query StorefrontRecovery($customer: ID!, $variants: [ID!]!) {
   customer(id: $customer) { id firstName lastName defaultPhoneNumber { phoneNumber } }
   nodes(ids: $variants) {
-    ... on ProductVariant { id title product { title status } }
+    ... on ProductVariant { id title sku product { id title status } }
   }
 }
 """
@@ -167,7 +167,7 @@ async def capture_cart(query: str, raw: bytes) -> dict:
             title = node["product"]["title"]
             if node.get("title") and node["title"] != "Default Title":
                 title += f" - {node['title']}"
-            products.append({"id": node["id"], "name": title[:300], "quantity": item["quantity"]})
+            products.append({"product_id": (node.get("product") or {}).get("id"), "variant_id": node["id"], "sku": node.get("sku"), "id": node["id"], "name": title[:300], "quantity": item["quantity"]})
         document.update({"phone": phone, "storefront_consent_phone": phone, "customer_name": s._name(customer), "products": products,
             "record_status": "abandoned", "reminder_status": "pending" if phone else "phone_missing",
             "reminder_due_at": now + timedelta(minutes=5) if phone else None,

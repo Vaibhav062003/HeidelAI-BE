@@ -96,7 +96,7 @@ async def _propagate_whatsapp_delivery_status(
             logger.debug("WhatsApp provider block propagation skipped for {}: {}", message_id, type(exc).__name__)
     if include_shopify:
         try:
-            await update_shopify_reminder_delivery(org_id, message_id, status_type, delivery_error)
+            await update_shopify_reminder_delivery(org_id, message_id, status_type, delivery_error, status_payload.get("timestamp"))
         except Exception as exc:
             logger.debug("Shopify reminder delivery propagation skipped for {}: {}", message_id, type(exc).__name__)
     try:
@@ -997,12 +997,20 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                             normalize_whatsapp_delivery_error(status, stage="delivery")
                             if status_type == "failed" else None
                         )
+                        from services.shopify_retargeting import record_receipt
+                        from services.shopify_service import db as commerce_db, utcnow as commerce_now
+                        try:
+                            await record_receipt(commerce_db, connection.get("org_id"), message_id, status_type, status.get("timestamp"), commerce_now(), delivery_error)
+                        except Exception as exc:
+                            # Retry the webhook rather than acknowledge a receipt that was never persisted.
+                            raise HTTPException(503, "Message receipt storage temporarily unavailable") from exc
+
                         logger.info(f"WhatsApp Status Update Received - Message ID: {message_id}, Status: {status_type}")
 
                         if status_type == "failed":
                             try:
                                 shopify_error = await update_shopify_reminder_delivery(
-                                    connection.get("org_id"), message_id, status_type, delivery_error,
+                                    connection.get("org_id"), message_id, status_type, delivery_error, status.get("timestamp"),
                                 )
                                 if shopify_error:
                                     delivery_error = shopify_error

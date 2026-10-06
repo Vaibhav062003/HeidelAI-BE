@@ -20,6 +20,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 NOW = datetime.now(timezone.utc)
 
 
@@ -105,6 +106,10 @@ def load_service():
     )
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[spec.name] = module
+    sys.modules["services.shopify_service"] = module
+    import services
+    services.shopify_service = module
     spec.loader.exec_module(module)
     return module
 
@@ -220,6 +225,7 @@ class FakeCollection:
                 return types.SimpleNamespace(matched_count=1, modified_count=1)
         if upsert:
             document = {key: value for key, value in query.items() if not key.startswith("$") and not isinstance(value, dict)}
+            document.update(copy.deepcopy(update.get("$setOnInsert", {})))
             apply_update(document, update)
             self.documents.append(document)
             return types.SimpleNamespace(matched_count=0, modified_count=0, upserted_id=len(self.documents))

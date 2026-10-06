@@ -201,7 +201,7 @@ def main():
     assert 'filter_field = "created_at" if kind == "checkouts"' in SERVICE
     assert 'mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: String!)' in SERVICE
     assert 'data = await _graphql(connection, CHECKOUT_NODE_QUERY' in SERVICE
-    assert SERVICE.index('data = await _graphql(connection, CHECKOUT_NODE_QUERY') < SERVICE.index('"provider_started_at": utcnow(), **frozen')
+    assert SERVICE.index('data = await _graphql(connection, CHECKOUT_NODE_QUERY') < SERVICE.index('"provider_started_at": utcnow(), "receipt_tracking_version": 1')
     assert 'idempotency_key=message_id' in SERVICE
     assert '"reminder_status": {"$in": ["sent", "delivery_unknown"]}' in SERVICE
     assert 'await list_compatible_templates(org_id, connection["whatsapp_id"], phone_id=connection.get("whatsapp_phone_id"))' in SERVICE
@@ -219,7 +219,9 @@ def main():
     assert '"record_status": "deleted", "provider_updated_at": event_time' in SERVICE
     assert '{"provider_updated_at": {"$lt": provider_time}}' in SERVICE
     assert "await asyncio.to_thread(record_whatsapp_preference, org_id, customer_phone_no, content)" in WEBHOOK
-    assert "await asyncio.to_thread(\n                                record_whatsapp_provider_block," in WEBHOOK
+    import ast
+    tree = ast.parse(WEBHOOK)
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "to_thread" and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == "record_whatsapp_provider_block" for node in ast.walk(tree))
     assert 'order_matches.append({"phone"' not in SERVICE
     assert 'asyncio.Semaphore(REMINDER_CONCURRENCY)' in SERVICE
     assert 'asyncio.wait_for(_send_claimed_checkout' in SERVICE

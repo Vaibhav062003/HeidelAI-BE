@@ -82,7 +82,7 @@ def attribution(orders, touches, now, days=7):
                     or touch.get("org_id") != order.get("org_id") or not sent
                     or not sent <= created <= min(now, sent + timedelta(days=days))):
                 continue
-            if touch.get("kind") == "recovery":
+            if touch.get("kind") in {"recovery", "retargeting"}:
                 eligible = touch.get("order_id") == identifier
             else:
                 eligible = bool(touch.get("customer_id") and touch["customer_id"] == order.get("customer_id"))
@@ -121,53 +121,14 @@ async def save_settings(org_id, values):
 
 
 async def sales_report(org_id, days=30):
-    s = service()
-    now = s.utcnow()
-    config = await settings(org_id)
-    cutoff = now - timedelta(days=days + config["attribution_days"])
-    touches = []
-    carts = await s.db.shopify_checkouts.find({"org_id": org_id, "provider_accepted_at": {"$gte": cutoff}}).to_list(None)
-    for cart in carts:
-        touches.append({"org_id": org_id, "kind": "recovery", "order_id": cart.get("converted_order_id"),
-                        "touch_id": f"whatsapp:{cart.get('provider_message_id') or cart['provider_id']}",
-                        "sent_at": cart["provider_accepted_at"], "status": cart.get("delivery_status", "accepted")})
-    jobs = await s.db.commerce_campaigns.find({"org_id": org_id, "channel": "whatsapp", "scheduled_for": {"$gte": cutoff}}).to_list(None)
-    by_job = {row["campaign_id"]: row for row in jobs}
-    results = await s.db.bulk_job_results.find({"org_id": org_id, "job_id": {"$in": list(by_job)}, "status": "sent"}).to_list(None)
-    messages = await s.db[f"messages_{org_id}"].find({"message_id": {"$in": [row.get("message_id") for row in results]}}).to_list(None)
-    delivery = {row.get("message_id"): row.get("status", "sent") for row in messages}
-    for result in results:
-        campaign = by_job[result["job_id"]]
-        customer = (campaign.get("recipient_customers") or {}).get(phone_key(result["phone_number"]))
-        touches.append({"org_id": org_id, "kind": "campaign", "campaign_id": result["job_id"], "customer_id": customer,
-                        "touch_id": f"whatsapp:{result.get('message_id') or result['_id']}",
-                        "sent_at": result["created_at"], "status": delivery.get(result.get("message_id"), "accepted")})
-    touches = list({row["touch_id"]: row for row in touches}.values())
-    orders = await s.db.shopify_orders.find({"org_id": org_id, "provider_created_at": {"$gte": now - timedelta(days=days)}}).to_list(None)
-    # ponytail: bounded reporting period is scanned in memory; move matching to aggregation when monthly volume warrants it.
-    report = attribution(orders, touches, now, config["attribution_days"])
-    recent = [row for row in touches if moment(row["sent_at"]) >= now - timedelta(days=days)]
-    delivered = sum(row["status"] in {"delivered", "read"} for row in recent)
-    accepted = len(recent)
-    rate = config.get("message_rate")
-    campaign_reports = {}
-    for entry in report["orders"]:
-        if not entry.get("campaign_id"):
-            continue
-        item = campaign_reports.setdefault(entry["campaign_id"], {"matched_orders": 0, "sales": {}})
-        item["matched_orders"] += 1
-        net = entry.get("net_payment")
-        if net and net.get("currency"):
-            item["sales"][net["currency"]] = item["sales"].get(net["currency"], Decimal(0)) + money(net["amount"])
-    for item in campaign_reports.values():
-        item["sales"] = [{"currency": key, "amount": str(value)} for key, value in sorted(item["sales"].items())]
-    report.update({"period_days": days, "attribution_days": config["attribution_days"], "accepted": accepted,
-                   "delivered": delivered, "read": sum(row["status"] == "read" for row in recent),
-                   "cost_estimate": {"amount": str(money(rate["amount"]) * delivered), "currency": rate["currency"]} if rate else None,
-                   "conversion_rate": round(100 * report["converted_contacts"] / len(touches), 2) if touches else 0,
-                   "conversion_denominator": len(touches), "campaigns": campaign_reports,
-                   "orders": sorted(report["orders"], key=lambda row: row["created_at"], reverse=True)[:100]})
-    return report
+    from services.shopify_reporting import report
+    data = await report(org_id, days=min(days, 366), compare=False)
+    summary = data["summary"]
+    campaigns = {row["campaign_id"]: {"matched_orders": row["matched_orders"], "sales": row["net_payments"]} for row in data["campaigns"]}
+    return {**summary, "period_days": days, "attribution_days": data["attribution_days"], "sales": summary["net_payments"],
+            "cost_estimate": summary["cost_estimates"][0] if len(summary["cost_estimates"]) == 1 else None,
+            "campaigns": campaigns, "orders": data["orders"][:100], "coverage": data["coverage"],
+            "pending_contacts": summary["pending_contacts"], "period": data["period"]}
 
 
 async def connected(org_id):
@@ -226,7 +187,7 @@ async def campaign_templates(org_id):
     s = service()
     connection = await connected(org_id)
     rows = await s.list_compatible_templates(org_id, connection.get("whatsapp_id"), phone_id=connection.get("whatsapp_phone_id"), purpose="campaign", raise_unavailable=True)
-    return [{"name": row["name"], "language": row["language"]} for row in rows]
+    return [{"name": row["name"], "language": row["language"], **({"tracking_button_index": row["tracking_button_index"]} if row.get("tracking_button_index") is not None else {})} for row in rows]
 
 
 async def create_campaign(org_id, payload, request_id):
@@ -239,8 +200,9 @@ async def create_campaign(org_id, payload, request_id):
     existing = await s.db.commerce_campaigns.find_one({"_id": identifier, "org_id": org_id})
     if existing:
         return public_campaign(existing)
-    if {"name": payload["template_name"], "language": payload["template_language"]} not in await campaign_templates(org_id):
-        raise HTTPException(422, "Choose an approved static marketing template")
+    selected = next((item for item in await campaign_templates(org_id) if item["name"] == payload["template_name"] and item["language"] == payload["template_language"]), None)
+    if not selected:
+        raise HTTPException(422, "Choose an approved compatible marketing template")
     preview = await audience(org_id, payload, True)
     if not preview["eligible"]:
         raise HTTPException(409, "No customers in this segment have permission for this channel")
@@ -250,7 +212,7 @@ async def create_campaign(org_id, payload, request_id):
         raise HTTPException(422, f"Your plan allows at most {limit} recipients per campaign")
     connection = await connected(org_id)
     row = {**payload, "_id": identifier, "campaign_id": identifier, "org_id": org_id, "shop": connection["shop"],
-           "recipient_customers": preview["recipients"], "total": preview["eligible"], "status": "scheduled", "created_at": s.utcnow()}
+           "tracking_button_index": selected.get("tracking_button_index"), "recipient_customers": preview["recipients"], "total": preview["eligible"], "status": "scheduled", "created_at": s.utcnow(), "message_rate": (await settings(org_id)).get("message_rate")}
     try:
         await s.db.commerce_campaigns.insert_one(row)
     except DuplicateKeyError:
@@ -299,6 +261,8 @@ async def recipient_eligible(org_id, identifier, address, reserve=True):
     customer_id = (campaign.get("recipient_customers") or {}).get(address)
     if not customer_id:
         return False
+    if await s.db.commerce_experiment_assignments.find_one({"org_id": org_id, "customer_id": customer_id, "outcome_ends_at": {"$gt": s.utcnow()}}):
+        return False
     customer = (await s._graphql(connection, CUSTOMER_QUERY, {"id": customer_id})).get("customer")
     if not customer or not segment_matches(customer, campaign["segment"], campaign["lapsed_days"], s.utcnow()):
         return False
@@ -316,6 +280,17 @@ async def recipient_eligible(org_id, identifier, address, reserve=True):
     return await s.reserve_marketing_contact(org_id, campaign["channel"], address, identifier)
 
 
+async def recipient_components(org_id, campaign_id, address):
+    s = service()
+    row = await s.db.commerce_campaigns.find_one({"org_id": org_id, "campaign_id": campaign_id, "status": "running"})
+    if not row or row.get("tracking_button_index") is None:
+        return None
+    from services.shopify_reporting import tracked_link
+    reference = f"{campaign_id}:{hashlib.sha256(address.encode()).hexdigest()[:20]}"
+    link = await tracked_link(org_id, row["shop"], "campaign", reference, f"https://{row['shop']}/", (row.get("recipient_customers") or {}).get(address))
+    return [{"type": "button", "sub_type": "url", "index": str(row["tracking_button_index"]), "parameters": [{"type": "text", "text": link.rsplit("/", 1)[-1]}]}]
+
+
 async def process_campaigns():
     s = service()
     now = s.utcnow()
@@ -328,7 +303,7 @@ async def process_campaigns():
     rows = await s.db.commerce_campaigns.find({"channel": "whatsapp", "status": "scheduled", "scheduled_for": {"$lte": now}}).limit(5).to_list(5)
     for row in rows:
         claim = await s.db.commerce_campaigns.update_one({"_id": row["_id"], "status": "scheduled"},
-                                                       {"$set": {"status": "running", "started_at": s.utcnow()}})
+                                                       {"$set": {"status": "running", "started_at": s.utcnow(), "message_rate": (await settings(row["org_id"])).get("message_rate")}})
         if not claim.modified_count:
             continue
         try:
@@ -339,7 +314,7 @@ async def process_campaigns():
                 raise HTTPException(409, "The store connected to this campaign has changed")
             await consume_quota_async(org_id, "BROADCASTING", "monthly_recipients", row["total"], f"broadcast:{identifier}")
             from services.wa_service import create_bulk_job, run_bulk_send_job
-            if {"name": row["template_name"], "language": row["template_language"]} not in await campaign_templates(org_id):
+            if not any(item["name"] == row["template_name"] and item["language"] == row["template_language"] for item in await campaign_templates(org_id)):
                 raise HTTPException(409, "The campaign template is no longer approved")
             sender = await s._selected_whatsapp_connection(await connected(org_id))
             if not sender:
@@ -391,6 +366,17 @@ async def capture_marketing_consent(query, raw):
 
 async def redact_customer(org_id, customer_ids):
     s = service()
+    from services.shopify_reporting import COLLECTIONS
+    attempts = await s.db.commerce_message_attempts.find({"org_id": org_id, "customer_id": {"$in": customer_ids}}).to_list(None)
+    jobs = await s.db.commerce_retargeting_jobs.find({"org_id": org_id, "customer_id": {"$in": customer_ids}}).to_list(None)
+    links = await s.db.commerce_tracked_links.find({"org_id": org_id, "customer_id": {"$in": customer_ids}}).to_list(None)
+    ids = [row["message_id"] for row in attempts] + [row.get("provider_message_id") for row in jobs]
+    await s.db.commerce_delivery_receipts.delete_many({"org_id": org_id, "message_id": {"$in": ids}})
+    await s.db.commerce_pixel_events.delete_many({"org_id": org_id, "touch_reference": {"$in": [row["reference"] for row in links]}})
+    for name in COLLECTIONS:
+        await s.db[name].delete_many({"org_id": org_id, "customer_id": {"$in": customer_ids}})
+    # Weekly aggregate exports can contain customer drilldowns. Remove snapshots on redaction.
+    await s.db.commerce_weekly_reports.delete_many({"org_id": org_id})
     # Retain deletion of historical email records for customer privacy.
     receipts = await s.db.commerce_email_sends.find({"org_id": org_id, "customer_id": {"$in": customer_ids}}, {"address_key": 1}).to_list(None)
     await s.db.commerce_email_suppressions.delete_many({"org_id": org_id, "_id": {"$in": [f"{org_id}:{row['address_key']}" for row in receipts if row.get("address_key")]}})
@@ -403,7 +389,8 @@ async def redact_customer(org_id, customer_ids):
 
 async def remove_store_data(org_id):
     s = service()
-    for name in ("commerce_campaigns", "commerce_marketing_consents", "commerce_email_sends", "commerce_email_suppressions", "commerce_contact_limits", "commerce_knowledge_sources"):
+    from services.shopify_reporting import COLLECTIONS
+    for name in (*COLLECTIONS, "commerce_campaigns", "commerce_marketing_consents", "commerce_email_sends", "commerce_email_suppressions", "commerce_contact_limits", "commerce_knowledge_sources"):
         await s.db[name].delete_many({"org_id": org_id})
     await s.db.commerce_growth_settings.delete_one({"_id": org_id})
     await s.db.commerce_knowledge_settings.delete_one({"_id": org_id})
