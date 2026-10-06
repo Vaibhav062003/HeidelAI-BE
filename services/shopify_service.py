@@ -27,8 +27,8 @@ from services.wa_service import create_or_update_whatsapp_conversation, store_wh
 from services.websocket_service import broadcast_org_admin_ws, broadcast_org_ws
 
 
-API_VERSION = "2025-10"
-OAUTH_SCOPES = "read_orders,read_customers,read_fulfillments,read_products"
+API_VERSION = "2026-10"
+OAUTH_SCOPES = "read_orders,read_customers,read_fulfillments,read_products,write_app_proxy"
 DEFAULT_REMINDER_DELAY_MINUTES = 10
 DEFAULT_TEMPLATE_LANGUAGE = "en_US"
 SHOPIFY_TEMPLATE_FOOTER = "Powered by Heidelai.com - AI Sales Agent"
