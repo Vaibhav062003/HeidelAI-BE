@@ -1753,7 +1753,9 @@ async def list_compatible_templates(
         if event not in ORDER_EVENTS or not selected.get("name"):
             continue
         current = next((item for item in templates if item.get("name") == selected.get("name") and item.get("language") == selected.get("language")), None)
-        updates[f"order_templates.{event}.status"] = "APPROVED" if current and _template_compatible(current, "order") else "INCOMPATIBLE"
+        compatible = bool(current and _template_compatible(current, "order"))
+        updates[f"order_templates.{event}.status"] = "APPROVED" if compatible else "INCOMPATIBLE"
+        updates[f"order_templates.{event}.parameter_count"] = _template_parameter_count(current) if compatible else 0
     if updates:
         updates["updated_at"] = utcnow()
         await db.shopify_connections.update_one(
@@ -1761,7 +1763,7 @@ async def list_compatible_templates(
             {"$set": updates},
         )
     return [
-        {"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category"), **({"tracking_button_index": _campaign_tracking_button(item)} if purpose == "campaign" else {})}
+        {"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category"), **({"tracking_button_index": _campaign_tracking_button(item)} if purpose == "campaign" else {}), **({"parameter_count": _template_parameter_count(item)} if purpose == "order" else {})}
         for item in templates if _template_compatible(item, purpose)
     ]
 
@@ -1861,6 +1863,11 @@ def _campaign_tracking_button(template: dict) -> int | None:
     return index if button.get("type") == "URL" and button.get("url") == expected and "{{" not in str(button.get("text", "")) else None
 
 
+def _template_parameter_count(template: dict) -> int:
+    body = next((part.get("text", "") for part in template.get("components") or [] if str(part.get("type") or "").upper() == "BODY"), "")
+    return len(re.findall(r"{{\s*\d+\s*}}", body))
+
+
 def _template_compatible(template: dict, purpose: str = "cart") -> bool:
     expected_category = "UTILITY" if purpose == "order" else "MARKETING"
     if str(template.get("status") or "").upper() != "APPROVED" or str(template.get("category") or "").upper() != expected_category:
@@ -1888,7 +1895,7 @@ def _template_compatible(template: dict, purpose: str = "cart") -> bool:
     if re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", body_text):
         return False
     placeholders = re.findall(r"{{\s*(\d+)\s*}}", body_text)
-    return sorted(placeholders) == ["1", "2", "3"]
+    return sorted(placeholders) in (["1"], ["1", "2", "3"]) if purpose == "order" else sorted(placeholders) == ["1", "2", "3"]
 
 
 async def update_settings(org_id: str, settings: dict) -> dict:
@@ -1923,16 +1930,16 @@ async def update_settings(org_id: str, settings: dict) -> dict:
     utility_templates = await list_compatible_templates(
         org_id, wa_id or None, phone_id=phone_id or None, purpose="order", raise_unavailable=order_enabled,
     ) if requested_order_templates and whatsapp else []
-    approved_utility = {(item["name"], item["language"]) for item in utility_templates}
+    approved_utility = {(item["name"], item["language"]): item["parameter_count"] for item in utility_templates}
     order_templates: dict[str, dict[str, str]] = {}
     for event in ORDER_EVENTS:
         requested = requested_order_templates.get(event) or {}
         name = str(requested.get("name") or "").strip()
         language = str(requested.get("language") or "en").strip()
         if name:
-            order_templates[event] = {"name": name, "language": language, "status": "APPROVED" if (name, language) in approved_utility else "INCOMPATIBLE"}
+            order_templates[event] = {"name": name, "language": language, "status": "APPROVED" if (name, language) in approved_utility else "INCOMPATIBLE", "parameter_count": approved_utility.get((name, language), 0)}
     if order_enabled and (not phone_id or len(order_templates) != len(ORDER_EVENTS) or any(item["status"] != "APPROVED" for item in order_templates.values())):
-        raise HTTPException(status_code=409, detail="Choose four approved three-variable Utility templates for Shopify order updates")
+        raise HTTPException(status_code=409, detail="Choose four approved one- or three-variable Utility templates for Shopify order updates")
     settings_update = {
         "whatsapp_id": wa_id or None, "whatsapp_phone_id": phone_id or None, "template_name": template_name or None, "template_language": template_language,
         "template_status": "APPROVED" if selected else None, "reminder_delay_minutes": delay,
@@ -2911,7 +2918,7 @@ async def _send_order_notification(job: dict, token: str) -> None:
         first_name = str(order.get("customer_name") or "").split(" ", 1)[0][:80] or "there"
         order_number = str(order.get("order_number") or "Order")[:80]
         product_summary = _product_summary(order.get("products") or [])
-        if not product_summary:
+        if not product_summary and template.get("parameter_count") != 1:
             await _finish_order_notification(job, token, "failed", "order_content_unavailable")
             return
         if await _is_whatsapp_suppressed(org_id, phone):
@@ -2932,7 +2939,7 @@ async def _send_order_notification(job: dict, token: str) -> None:
             "messaging_product": "whatsapp", "to": phone.lstrip("+"), "type": "template",
             "template": {
                 "name": template["name"], "language": {"code": template["language"]},
-                "components": [{"type": "body", "parameters": [{"type": "text", "text": value} for value in (first_name, order_number, product_summary)]}],
+                "components": [{"type": "body", "parameters": [{"type": "text", "text": value} for value in ((order_number,) if template.get("parameter_count") == 1 else (first_name, order_number, product_summary))]}],
             },
         }
         try:
