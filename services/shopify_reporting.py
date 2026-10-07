@@ -83,6 +83,7 @@ async def touches(org_id, start, end):
     for attempt in originals.values():
         cart = cart_map.get(attempt["checkout_id"], {})
         rows.append({"org_id": org_id, "kind": "recovery", "order_id": cart.get("converted_order_id"), "checkout_id": attempt["checkout_id"],
+                     "journey_id": cart.get("recovery_journey_id") or cart.get("cart_token") or cart.get("checkout_token") or attempt["checkout_id"],
                      "customer_id": cart.get("customer_id"), "touch_id": f"whatsapp:{attempt['message_id']}", "message_id": attempt["message_id"],
                      "sent_at": attempt["accepted_at"], "status": cart.get("delivery_status", "accepted") if cart.get("provider_message_id") == attempt["message_id"] else "accepted",
                      "message_rate": attempt.get("message_rate"), "rate_recorded": attempt["message_id"] in by_message})
@@ -90,6 +91,7 @@ async def touches(org_id, start, end):
     for job in jobs:
         cart = cart_map.get(job["checkout_id"]) or await s.db.shopify_checkouts.find_one({"org_id": org_id, "provider_id": job["checkout_id"]}) or {}
         rows.append({"org_id": org_id, "kind": "retargeting", "branch": job.get("branch"), "order_id": cart.get("converted_order_id"),
+                     "journey_id": cart.get("recovery_journey_id") or cart.get("cart_token") or cart.get("checkout_token") or job["checkout_id"],
                      "customer_id": job.get("customer_id"), "checkout_id": job["checkout_id"], "touch_id": f"whatsapp:{job['provider_message_id']}", "message_id": job["provider_message_id"],
                      "sent_at": job["provider_accepted_at"], "status": job.get("delivery_status", "accepted"), "message_rate": job.get("message_rate"), "rate_recorded": True})
     campaigns = await s.db.commerce_campaigns.find({"org_id": org_id, "channel": "whatsapp"}).to_list(None)
@@ -322,6 +324,16 @@ async def period_report(org_id, start, end, zone="UTC"):
     cohort_attribution = growth.attribution(orders, all_touches, now, config["attribution_days"])
     cohort_ids = {row["touch_id"] for row in cohort}
     conversions = {row["touch_id"] for row in cohort_attribution["orders"] if row["touch_id"] in cohort_ids}
+    cart_touches = [row for row in cohort if row["kind"] in {"recovery", "retargeting"}]
+    cart_messages = {row["touch_id"]: row for row in cart_touches}
+    cart_windows = {}
+    for row in cart_touches:
+        journey = row["journey_id"]
+        cart_windows[journey] = max(cart_windows.get(journey, start), growth.moment(row["sent_at"]) + window)
+    # Cart outcomes use the strict checkout/order match, independently of campaign revenue credit.
+    cart_attribution = growth.attribution(orders, cart_touches, now, config["attribution_days"])
+    converted_carts = {cart_messages[row["touch_id"]]["journey_id"] for row in cart_attribution["orders"]}
+    mature_carts = sum(stop <= now for stop in cart_windows.values())
     mature = [row for row in cohort if growth.moment(row["sent_at"]) + window <= now]
     delivered = [row for row in cohort if row["status"] in {"delivered", "read"}]
     cost = totals({"amount": row["message_rate"]["amount"], "currency": row["message_rate"]["currency"]} for row in delivered if row.get("message_rate"))
@@ -426,6 +438,7 @@ async def period_report(org_id, start, end, zone="UTC"):
         local_day += timedelta(days=1)
     summary = {"accepted": len(cohort), "delivered": len(delivered), "read": sum(row["status"] == "read" for row in cohort), "matched_orders": attribution["matched_orders"], "paid_orders": sum(row["net_payment"] is not None and growth.money(row["net_payment"].get("amount")) > 0 for row in attribution["orders"]), "net_payments": attribution["sales"], "cost_estimates": cost,
                "cost_unknown_deliveries": sum(not row.get("message_rate") for row in delivered), "conversion_denominator": len(cohort), "converted_contacts": len(conversions), "conversion_rate": round(100*len(conversions)/len(cohort), 2) if cohort else 0, "mature_contacts": len(mature), "pending_contacts": len(cohort)-len(mature), "value_unavailable": attribution["value_unavailable"],
+               "cart_conversion_denominator": len(cart_windows), "converted_carts": len(converted_carts), "cart_conversion_rate": round(100*len(converted_carts)/len(cart_windows), 2) if cart_windows else 0, "mature_carts": mature_carts, "pending_carts": len(cart_windows)-mature_carts,
                "confirmed_visitors": len({row["client_key"] for row in events if row.get("touch_reference") and row["event_name"] == "page_viewed"})}
     return {"summary": summary, "sources": sources, "recovery": recovery, "branches": branch_performance, "blockers": [{"reason": key, "count": value} for key, value in blockers.items()], "actions": actions, "orders": attribution["orders"], "campaigns": campaign_rows, "customers": customers, "customer_summary": {"first_time": first_count, "repeat": repeat_count, "lapsed_returned": returned_count, "purchase_count_unavailable": sum(row["shopify_purchase_count"] is None for row in customers)}, "retention": retention, "products": list(product_rows.values()), "trends": trends,
             "coverage": {"product_identity_missing": missing_products, "carts_with_missing_values": sum(not cart.get("total") for cart in carts), "line_items_incomplete": sum(row.get("line_items_incomplete", False) for row in carts+period_orders), "refund_lines_incomplete": sum(row.get("refund_lines_incomplete", False) for row in period_orders), "observed_history_start": min((growth.moment(row.get("provider_created_at")) for row in all_orders if growth.moment(row.get("provider_created_at"))), default=None), "browser_events": len(events), "retargeting_jobs": len(jobs)}}
@@ -440,7 +453,7 @@ async def report(org_id, start=None, end=None, days=30, compare=True):
     prior = await period_report(org_id, prior_start, first, zone) if compare else None
     connection = await growth.connected(org_id)
     current.update({"period": {"start": first, "end": stop, "timezone": zone, "timezone_fallback": fallback}, "comparison": prior["summary"] if prior else None, "attribution_days": (await growth.settings(org_id))["attribution_days"], "generated_at": growth.service().utcnow(), "last_sync_at": connection.get("last_sync_at"),
-                    "definitions": ["Revenue: attributed net payments after available refunds; unpaid orders excluded. Currencies are separate.", "Attribution: one last eligible contact per order; this measures observed attribution, not uplift.", "Contact conversion: contacts sent in this period with an attributed purchase in their window; immature contacts are labelled pending.", "Customers: observed history only; first/repeat counts use authoritative Shopify customer purchase counts.", "Product values: recorded discounted line values, where available; recovered value is order value, not additional uplift.", "Campaign opt-outs: selected recipients opting out during this period; not proof the campaign caused the opt-out.", "Browser visits: consented pixel observations; redirects and preview requests are not confirmed shoppers.", "Costs: rate saved at send time; unknown historical rates are excluded. Provider invoice totals may differ."]})
+                    "definitions": ["Revenue: attributed net payments after available refunds; unpaid orders excluded. Currencies are separate.", "Attribution: one last eligible contact per order; this measures observed attribution, not uplift.", "Cart recovery: unique cart journeys contacted in this period with an identifier-matched purchase within a message attribution window; campaigns excluded. Open windows are labelled pending.", "Message attribution: accepted messages sent in this period credited with a purchase; follow-ups count separately. Revenue is credited once per order.", "Customers: observed history only; first/repeat counts use authoritative Shopify customer purchase counts.", "Product values: recorded discounted line values, where available; recovered value is order value, not additional uplift.", "Campaign opt-outs: selected recipients opting out during this period; not proof the campaign caused the opt-out.", "Browser visits: consented pixel observations; redirects and preview requests are not confirmed shoppers.", "Costs: rate saved at send time; unknown historical rates are excluded. Provider invoice totals may differ."]})
     return current
 
 
