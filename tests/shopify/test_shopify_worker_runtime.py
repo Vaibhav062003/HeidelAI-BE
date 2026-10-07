@@ -1062,9 +1062,42 @@ async def test_legacy_repair_does_not_scan_historical_phones(service):
     await service._repair_org_checkout_states("org", saved)
 
 
+async def test_records_batch_followups(service):
+    carts = [checkout(str(index)) for index in range(31)]
+    jobs = FakeCollection([
+        {"org_id": "org", "checkout_id": "9", "status": "pending", "due_at": NOW, "phone": "private"},
+        {"org_id": "other", "checkout_id": "8", "status": "accepted"},
+    ])
+    service.db = FakeDB(shopify_checkouts=FakeCollection(carts), commerce_retargeting_jobs=jobs)
+    async def chat(org_id, item, record_type, phone_id):
+        return f"chat:{item['provider_id']}"
+    service._record_conversation_id = chat
+    calls = []
+    find = jobs.find
+    def batch(query, projection=None):
+        calls.append(query)
+        return find(query, projection)
+    async def no_per_cart(*args, **kwargs):
+        raise AssertionError("records loaded follow-ups one cart at a time")
+    jobs.find, jobs.find_one = batch, no_per_cart
+    page = await service.list_records("org", "checkout")
+    assert len(page["items"]) == 30 and page["next_cursor"]
+    assert len(calls) == 1 and calls[0]["org_id"] == "org"
+    assert set(calls[0]["checkout_id"]["$in"]) == {item["provider_id"] for item in page["items"]}
+    by_id = {item["provider_id"]: item for item in page["items"]}
+    assert by_id["9"]["followup"]["status"] == "pending"
+    assert by_id["9"]["followup"]["due_at"] == service._iso_utc(NOW)
+    assert "phone" not in by_id["9"]["followup"] and "followup" not in by_id["8"]
+    assert by_id["9"]["conversation_id"] == "chat:9"
+    await service.list_records("empty", "checkout")
+    await service.list_records("org", "order")
+    assert len(calls) == 1
+
+
 async def main():
     test_delays_and_product_summary(load_service())
     await test_legacy_repair_does_not_scan_historical_phones(load_service())
+    await test_records_batch_followups(load_service())
     await test_hanging_checkout_does_not_block_next(load_service())
     await test_concurrent_workers_claim_once(load_service())
     await test_database_outage_defers_worker_ticks(load_service())
