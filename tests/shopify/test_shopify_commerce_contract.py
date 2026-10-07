@@ -113,8 +113,8 @@ def main():
     assert ns["_reminder_due"](provider_time, 30) == provider_time + timedelta(minutes=30)
     assert ns["_reminder_due"](provider_time, 30, provider_time + timedelta(hours=24)) == provider_time + timedelta(hours=24)
     enabled_at = provider_time
-    assert ns["_recovery_activity_time"](provider_time - timedelta(hours=2), enabled_at) == enabled_at
-    assert ns["_recovery_activity_time"](provider_time - timedelta(days=2), enabled_at) is None
+    assert ns["_recovery_activity_time"](provider_time - timedelta(hours=2), enabled_at, provider_time - timedelta(hours=3)) is None
+    assert ns["_recovery_activity_time"](provider_time - timedelta(days=2), enabled_at, provider_time - timedelta(days=2)) is None
     unchanged = {"provider_updated_at": provider_time, "phone": "+14155550004", "products": [{"name": "A"}], "recovery_url": "https://example.test", "completed_at": None, "record_status": "abandoned"}
     assert not ns["_checkout_changed_for_send"](unchanged, dict(unchanged))
     assert ns["_checkout_changed_for_send"](unchanged, {**unchanged, "products": [{"name": "B"}]})
@@ -138,9 +138,9 @@ def main():
         payload = ns["_default_template_payload"](event, "en")
         assert payload["language"] == "en_US"
         body = payload["components"][0]["text"]
-        assert sorted(re.findall(r"{{\s*(\d+)\s*}}", body)) == ["1", "2", "3"]
+        assert sorted(re.findall(r"{{\s*(\d+)\s*}}", body)) == (["1", "2"] if event == "shipped" else ["1", "2", "3"])
         assert payload["category"] == ("MARKETING" if event == "abandoned_cart" else "UTILITY")
-        if event != "abandoned_cart":
+        if event not in {"abandoned_cart", "shipped"}:
             assert len(re.sub(r"{{\s*\d+\s*}}", "", body)) >= 80
 
     class MetaResponse:
@@ -198,7 +198,9 @@ def main():
         assert required in SERVICE, f"missing boundary: {required}"
     assert 'consent != "SUBSCRIBED"' not in SERVICE
     assert 'API_VERSION = "2026-10"' in SERVICE
-    assert 'filter_field = "created_at" if kind == "checkouts"' in SERVICE
+    assert 'field = "created_at" if mode == "initial" else "updated_at"' in SERVICE
+    assert 'timedelta(days=7)' not in SERVICE
+    assert 'timedelta(days=60) if' not in SERVICE
     assert 'mutation ShopifyWebhook($topic: WebhookSubscriptionTopic!, $uri: String!)' in SERVICE
     assert 'data = await _graphql(connection, CHECKOUT_NODE_QUERY' in SERVICE
     assert SERVICE.index('data = await _graphql(connection, CHECKOUT_NODE_QUERY') < SERVICE.index('"provider_started_at": utcnow(), "receipt_tracking_version": 1')

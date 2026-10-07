@@ -9,6 +9,8 @@ import hmac
 import json
 import re
 import secrets
+import time
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
@@ -50,6 +52,22 @@ OPT_IN_COMMANDS = {"start", "subscribe"}
 OAUTH_TTL_MINUTES = 10
 WEBHOOK_TTL_DAYS = 30
 CLAIM_LEASE_MINUTES = 5
+SYNC_VERSION = 2
+SYNC_BATCH_SIZE = 5
+SYNC_REQUEST_LIMIT = 20
+SYNC_PASS_SECONDS = 60
+IST = timezone(timedelta(hours=5, minutes=30))
+_sync_budget: ContextVar[dict | None] = ContextVar("shopify_sync_budget", default=None)
+
+
+class _SyncYield(Exception):
+    """End this worker pass while retaining durable progress."""
+
+
+class _SyncCursorExpired(Exception):
+    """Restart only the current resource in its saved window."""
+
+
 REMINDER_BATCH_SIZE = 10
 REMINDER_CONCURRENCY = 3
 REMINDER_ATTEMPT_TIMEOUT_SECONDS = 45
@@ -75,20 +93,7 @@ _runtime_lock = asyncio.Lock()
 CHECKOUTS_QUERY = """
 query ShopifyCheckouts($first: Int!, $after: String, $query: String!, $sortKey: AbandonedCheckoutSortKeys!) {
   abandonedCheckouts(first: $first, after: $after, query: $query, sortKey: $sortKey) {
-    nodes {
-      id abandonedCheckoutUrl createdAt updatedAt completedAt
-      customer {
-        id firstName lastName numberOfOrders
-        defaultPhoneNumber { phoneNumber }
-      }
-      shippingAddress { phone }
-      billingAddress { phone }
-      lineItems(first: 10) {
-        nodes { id title quantity sku product { id } variant { id } originalTotalPriceSet { shopMoney { amount currencyCode } } discountedTotalPriceWithCodeDiscount { shopMoney { amount currencyCode } } }
-        pageInfo { hasNextPage endCursor }
-      }
-      totalPriceSet { shopMoney { amount currencyCode } }
-    }
+    nodes { id createdAt updatedAt }
     pageInfo { hasNextPage endCursor }
   }
 }
@@ -118,8 +123,16 @@ query ShopifyCheckout($id: ID!) {
 ORDERS_QUERY = """
 query ShopifyOrders($first: Int!, $after: String, $query: String!, $sortKey: OrderSortKeys!) {
   orders(first: $first, after: $after, query: $query, sortKey: $sortKey) {
-    nodes {
-      id name createdAt updatedAt cancelledAt
+    nodes { id createdAt updatedAt }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+ORDER_NODE_QUERY = """
+query ShopifyOrder($id: ID!) {
+  node(id: $id) { ... on Order {
+      id name createdAt updatedAt cancelledAt cartToken checkoutToken
       displayFinancialStatus displayFulfillmentStatus
       customer {
         id firstName lastName numberOfOrders
@@ -136,8 +149,16 @@ query ShopifyOrders($first: Int!, $after: String, $query: String!, $sortKey: Ord
       customerJourneySummary { customerOrderIndex }
       transactions(first: 250) { id kind status processedAt amountSet { shopMoney { amount currencyCode } } }
       refunds { id refundLineItems(first: 10) { nodes { quantity subtotalSet { shopMoney { amount currencyCode } } lineItem { id } } pageInfo { hasNextPage endCursor } } }
-    }
-    pageInfo { hasNextPage endCursor }
+
+  } }
+}
+"""
+
+SYNC_NODE_QUERY = """
+query SyncVersion($id: ID!) {
+  node(id: $id) {
+    ... on Order { id createdAt updatedAt }
+    ... on AbandonedCheckout { id createdAt updatedAt }
   }
 }
 """
@@ -201,7 +222,8 @@ def _parse_datetime(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc)
     except (TypeError, ValueError):
         return None
 
@@ -231,15 +253,14 @@ def _reminder_due(provider_updated_at: Any, delay_minutes: int, frequency_after:
     return max(due, frequency_due) if frequency_due else due
 
 
-def _recovery_activity_time(provider_updated_at: Any, automation_enabled_at: Any) -> datetime | None:
-    """Treat a recently active cart as new when recovery is first enabled."""
+def _recovery_activity_time(provider_updated_at: Any, automation_enabled_at: Any, provider_created_at: Any) -> datetime | None:
+    """Only message records created and active after the saved cutoff."""
     updated = _parse_datetime(provider_updated_at)
     enabled = _parse_datetime(automation_enabled_at)
-    if not updated or not enabled:
+    created = _parse_datetime(provider_created_at)
+    if not updated or not enabled or not created or min(created, updated) < enabled:
         return None
-    if updated >= enabled:
-        return updated
-    return enabled if updated >= enabled - timedelta(hours=24) else None
+    return updated
 
 
 def _checkout_changed_for_send(expected: dict, current: dict | None) -> bool:
@@ -612,6 +633,8 @@ async def ensure_shopify_indexes() -> None:
     await db.shopify_orders.create_index([("org_id", 1), ("updated_at", -1), ("provider_id", -1)])
     await db.shopify_orders.create_index([("org_id", 1), ("payment_status", 1), ("updated_at", -1)])
     await db.shopify_orders.create_index([("shop", 1), ("provider_id", 1)])
+    await db.shopify_orders.create_index([("org_id", 1), ("updated_at", 1)], partialFilterExpression={"details_refresh_token": {"$exists": True}})
+    await db.shopify_checkouts.create_index([("org_id", 1), ("updated_at", 1)], partialFilterExpression={"details_refresh_token": {"$exists": True}})
     await db.shopify_order_notifications.create_index([("org_id", 1), ("order_provider_id", 1), ("event", 1)], unique=True)
     await db.shopify_order_notifications.create_index([("status", 1), ("due_at", 1), ("claim_expires_at", 1)])
     await db.shopify_order_notifications.create_index(
@@ -693,7 +716,9 @@ async def complete_oauth(params: dict[str, str]) -> str:
         raise HTTPException(status_code=409, detail="Shopify authorization has expired or was already used")
     token = await _exchange_token(shop, code)
     now = utcnow()
-    existing = await db.shopify_connections.find_one({"org_id": state_doc["org_id"]}, {"shop": 1, "status": 1})
+    existing = await db.shopify_connections.find_one({"org_id": state_doc["org_id"]})
+    if existing and existing.get("status") == "cleanup_pending":
+        raise HTTPException(status_code=409, detail="Shopify cleanup is finishing; retry connecting shortly")
     if existing and existing.get("status") == "connected" and existing.get("shop") != shop:
         raise HTTPException(status_code=409, detail="Disconnect the current Shopify store before connecting another")
     owner = await db.shopify_connections.find_one({"shop": shop, "org_id": {"$ne": state_doc["org_id"]}, "status": {"$ne": "disconnected"}}, {"_id": 1})
@@ -703,8 +728,7 @@ async def complete_oauth(params: dict[str, str]) -> str:
         "org_id": state_doc["org_id"], "shop": shop, "status": "connected",
         "access_token": _seal(token["access_token"]),
         "scopes": sorted(set(str(token.get("scope") or OAUTH_SCOPES).split(","))),
-        "connected_by": state_doc["user_id"], "connected_at": now, "updated_at": now,
-        "sync_status": "pending", "sync_requested_at": now, "sync_full": True,
+        "connected_by": state_doc["user_id"], "updated_at": now,
         "sync_error": None, "webhook_error": None, "reminder_error": None, "last_error": None,
     }
     if not existing or existing.get("status") == "disconnected":
@@ -712,7 +736,16 @@ async def complete_oauth(params: dict[str, str]) -> str:
             "automation_enabled": False, "reminder_delay_minutes": DEFAULT_REMINDER_DELAY_MINUTES,
             "whatsapp_id": None, "template_name": None, "template_status": None,
             "order_notifications_enabled": False, "order_templates": {},
-            "sync_cursor": {}, "import_counts": {"checkouts": 0, "orders": 0},
+            "connected_at": now, "sync_version": SYNC_VERSION,
+            "sync_status": "pending", "sync_requested_at": now,
+            "sync_import_floor_at": now - timedelta(days=1),
+            "synced_through_at": None, "last_sync_at": None,
+            "sync_window_start_at": None, "sync_window_end_at": None,
+            "sync_mode": None, "sync_cursor": {}, "sync_pages": {}, "sync_details": {},
+            "sync_completed_resources": [], "sync_counts": {}, "sync_touched_phones": [],
+            "sync_claim_token": None, "sync_claimed_at": None,
+            "next_sync_attempt_at": now, "next_verification_at": _next_verification(now),
+            "resync_requested": False, "import_counts": {"checkouts": 0, "orders": 0},
         })
     if token.get("refresh_token"):
         update["refresh_token"] = _seal(token["refresh_token"])
@@ -723,9 +756,28 @@ async def complete_oauth(params: dict[str, str]) -> str:
     except DuplicateKeyError as exc:
         raise HTTPException(status_code=409, detail="This Shopify store is already connected") from exc
     connection = await db.shopify_connections.find_one({"org_id": state_doc["org_id"]})
+    await request_sync(state_doc["org_id"])
     await _register_webhooks(connection)
     await _commerce_event(state_doc["org_id"], "connection", state_doc["org_id"])
     return state_doc["org_id"]
+
+
+def _sync_http_timeout(timeout: float) -> float:
+    budget = _sync_budget.get()
+    if budget is None:
+        return timeout
+    remaining = budget["deadline"] - time.monotonic()
+    if remaining <= 0 or budget["requests"] >= SYNC_REQUEST_LIMIT:
+        raise _SyncYield()
+    budget["requests"] += 1
+    return min(timeout, remaining)
+
+
+async def _shopify_retry_sleep(seconds: float) -> None:
+    budget = _sync_budget.get()
+    if budget is not None and time.monotonic() + seconds >= budget["deadline"]:
+        raise _SyncYield()
+    await asyncio.sleep(seconds)
 
 
 async def _access_token(connection: dict) -> str:
@@ -737,7 +789,7 @@ async def _access_token(connection: dict) -> str:
     if not refresh:
         raise HTTPException(status_code=503, detail="Reconnect Shopify to refresh authorization")
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=_sync_http_timeout(15)) as client:
             response = await client.post(
                 f"https://{connection['shop']}/admin/oauth/access_token",
                 json={
@@ -753,6 +805,7 @@ async def _access_token(connection: dict) -> str:
         if payload.get("expires_in"):
             update["token_expires_at"] = utcnow() + timedelta(seconds=int(payload["expires_in"]))
         await db.shopify_connections.update_one({"org_id": connection["org_id"], "shop": connection["shop"]}, {"$set": update})
+        connection.update(update)
         return payload["access_token"]
     except (httpx.HTTPError, KeyError, ValueError) as exc:
         logger.warning("Shopify token refresh failed: {}", type(exc).__name__)
@@ -763,7 +816,7 @@ async def _graphql(connection: dict, query: str, variables: dict, *, timeout: fl
     headers = {"X-Shopify-Access-Token": await _access_token(connection), "Content-Type": "application/json"}
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=_sync_http_timeout(timeout)) as client:
                 response = await client.post(
                     f"https://{connection['shop']}/admin/api/{API_VERSION}/graphql.json",
                     headers=headers, json={"query": query, "variables": variables},
@@ -771,7 +824,7 @@ async def _graphql(connection: dict, query: str, variables: dict, *, timeout: fl
             if response.status_code == 429:
                 retry = min(int(response.headers.get("Retry-After", "2") or 2), 30)
                 if attempt < 2:
-                    await asyncio.sleep(max(retry, 1))
+                    await _shopify_retry_sleep(max(retry, 1))
                     continue
                 raise HTTPException(status_code=503, detail="Shopify is busy; synchronization will resume")
             response.raise_for_status()
@@ -789,9 +842,15 @@ async def _graphql(connection: dict, query: str, variables: dict, *, timeout: fl
             requested = float(cost.get("requestedQueryCost") or cost.get("actualQueryCost") or 1)
             available = float(throttle.get("currentlyAvailable") or 0)
             restore = max(float(throttle.get("restoreRate") or 1), 1)
-            await asyncio.sleep(min(max((requested - available) / restore, 1), 30))
+            await _shopify_retry_sleep(min(max((requested - available) / restore, 1), 30))
             continue
         if errors:
+            if _sync_budget.get() is not None and variables.get("after") and any(
+                "cursor" in str(error.get("message") or "").lower()
+                and any(word in str(error.get("message") or "").lower() for word in ("invalid", "expired", "malformed"))
+                for error in errors
+            ):
+                raise _SyncCursorExpired()
             logger.warning("Shopify GraphQL returned {} error(s)", len(errors))
             raise HTTPException(status_code=503 if throttled else 502, detail="Shopify could not complete the request")
         return payload.get("data") or {}
@@ -828,7 +887,7 @@ def _report_product(item: dict, *, checkout: bool = False) -> dict:
             "total": {"amount": str(bag.get("amount", "0")), "currency": bag.get("currencyCode", "")} if value else None}
 
 
-async def _complete_line_items(connection: dict, node: dict, checkout: bool) -> dict:
+async def _complete_line_items(connection: dict, node: dict, checkout: bool, *, save_progress=None) -> dict:
     fields = CART_REPORT_FIELDS if checkout else ORDER_REPORT_FIELDS
     kind = "AbandonedCheckout" if checkout else "Order"
     lines = node.get("lineItems") or {}
@@ -843,10 +902,14 @@ async def _complete_line_items(connection: dict, node: dict, checkout: bool) -> 
         page = (data.get("node") or {}).get("lineItems")
         if not page:
             raise HTTPException(502, "Shopify line items unavailable")
-        nodes.extend(page.get("nodes") or [])
-        info = page.get("pageInfo") or {}
-        if info.get("hasNextPage") and info.get("endCursor") == cursor:
+        _validate_sync_page(page)
+        if page["nodes"] and page["pageInfo"].get("endCursor") == cursor:
             raise HTTPException(502, "Shopify repeated a line-item cursor")
+        nodes.extend(page["nodes"])
+        info = page["pageInfo"]
+        node["lineItems"] = {"nodes": nodes, "pageInfo": info}
+        if save_progress:
+            await save_progress()
     if not checkout:
         for refund in node.get("refunds") or []:
             refund_lines = refund.get("refundLineItems") or {}
@@ -859,10 +922,14 @@ async def _complete_line_items(connection: dict, node: dict, checkout: bool) -> 
                 query = "query ReportRefundLines($id: ID!, $after: String) { node(id: $id) { ... on Refund { refundLineItems(first: 100, after: $after) { nodes { quantity subtotalSet { shopMoney { amount currencyCode } } lineItem { id } } pageInfo { hasNextPage endCursor } } } } }"
                 data = await _graphql(connection, query, {"id": refund["id"], "after": refund_cursor})
                 page = (data.get("node") or {}).get("refundLineItems")
-                if not page or (page.get("pageInfo", {}).get("hasNextPage") and page.get("pageInfo", {}).get("endCursor") == refund_cursor):
+                if not page or (page.get("nodes") and page.get("pageInfo", {}).get("endCursor") == refund_cursor):
                     raise HTTPException(502, "Shopify refund lines unavailable")
-                refund_nodes.extend(page.get("nodes") or [])
-                refund_info = page.get("pageInfo") or {}
+                _validate_sync_page(page)
+                refund_nodes.extend(page["nodes"])
+                refund_info = page["pageInfo"]
+                refund["refundLineItems"] = {"nodes": refund_nodes, "pageInfo": refund_info}
+                if save_progress:
+                    await save_progress()
             refund["refundLineItems"] = {"nodes": refund_nodes, "pageInfo": refund_info}
     return {**node, "lineItems": {"nodes": nodes, "pageInfo": info}}
 
@@ -890,7 +957,7 @@ def _checkout_from_graphql(org_id: str, shop: str, node: dict, historical: bool,
         "whatsapp_consent": consent, "consent_updated_at": consent_at,
         "products": items, "total": _money(node.get("totalPriceSet")),
         "recovery_url": recovery_url,
-        "created_at": created, "provider_created_at": created,
+        "created_at": created, "provider_created_at": _parse_datetime(node.get("createdAt")),
         "updated_at": updated, "provider_updated_at": updated, "completed_at": _parse_datetime(node.get("completedAt")),
         "record_status": "converted" if node.get("completedAt") else "abandoned",
         "reminder_status": "converted" if node.get("completedAt") else ("historical" if historical else _eligibility_status(phone, items)),
@@ -919,6 +986,7 @@ def _order_from_graphql(org_id: str, shop: str, node: dict) -> dict:
     updated = _parse_datetime(node.get("updatedAt")) or created
     return {
         "org_id": org_id, "shop": shop, "provider_id": provider_id, "order_number": node.get("name") or "",
+        "cart_token": node.get("cartToken"), "checkout_token": node.get("checkoutToken"),
         "order_url": f"https://{shop}/admin/orders/{provider_id.rsplit('/', 1)[-1]}",
         "customer_id": customer.get("id"), "customer_name": _name(customer), "phone": phone,
         "products": items, "total": _money(node.get("totalPriceSet")),
@@ -931,7 +999,7 @@ def _order_from_graphql(org_id: str, shop: str, node: dict) -> dict:
         "net_payment": {"amount": str((node["netPaymentSet"].get("shopMoney") or {}).get("amount", "0")), "currency": (node["netPaymentSet"].get("shopMoney") or {}).get("currencyCode", "")} if node.get("netPaymentSet") else None,
         "payment_status": node.get("displayFinancialStatus") or "", "fulfillment_status": node.get("displayFulfillmentStatus") or "",
         "cancelled_at": _parse_datetime(node.get("cancelledAt")), "record_status": "active",
-        "created_at": created, "provider_created_at": created,
+        "created_at": created, "provider_created_at": _parse_datetime(node.get("createdAt")),
         "updated_at": updated, "provider_updated_at": updated, "status_updated_at": utcnow(),
     }
 
@@ -944,47 +1012,83 @@ def _eligibility_status(phone: str, items: list) -> str:
     return "pending"
 
 
+def _next_verification(now: datetime) -> datetime:
+    local = now.astimezone(IST)
+    return (local.replace(hour=0, minute=5, second=0, microsecond=0) + timedelta(days=1)).astimezone(timezone.utc)
+
+
+async def _migrate_sync(connection: dict) -> dict:
+    if connection.get("sync_version") == SYNC_VERSION:
+        return connection
+    now = utcnow()
+    checkpoint = _parse_datetime(connection.get("last_sync_at"))
+    setup = (_parse_datetime(connection.get("connected_at")) or now) if checkpoint else now
+    update = {
+        "sync_version": SYNC_VERSION, "sync_import_floor_at": setup - timedelta(days=1),
+        "synced_through_at": checkpoint, "sync_window_start_at": None, "sync_window_end_at": None,
+        "sync_mode": None, "sync_cursor": {}, "sync_pages": {}, "sync_details": {},
+        "sync_completed_resources": [], "sync_counts": {}, "sync_touched_phones": [],
+        "sync_status": "pending", "sync_requested_at": now, "next_sync_attempt_at": now,
+        "next_verification_at": _next_verification(now),
+    }
+    result = await db.shopify_connections.update_one(
+        {"org_id": connection["org_id"], "status": "connected", "sync_version": {"$ne": SYNC_VERSION}},
+        {"$set": update, "$unset": {"sync_full": "", "sync_cutoff_at": "", "sync_filter_field": "", "sync_claim_token": "", "sync_claimed_at": ""}},
+    )
+    if result.matched_count:
+        return {**connection, **update}
+    return await db.shopify_connections.find_one({"org_id": connection["org_id"]}) or connection
+
+
 async def request_sync(org_id: str) -> None:
-    connection = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected"})
+    connection = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "cleanup_pending": {"$ne": True}})
     if not connection:
         raise HTTPException(status_code=404, detail="Connect Shopify before synchronizing")
-    connection = await _repair_legacy_connection(connection)
-    if connection.get("sync_status") == "syncing" and (_parse_datetime(connection.get("sync_claimed_at")) or utcnow()) > utcnow() - timedelta(minutes=CLAIM_LEASE_MINUTES):
-        await db.shopify_connections.update_one(
-            {"org_id": org_id, "status": "connected", "sync_status": "syncing"},
-            {"$set": {"resync_requested": True, "sync_error": None, "updated_at": utcnow()}},
-        )
-        return
+    connection = await _migrate_sync(connection)
+    # Do not reset windows, cursors, retry backoff, or the one-minute continuation delay.
     result = await db.shopify_connections.update_one(
-        {"org_id": org_id, "status": "connected", "$or": [{"sync_status": {"$ne": "syncing"}}, {"sync_claimed_at": {"$lte": utcnow() - timedelta(minutes=CLAIM_LEASE_MINUTES)}}]},
-        {"$set": {"sync_status": "pending", "sync_requested_at": utcnow(), "sync_full": True, "sync_cursor": {}, "sync_completed_resources": [], "import_counts": {"checkouts": 0, "orders": 0}, "sync_error": None, "sync_failures": 0, "updated_at": utcnow()}, "$unset": {"sync_cutoff_at": "", "sync_filter_field": "", "next_sync_attempt_at": ""}},
+        {"org_id": org_id, "status": "connected", "sync_status": "complete"},
+        {"$set": {"sync_status": "pending", "sync_requested_at": utcnow(), "updated_at": utcnow()}},
     )
     if not result.matched_count:
-        queued = await db.shopify_connections.update_one(
-            {"org_id": org_id, "status": "connected", "sync_status": "syncing"},
-            {"$set": {"resync_requested": True, "sync_error": None, "updated_at": utcnow()}},
+        await db.shopify_connections.update_one(
+            {"org_id": org_id, "status": "connected", "sync_window_end_at": {"$ne": None}},
+            {"$set": {"resync_requested": True, "updated_at": utcnow()}},
         )
-        if not queued.matched_count:
-            raise HTTPException(status_code=404, detail="Connect Shopify before synchronizing")
-    await _register_webhooks(connection)
     await _commerce_event(org_id, "sync", org_id)
 
 
-async def _upsert_newer(collection, key: dict, fields: dict, *, on_insert: dict | None = None) -> bool:
+async def _upsert_newer(collection, key: dict, fields: dict, *, on_insert: dict | None = None, complete: bool = False, refresh_token: str | None = None) -> bool:
     provider_time = fields.get("provider_updated_at") or utcnow()
-    result = await collection.update_one(
-        {**key, "$or": [{"provider_updated_at": {"$lt": provider_time}}, {"provider_updated_at": {"$exists": False}}]},
-        {"$set": fields},
-    )
+    query = {**key, "$or": [{"provider_updated_at": {"$lt": provider_time}}, {"provider_updated_at": {"$exists": False}}]}
+    if fields.get("record_status") != "deleted":
+        query["record_status"] = {"$ne": "deleted"}
+    else:
+        query["$or"].append({"provider_updated_at": provider_time})
+    operation = {"$set": fields}
+    if fields.get("record_status") == "deleted":
+        operation["$unset"] = {"details_refresh_token": ""}
+    if complete:
+        query["$or"].append({"provider_updated_at": provider_time})
+        query["details_refresh_token"] = refresh_token if refresh_token else {"$exists": False}
+        operation["$unset"] = {"details_refresh_token": ""}
+    if fields.get("record_status") == "abandoned":
+        query["record_status"] = {"$nin": ["deleted", "converted"]}
+    result = await collection.update_one(query, operation)
+    if not result.matched_count and fields.get("record_status") == "abandoned":
+        # Conversion is terminal even if a later checkout payload is incomplete.
+        terminal_fields = {name: value for name, value in fields.items() if name not in {"record_status", "completed_at"}}
+        result = await collection.update_one({**query, "record_status": "converted"}, {**operation, "$set": terminal_fields})
     if result.matched_count:
         return True
-    if await collection.find_one(key, {"_id": 1}):
+    if await collection.find_one(key, {"_id": 1}) is not None:
         return False
     try:
         await collection.insert_one({**key, **fields, **(on_insert or {})})
         return True
     except DuplicateKeyError:
         return False
+
 
 
 def _delivery_started(checkout: dict) -> bool:
@@ -1068,7 +1172,7 @@ async def _reconcile_phone_checkouts(org_id: str, phone: str, connection: dict, 
         status, reason = "opted_out", "storefront_consent_missing"
     elif not connection.get("automation_enabled"):
         status, reason = "cancelled", "automation_disabled"
-    activity_time = _recovery_activity_time(_provider_time(latest), activation)
+    activity_time = _recovery_activity_time(_provider_time(latest), activation, latest.get("provider_created_at"))
     if status == "pending" and not activity_time:
         status, reason = "historical", "before_automation_activation"
     elif status == "pending" and not (configured if configured is not None else await _configuration_ready(connection)):
@@ -1104,6 +1208,8 @@ async def _repair_org_checkout_states(org_id: str, connection: dict | None = Non
     phone_values = phones if phones is not None else set(await db.shopify_checkouts.distinct("phone", {"org_id": org_id, "phone": {"$ne": ""}}))
     for phone in phone_values:
         await _reconcile_phone_checkouts(org_id, phone, connection, configured=configured)
+    if phones is not None:
+        return
     await db.shopify_checkouts.update_many(
         {"org_id": org_id, "phone": "", "record_status": "abandoned", "reminder_status": {"$in": list(RECONCILABLE_REMINDERS)}, "provider_started_at": {"$exists": False}},
         {"$set": {"reminder_status": "phone_missing", "failure_category": "phone_missing", "reminder_due_at": None, "status_updated_at": utcnow()}, "$unset": {"claim_token": "", "claim_expires_at": ""}},
@@ -1117,6 +1223,8 @@ async def _repair_legacy_connection(connection: dict) -> dict:
         update["reminder_delay_minutes"] = DEFAULT_REMINDER_DELAY_MINUTES
     if connection.get("automation_enabled") and not connection.get("automation_enabled_at"):
         update["automation_enabled_at"] = utcnow()
+    if connection.get("order_notifications_enabled") and not connection.get("order_notifications_enabled_at"):
+        update["order_notifications_enabled_at"] = utcnow()
     if connection.get("automation_enabled") and connection.get("whatsapp_id") and not connection.get("whatsapp_phone_id"):
         matches = await db.whatsapp_connections.find(
             {
@@ -1136,8 +1244,6 @@ async def _repair_legacy_connection(connection: dict) -> dict:
             {"$set": update},
         )
         connection = {**connection, **update}
-    if connection.get("automation_enabled"):
-        await _repair_org_checkout_states(connection["org_id"], connection)
     return connection
 
 
@@ -1153,7 +1259,10 @@ async def repair_legacy_shopify_connections() -> None:
     )
     cursor = db.shopify_connections.find({"status": "connected"})
     async for connection in cursor:
-        await _repair_legacy_connection(connection)
+        await _migrate_sync(connection)
+        repaired = await _repair_legacy_connection(connection)
+        if repaired.get("automation_enabled"):
+            await _repair_org_checkout_states(repaired["org_id"], repaired)
 
 
 async def ensure_shopify_runtime_ready() -> None:
@@ -1190,122 +1299,288 @@ async def _mark_order_conversion(org_id: str, order: dict) -> set[str]:
     return {phone for phone in affected if phone}
 
 
-async def sync_shopify_org(org_id: str) -> None:
-    token = secrets.token_urlsafe(16)
-    lease_before = utcnow() - timedelta(minutes=CLAIM_LEASE_MINUTES)
-    connection = await db.shopify_connections.find_one_and_update(
-        {"org_id": org_id, "status": "connected", "sync_status": {"$in": ["pending", "failed", "syncing"]}, "next_sync_attempt_at": {"$not": {"$gt": utcnow()}}, "$or": [{"sync_claimed_at": {"$lt": lease_before}}, {"sync_claimed_at": None}, {"sync_status": {"$ne": "syncing"}}]},
-        {"$set": {"sync_status": "syncing", "sync_claim_token": token, "sync_claimed_at": utcnow(), "sync_error": None}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not connection:
-        return
-    full_sync = bool(connection.get("sync_full"))
-    last_sync = _parse_datetime(connection.get("last_sync_at"))
-    cutoff_time = _parse_datetime(connection.get("sync_cutoff_at")) or (utcnow() - timedelta(days=60) if full_sync or not last_sync else last_sync - timedelta(minutes=10))
-    cursor_state: dict[str, Any] = dict(connection.get("sync_cursor") or {})
-    completed = set(connection.get("sync_completed_resources") or [])
-    counts = dict(connection.get("import_counts") or {"checkouts": 0, "orders": 0})
-    activation = _parse_datetime(connection.get("automation_enabled_at") or connection.get("connected_at"))
-    touched_phones: set[str] = set()
-    await db.shopify_connections.update_one(
-        {"org_id": org_id, "sync_claim_token": token},
-        {"$set": {"sync_cutoff_at": cutoff_time}},
-    )
-    try:
-        for kind, query, root in (("checkouts", CHECKOUTS_QUERY, "abandonedCheckouts"), ("orders", ORDERS_QUERY, "orders")):
-            if kind in completed:
-                continue
-            cursor = cursor_state.get(kind)
-            filter_field = "created_at" if kind == "checkouts" or full_sync or not last_sync else "updated_at"
-            resource_cutoff = cutoff_time - timedelta(days=7) if kind == "checkouts" and not full_sync and last_sync else cutoff_time
-            cutoff = resource_cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
-            sort_key = "CREATED_AT" if filter_field == "created_at" else "UPDATED_AT"
-            while True:
-                data = await _graphql(connection, query, {"first": 10, "after": cursor, "query": f"{filter_field}:>={cutoff}", "sortKey": sort_key}, timeout=30)
-                page = data.get(root) or {}
-                nodes = page.get("nodes") or []
-                for node in nodes:
-                    node = await _complete_line_items(connection, node, kind == "checkouts")
+def _validate_sync_page(page: Any) -> None:
+    if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+        raise HTTPException(502, "Shopify returned an incomplete page; synchronization will retry")
+    info = page.get("pageInfo")
+    if not isinstance(info, dict) or not isinstance(info.get("hasNextPage"), bool):
+        raise HTTPException(502, "Shopify pagination unavailable; synchronization will retry")
+    if info["hasNextPage"] and (not page["nodes"] or not info.get("endCursor")):
+        raise HTTPException(502, "Shopify pagination did not advance; synchronization will retry")
+
+
+def _sync_times(node: dict) -> tuple[datetime, datetime]:
+    created, updated = _parse_datetime(node.get("createdAt")), _parse_datetime(node.get("updatedAt"))
+    if not node.get("id") or not created or not updated or max(created, updated) > utcnow() + timedelta(minutes=5):
+        raise HTTPException(502, "Shopify record timestamps unavailable; synchronization will retry")
+    return created, updated
+
+
+async def _tracked_sync_record(connection: dict, collection, metadata: dict) -> dict | None:
+    created, _ = _sync_times(metadata)
+    existing = await collection.find_one({"org_id": connection["org_id"], "provider_id": metadata["id"]},
+        {"provider_updated_at": 1, "updated_at": 1, "provider_created_at": 1, "created_at": 1,
+         "record_status": 1, "details_refresh_token": 1, "line_items_incomplete": 1, "refund_lines_incomplete": 1})
+    floor = _parse_datetime(connection.get("sync_import_floor_at"))
+    if not existing and floor and created < floor:
+        return None
+    return existing or {}
+
+
+async def _hydrate_sync_record(connection: dict, kind: str, metadata: dict, state: dict, save, refresh_token: str | None) -> dict | None:
+    node = state["sync_details"].get(kind)
+    if node:
+        data = await _graphql(connection, SYNC_NODE_QUERY, {"id": metadata["id"]})
+        current = data.get("node")
+        if not isinstance(current, dict) or current.get("id") != metadata["id"]:
+            raise HTTPException(502, "Shopify record unavailable; verify authorization or deletion")
+        if _sync_times(current)[1] != _sync_times(node)[1]:
+            node = None
+            state["sync_details"].pop(kind, None)
+            await save()
+    if not node:
+        data = await _graphql(connection, CHECKOUT_NODE_QUERY if kind == "checkouts" else ORDER_NODE_QUERY, {"id": metadata["id"]})
+        node = data.get("node")
+        if not isinstance(node, dict) or node.get("id") != metadata["id"]:
+            raise HTTPException(502, "Shopify record unavailable; verify authorization or deletion")
+        _sync_times(node)
+        _validate_sync_page(node.get("lineItems"))
+        for refund in node.get("refunds") or []:
+            _validate_sync_page(refund.get("refundLineItems"))
+        # ponytail: partial details share the connection's Mongo document limit; split storage if exceeded.
+        node["_sync_refresh_token"] = refresh_token
+        state["sync_details"][kind] = node
+        await save()
+    node = await _complete_line_items(connection, node, kind == "checkouts", save_progress=save)
+    state["sync_details"][kind] = node
+    data = await _graphql(connection, SYNC_NODE_QUERY, {"id": metadata["id"]})
+    current = data.get("node")
+    if not isinstance(current, dict) or current.get("id") != metadata["id"]:
+        raise HTTPException(502, "Shopify record unavailable; verify authorization or deletion")
+    if _sync_times(current)[1] != _sync_times(node)[1]:
+        state["sync_details"].pop(kind, None)
+        await save()
+        return None
+    return node
+
+
+async def _sync_pass(connection: dict, token: str) -> None:
+    org_id = connection["org_id"]
+    owner = {"org_id": org_id, "shop": connection["shop"], "status": "connected", "cleanup_pending": {"$ne": True}, "sync_claim_token": token}
+    now = utcnow()
+    state = {key: connection.get(key) or {} for key in ("sync_cursor", "sync_pages", "sync_details", "sync_counts")}
+    state["sync_completed_resources"] = list(connection.get("sync_completed_resources") or [])
+    state["sync_touched_phones"] = list(connection.get("sync_touched_phones") or [])
+    end = _parse_datetime(connection.get("sync_window_end_at"))
+    start = _parse_datetime(connection.get("sync_window_start_at"))
+    mode = connection.get("sync_mode")
+    if not end or not start:
+        checkpoint = _parse_datetime(connection.get("synced_through_at"))
+        due = _parse_datetime(connection.get("next_verification_at"))
+        mode = "initial" if not checkpoint else ("verification" if due and due <= now else "incremental")
+        if checkpoint and checkpoint > now:
+            raise HTTPException(503, "Server clock precedes the saved checkpoint; synchronization is paused")
+        end = now
+        start = (end - timedelta(days=1)) if mode == "verification" else (
+            checkpoint - timedelta(minutes=10) if checkpoint else _parse_datetime(connection["sync_import_floor_at"])
+        )
+        state.update({"sync_cursor": {}, "sync_pages": {}, "sync_details": {}, "sync_counts": {}, "sync_completed_resources": [], "sync_touched_phones": []})
+    state.update({"sync_mode": mode, "sync_window_start_at": start, "sync_window_end_at": end})
+
+    async def save():
+        result = await db.shopify_connections.update_one(owner, {"$set": {**state, "sync_claimed_at": utcnow()}})
+        if not result.matched_count:
+            raise _SyncYield()
+
+    async def check_owner():
+        if await db.shopify_connections.find_one(owner, {"_id": 1}) is None:
+            raise _SyncYield()
+
+    await save()
+    scopes = connection.get("scopes") or OAUTH_SCOPES.split(",")
+    if "read_all_orders" not in scopes and start < now - timedelta(days=60):
+        raise HTTPException(403, "Order catch-up exceeds Shopify's 60-day access limit. Additional order access is required; the checkpoint is paused.")
+    if "read_orders" not in scopes:
+        raise HTTPException(403, "Reconnect Shopify to restore order access; the checkpoint is paused")
+    resources = [("checkouts", CHECKOUTS_QUERY, "abandonedCheckouts", db.shopify_checkouts), ("orders", ORDERS_QUERY, "orders", db.shopify_orders)]
+    if connection.get("sync_first_resource") == "orders":
+        resources.reverse()
+    state["sync_first_resource"] = "checkouts" if resources[0][0] == "orders" else "orders"
+    errors = []
+    for kind, query, root, collection in resources:
+        if kind in state["sync_completed_resources"]:
+            continue
+        counts = state["sync_counts"].setdefault(kind, {"scanned": 0, "changed": 0, "skipped": 0})
+        try:
+            dirty = await collection.find({"org_id": org_id, "shop": connection["shop"], "record_status": {"$ne": "deleted"}, "details_refresh_token": {"$exists": True}},
+                {"provider_id": 1, "provider_created_at": 1, "created_at": 1, "provider_updated_at": 1}).sort([("updated_at", 1)]).limit(SYNC_BATCH_SIZE).to_list(length=SYNC_BATCH_SIZE)
+            processed = 0
+            while processed < SYNC_BATCH_SIZE:
+                await check_owner()
+                if time.monotonic() >= _sync_budget.get()["deadline"]:
+                    raise _SyncYield()
+                page = state["sync_pages"].get(kind)
+                if not page:
+                    if dirty:
+                        record = dirty.pop(0)
+                        created = _parse_datetime(record.get("provider_created_at") or record.get("created_at"))
+                        updated = _parse_datetime(record.get("provider_updated_at"))
+                        page = {"nodes": [{"id": record["provider_id"], "createdAt": created, "updatedAt": updated}], "targeted": True}
+                    else:
+                        field = "created_at" if mode == "initial" else "updated_at"
+                        variables = {"first": SYNC_BATCH_SIZE - processed, "after": state["sync_cursor"].get(kind),
+                                     "query": f"{field}:>='{_iso_utc(start)}' {field}:<'{_iso_utc(end)}'",
+                                     "sortKey": "ID" if kind == "checkouts" else ("CREATED_AT" if mode == "initial" else "UPDATED_AT")}
+                        data = await _graphql(connection, query, variables)
+                        page = data.get(root)
+                        _validate_sync_page(page)
+                        if page["nodes"] and page["pageInfo"].get("endCursor") == variables["after"]:
+                            raise HTTPException(502, "Shopify repeated a pagination cursor; synchronization will retry")
+                    state["sync_pages"][kind] = page
+                    await save()
+                if not page["nodes"]:
+                    if not page.get("targeted"):
+                        state["sync_cursor"][kind] = page["pageInfo"].get("endCursor")
+                        if not page["pageInfo"]["hasNextPage"]:
+                            state["sync_completed_resources"].append(kind)
+                    state["sync_pages"].pop(kind, None)
+                    await save()
+                    if kind in state["sync_completed_resources"]:
+                        break
+                    continue
+                metadata = page["nodes"][0]
+                existing = await _tracked_sync_record(connection, collection, metadata)
+                _, updated = _sync_times(metadata)
+                needs_details = existing is not None and existing.get("record_status") != "deleted" and (
+                    not existing or _provider_time(existing) < updated or existing.get("details_refresh_token")
+                    or existing.get("line_items_incomplete") or existing.get("refund_lines_incomplete")
+                    or state["sync_details"].get(kind)
+                )
+                processed += 1
+                if needs_details:
+                    node = await _hydrate_sync_record(connection, kind, metadata, state, save, existing.get("details_refresh_token"))
+                    if node is None:
+                        continue
+                    await check_owner()
+                    current = await collection.find_one({"org_id": org_id, "provider_id": metadata["id"]}, {"phone": 1}) or {}
                     if kind == "checkouts":
-                        updated = _parse_datetime(node.get("updatedAt")) or utcnow()
-                        activity_time = _recovery_activity_time(updated, activation) if connection.get("automation_enabled") else None
-                        historical = not activity_time
-                        document = _checkout_from_graphql(org_id, connection["shop"], node, historical=historical, delay_minutes=int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES))
-                        if activity_time and document.get("reminder_status") == "pending":
-                            document["reminder_due_at"] = _reminder_due(activity_time, int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES))
-                        if not any(document.get(field) for field in ("customer_id", "phone", "customer_name")):
-                            continue
-                        existing = await db.shopify_checkouts.find_one(
-                            {"org_id": org_id, "provider_id": document["provider_id"]}, {"phone": 1},
-                        )
-                        if existing and existing.get("phone"):
-                            touched_phones.add(existing["phone"])
-                        if document.get("phone"):
-                            touched_phones.add(document["phone"])
-                        reminder_status = document.pop("reminder_status")
-                        reminder_due_at = document.pop("reminder_due_at")
-                        await _upsert_newer(
-                            db.shopify_checkouts,
-                            {"org_id": org_id, "provider_id": document["provider_id"]},
-                            document,
-                            on_insert={"reminder_status": reminder_status, "reminder_due_at": reminder_due_at, "imported_at": utcnow()},
-                        )
+                        activation = connection.get("automation_enabled_at")
+                        activity = _recovery_activity_time(node.get("updatedAt"), activation, node.get("createdAt")) if connection.get("automation_enabled") else None
+                        document = _checkout_from_graphql(org_id, connection["shop"], node, historical=not activity, delay_minutes=int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES))
+                        reminder = {key: document.pop(key) for key in ("reminder_status", "reminder_due_at")}
                     else:
                         document = _order_from_graphql(org_id, connection["shop"], node)
-                        await _upsert_newer(db.shopify_orders, {"org_id": org_id, "provider_id": document["provider_id"]}, document, on_insert={"imported_at": utcnow()})
-                        touched_phones.update(await _mark_order_conversion(org_id, document))
-                    counts[kind] = counts.get(kind, 0) + 1
-                info = page.get("pageInfo") or {}
-                cursor = info.get("endCursor")
-                cursor_state[kind] = cursor
-                await db.shopify_connections.update_one({"org_id": org_id, "sync_claim_token": token}, {"$set": {"sync_cursor": cursor_state, "import_counts": counts, "sync_claimed_at": utcnow()}})
-                if not info.get("hasNextPage"):
-                    completed.add(kind)
-                    await db.shopify_connections.update_one(
-                        {"org_id": org_id, "sync_claim_token": token},
-                        {"$set": {"sync_completed_resources": sorted(completed), "sync_claimed_at": utcnow()}},
-                    )
+                        reminder = {}
+                    phones = {phone for phone in (current.get("phone"), document.get("phone")) if phone}
+                    state["sync_touched_phones"] = sorted(set(state["sync_touched_phones"]) | phones)
+                    await save()
+                    changed = await _upsert_newer(collection, {"org_id": org_id, "provider_id": metadata["id"]}, document,
+                                                  on_insert={**reminder, "imported_at": utcnow()}, complete=True,
+                                                  refresh_token=node.get("_sync_refresh_token"))
+                    if kind == "orders" and changed:
+                        state["sync_touched_phones"] = sorted(set(state["sync_touched_phones"]) | await _mark_order_conversion(org_id, document))
+                    counts["changed"] += int(changed)
+                else:
+                    counts["skipped"] += 1
+                counts["scanned"] += 1
+                page["nodes"].pop(0)
+                dirty = [record for record in dirty if record["provider_id"] != metadata["id"]]
+                state["sync_details"].pop(kind, None)
+                if not page["nodes"]:
+                    if not page.get("targeted"):
+                        state["sync_cursor"][kind] = page["pageInfo"].get("endCursor")
+                        if not page["pageInfo"]["hasNextPage"]:
+                            state["sync_completed_resources"].append(kind)
+                    state["sync_pages"].pop(kind, None)
+                await save()
+                if kind in state["sync_completed_resources"]:
                     break
+        except _SyncCursorExpired:
+            state["sync_cursor"].pop(kind, None)
+            state["sync_pages"].pop(kind, None)
+            state["sync_details"].pop(kind, None)
+            await save()
+        except HTTPException as exc:
+            errors.append(exc)
+    await check_owner()
+    if len(state["sync_completed_resources"]) == 2 and mode != "verification":
         if connection.get("whatsapp_id") and connection.get("template_name"):
             await list_compatible_templates(org_id, connection["whatsapp_id"], phone_id=connection.get("whatsapp_phone_id"))
         if connection.get("whatsapp_id") and connection.get("order_templates"):
             await list_compatible_templates(org_id, connection["whatsapp_id"], phone_id=connection.get("whatsapp_phone_id"), purpose="order")
-        if connection.get("whatsapp_id") and (connection.get("template_name") or connection.get("order_templates")):
-            connection = await db.shopify_connections.find_one({"org_id": org_id, "sync_claim_token": token}) or connection
-        await _repair_org_checkout_states(org_id, connection, None if full_sync else touched_phones)
-        counts = {
-            "checkouts": await db.shopify_checkouts.count_documents({"org_id": org_id}),
-            "orders": await db.shopify_orders.count_documents({"org_id": org_id}),
-        }
-        await db.shopify_connections.update_one(
-            {"org_id": org_id, "sync_claim_token": token},
-            {"$set": {"sync_status": "complete", "last_sync_at": utcnow(), "sync_error": None, "sync_failures": 0, "last_error": None, "import_counts": counts, "updated_at": utcnow()}, "$unset": {"sync_claim_token": "", "sync_claimed_at": "", "sync_full": "", "sync_cursor": "", "sync_cutoff_at": "", "sync_filter_field": "", "sync_completed_resources": "", "next_sync_attempt_at": ""}},
-        )
-        await db.shopify_connections.update_one(
-            {"org_id": org_id, "sync_status": "complete", "resync_requested": True},
-            {"$set": {"sync_status": "pending", "sync_full": True, "sync_requested_at": utcnow(), "sync_cursor": {}, "sync_completed_resources": [], "import_counts": {"checkouts": 0, "orders": 0}}, "$unset": {"resync_requested": ""}},
-        )
+        await check_owner()
+    latest = await db.shopify_connections.find_one(owner)
+    await _repair_org_checkout_states(org_id, latest, set(state["sync_touched_phones"]))
+    state["sync_touched_phones"] = []
+    await save()
+    if errors:
+        raise errors[0]
+    if len(state["sync_completed_resources"]) < 2:
+        return
+    counts = {"checkouts": await db.shopify_checkouts.count_documents({"org_id": org_id}),
+              "orders": await db.shopify_orders.count_documents({"org_id": org_id})}
+    # Atomically observe refresh requests at completion; a request after completion queues itself.
+    update = {"sync_status": "complete", "last_sync_at": utcnow(), "import_counts": counts,
+              "sync_error": None, "sync_failures": 0, "next_sync_attempt_at": utcnow() + timedelta(minutes=1), "sync_window_start_at": None, "sync_window_end_at": None,
+              "sync_cursor": {}, "sync_pages": {}, "sync_details": {}, "sync_completed_resources": [], "sync_touched_phones": []}
+    if mode == "verification":
+        update["last_verification_at"] = utcnow()
+        update["next_verification_at"] = _next_verification(utcnow())
+    else:
+        update["synced_through_at"] = end
+    previous = await db.shopify_connections.find_one_and_update(owner, {"$set": update, "$unset": {"resync_requested": ""}}, return_document=False)
+    if previous and previous.get("resync_requested"):
+        await db.shopify_connections.update_one({**owner, "sync_status": "complete"}, {"$set": {"sync_status": "pending", "sync_requested_at": utcnow()}})
+
+
+async def sync_shopify_org(org_id: str) -> None:
+    connection = await db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "cleanup_pending": {"$ne": True}})
+    if not connection:
+        return
+    await _migrate_sync(connection)
+    token = secrets.token_urlsafe(16)
+    connection = await db.shopify_connections.find_one_and_update(
+        {"org_id": org_id, "status": "connected", "cleanup_pending": {"$ne": True}, "sync_version": SYNC_VERSION,
+         "sync_status": {"$in": ["pending", "failed", "syncing"]}, "next_sync_attempt_at": {"$not": {"$gt": utcnow()}},
+         "$or": [{"sync_claimed_at": {"$lt": utcnow() - timedelta(minutes=CLAIM_LEASE_MINUTES)}}, {"sync_claimed_at": None}]},
+        {"$set": {"sync_status": "syncing", "sync_claim_token": token, "sync_claimed_at": utcnow()}}, return_document=ReturnDocument.AFTER,
+    )
+    if not connection:
+        return
+    budget = {"deadline": time.monotonic() + SYNC_PASS_SECONDS, "requests": 0}
+    context = _sync_budget.set(budget)
+    owner = {"org_id": org_id, "status": "connected", "sync_claim_token": token}
+    try:
+        try:
+            await asyncio.wait_for(_sync_pass(connection, token), timeout=SYNC_PASS_SECONDS)
+        except (_SyncYield, TimeoutError):
+            pass
+        await db.shopify_connections.update_one({**owner, "sync_status": "syncing"},
+            {"$set": {"sync_status": "pending", "sync_requested_at": utcnow(), "next_sync_attempt_at": utcnow() + timedelta(minutes=1)}})
     except Exception as exc:
         logger.warning("Shopify sync failed for org suffix {}: {}", org_id[-6:], type(exc).__name__)
         failures = int(connection.get("sync_failures") or 0) + 1
-        await db.shopify_connections.update_one(
-            {"org_id": org_id, "sync_claim_token": token},
-            {"$set": {"sync_status": "failed", "sync_error": "Shopify sync paused and will resume automatically", "sync_failures": failures, "next_sync_attempt_at": _sync_retry_at(failures), "updated_at": utcnow()}, "$unset": {"sync_claim_token": "", "sync_claimed_at": ""}},
-        )
-        await _admin_warning(org_id, "sync_failed")
+        message = exc.detail if isinstance(exc, HTTPException) else "Shopify sync paused and will resume automatically"
+        await db.shopify_connections.update_one(owner, {"$set": {"sync_status": "failed", "sync_error": message,
+            "sync_failures": failures, "next_sync_attempt_at": _sync_retry_at(failures), "sync_requested_at": utcnow(), "updated_at": utcnow()}})
+    finally:
+        _sync_budget.reset(context)
+        await db.shopify_connections.update_one(owner, {"$unset": {"sync_claim_token": "", "sync_claimed_at": ""},
+            "$set": {"sync_last_request_count": budget["requests"], "sync_last_pass_seconds": round(SYNC_PASS_SECONDS - max(0, budget["deadline"] - time.monotonic()), 3)}})
     await _commerce_event(org_id, "sync", org_id)
 
 
 async def process_shopify_syncs() -> None:
     try:
+        now = utcnow()
         await db.shopify_connections.update_many(
-            {"status": "connected", "sync_status": "complete", "last_sync_at": {"$lte": utcnow() - timedelta(minutes=5)}},
-            {"$set": {"sync_status": "pending", "sync_full": False, "sync_requested_at": utcnow(), "sync_cursor": {}, "sync_completed_resources": []}, "$unset": {"sync_cutoff_at": "", "sync_filter_field": "", "next_sync_attempt_at": ""}},
+            {"status": "connected", "cleanup_pending": {"$ne": True}, "sync_status": "complete",
+             "$or": [{"last_sync_at": {"$lte": now - timedelta(minutes=5)}}, {"next_verification_at": {"$lte": now}}]},
+            {"$set": {"sync_status": "pending", "sync_requested_at": now}},
         )
         cursor = db.shopify_connections.find(
-            {"status": "connected", "sync_status": {"$in": ["pending", "failed", "syncing"]}, "next_sync_attempt_at": {"$not": {"$gt": utcnow()}}},
-            {"org_id": 1},
+            {"status": "connected", "cleanup_pending": {"$ne": True}, "sync_status": {"$in": ["pending", "failed", "syncing"]},
+             "next_sync_attempt_at": {"$not": {"$gt": now}}}, {"org_id": 1},
         ).sort([("next_sync_attempt_at", 1), ("sync_requested_at", 1)]).limit(5)
         async for item in cursor:
             await sync_shopify_org(item["org_id"])
@@ -1383,6 +1658,12 @@ async def _queue_order_notification(connection: dict, event: str, order_provider
         return
     if event == "shipped" and (template.get("parameter_count") != 2 or not tracking or not tracking.get("number")):
         return
+    cutoff = _parse_datetime(connection.get("order_notifications_enabled_at"))
+    if not cutoff or event_time < cutoff:
+        return
+    order = await db.shopify_orders.find_one({"org_id": connection["org_id"], "provider_id": order_provider_id})
+    if order and not _recovery_activity_time(event_time, cutoff, order.get("provider_created_at")):
+        return
     now = utcnow()
     try:
         await db.shopify_order_notifications.insert_one({
@@ -1399,6 +1680,15 @@ async def _queue_order_notification(connection: dict, event: str, order_provider
                  "event": event, "status": {"$in": ["pending", "retryable"]}},
                 {"$set": {"tracking": tracking, "updated_at": now}},
             )
+
+
+async def _webhook_record_allowed(connection: dict, collection, provider_id: str, created_at: Any) -> bool:
+    if await collection.find_one({"org_id": connection["org_id"], "provider_id": provider_id}, {"_id": 1}) is not None:
+        return True
+    created = _parse_datetime(created_at)
+    setup = (_parse_datetime(connection.get("connected_at")) or utcnow()) if connection.get("last_sync_at") else utcnow()
+    floor = _parse_datetime(connection.get("sync_import_floor_at")) or setup - timedelta(days=1)
+    return bool(created and floor <= created <= utcnow() + timedelta(minutes=5))
 
 
 async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time: datetime) -> None:
@@ -1425,9 +1715,10 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
         return
     if topic == "refunds/create":
         provider_id = _provider_gid("Order", payload.get("order_id"))
-        await db.shopify_orders.update_one({"org_id": org_id, "provider_id": provider_id},
-                                          {"$set": {"net_payment": None, "payment_status": "REFUND_SYNC_PENDING"}})
-        await request_sync(org_id)
+        result = await db.shopify_orders.update_one({"org_id": org_id, "provider_id": provider_id, "record_status": {"$ne": "deleted"}},
+            {"$set": {"net_payment": None, "payment_status": "REFUND_SYNC_PENDING", "details_refresh_token": secrets.token_urlsafe(16)}})
+        if result.matched_count:
+            await request_sync(org_id)
         return
     if topic in {"fulfillments/create", "fulfillments/update"}:
         if not payload.get("order_id"):
@@ -1452,18 +1743,25 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
                 db.shopify_orders,
                 {"org_id": org_id, "provider_id": provider_id},
                 {"shop": connection["shop"], "record_status": "deleted", "provider_updated_at": event_time, "updated_at": event_time, "status_updated_at": utcnow()},
-                on_insert={"created_at": event_time, "provider_created_at": event_time},
+                on_insert={"deleted_at": event_time},
             )
             await _commerce_event(org_id, "order", provider_id)
             return
         order = _order_from_webhook(org_id, connection["shop"], payload)
-        await _upsert_newer(db.shopify_orders, {"org_id": org_id, "provider_id": order["provider_id"]}, order)
+        if not await _webhook_record_allowed(connection, db.shopify_orders, order["provider_id"], payload.get("created_at")):
+            return
+        order["details_refresh_token"] = secrets.token_urlsafe(16)
+        accepted = await _upsert_newer(db.shopify_orders, {"org_id": org_id, "provider_id": order["provider_id"]}, order)
+        stored = await db.shopify_orders.find_one({"org_id": org_id, "provider_id": order["provider_id"], "record_status": {"$ne": "deleted"}})
+        if not stored:
+            return
         from services.sales_workflow_service import verified_outcome
-        stored_order = await db.shopify_orders.find_one({"org_id": org_id, "provider_id": order["provider_id"]}) or order
-        outcome = "refunded" if stored_order.get("payment_status") == "REFUNDED" else "cancelled" if stored_order.get("cancelled_at") else "paid" if stored_order.get("payment_status") == "PAID" else ""
+        outcome = "refunded" if stored.get("payment_status") == "REFUNDED" else "cancelled" if stored.get("cancelled_at") else "paid" if stored.get("payment_status") == "PAID" else ""
         if outcome:
-            await verified_outcome(org_id, outcome, f"shopify:{stored_order['provider_id']}:{stored_order.get('provider_updated_at')}:{outcome}", order=stored_order)
-        touched = await _mark_order_conversion(org_id, order)
+            await verified_outcome(org_id, outcome, f"shopify:{stored['provider_id']}:{stored.get('provider_updated_at')}:{outcome}", order=stored)
+        touched = await _mark_order_conversion(org_id, stored) if accepted else set()
+        if accepted:
+            await request_sync(org_id)
         if touched:
             await _repair_org_checkout_states(org_id, connection, touched)
         event = ORDER_EVENT_TOPICS.get(topic)
@@ -1504,6 +1802,8 @@ async def _apply_webhook(connection: dict, topic: str, payload: dict, event_time
                 await _reconcile_phone_checkouts(org_id, deleted["phone"], connection)
         else:
             checkout = _checkout_from_webhook(org_id, connection["shop"], payload, connection)
+            if not await _webhook_record_allowed(connection, db.shopify_checkouts, checkout["provider_id"], payload.get("created_at")):
+                return
             if not any(checkout.get(field) for field in ("customer_id", "phone", "customer_name")):
                 return
             if checkout.get("checkout_token"):
@@ -1619,7 +1919,7 @@ def _checkout_from_webhook(org_id: str, shop: str, payload: dict, connection: di
     updated = _parse_datetime(payload.get("updated_at")) or utcnow()
     customer_id = _provider_gid("Customer", customer.get("admin_graphql_api_id") or customer.get("id")) if customer.get("id") or customer.get("admin_graphql_api_id") else ""
     activation = _parse_datetime(connection.get("automation_enabled_at"))
-    activity_time = _recovery_activity_time(updated, activation) if connection.get("automation_enabled") else None
+    activity_time = _recovery_activity_time(updated, activation, payload.get("created_at")) if connection.get("automation_enabled") else None
     status = _eligibility_status(phone, items) if activity_time else ("cancelled" if not connection.get("automation_enabled") else "historical")
     if payload.get("completed_at"):
         status = "converted"
@@ -1633,7 +1933,7 @@ def _checkout_from_webhook(org_id: str, shop: str, payload: dict, connection: di
         "phone": phone, "whatsapp_consent": consent, "consent_updated_at": consent_at,
         "products": items, "total": {"amount": float(payload.get("total_price") or 0), "currency": payload.get("currency") or ""},
         "recovery_url": payload.get("abandoned_checkout_url") or payload.get("web_url") or "",
-        "created_at": _parse_datetime(payload.get("created_at")) or updated, "provider_created_at": _parse_datetime(payload.get("created_at")) or updated,
+        "created_at": _parse_datetime(payload.get("created_at")) or updated, "provider_created_at": _parse_datetime(payload.get("created_at")),
         "updated_at": updated, "provider_updated_at": updated, "status_updated_at": utcnow(),
         "completed_at": _parse_datetime(payload.get("completed_at")), "record_status": "converted" if payload.get("completed_at") else "abandoned",
         "reminder_status": status, "reminder_due_at": None if status != "pending" else _reminder_due(activity_time, int(connection.get("reminder_delay_minutes") or DEFAULT_REMINDER_DELAY_MINUTES)),
@@ -1683,7 +1983,7 @@ def _order_from_webhook(org_id: str, shop: str, payload: dict) -> dict:
         "paid_at": min((_parse_datetime(tx.get("processed_at")) for tx in payload.get("transactions") or [] if tx.get("status") == "success" and tx.get("kind") in {"sale", "capture"} and _parse_datetime(tx.get("processed_at"))), default=None),
         "payment_status": str(payload.get("financial_status") or "").upper(), "fulfillment_status": str(payload.get("fulfillment_status") or "UNFULFILLED").upper(),
         "cancelled_at": _parse_datetime(payload.get("cancelled_at")), "record_status": "active",
-        "created_at": created, "provider_created_at": created,
+        "created_at": created, "provider_created_at": _parse_datetime(payload.get("created_at")),
         "updated_at": updated, "provider_updated_at": updated, "status_updated_at": utcnow(),
     }
 
@@ -1698,12 +1998,22 @@ async def get_connection(org_id: str) -> dict:
         return {"connected": False, "configured": bool(SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET and SHOPIFY_PUBLIC_BASE_URL), "whatsapp_connections": whatsapp_connections}
     safe = {key: connection.get(key) for key in (
         "org_id", "shop", "status", "connected_at", "updated_at", "sync_status", "last_sync_at",
+        "synced_through_at", "sync_window_start_at", "sync_window_end_at", "sync_mode", "last_verification_at",
         "sync_error", "webhook_error", "reminder_error", "import_counts", "whatsapp_id", "whatsapp_phone_id", "template_name", "template_language",
-        "template_status", "reminder_delay_minutes", "automation_enabled", "order_notifications_enabled", "order_templates", "scopes",
+        "template_status", "reminder_delay_minutes", "automation_enabled", "automation_enabled_at", "order_notifications_enabled", "order_notifications_enabled_at", "order_templates", "scopes",
     ) if connection.get(key) is not None}
     for key, value in list(safe.items()):
         if isinstance(value, datetime):
             safe[key] = _iso_utc(value)
+    checkpoint = _parse_datetime(connection.get("synced_through_at"))
+    anchor = checkpoint or _parse_datetime(connection.get("sync_window_end_at") or connection.get("sync_requested_at"))
+    safe["sync_lag_seconds"] = max(0, int((utcnow() - anchor).total_seconds())) if anchor else 0
+    safe["sync_catching_up"] = safe["sync_lag_seconds"] > 1800
+    scopes = connection.get("scopes") or []
+    if "read_all_orders" not in scopes:
+        safe["sync_access_note"] = "Updates to stored orders older than 60 days may require additional Shopify access."
+    completed = set(connection.get("sync_completed_resources") or [])
+    safe["sync_progress"] = {kind: {**(connection.get("sync_counts") or {}).get(kind, {}), "complete": kind in completed or connection.get("sync_status") == "complete"} for kind in ("checkouts", "orders")}
     safe["connected"] = connection.get("status") == "connected"
     safe["last_error"] = connection.get("reminder_error") or connection.get("webhook_error") or connection.get("sync_error") or connection.get("last_error")
     safe["configured"] = bool(SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET and SHOPIFY_PUBLIC_BASE_URL)
@@ -1966,8 +2276,12 @@ async def update_settings(org_id: str, settings: dict) -> dict:
         "automation_enabled": enabled, "updated_at": utcnow(), "reminder_error": None, "last_error": None,
         "order_notifications_enabled": order_enabled, "order_templates": order_templates,
     }
-    if enabled and (not existing.get("automation_enabled") or not existing.get("automation_enabled_at")):
-        settings_update["automation_enabled_at"] = utcnow()
+    start_from_now = bool(settings.get("start_from_now"))
+    now = utcnow()
+    if start_from_now or (enabled and (not existing.get("automation_enabled") or not existing.get("automation_enabled_at"))):
+        settings_update["automation_enabled_at"] = now
+    if start_from_now or (order_enabled and (not existing.get("order_notifications_enabled") or not existing.get("order_notifications_enabled_at"))):
+        settings_update["order_notifications_enabled_at"] = now
     result = await db.shopify_connections.update_one(
         {"org_id": org_id, "status": "connected"},
         {"$set": settings_update},
@@ -1975,6 +2289,26 @@ async def update_settings(org_id: str, settings: dict) -> dict:
     if not result.matched_count:
         raise HTTPException(status_code=404, detail="Connect Shopify before changing settings")
     connection = await db.shopify_connections.find_one({"org_id": org_id})
+    if start_from_now:
+        await db.shopify_checkouts.update_many(
+            {"org_id": org_id, "reminder_status": {"$in": list(RECONCILABLE_REMINDERS | {"sending"})},
+             "provider_started_at": {"$exists": False},
+             "$or": [{"provider_created_at": {"$lt": now}}, {"provider_created_at": None}]},
+            {"$set": {"reminder_status": "historical", "failure_category": "before_automation_activation", "reminder_due_at": None, "status_updated_at": now},
+             "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        )
+        await db.shopify_order_notifications.update_many(
+            {"org_id": org_id, "status": {"$in": ["pending", "retryable", "sending"]},
+             "provider_started_at": {"$exists": False}, "$or": [{"event_at": {"$lt": now}}, {"event_at": None}]},
+            {"$set": {"status": "cancelled", "failure_category": "before_automation_activation", "updated_at": now},
+             "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        )
+        await db.commerce_retargeting_jobs.update_many(
+            {"org_id": org_id, "status": {"$in": ["observing", "pending", "sending"]},
+             "provider_started_at": {"$exists": False}, "$or": [{"original_accepted_at": {"$lt": now}}, {"original_accepted_at": None}]},
+            {"$set": {"status": "cancelled", "reason": "before_automation_activation", "updated_at": now},
+             "$unset": {"claim_token": "", "claim_expires_at": ""}},
+        )
     if enabled:
         await _repair_org_checkout_states(org_id, connection)
     else:
@@ -1995,7 +2329,7 @@ async def disconnect_shopify(org_id: str, *, provider_uninstall: bool = False) -
     now = utcnow()
     result = await db.shopify_connections.update_one(
         {"org_id": org_id, "status": {"$in": ["connected", "cleanup_pending"]}},
-        {"$set": {"status": "cleanup_pending" if provider_uninstall else "connected", "cleanup_pending": provider_uninstall, "automation_enabled": False, "order_notifications_enabled": False, "updated_at": now}},
+        {"$set": {"status": "cleanup_pending", "cleanup_pending": True, "cleanup_provider_uninstall": provider_uninstall, "automation_enabled": False, "order_notifications_enabled": False, "updated_at": now}, "$unset": {"sync_claim_token": "", "sync_claimed_at": ""}},
     )
     if not result.matched_count:
         raise HTTPException(status_code=404, detail="Shopify is not connected")
@@ -2052,7 +2386,7 @@ async def disconnect_shopify(org_id: str, *, provider_uninstall: bool = False) -
 async def _finish_shopify_disconnect(org_id: str, *, provider_uninstall: bool = False) -> None:
     await db.shopify_connections.update_one(
         {"org_id": org_id, "status": {"$in": ["connected", "cleanup_pending"]}},
-        {"$set": {"status": "disconnected", "updated_at": utcnow(), "last_error": "Shopify app was uninstalled" if provider_uninstall else None}, "$unset": {"shop": "", "access_token": "", "refresh_token": "", "token_expires_at": "", "sync_claim_token": "", "sync_claimed_at": "", "cleanup_pending": ""}},
+        {"$set": {"status": "disconnected", "updated_at": utcnow(), "last_error": "Shopify app was uninstalled" if provider_uninstall else None}, "$unset": {"shop": "", "access_token": "", "refresh_token": "", "token_expires_at": "", "sync_claim_token": "", "sync_claimed_at": "", "cleanup_pending": "", "cleanup_provider_uninstall": ""}},
     )
     await db.shopify_checkouts.delete_many({"org_id": org_id})
     await db.shopify_storefront_consents.delete_many({"org_id": org_id})
@@ -2064,7 +2398,7 @@ async def _finish_shopify_disconnect(org_id: str, *, provider_uninstall: bool = 
 
 
 async def _finish_pending_disconnects() -> None:
-    cursor = db.shopify_connections.find({"status": "cleanup_pending", "cleanup_pending": True}, {"org_id": 1}).limit(10)
+    cursor = db.shopify_connections.find({"status": "cleanup_pending", "cleanup_pending": True}, {"org_id": 1, "cleanup_provider_uninstall": 1}).limit(10)
     async for connection in cursor:
         checkout_in_flight = await db.shopify_checkouts.find_one(
             {"org_id": connection["org_id"], "$or": [
@@ -2081,7 +2415,7 @@ async def _finish_pending_disconnects() -> None:
             ]}, {"_id": 1},
         )
         if not checkout_in_flight and not order_in_flight:
-            await _finish_shopify_disconnect(connection["org_id"], provider_uninstall=True)
+            await _finish_shopify_disconnect(connection["org_id"], provider_uninstall=connection.get("cleanup_provider_uninstall", True))
 
 
 async def commerce_summary(org_id: str) -> dict:
@@ -2586,6 +2920,9 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         if not connection:
             await _fail_claim(checkout, token, "cancelled", "automation_disabled")
             return
+        if not _recovery_activity_time(_provider_time(checkout), connection.get("automation_enabled_at"), checkout.get("provider_created_at")):
+            await _fail_claim(checkout, token, "historical", "before_automation_activation")
+            return
         latest = await db.shopify_checkouts.find_one(
             {"org_id": org_id, "phone": checkout.get("phone")},
             sort=[("provider_updated_at", -1), ("provider_created_at", -1), ("provider_id", -1)],
@@ -2639,7 +2976,7 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         # Final fence: checkout claim and connection settings must still be authoritative.
         current, current_connection, current_wa, opted_out = await asyncio.gather(
             db.shopify_checkouts.find_one({"_id": checkout["_id"], "claim_token": token, "reminder_status": "sending", "record_status": "abandoned", "completed_at": None}),
-            db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "whatsapp_phone_id": wa["phone_id"], "template_name": template["name"], "template_language": template["language"], "template_status": "APPROVED"}, {"_id": 1}),
+            db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "whatsapp_phone_id": wa["phone_id"], "template_name": template["name"], "template_language": template["language"], "template_status": "APPROVED"}, {"automation_enabled_at": 1}),
             db.whatsapp_connections.find_one({"org_id": org_id, "wa_id": wa["wa_id"], "phone_id": wa["phone_id"], "is_active": {"$ne": False}, "automation_enabled": {"$ne": False}}, {"_id": 1}),
             _is_whatsapp_suppressed(org_id, phone),
         )
@@ -2647,6 +2984,9 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
             return
         if not current_connection or not current_wa:
             await _fail_claim(checkout, token, "cancelled", "configuration_changed")
+            return
+        if not _recovery_activity_time(_provider_time(current), current_connection.get("automation_enabled_at"), current.get("provider_created_at")):
+            await _fail_claim(checkout, token, "historical", "before_automation_activation")
             return
         if opted_out:
             await _fail_claim(checkout, token, "opted_out", "customer_opt_out")
@@ -2918,6 +3258,9 @@ async def _send_order_notification(job: dict, token: str) -> None:
         if not order:
             await _finish_order_notification(job, token, "failed", "order_unavailable", retry=int(job.get("pre_provider_attempts") or 0) < 3)
             return
+        if not _recovery_activity_time(job.get("event_at"), connection.get("order_notifications_enabled_at"), order.get("provider_created_at")):
+            await _finish_order_notification(job, token, "cancelled", "before_automation_activation")
+            return
         phone = normalize_phone(order.get("phone"))
         if not phone:
             await _finish_order_notification(job, token, "phone_missing", "phone_missing")
@@ -2932,8 +3275,11 @@ async def _send_order_notification(job: dict, token: str) -> None:
             _is_whatsapp_suppressed(org_id, phone),
         )
         current_template = ((current_connection or {}).get("order_templates") or {}).get(event) or {}
-        if not current_wa or current_template != template:
+        if not current_connection or not current_wa or current_template != template:
             await _finish_order_notification(job, token, "cancelled", "configuration_changed")
+            return
+        if not _recovery_activity_time(job.get("event_at"), current_connection.get("order_notifications_enabled_at"), order.get("provider_created_at")):
+            await _finish_order_notification(job, token, "cancelled", "before_automation_activation")
             return
         if opted_out:
             await _finish_order_notification(job, token, "opted_out", "customer_opt_out")

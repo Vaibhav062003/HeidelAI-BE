@@ -95,6 +95,8 @@ jobs:
           python test_release_messaging.py
           python test_release_commerce.py
           python tests/shopify/test_shopify_worker_runtime.py
+          python tests/shopify/test_shopify_activation_cutoff.py
+          python tests/shopify/test_shopify_sync_runtime.py
           python tests/shopify/test_commerce_growth.py
           python tests/shopify/test_owner_reporting.py
           node tests/shopify/test_owner_pixel.cjs
