@@ -199,17 +199,34 @@ async def reserve_marketing_contact(org_id: str, channel: str, address: str, own
 
 
 async def recovery_permission(checkout: dict) -> bool:
-    if checkout.get("whatsapp_consent") == "SUBSCRIBED":
-        return True
-    customer_id = checkout.get("customer_id")
-    if not customer_id:
-        return False
-    phone = _phone_key(checkout.get("phone"))
-    org_id = checkout["org_id"]
-    marketing = await db.commerce_marketing_consents.find_one({"_id": f"{org_id}:{customer_id}:whatsapp"})
-    cart = await db.shopify_storefront_consents.find_one({"_id": f"{org_id}:{customer_id}"})
-    return bool((marketing and marketing.get("granted") and marketing.get("address_key") == phone)
-                or (cart and cart.get("granted") and cart.get("phone_key") == phone))
+    return (await recovery_permissions([checkout]))[0]
+
+
+async def recovery_permissions(checkouts: list[dict]) -> list[bool]:
+    keys = {f"{row['org_id']}:{row['customer_id']}" for row in checkouts
+            if row.get("whatsapp_consent") != "SUBSCRIBED" and row.get("customer_id")}
+    marketing, carts = {}, {}
+    if keys:
+        marketing_rows, cart_rows = await asyncio.gather(
+            db.commerce_marketing_consents.find({"_id": {"$in": [f"{key}:whatsapp" for key in keys]}}, {"granted": 1, "address_key": 1}).to_list(None),
+            db.shopify_storefront_consents.find({"_id": {"$in": list(keys)}}, {"granted": 1, "phone_key": 1}).to_list(None),
+        )
+        marketing = {row["_id"]: row for row in marketing_rows}
+        carts = {row["_id"]: row for row in cart_rows}
+    result = []
+    for checkout in checkouts:
+        if checkout.get("whatsapp_consent") == "SUBSCRIBED":
+            result.append(True)
+            continue
+        if not checkout.get("customer_id"):
+            result.append(False)
+            continue
+        key = f"{checkout['org_id']}:{checkout.get('customer_id')}"
+        phone = _phone_key(checkout.get("phone"))
+        consent, cart = marketing.get(f"{key}:whatsapp"), carts.get(key)
+        result.append(bool((consent and consent.get("granted") and consent.get("address_key") == phone)
+                           or (cart and cart.get("granted") and cart.get("phone_key") == phone)))
+    return result
 
 
 def _iso_utc(value: datetime) -> str:
@@ -622,6 +639,7 @@ async def ensure_shopify_indexes() -> None:
     await db.shopify_checkouts.create_index([("org_id", 1), ("updated_at", -1), ("provider_id", -1)])
     await db.shopify_checkouts.create_index([("org_id", 1), ("reminder_status", 1), ("updated_at", -1)])
     await db.shopify_checkouts.create_index([("shop", 1), ("provider_id", 1)])
+    await db.shopify_checkouts.create_index([("org_id", 1), ("provider_created_at", 1)])
     await db.shopify_checkouts.create_index([("reminder_status", 1), ("reminder_due_at", 1), ("claim_expires_at", 1)])
     await db.shopify_checkouts.create_index([("inbox_sync_status", 1), ("inbox_next_attempt_at", 1)])
     await db.shopify_checkouts.create_index(
@@ -629,6 +647,8 @@ async def ensure_shopify_indexes() -> None:
         partialFilterExpression={"provider_message_id": {"$type": "string"}},
     )
     await db.shopify_orders.create_index([("org_id", 1), ("provider_id", 1)], unique=True)
+    await db.shopify_orders.create_index([("org_id", 1), ("provider_created_at", 1)])
+    await db.shopify_orders.create_index([("org_id", 1), ("customer_id", 1)])
     await db.shopify_orders.create_index([("org_id", 1), ("phone", 1), ("created_at", -1)])
     await db.shopify_orders.create_index([("org_id", 1), ("provider_updated_at", -1), ("provider_id", -1)])
     await db.shopify_orders.create_index([("org_id", 1), ("updated_at", -1), ("provider_id", -1)])
@@ -2431,7 +2451,7 @@ async def _finish_pending_disconnects() -> None:
             await _finish_shopify_disconnect(connection["org_id"], provider_uninstall=connection.get("cleanup_provider_uninstall", True))
 
 
-async def commerce_summary(org_id: str) -> dict:
+async def commerce_summary(org_id: str, *, start: datetime | None = None, end: datetime | None = None) -> dict:
     connection = await get_connection(org_id)
     now = utcnow()
     empty_counts = {
@@ -2441,17 +2461,18 @@ async def commerce_summary(org_id: str) -> dict:
     if not connection.get("connected"):
         return {"connected": False, "server_time": _iso_utc(now), "counts": empty_counts, "connection": connection}
     overdue_before = now - timedelta(seconds=OVERDUE_GRACE_SECONDS)
+    period = {"provider_updated_at": {**({"$gte": start} if start else {}), **({"$lte": end} if end else {})}} if start or end else {}
     carts, orders, pending, scheduled, overdue, processing, failed, sent, unknown, permission_missing, heartbeat = await asyncio.gather(
-        db.shopify_checkouts.count_documents({"org_id": org_id}),
-        db.shopify_orders.count_documents({"org_id": org_id, "record_status": {"$ne": "deleted"}}),
-        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}}),
-        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}, "reminder_due_at": {"$gt": overdue_before}}),
-        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}, "reminder_due_at": {"$lte": overdue_before}}),
-        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": {"$in": ["sending", "provider_accepted"]}}),
-        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": {"$in": ["failed", "configuration_failure", "phone_missing"]}}),
-        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": "sent"}),
-        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": "delivery_unknown"}),
-        db.shopify_checkouts.count_documents({"org_id": org_id, "reminder_status": "permission_missing"}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id}),
+        db.shopify_orders.count_documents({**period, "org_id": org_id, "record_status": {"$ne": "deleted"}}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}, "reminder_due_at": {"$gt": overdue_before}}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id, "reminder_status": {"$in": ["pending", "retryable"]}, "reminder_due_at": {"$lte": overdue_before}}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id, "reminder_status": {"$in": ["sending", "provider_accepted"]}}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id, "reminder_status": {"$in": ["failed", "configuration_failure", "phone_missing"]}}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id, "reminder_status": "sent"}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id, "reminder_status": "delivery_unknown"}),
+        db.shopify_checkouts.count_documents({**period, "org_id": org_id, "reminder_status": "permission_missing"}),
         db.shopify_worker_heartbeats.find_one({"_id": "recovery"}),
     )
     heartbeat = heartbeat or {}

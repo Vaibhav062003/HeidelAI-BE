@@ -196,6 +196,29 @@ async def main():
     s.db.shopify_orders.documents[0].pop("cancelled_at")
     empty = await reporting.period_report("org", NOW-timedelta(days=20), NOW-timedelta(days=19))
     assert empty["summary"]["cart_conversion_denominator"] == 0 and empty["summary"]["cart_conversion_rate"] == 0
+    # Histories are loaded only for customers active in the report period.
+    old_time = NOW-timedelta(days=100)
+    s.db.shopify_orders.documents.append({**base, "provider_id": "unrelated", "customer_id": "inactive", "provider_created_at": old_time})
+    orders = s.db.shopify_orders
+    original_find = orders.find
+    def scoped_history(query, projection=None):
+        if "record_status" in query and "provider_created_at" not in query:
+            assert query["customer_id"]["$in"] == ["customer"], query
+            assert projection and "products" not in projection
+        return original_find(query, projection)
+    orders.find = scoped_history
+    result = await reporting.period_report("org", NOW-timedelta(days=1), NOW+timedelta(seconds=1))
+    assert all(row["customer_id"] != "inactive" for row in result["customers"])
+    assert result["coverage"]["observed_history_start"] == old_time
+    orders.find = original_find
+    original_sales = growth.sales_report
+    async def no_historical_report(*args, **kwargs):
+        raise AssertionError("empty campaign list loaded historical reports")
+    growth.sales_report = no_historical_report
+    try:
+        assert await growth.list_campaigns("empty") == []
+    finally:
+        growth.sales_report = original_sales
     # Finishing a pre-provider error must never restore a cancelled sending job.
     cancelled = {**saved, "_id": "cancelled", "status": "cancelled", "claim_token": "cancelled-claim"}
     s.db.commerce_retargeting_jobs.documents.append(cancelled)

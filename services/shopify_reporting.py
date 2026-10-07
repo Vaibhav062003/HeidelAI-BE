@@ -348,10 +348,7 @@ async def period_report(org_id, start, end, zone="UTC"):
         matched = [row for row in attribution["orders"] if row["kind"] == kind]
         sources.append({"source": kind, "accepted": len(selected), "delivered": sum(row["status"] in {"delivered", "read"} for row in selected), "read": sum(row["status"] == "read" for row in selected), "matched_orders": len(matched), "net_payments": totals(row["net_payment"] for row in matched)})
     recovery = [{"stage": "Observed carts", "count": len(carts)}, {"stage": "Permission available", "count": 0}]
-    permission_count = 0
-    for cart in carts:
-        permission_count += bool(await s.recovery_permission(cart))
-    recovery[1]["count"] = permission_count
+    recovery[1]["count"] = sum(await s.recovery_permissions(carts))
     recovery.extend([{"stage": "Original accepted", "count": sum(row["kind"] == "recovery" for row in cohort)}, {"stage": "Confirmed delivered", "count": sum(row["kind"] == "recovery" for row in delivered)},
                      {"stage": "Confirmed read", "count": sum(row["kind"] == "recovery" and row["status"] == "read" for row in cohort)}, {"stage": "Follow-up accepted", "count": sum(row["kind"] == "retargeting" for row in cohort)},
                      {"stage": "Matched cart purchases", "count": sum(row["kind"] in {"recovery", "retargeting"} for row in attribution["orders"])}])
@@ -380,7 +377,16 @@ async def period_report(org_id, start, end, zone="UTC"):
     for row in product_rows.values():
         for key in ("abandoned_values", "recovered_values", "refunded_values"):
             row[key] = totals(row[key])
-    all_orders = await s.db.shopify_orders.find({"org_id": org_id, "record_status": {"$ne": "deleted"}, "cancelled_at": None}).to_list(None)
+    history_query = {"org_id": org_id, "record_status": {"$ne": "deleted"}, "cancelled_at": None}
+    customer_ids = list({row["customer_id"] for row in period_orders if row.get("customer_id") and row.get("record_status") != "deleted" and not row.get("cancelled_at")})
+    all_orders = await s.db.shopify_orders.find(
+        {**history_query, "customer_id": {"$in": customer_ids}},
+        {"provider_id": 1, "customer_id": 1, "order_number": 1, "provider_created_at": 1, "created_at": 1,
+         "customer_order_count": 1, "customer_order_count_at_purchase": 1, "net_payment": 1, "total": 1, "payment_status": 1},
+    ).to_list(None) if customer_ids else []
+    first_observed_order = await s.db.shopify_orders.find_one(
+        {**history_query, "provider_created_at": {"$exists": True, "$ne": None}}, {"provider_created_at": 1}, sort=[("provider_created_at", 1)],
+    )
     customer_rows = defaultdict(list)
     for order in all_orders:
         if order.get("customer_id"):
@@ -441,10 +447,10 @@ async def period_report(org_id, start, end, zone="UTC"):
                "cart_conversion_denominator": len(cart_windows), "converted_carts": len(converted_carts), "cart_conversion_rate": round(100*len(converted_carts)/len(cart_windows), 2) if cart_windows else 0, "mature_carts": mature_carts, "pending_carts": len(cart_windows)-mature_carts,
                "confirmed_visitors": len({row["client_key"] for row in events if row.get("touch_reference") and row["event_name"] == "page_viewed"})}
     return {"summary": summary, "sources": sources, "recovery": recovery, "branches": branch_performance, "blockers": [{"reason": key, "count": value} for key, value in blockers.items()], "actions": actions, "orders": attribution["orders"], "campaigns": campaign_rows, "customers": customers, "customer_summary": {"first_time": first_count, "repeat": repeat_count, "lapsed_returned": returned_count, "purchase_count_unavailable": sum(row["shopify_purchase_count"] is None for row in customers)}, "retention": retention, "products": list(product_rows.values()), "trends": trends,
-            "coverage": {"product_identity_missing": missing_products, "carts_with_missing_values": sum(not cart.get("total") for cart in carts), "line_items_incomplete": sum(row.get("line_items_incomplete", False) for row in carts+period_orders), "refund_lines_incomplete": sum(row.get("refund_lines_incomplete", False) for row in period_orders), "observed_history_start": min((growth.moment(row.get("provider_created_at")) for row in all_orders if growth.moment(row.get("provider_created_at"))), default=None), "browser_events": len(events), "retargeting_jobs": len(jobs)}}
+            "coverage": {"product_identity_missing": missing_products, "carts_with_missing_values": sum(not cart.get("total") for cart in carts), "line_items_incomplete": sum(row.get("line_items_incomplete", False) for row in carts+period_orders), "refund_lines_incomplete": sum(row.get("refund_lines_incomplete", False) for row in period_orders), "observed_history_start": growth.moment((first_observed_order or {}).get("provider_created_at")), "browser_events": len(events), "retargeting_jobs": len(jobs)}}
 
 
-async def report(org_id, start=None, end=None, days=30, compare=True):
+async def report(org_id, start=None, end=None, days=1, compare=True):
     first, stop, zone, fallback = await date_range(org_id, start, end, days)
     current = await period_report(org_id, first, stop, zone)
     local_first = first.astimezone(ZoneInfo(zone))

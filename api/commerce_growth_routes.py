@@ -204,14 +204,14 @@ class PixelEvent(BaseModel):
 
 
 @router.get("/api/commerce/shopify/reports")
-async def reports(request: Request, user: CurrentUser, start: date | None = None, end: date | None = None, days: int = Query(default=30, ge=1, le=366), compare: bool = True):
+async def reports(request: Request, user: CurrentUser, start: date | None = None, end: date | None = None, days: int = Query(default=1, ge=1, le=366), compare: bool = True):
     workspace_scope(request, user)
     return await reporting.report(user.org_id, start, end, days, compare)
 
 
 @router.get("/api/commerce/shopify/reports/export")
 @limiter.limit("10/minute")
-async def export_report(request: Request, user: CurrentUser, view: Literal["summary", "sources", "recovery", "branches", "blockers", "orders", "campaigns", "customers", "retention", "products", "trends"] = "orders", start: date | None = None, end: date | None = None, days: int = Query(default=30, ge=1, le=366)):
+async def export_report(request: Request, user: CurrentUser, view: Literal["summary", "sources", "recovery", "branches", "blockers", "orders", "campaigns", "customers", "retention", "products", "trends"] = "orders", start: date | None = None, end: date | None = None, days: int = Query(default=1, ge=1, le=366)):
     await workspace_admin(request, user)
     data = await reporting.report(user.org_id, start, end, days, False)
     return Response(reporting.csv_report(data, view), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="shopify-{view}.csv"', "Cache-Control": "no-store"})
