@@ -135,12 +135,17 @@ async def main():
     s.db.shopify_orders.documents.extend([{**base, "provider_id": "order", "order_number": "#1", "net_payment": {"amount": "80.10", "currency": "INR"}, "total": {"amount": "100.10", "currency": "INR"}},
                                          {**base, "provider_id": "cod", "payment_status": "PENDING", "net_payment": None, "total": {"amount": "900", "currency": "INR"}}])
     s.db.shopify_checkouts.documents[0].update(provider_message_id="original", converted_order_id="order")
+    # Discard synthetic message IDs used above to exercise receipt races and activation.
+    s.db.commerce_message_attempts.documents[:] = [row for row in s.db.commerce_message_attempts.documents if row["message_id"] == "original"]
     # Provider acceptance in this test occurred at NOW, so put follow-up earlier than the purchase.
     saved["provider_accepted_at"] = NOW-timedelta(minutes=2)
     result = await reporting.period_report("org", NOW-timedelta(days=1), NOW+timedelta(seconds=1))
     assert result["summary"]["matched_orders"] == 1 and result["summary"]["net_payments"] == [{"currency": "INR", "amount": "80.10"}]
     assert result["orders"][0]["kind"] == "retargeting"
-    assert result["summary"]["converted_contacts"] == 1 and result["summary"]["conversion_denominator"] >= 2
+    assert result["summary"]["converted_contacts"] == 1 and result["summary"]["conversion_denominator"] == 2
+    assert result["summary"]["conversion_rate"] == 50
+    assert result["summary"]["cart_conversion_denominator"] == 1
+    assert result["summary"]["converted_carts"] == 1 and result["summary"]["cart_conversion_rate"] == 100
     assert reporting.totals([{"amount": "0.10", "currency": "USD"}, {"amount": "0.20", "currency": "USD"}, {"amount": "1", "currency": "INR"}]) == [{"currency": "INR", "amount": "1"}, {"currency": "USD", "amount": "0.30"}]
     assert "'=1+1" in reporting.csv_report({"orders": [{"name": "=1+1"}]}, "orders")
     assert "'  @evil" in reporting.csv_report({"orders": [{"name": "  @evil"}]}, "orders")
@@ -168,6 +173,29 @@ async def main():
     result = await reporting.period_report("org", NOW-timedelta(days=1), NOW+timedelta(seconds=1))
     assert next(row for row in result["campaigns"] if row["campaign_id"] == "older")["accepted"] == 1
     assert all(row["pending"] == 0 for row in result["retention"])
+    # A newer campaign can win revenue credit without hiding a cart recovery.
+    s.db.commerce_campaigns.documents[0]["recipient_customers"] = {growth.phone_key(parent["phone"]): "customer"}
+    s.db.bulk_job_results.documents[0]["created_at"] = NOW-timedelta(seconds=30)
+    s.db.shopify_orders.documents[0]["provider_created_at"] = NOW-timedelta(seconds=10)
+    # Same buyer, separate unmatched cart: identity alone must not manufacture recovery.
+    unmatched = {**parent, "_id": "unmatched", "provider_id": "unmatched", "checkout_token": "unmatched", "provider_message_id": "unmatched-message"}
+    unmatched.pop("converted_order_id", None)
+    s.db.shopify_checkouts.documents.append(unmatched)
+    result = await reporting.period_report("org", NOW-timedelta(days=1), NOW+timedelta(seconds=1))
+    assert next(row for row in result["orders"] if row["order_id"] == "order")["kind"] == "campaign"
+    assert result["summary"]["cart_conversion_denominator"] == 2
+    assert result["summary"]["converted_carts"] == 1 and result["summary"]["cart_conversion_rate"] == 50
+    # Alias records for one journey do not increase the denominator.
+    alias = {**parent, "_id": "alias", "provider_id": "alias", "provider_message_id": "alias-message", "converted_order_id": "order"}
+    s.db.shopify_checkouts.documents.append(alias)
+    result = await reporting.period_report("org", NOW-timedelta(days=1), NOW+timedelta(seconds=1))
+    assert result["summary"]["cart_conversion_denominator"] == 2 and result["summary"]["converted_carts"] == 1
+    s.db.shopify_orders.documents[0]["cancelled_at"] = NOW
+    result = await reporting.period_report("org", NOW-timedelta(days=1), NOW+timedelta(seconds=1))
+    assert result["summary"]["converted_carts"] == 0 and result["summary"]["cart_conversion_rate"] == 0
+    s.db.shopify_orders.documents[0].pop("cancelled_at")
+    empty = await reporting.period_report("org", NOW-timedelta(days=20), NOW-timedelta(days=19))
+    assert empty["summary"]["cart_conversion_denominator"] == 0 and empty["summary"]["cart_conversion_rate"] == 0
     # Finishing a pre-provider error must never restore a cancelled sending job.
     cancelled = {**saved, "_id": "cancelled", "status": "cancelled", "claim_token": "cancelled-claim"}
     s.db.commerce_retargeting_jobs.documents.append(cancelled)
