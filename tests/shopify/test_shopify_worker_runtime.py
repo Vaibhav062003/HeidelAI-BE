@@ -1031,8 +1031,40 @@ def test_delays_and_product_summary(service):
     }, summary
 
 
+async def test_legacy_repair_does_not_scan_historical_phones(service):
+    service.utcnow = lambda: NOW
+    activation = NOW - timedelta(minutes=5)
+    connection = {"_id": "connection", "org_id": "org", "status": "connected", "automation_enabled": True,
+                  "automation_enabled_at": activation, "reminder_delay_minutes": 15, "whatsapp_id": "waba", "whatsapp_phone_id": "phone", "sync_version": service.SYNC_VERSION}
+    carts = FakeCollection([
+        checkout("old", provider_created_at=NOW-timedelta(days=30), reminder_status="pending", claim_token="old-claim"),
+        checkout("submitted", provider_created_at=NOW-timedelta(days=30), reminder_status="sending", provider_started_at=NOW-timedelta(minutes=1)),
+        checkout("new", provider_created_at=NOW-timedelta(minutes=1)),
+        checkout("other", org_id="other", provider_created_at=NOW-timedelta(days=30)),
+    ])
+    service.db = FakeDB(shopify_connections=FakeCollection([connection]), shopify_checkouts=carts)
+    async def no_full_scan(*args, **kwargs):
+        raise AssertionError("startup scanned every checkout phone")
+    carts.distinct = no_full_scan
+    await service.repair_legacy_shopify_connections()
+    assert [row["reminder_status"] for row in carts.documents] == ["historical", "sending", "pending", "pending"]
+    assert "claim_token" not in carts.documents[0]
+    saved = service.db.shopify_connections.documents[0]
+    assert saved["automation_enabled_at"] == activation and saved["reminder_delay_minutes"] == 15
+    # Settings changes may reconcile only unsent carts created after the activation cutoff.
+    async def eligible_phones(field, query):
+        assert field == "phone" and query["provider_created_at"] == {"$gte": activation}
+        assert query["provider_started_at"] == {"$exists": False}
+        assert set(query["reminder_status"]["$in"]) == service.RECONCILABLE_REMINDERS
+        return []
+    carts.distinct = eligible_phones
+    service._configuration_ready = lambda *args: _value(True)
+    await service._repair_org_checkout_states("org", saved)
+
+
 async def main():
     test_delays_and_product_summary(load_service())
+    await test_legacy_repair_does_not_scan_historical_phones(load_service())
     await test_hanging_checkout_does_not_block_next(load_service())
     await test_concurrent_workers_claim_once(load_service())
     await test_database_outage_defers_worker_ticks(load_service())

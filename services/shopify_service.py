@@ -1205,7 +1205,11 @@ async def _repair_org_checkout_states(org_id: str, connection: dict | None = Non
     if not connection:
         return
     configured = await _configuration_ready(connection)
-    phone_values = phones if phones is not None else set(await db.shopify_checkouts.distinct("phone", {"org_id": org_id, "phone": {"$ne": ""}}))
+    query = {"org_id": org_id, "phone": {"$ne": ""}, "reminder_status": {"$in": list(RECONCILABLE_REMINDERS)}, "provider_started_at": {"$exists": False}}
+    activation = _parse_datetime(connection.get("automation_enabled_at"))
+    if activation:
+        query["provider_created_at"] = {"$gte": activation}
+    phone_values = phones if phones is not None else set(await db.shopify_checkouts.distinct("phone", query))
     for phone in phone_values:
         await _reconcile_phone_checkouts(org_id, phone, connection, configured=configured)
     if phones is not None:
@@ -1261,8 +1265,15 @@ async def repair_legacy_shopify_connections() -> None:
     async for connection in cursor:
         await _migrate_sync(connection)
         repaired = await _repair_legacy_connection(connection)
-        if repaired.get("automation_enabled"):
-            await _repair_org_checkout_states(repaired["org_id"], repaired)
+        activation = _parse_datetime(repaired.get("automation_enabled_at"))
+        if repaired.get("automation_enabled") and activation:
+            # Startup must not walk every historical phone; sync/webhooks reconcile touched carts.
+            await db.shopify_checkouts.update_many(
+                {"org_id": repaired["org_id"], "reminder_status": {"$in": list(RECONCILABLE_REMINDERS - {"historical"})}, "provider_started_at": {"$exists": False},
+                 "$or": [{"provider_created_at": {"$lt": activation}}, {"provider_created_at": None}]},
+                {"$set": {"reminder_status": "historical", "failure_category": "before_automation_activation", "reminder_due_at": None, "status_updated_at": now},
+                 "$unset": {"claim_token": "", "claim_expires_at": ""}},
+            )
 
 
 async def ensure_shopify_runtime_ready() -> None:
