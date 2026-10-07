@@ -598,6 +598,7 @@ async def ensure_shopify_indexes() -> None:
     await db.commerce_delivery_receipts.create_index("received_at", expireAfterSeconds=400 * 86400)
     await db.commerce_retargeting_jobs.create_index([("status", 1), ("updated_at", 1)])
     await db.commerce_retargeting_jobs.create_index([("org_id", 1), ("created_at", -1)])
+    await db.commerce_retargeting_jobs.create_index([("org_id", 1), ("checkout_id", 1)])
     await db.commerce_message_attempts.create_index([("org_id", 1), ("accepted_at", 1)])
     await db.commerce_experiments.create_index("org_id", unique=True, partialFilterExpression={"status": "running"})
     await db.commerce_experiment_assignments.create_index([("org_id", 1), ("customer_id", 1), ("outcome_ends_at", 1)])
@@ -2571,12 +2572,20 @@ async def list_records(org_id: str, record_type: str, *, status: str = "", searc
     conversation_ids = await asyncio.gather(*(
         _record_conversation_id(org_id, item, record_type, configured_phone_id) for item in items
     ))
+    followups = {}
+    if record_type == "checkout" and items:
+        jobs = await db.commerce_retargeting_jobs.find(
+            {"org_id": org_id, "checkout_id": {"$in": [item["provider_id"] for item in items]}},
+            {"checkout_id": 1, "status": 1, "branch": 1, "reason": 1, "due_at": 1, "delivery_status": 1, "delivered_at": 1, "read_at": 1, "provider_accepted_at": 1},
+        ).to_list(length=None)
+        for job in jobs:
+            followups.setdefault(job["checkout_id"], job)
     safe_items = []
     for item, conversation_id in zip(items, conversation_ids):
         safe = _safe_document(item, include_url=True)
         safe["conversation_id"] = conversation_id
         if record_type == "checkout":
-            job = await db.commerce_retargeting_jobs.find_one({"org_id": org_id, "checkout_id": item["provider_id"]})
+            job = followups.get(item["provider_id"])
             if job:
                 safe["followup"] = {key: _iso_utc(job[key]) if isinstance(job.get(key), datetime) else job.get(key) for key in ("status", "branch", "reason", "due_at", "delivery_status", "delivered_at", "read_at", "provider_accepted_at")}
         safe_items.append(safe)
