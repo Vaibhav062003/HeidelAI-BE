@@ -130,8 +130,8 @@ async def main():
     s.db.shopify_orders.documents.extend([{**base, "provider_id": "order", "order_number": "#1", "net_payment": {"amount": "80.10", "currency": "INR"}, "total": {"amount": "100.10", "currency": "INR"}},
                                          {**base, "provider_id": "cod", "payment_status": "PENDING", "net_payment": None, "total": {"amount": "900", "currency": "INR"}}])
     s.db.shopify_checkouts.documents[0].update(provider_message_id="original", converted_order_id="order")
-    # Discard the synthetic original2 ID used above to exercise receipt races.
-    s.db.commerce_message_attempts.documents[:] = [row for row in s.db.commerce_message_attempts.documents if row["message_id"] != "original2"]
+    # Discard synthetic message IDs used above to exercise receipt races and activation.
+    s.db.commerce_message_attempts.documents[:] = [row for row in s.db.commerce_message_attempts.documents if row["message_id"] == "original"]
     # Provider acceptance in this test occurred at NOW, so put follow-up earlier than the purchase.
     saved["provider_accepted_at"] = NOW-timedelta(minutes=2)
     result = await reporting.period_report("org", NOW-timedelta(days=1), NOW+timedelta(seconds=1))
