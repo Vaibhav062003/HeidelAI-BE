@@ -654,11 +654,15 @@ async def test_provider_fence_timeout_is_unknown_and_not_retried(service):
     assert posts == 1, "ambiguous provider outcome was retried"
 
 
-async def test_acceptance_precedes_inbox_and_reconciles_once(service):
+async def test_acceptance_precedes_inbox_and_reconciles_once(service, parameter_count=3):
     item = checkout("accepted", reminder_status="sending", claim_token="claim")
     collection = FakeCollection([item])
     database = _configured_send_db(collection)
     _prepare_send(service, database)
+    database.shopify_connections.documents[0]["template_parameter_count"] = parameter_count
+    if parameter_count == 2:
+        item["products"] = []  # The two-variable template does not require product text.
+        collection.documents[0]["products"] = []
     posts = 0
 
     class Response:
@@ -682,6 +686,11 @@ async def test_acceptance_precedes_inbox_and_reconciles_once(service):
         async def post(self, *_args, **_kwargs):
             nonlocal posts
             posts += 1
+            parameters = _kwargs["json"]["template"]["components"][0]["parameters"]
+            assert len(parameters) == parameter_count
+            assert parameters[-1]["text"].startswith("https://")
+            if parameter_count == 3:
+                assert parameters[1]["text"] == service._product_summary(item["products"])
             return Response()
 
     service.httpx.AsyncClient = Client
@@ -986,6 +995,12 @@ def test_delays_and_product_summary(service):
     tracking_template = {**compliant_template, "components": [{"type": "BODY", "text": "Order {{1}} tracking: {{2}}."}, compliant_template["components"][1]]}
     assert service._template_compatible(tracking_template, "order")
     assert not service._template_compatible(order_id_template, "cart")
+    cart_template = {**tracking_template, "category": "MARKETING", "components": [{"type": "BODY", "text": "Hi {{1}}, complete your order here: {{2}}. Our team is happy to help."}, compliant_template["components"][1]]}
+    assert service._template_compatible(cart_template, "cart")
+    assert service._template_parameter_count(cart_template) == 2
+    assert not service._template_compatible({**cart_template, "status": "PENDING"}, "cart")
+    assert not service._template_compatible({**cart_template, "components": [{"type": "BODY", "text": "Hi {{1}}, complete your order here: {{3}}. Our team is happy to help."}, compliant_template["components"][1]]}, "cart")
+    assert service._template_compatible({**compliant_template, "category": "MARKETING"}, "cart")
     assert not service._template_compatible({**compliant_template, "components": compliant_template["components"][:1]}, "order")
     assert not service._template_compatible({
         **compliant_template,
@@ -1030,6 +1045,7 @@ async def main():
     await test_websocket_hang_is_bounded(load_service())
     await test_provider_fence_timeout_is_unknown_and_not_retried(load_service())
     await test_acceptance_precedes_inbox_and_reconciles_once(load_service())
+    await test_acceptance_precedes_inbox_and_reconciles_once(load_service(), parameter_count=2)
     await test_order_event_sends_approved_template_once(load_service())
     await test_order_event_sends_approved_template_once(load_service(), parameter_count=1)
     await test_order_event_sends_approved_template_once(load_service(), parameter_count=2, event="shipped")

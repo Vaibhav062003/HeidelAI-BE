@@ -2070,6 +2070,7 @@ async def list_compatible_templates(
         compatible = bool(current and _template_compatible(current, "cart"))
         updates.update({
             "template_status": str((current or {}).get("status") or "UNAVAILABLE").upper() if compatible else "INCOMPATIBLE",
+            "template_parameter_count": _template_parameter_count(current) if compatible else 0,
             "reminder_error": None if compatible else "The selected abandoned-cart template is not approved and compatible",
         })
     for event, selected in ((selected_connection or {}).get("order_templates") or {}).items():
@@ -2086,7 +2087,7 @@ async def list_compatible_templates(
             {"$set": updates},
         )
     return [
-        {"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category"), **({"tracking_button_index": _campaign_tracking_button(item)} if purpose == "campaign" else {}), **({"parameter_count": _template_parameter_count(item)} if purpose == "order" else {})}
+        {"name": item.get("name"), "language": item.get("language"), "status": item.get("status"), "category": item.get("category"), **({"tracking_button_index": _campaign_tracking_button(item)} if purpose == "campaign" else {}), **({"parameter_count": _template_parameter_count(item)} if purpose in {"cart", "order"} else {})}
         for item in templates if _template_compatible(item, purpose)
     ]
 
@@ -2223,7 +2224,7 @@ def _template_compatible(template: dict, purpose: str = "cart") -> bool:
     if re.search(r"^\s*{{\s*\d+\s*}}|{{\s*\d+\s*}}\s*$", body_text):
         return False
     placeholders = re.findall(r"{{\s*(\d+)\s*}}", body_text)
-    return sorted(placeholders) in (["1"], ["1", "2"], ["1", "2", "3"]) if purpose == "order" else sorted(placeholders) == ["1", "2", "3"]
+    return sorted(placeholders) in (["1"], ["1", "2"], ["1", "2", "3"]) if purpose == "order" else sorted(placeholders) in (["1", "2"], ["1", "2", "3"])
 
 
 async def update_settings(org_id: str, settings: dict) -> dict:
@@ -2254,7 +2255,7 @@ async def update_settings(org_id: str, settings: dict) -> dict:
     templates = await list_compatible_templates(org_id, wa_id or None, phone_id=phone_id or None, raise_unavailable=enabled) if template_name and whatsapp else []
     selected = next((item for item in templates if item["name"] == template_name and item["language"] == template_language), None)
     if enabled and (not phone_id or not selected):
-        raise HTTPException(status_code=409, detail="Choose an active WhatsApp number and approved three-variable Marketing template")
+        raise HTTPException(status_code=409, detail="Choose an active WhatsApp number and approved two- or three-variable Marketing template")
     utility_templates = await list_compatible_templates(
         org_id, wa_id or None, phone_id=phone_id or None, purpose="order", raise_unavailable=order_enabled,
     ) if requested_order_templates and whatsapp else []
@@ -2272,7 +2273,7 @@ async def update_settings(org_id: str, settings: dict) -> dict:
         raise HTTPException(status_code=409, detail="Choose an approved two-variable shipped template: order number and tracking details")
     settings_update = {
         "whatsapp_id": wa_id or None, "whatsapp_phone_id": phone_id or None, "template_name": template_name or None, "template_language": template_language,
-        "template_status": "APPROVED" if selected else None, "reminder_delay_minutes": delay,
+        "template_status": "APPROVED" if selected else None, "template_parameter_count": selected.get("parameter_count", 3) if selected else 0, "reminder_delay_minutes": delay,
         "automation_enabled": enabled, "updated_at": utcnow(), "reminder_error": None, "last_error": None,
         "order_notifications_enabled": order_enabled, "order_templates": order_templates,
     }
@@ -2957,18 +2958,20 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
             await _defer_claim(checkout, token, _parse_datetime(prior["provider_started_at"]) + timedelta(hours=24), "phone_frequency_cap")
             return
         wa = await _selected_whatsapp_connection(connection, {"wa_id": 1, "phone_id": 1, "access_token": 1})
-        template = ({"name": connection.get("template_name"), "language": connection.get("template_language")}
+        template = ({"name": connection.get("template_name"), "language": connection.get("template_language"), "parameter_count": connection.get("template_parameter_count", 3)}
                     if connection.get("template_status") == "APPROVED" and connection.get("template_name") and connection.get("template_language") else None)
-        if not wa or not template:
+        if not wa or not template or template["parameter_count"] not in {2, 3}:
             await _fail_claim(checkout, token, "configuration_failure", "whatsapp_or_template_unavailable")
             await _admin_warning(org_id, "reminder_configuration")
             return
         values = [str(checkout.get("customer_name") or "").split(" ", 1)[0][:80] or "there", _product_summary(checkout.get("products") or []), str(checkout.get("recovery_url") or "")[:2048]]
-        if not values[1] or not values[2].startswith("https://"):
+        if (template["parameter_count"] == 3 and not values[1]) or not values[2].startswith("https://"):
             await _fail_claim(checkout, token, "configuration_failure", "checkout_content_unavailable")
             return
         from services.shopify_reporting import tracked_link
         values[2] = await tracked_link(org_id, connection["shop"], "recovery", checkout["provider_id"], values[2], checkout.get("customer_id"))
+        if template["parameter_count"] == 2:
+            values.pop(1)  # Two-variable templates use name and checkout link.
         body = {
             "messaging_product": "whatsapp", "to": phone.lstrip("+"), "type": "template",
             "template": {"name": template["name"], "language": {"code": template["language"]}, "components": [{"type": "body", "parameters": [{"type": "text", "text": value} for value in values]}]},
@@ -2976,7 +2979,7 @@ async def _send_claimed_checkout(checkout: dict, token: str) -> None:
         # Final fence: checkout claim and connection settings must still be authoritative.
         current, current_connection, current_wa, opted_out = await asyncio.gather(
             db.shopify_checkouts.find_one({"_id": checkout["_id"], "claim_token": token, "reminder_status": "sending", "record_status": "abandoned", "completed_at": None}),
-            db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "whatsapp_phone_id": wa["phone_id"], "template_name": template["name"], "template_language": template["language"], "template_status": "APPROVED"}, {"automation_enabled_at": 1}),
+            db.shopify_connections.find_one({"org_id": org_id, "status": "connected", "automation_enabled": True, "whatsapp_id": wa["wa_id"], "whatsapp_phone_id": wa["phone_id"], "template_name": template["name"], "template_language": template["language"], "template_status": "APPROVED", "template_parameter_count": connection.get("template_parameter_count")}, {"automation_enabled_at": 1}),
             db.whatsapp_connections.find_one({"org_id": org_id, "wa_id": wa["wa_id"], "phone_id": wa["phone_id"], "is_active": {"$ne": False}, "automation_enabled": {"$ne": False}}, {"_id": 1}),
             _is_whatsapp_suppressed(org_id, phone),
         )
