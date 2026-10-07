@@ -242,7 +242,7 @@ def test_scheduler_runs_jobs_without_a_mongo_circuit() -> None:
     source = _source("core/scheduler.py")
     start = ast.get_source_segment(source, _function("core/scheduler.py", "start_scheduler"))
     assert "_add_mongo_job" not in source
-    assert start.count("scheduler.add_job(") == 22
+    assert start.count("scheduler.add_job(") == 24
 
 
 def test_deployments_verify_liveness_and_exact_revision() -> None:
