@@ -1094,10 +1094,59 @@ async def test_records_batch_followups(service):
     assert len(calls) == 1
 
 
+async def test_batch_recovery_permissions(service):
+    marketing = FakeCollection([{"_id": "org:customer:whatsapp", "granted": True, "address_key": "14155550100"}])
+    storefront = FakeCollection([{"_id": "org:cart", "granted": True, "phone_key": "14155550101"}])
+    service.db = FakeDB(commerce_marketing_consents=marketing, shopify_storefront_consents=storefront)
+    calls = []
+    for collection in (marketing, storefront):
+        original = collection.find
+        def batch(query, projection=None, original=original):
+            calls.append(query)
+            return original(query, projection)
+        collection.find = batch
+        async def no_single(*args, **kwargs):
+            raise AssertionError("permissions queried one cart at a time")
+        collection.find_one = no_single
+    rows = [checkout("one", customer_id="customer", whatsapp_consent=None),
+            checkout("changed", customer_id="customer", phone="+14155550999", whatsapp_consent=None),
+            checkout("other", org_id="other", customer_id="customer", whatsapp_consent=None),
+            checkout("cart", customer_id="cart", phone="+14155550101", whatsapp_consent=None),
+            {"whatsapp_consent": "SUBSCRIBED"}, {}]
+    assert await service.recovery_permissions(rows) == [True, False, False, True, True, False]
+    assert len(calls) == 2
+    assert await service.recovery_permissions([]) == [] and len(calls) == 2
+    assert await service.recovery_permission({"whatsapp_consent": "SUBSCRIBED"})
+    assert not await service.recovery_permission({}) and len(calls) == 2
+
+
+async def test_summary_date_scope(service):
+    service.utcnow = lambda: NOW
+    service.get_connection = lambda *_: _value({"connected": True})
+    service.db = FakeDB(
+        shopify_checkouts=FakeCollection([
+            checkout("old", provider_updated_at=NOW-timedelta(days=30)),
+            checkout("sent", provider_updated_at=NOW, reminder_status="sent"),
+            checkout("failed", provider_updated_at=NOW, reminder_status="failed"),
+            checkout("other", org_id="other", provider_updated_at=NOW),
+        ]),
+        shopify_orders=FakeCollection([
+            {"org_id": "org", "provider_updated_at": NOW},
+            {"org_id": "org", "provider_updated_at": NOW-timedelta(days=30)},
+        ]),
+    )
+    result = await service.commerce_summary("org", start=NOW-timedelta(hours=1), end=NOW+timedelta(hours=1))
+    assert result["counts"]["carts"] == 2 and result["counts"]["orders"] == 1
+    assert result["counts"]["sent"] == 1 and result["counts"]["failed"] == 1
+    assert result["counts"]["pending"] == result["counts"]["overdue"] == 0
+
+
 async def main():
     test_delays_and_product_summary(load_service())
     await test_legacy_repair_does_not_scan_historical_phones(load_service())
     await test_records_batch_followups(load_service())
+    await test_batch_recovery_permissions(load_service())
+    await test_summary_date_scope(load_service())
     await test_hanging_checkout_does_not_block_next(load_service())
     await test_concurrent_workers_claim_once(load_service())
     await test_database_outage_defers_worker_ticks(load_service())

@@ -228,6 +228,8 @@ def public_campaign(row):
 async def list_campaigns(org_id):
     s = service()
     rows = await s.db.commerce_campaigns.find({"org_id": org_id, "channel": "whatsapp"}).sort("created_at", -1).limit(50).to_list(50)
+    if not rows:
+        return []
     oldest = min((moment(row["created_at"]) for row in rows), default=s.utcnow())
     report = await sales_report(org_id, max(90, (s.utcnow() - oldest).days + 1))
     result = []

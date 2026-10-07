@@ -192,8 +192,12 @@ async def shopify_webhook(
 
 
 @router.get("/api/commerce/shopify/summary")
-async def shopify_summary(user: CurrentUser):
-    return await commerce_summary(user.org_id)
+async def shopify_summary(user: CurrentUser, start: datetime | None = None, end: datetime | None = None):
+    start = start.replace(tzinfo=start.tzinfo or timezone.utc).astimezone(timezone.utc) if start else None
+    end = end.replace(tzinfo=end.tzinfo or timezone.utc).astimezone(timezone.utc) if end else None
+    if start and end and start > end:
+        raise HTTPException(status_code=422, detail="Start date must be before end date")
+    return await commerce_summary(user.org_id, start=start, end=end)
 
 
 @router.get("/api/commerce/shopify/records")
