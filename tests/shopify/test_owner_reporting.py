@@ -32,6 +32,9 @@ async def main():
     prepared = _configured_send_db(Collection([parent]))
     s.db.collections.update(prepared.collections)
     _prepare_send(s, s.db)
+    s.list_compatible_templates = lambda *_args, **_kwargs: value([{
+        "name": "cart", "language": "en", "status": "APPROVED", "category": "MARKETING", "parameter_count": 2,
+    }])
     s.db.commerce_retargeting_settings.documents.append({"_id": "org", "org_id": "org", **config})
     async def graphql(connection, query, variables, **kwargs):
         if "GrowthCustomer" in query:
@@ -74,6 +77,8 @@ async def main():
     s.store_whatsapp_message = lambda **kwargs: value(None)
     await asyncio.gather(retarget.process_retargeting(), retarget.process_retargeting())
     assert len(posts) == 1
+    parameters = posts[0]["template"]["components"][0]["parameters"]
+    assert len(parameters) == 2 and parameters[1]["text"].startswith("https://")
     saved = s.db.commerce_retargeting_jobs.documents[0]
     assert saved["status"] == "accepted" and saved["branch"] == "read" and saved["provider_message_id"] == "followup"
     assert saved["inbox_sync_status"] == "complete"

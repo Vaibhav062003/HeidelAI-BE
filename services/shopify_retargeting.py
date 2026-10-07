@@ -189,16 +189,19 @@ async def send_followup(s, job, token):
             return
         branch = step["branch"]
         name, language = config[f"{branch}_template_name"], config[f"{branch}_template_language"]
-        if not any(item["name"] == name and item["language"] == language for item in await compatible_templates(job["org_id"])):
+        template = next((item for item in await compatible_templates(job["org_id"]) if item["name"] == name and item["language"] == language), None)
+        if not template:
             await finish(s, job, token, "cancelled", "template_unavailable")
             return
         sender = await s._selected_whatsapp_connection(connection)
         values = [str(cart.get("customer_name") or "there").split(" ", 1)[0][:80], s._product_summary(cart.get("products") or []), cart.get("recovery_url", "")]
-        if not values[1] or not values[2].startswith("https://"):
+        if (template.get("parameter_count", 3) == 3 and not values[1]) or not values[2].startswith("https://"):
             await finish(s, job, token, "cancelled", "cart_content_unavailable")
             return
         from services.shopify_reporting import tracked_link
         values[2] = await tracked_link(job["org_id"], job["shop"], "retargeting", job["_id"], values[2], job.get("customer_id"))
+        if template.get("parameter_count", 3) == 2:
+            values.pop(1)
         _, current_config, _, reason = await eligible(s, job)
         if reason or current_config["revision"] != config["revision"]:
             await finish(s, job, token, "cancelled", reason or "settings_changed")
