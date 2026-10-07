@@ -2241,7 +2241,7 @@ async def update_settings(org_id: str, settings: dict) -> dict:
         raise HTTPException(status_code=404, detail="Connect Shopify before changing settings")
     order_enabled = bool(existing.get("order_notifications_enabled")) if settings.get("order_notifications_enabled") is None else bool(settings["order_notifications_enabled"])
     requested_order_templates = (existing.get("order_templates") or {}) if settings.get("order_templates") is None else settings["order_templates"]
-    if order_enabled and "read_fulfillments" not in (existing.get("scopes") or []):
+    if order_enabled and str((requested_order_templates.get("shipped") or {}).get("name") or "").strip() and "read_fulfillments" not in (existing.get("scopes") or []):
         raise HTTPException(status_code=409, detail="Reconnect Shopify once to enable shipment notifications")
     whatsapp = await _whatsapp_connection_for_selector(
         org_id,
@@ -2267,9 +2267,9 @@ async def update_settings(org_id: str, settings: dict) -> dict:
         language = str(requested.get("language") or "en").strip()
         if name:
             order_templates[event] = {"name": name, "language": language, "status": "APPROVED" if (name, language) in approved_utility else "INCOMPATIBLE", "parameter_count": approved_utility.get((name, language), 0)}
-    if order_enabled and (not phone_id or len(order_templates) != len(ORDER_EVENTS) or any(item["status"] != "APPROVED" for item in order_templates.values())):
-        raise HTTPException(status_code=409, detail="Choose four approved Utility templates for Shopify order updates")
-    if order_enabled and order_templates["shipped"]["parameter_count"] != 2:
+    if order_enabled and (not phone_id or not order_templates or any(item["status"] != "APPROVED" for item in order_templates.values())):
+        raise HTTPException(status_code=409, detail="Choose an active WhatsApp number and at least one approved Utility template for Shopify order updates")
+    if order_enabled and "shipped" in order_templates and order_templates["shipped"]["parameter_count"] != 2:
         raise HTTPException(status_code=409, detail="Choose an approved two-variable shipped template: order number and tracking details")
     settings_update = {
         "whatsapp_id": wa_id or None, "whatsapp_phone_id": phone_id or None, "template_name": template_name or None, "template_language": template_language,

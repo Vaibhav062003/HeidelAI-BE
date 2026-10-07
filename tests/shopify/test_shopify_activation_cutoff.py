@@ -127,6 +127,41 @@ async def main():
     await s.update_settings("org", {**settings, "start_from_now": False})
     assert saved["automation_enabled_at"] == saved["order_notifications_enabled_at"] == NOW
 
+    # Partial order templates work without shipment permission; skipped events never queue.
+    saved["scopes"] = []
+    partial = {**settings, "start_from_now": False, "order_templates": {"received": templates["received"]}}
+    saved = await s.update_settings("org", partial)
+    assert saved["order_notifications_enabled"] and set(saved["order_templates"]) == {"received"}
+    assert saved["order_notifications_enabled_at"] == NOW  # Saving a subset cannot move the cutoff.
+    notifications = s.db.shopify_order_notifications
+    before = len(notifications.documents)
+    s.db.shopify_orders = Collection([{"org_id": "org", "provider_id": "new-order", "provider_created_at": NOW}])
+    await s._queue_order_notification(saved, "received", "new-order", s.utcnow())
+    assert len(notifications.documents) == before + 1 and notifications.documents[-1]["event"] == "received"
+    for event in ("shipped", "fulfilled", "cancelled"):
+        await s._queue_order_notification(saved, event, "new-order", s.utcnow(), {"number": "12345"})
+    assert len(notifications.documents) == before + 1
+    # Blank selections are optional; selected but unavailable templates are still rejected.
+    saved = await s.update_settings("org", {**partial, "order_templates": {"received": templates["received"], "fulfilled": templates["fulfilled"], "shipped": {"name": ""}, "cancelled": {"name": ""}}})
+    assert set(saved["order_templates"]) == {"received", "fulfilled"}
+    for invalid in ({}, {"received": {"name": "unapproved", "language": "en"}}, {"shipped": templates["shipped"]}):
+        try:
+            await s.update_settings("org", {**partial, "order_templates": invalid})
+        except s.HTTPException as exc:
+            assert exc.status_code == 409
+        else:
+            raise AssertionError(f"Enabled invalid order templates: {invalid}")
+    # Removing a template cancels its already-queued event before any provider submission.
+    queued = {"_id": "removed", "org_id": "org", "order_provider_id": "new-order", "event": "cancelled", "event_at": s.utcnow(), "status": "sending", "claim_token": "removed-claim"}
+    notifications.documents.append(queued)
+    await s._send_order_notification(queued.copy(), "removed-claim")
+    assert queued["status"] == "configuration_failure" and "provider_started_at" not in queued
+    # Preserve shipment permission and parameter validation when a shipped template is selected.
+    saved["scopes"] = ["read_fulfillments"]
+    for event in s.ORDER_EVENTS:
+        saved = await s.update_settings("org", {**partial, "order_templates": {event: templates[event]}})
+        assert set(saved["order_templates"]) == {event}
+
     # Previously accepted recovery messages cannot revive old cart follow-ups.
     from services import shopify_retargeting as r
     r.settings = lambda *_args: _value({"enabled": True})
