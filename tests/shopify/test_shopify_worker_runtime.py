@@ -101,6 +101,7 @@ def load_service():
         broadcast_org_admin_ws=async_noop,
         broadcast_org_ws=async_noop,
     )
+    _module("services.sales_workflow_service", verified_outcome=async_noop)
     spec = importlib.util.spec_from_file_location(
         "shopify_service_runtime_test", ROOT / "services/shopify_service.py"
     )
@@ -178,9 +179,16 @@ def apply_update(document: dict, update: dict) -> None:
 
 
 class FakeCursor:
-    def __init__(self, documents):
+    def __init__(self, documents, projection=None):
         self.documents = list(documents)
         self.position = 0
+        self.projection = projection
+
+    def project(self, document):
+        if not self.projection:
+            return copy.deepcopy(document)
+        include = {key for key, value in self.projection.items() if value}
+        return {key: copy.deepcopy(value) for key, value in document.items() if key in include or key == "_id"}
 
     def sort(self, keys, direction=None):
         pairs = [(keys, direction)] if isinstance(keys, str) else keys
@@ -193,7 +201,7 @@ class FakeCursor:
         return self
 
     async def to_list(self, length=None):
-        return copy.deepcopy(self.documents[:length])
+        return [self.project(document) for document in self.documents[:length]]
 
     def __aiter__(self):
         return self
@@ -201,7 +209,7 @@ class FakeCursor:
     async def __anext__(self):
         if self.position >= len(self.documents):
             raise StopAsyncIteration
-        value = copy.deepcopy(self.documents[self.position])
+        value = self.project(self.documents[self.position])
         self.position += 1
         return value
 
@@ -209,6 +217,15 @@ class FakeCursor:
 class FakeCollection:
     def __init__(self, documents=None):
         self.documents = [copy.deepcopy(item) for item in (documents or [])]
+
+    async def insert_one(self, document):
+        row = copy.deepcopy(document)
+        row.setdefault("_id", len(self.documents) + 1)
+        for existing in self.documents:
+            if existing.get("_id") == row["_id"] or (row.get("provider_id") and existing.get("org_id") == row.get("org_id") and existing.get("provider_id") == row["provider_id"]):
+                raise sys.modules["pymongo.errors"].DuplicateKeyError("Duplicate record")
+        self.documents.append(row)
+        return types.SimpleNamespace(inserted_id=row["_id"])
 
     async def update_many(self, query, update):
         modified = 0
@@ -237,8 +254,9 @@ class FakeCollection:
             for key, order in reversed(sort):
                 candidates.sort(key=lambda item: item.get(key) or datetime.min.replace(tzinfo=timezone.utc), reverse=order < 0)
         if candidates:
+            before = copy.deepcopy(candidates[0])
             apply_update(candidates[0], update)
-            return copy.deepcopy(candidates[0])
+            return before if return_document is False else copy.deepcopy(candidates[0])
         if upsert:
             if any(item.get("_id") == query.get("_id") for item in self.documents) and query.get("_id") is not None:
                 raise sys.modules["pymongo.errors"].DuplicateKeyError("Duplicate _id")
@@ -246,18 +264,21 @@ class FakeCollection:
             return copy.deepcopy(self.documents[-1])
         return None
 
+    async def find_one_and_delete(self, query):
+        for index, document in enumerate(self.documents):
+            if matches(document, query):
+                return self.documents.pop(index)
+        return None
+
     async def find_one(self, query, projection=None, sort=None):
         cursor = self.find(query, projection)
         if sort:
             cursor.sort(sort)
-        return copy.deepcopy(cursor.documents[0]) if cursor.documents else None
+        return cursor.project(cursor.documents[0]) if cursor.documents else None
 
     def find(self, query, projection=None):
         documents = [item for item in self.documents if matches(item, query)]
-        if projection:
-            include = {key for key, value in projection.items() if value}
-            documents = [{key: value for key, value in item.items() if key in include or key == "_id"} for item in documents]
-        return FakeCursor(documents)
+        return FakeCursor(documents, projection)
 
     async def distinct(self, key, query):
         return list({item.get(key) for item in self.documents if matches(item, query) and item.get(key) is not None})
@@ -568,7 +589,7 @@ def _configured_send_db(collection):
         shopify_orders=FakeCollection(),
         shopify_connections=FakeCollection([{
             "_id": "connection", "org_id": "org", "shop": "shop.test",
-            "status": "connected", "automation_enabled": True,
+            "status": "connected", "automation_enabled": True, "automation_enabled_at": NOW - timedelta(hours=1),
             "whatsapp_id": "waba", "whatsapp_phone_id": "phone",
             "template_name": "cart", "template_language": "en",
             "template_status": "APPROVED", "reminder_delay_minutes": 10,
@@ -739,10 +760,11 @@ async def test_order_event_sends_approved_template_once(service, parameter_count
         shopify_orders=FakeCollection([{
             "_id": "order", "org_id": "org", "provider_id": job["order_provider_id"], "record_status": "active",
             "phone": "+14155550100", "customer_name": "Customer", "order_number": "#1001",
-            "products": [{"name": "Board", "quantity": 2}] if parameter_count == 3 else [],
+            "products": [{"name": "Board", "quantity": 2}] if parameter_count == 3 else [], "provider_created_at": NOW,
         }]),
         shopify_connections=FakeCollection([{
             "org_id": "org", "status": "connected", "order_notifications_enabled": True,
+            "order_notifications_enabled_at": NOW - timedelta(hours=1),
             "whatsapp_id": "waba", "whatsapp_phone_id": "phone",
             "order_templates": {event: {"name": f"order_{event}", "language": "en", "status": "APPROVED", "parameter_count": parameter_count}},
         }]),
@@ -794,10 +816,11 @@ async def test_shipped_waits_for_tracking_update(service):
             self.documents.append(copy.deepcopy(document))
 
     notifications = Notifications()
-    orders = FakeCollection([{"org_id": "org", "provider_id": "gid://shopify/Order/1"}])
+    orders = FakeCollection([{"org_id": "org", "provider_id": "gid://shopify/Order/1", "provider_created_at": NOW}])
     service.db = FakeDB(shopify_order_notifications=notifications, shopify_orders=orders)
     service._commerce_event = async_noop
     connection = {"org_id": "org", "shop": "example.myshopify.com", "order_notifications_enabled": True,
+                  "order_notifications_enabled_at": NOW - timedelta(hours=1),
                   "order_templates": {"shipped": {"status": "APPROVED", "parameter_count": 2}}}
     await service._apply_webhook(connection, "fulfillments/create", {"order_id": 1}, NOW)
     assert not notifications.documents
@@ -831,10 +854,11 @@ async def test_immediate_meta_rejection_is_visible_and_retried(service):
         shopify_orders=FakeCollection([{
             "org_id": "org", "provider_id": "order-1", "record_status": "active",
             "phone": "+14155550100", "customer_name": "Customer", "order_number": "#1001",
-            "products": [{"name": "Board", "quantity": 1}],
+            "products": [{"name": "Board", "quantity": 1}], "provider_created_at": NOW,
         }]),
         shopify_connections=FakeCollection([{
             "org_id": "org", "status": "connected", "order_notifications_enabled": True,
+            "order_notifications_enabled_at": NOW - timedelta(hours=1),
             "order_templates": {"received": {"name": "order_received", "language": "en", "status": "APPROVED"}},
         }]),
         whatsapp_connections=FakeCollection([{"_id": "wa", "org_id": "org", "wa_id": "waba", "phone_id": "phone", "is_active": True}]),

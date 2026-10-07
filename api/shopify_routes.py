@@ -64,6 +64,7 @@ class ShopifySettingsPayload(BaseModel):
     template_language: str = Field(default="en", min_length=1, max_length=20)
     reminder_delay_minutes: int = 10
     automation_enabled: bool = False
+    start_from_now: bool = False
     order_notifications_enabled: bool | None = None
     order_templates: dict[str, ShopifyTemplateSelection] | None = None
 

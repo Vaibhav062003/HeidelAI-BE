@@ -118,6 +118,8 @@ async def eligible(s, job):
     cart = await s.db.shopify_checkouts.find_one({"org_id": job["org_id"], "provider_id": job["checkout_id"]})
     if not cart or cart.get("record_status") != "abandoned" or cart.get("completed_at") or cart.get("converted_order_id") or cart.get("storefront_checkout_started"):
         return cart, config, connection, "purchased_or_cart_unavailable"
+    if not s._recovery_activity_time(cart.get("provider_updated_at"), connection.get("automation_enabled_at"), cart.get("provider_created_at")):
+        return cart, config, connection, "before_automation_activation"
     if cart.get("provider_message_id") != job["original_message_id"] or cart.get("phone") != job["phone"]:
         return cart, config, connection, "cart_or_phone_changed"
     if job["original_accepted_at"] + timedelta(days=7) <= now:

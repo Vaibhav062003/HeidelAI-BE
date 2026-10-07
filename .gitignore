@@ -39,3 +39,6 @@ conversation_export.jsonl
 !tests/shopify/test_owner_reporting.py
 !tests/shopify/test_owner_pixel.cjs
 !tests/shopify/test_owner_e2e.py
+
+!tests/shopify/test_shopify_activation_cutoff.py
+!tests/shopify/test_shopify_sync_runtime.py
