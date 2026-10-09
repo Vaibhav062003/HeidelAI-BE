@@ -2,6 +2,7 @@
 
 Dry-run is the default. The command only writes when --apply is supplied.
 Omit --hr-email to give each child only admin and salesperson access.
+Keep CSV names unchanged after creation; rename display names from the parent.
 The CSV is the exact child roster; apply removes other child members/invitations.
 Parent conversion happens last and hides its existing customer views.
 Run one provisioner per parent at a time; rerun the same CSV after a failure.
@@ -247,7 +248,7 @@ def plan_workspaces(db, parent_id, rows, organizations):
         if not org and row.slug in by_slug:
             raise ValueError(f"Slug {row.slug} already belongs to another workspace group")
         plan.append({
-            "workspace_name": row.name, "slug": row.slug, "sales_emails": list(row.sales_emails),
+            "workspace_name": org["name"] if org else row.name, "slug": row.slug, "sales_emails": list(row.sales_emails),
             "status": "existing" if org else "create", "org_id": org["id"] if org else None,
         })
     return plan, len(existing)
@@ -370,9 +371,10 @@ async def run(args) -> dict:
             await clerk.request("PATCH", f"/organizations/{child_id}/metadata", json={"public_metadata": child_metadata})
             db.organizations.update_one({"org_id": child_id}, {
                 "$set": {
-                    "org_name": row.name, "provisioning_key": row.slug, **child_metadata, "updated_at": now,
+                    "provisioning_key": row.slug, **child_metadata, "updated_at": now,
                 },
                 "$setOnInsert": {
+                    "org_name": item["workspace_name"],
                     "org_id": child_id, "owner": owner, "wa_id": None, "ig_id": None, "status": "active",
                     "onboarding_flow_completed": True, "sign_up_flow_completed": True,
                     "plan": main_doc.get("plan", "free"), "created_at": now,
