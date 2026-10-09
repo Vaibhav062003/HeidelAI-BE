@@ -235,6 +235,29 @@ class ProvisioningTests(unittest.TestCase):
         self.assertIn("hides", preview["parent_conversion_effect"])
         self.assertFalse(self.clerk.writes or self.db.organizations.writes or self.db.feature_entitlements.writes)
 
+    def test_rerun_preserves_renamed_child_and_reports_current_clerk_name(self):
+        report = self.provision_children()
+        child_id = report["completed_org_ids"][0]
+        renamed = "Sales — New label"
+        self.clerk.orgs[child_id]["name"] = renamed
+        child = next(doc for doc in self.db.organizations.documents if doc["org_id"] == child_id)
+        child["org_name"] = renamed
+        preview = self.run_setup(apply=False)
+        self.assertEqual(preview["workspaces"][0]["workspace_name"], renamed)
+        original_plan = provision.plan_workspaces
+
+        def rename_after_planning(*args):
+            result = original_plan(*args)
+            child["org_name"] = "Sales — Newer label"
+            return result
+
+        with patch.object(provision, "plan_workspaces", side_effect=rename_after_planning):
+            self.provision_children()
+        self.assertEqual(child["org_name"], "Sales — Newer label")
+        self.assertEqual(self.clerk.orgs[child_id]["name"], renamed)
+        self.assertEqual(child["provisioning_key"], "customer-branch-01")
+        self.assertEqual(len(self.clerk.orgs), 19)
+
     def test_reassignment_removes_stale_access_before_adding_at_capacity(self):
         report = self.provision_children()
         child_id = report["completed_org_ids"][0]

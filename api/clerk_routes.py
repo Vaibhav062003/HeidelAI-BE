@@ -1,11 +1,13 @@
 import requests
 import uuid
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 
 from core.limiter import limiter
 from auth.dependencies import CurrentUser
 from config.settings import CLERK_TOKEN
+from database import get_mongo_db
 from loguru import logger
 from services.push_notification_service import process_member_device_revocation, queue_member_device_revocation
 from services.entitlement_service import release_capacity, require_feature, reserve_capacity
@@ -38,6 +40,76 @@ class DeleteMemberRequest(BaseModel):
 
 class WaitList(BaseModel):
     email: str
+
+
+class RenameOrganizationRequest(BaseModel):
+    name: str
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def valid_name(cls, value):
+        if not isinstance(value, str):
+            raise ValueError("Name must be a string")
+        name = " ".join(value.split())
+        if not 1 <= len(name) <= 100:
+            raise ValueError("Name must be 1-100 characters")
+        return name
+
+
+@router.patch("/organizations/{child_org_id}/name")
+@limiter.limit("30/minute")
+def rename_child_organization(request: Request, child_org_id: str, data: RenameOrganizationRequest, user: CurrentUser):
+    if user.role not in {"admin", "org:admin"}:
+        raise HTTPException(status_code=403, detail="Only parent workspace admins can rename children")
+    try:
+        db = get_mongo_db()
+        parent = db.organizations.find_one({
+            "org_id": user.org_id, "workspace_kind": "management", "workspace_group_id": user.org_id,
+        })
+        if not parent:
+            raise HTTPException(status_code=403, detail="Select the parent management workspace first")
+        child_query = {
+            "org_id": child_org_id, "workspace_kind": "child",
+            "parent_org_id": user.org_id, "workspace_group_id": user.org_id,
+        }
+        child = db.organizations.find_one(child_query)
+        if not child:
+            raise HTTPException(status_code=404, detail="Child workspace not found")
+        # shortcut: request-time duplicate check; coordinate one rename at a time across admin tabs.
+        siblings = db.organizations.find({"parent_org_id": user.org_id, "workspace_kind": "child"})
+        if any(
+            item.get("org_id") != child_org_id
+            and " ".join(str(item.get("org_name") or "").split()).casefold() == data.name.casefold()
+            for item in siblings
+        ):
+            raise HTTPException(status_code=409, detail="Another child workspace already has this name")
+        url = f"{base_url}/organizations/{child_org_id}"
+        response = requests.get(url, headers=clerk_headers(), timeout=15)
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Child workspace not found")
+        if not response.ok:
+            raise HTTPException(status_code=502, detail="Could not verify the child workspace. Retry shortly.")
+        organization = response.json()
+        metadata = organization.get("public_metadata") or {}
+        if any(metadata.get(key) != child_query[key] for key in ("workspace_kind", "parent_org_id", "workspace_group_id")):
+            raise HTTPException(status_code=409, detail="Workspace grouping is inconsistent; repair it before renaming")
+        if organization.get("name") == data.name and child.get("org_name") == data.name:
+            return {"org_id": child_org_id, "name": data.name}
+        if organization.get("name") != data.name:
+            response = requests.patch(url, headers=clerk_headers(), json={"name": data.name}, timeout=15)
+            if not response.ok or response.json().get("name") != data.name:
+                raise HTTPException(status_code=502, detail="Could not rename the workspace. Retry the same name.")
+        result = db.organizations.update_one(child_query, {"$set": {
+            "org_name": data.name, "updated_at": datetime.now(timezone.utc),
+        }})
+        if not result.matched_count:
+            raise HTTPException(status_code=404, detail="Child workspace no longer exists in this parent")
+        return {"org_id": child_org_id, "name": data.name}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Workspace rename failed for {} ({})", child_org_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Rename could not be completed. Retry the same name to synchronize.") from exc
 
 @router.post("/invite-agent")
 @limiter.limit("30/minute")
