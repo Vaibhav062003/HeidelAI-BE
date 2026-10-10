@@ -3,7 +3,8 @@
 ## Existing mechanisms reused
 
 - `purchase_intent_queue` and its existing structured extractor capture product
-  enquiries separately from time-bound purchase intent. No second model call.
+  observations separately from time-bound purchase intent. One additional independent
+  verification call is used only for uncertain batches; durable event results are reused.
 - Conversation team access, configured `organizations.sales_catalogue_org_id`,
   existing template sender, WhatsApp suppression and broadcast quota checks.
 - The existing intent-worker loop dispatches the durable restock outbox. No new
@@ -17,22 +18,50 @@ text/customer, interest status, match status, exact product and WhatsApp line.
 Pagination is 50 rows. The register does not silently scan historical chats.
 
 Every catalogue match requires human review, including capacity/colour/model
-variants. Specific named products outside the catalogue remain unmatched. Generic
-categories, setup/build descriptions, complete sentences and low-confidence or
-ambiguous references are not saved. Requested custom builds produce identifiable
-component products, not a build description; unspecified RAM/storage specs are
-omitted. A named product need not contain digits.
+variants. Unknown products remain recorded and unmatched; low-confidence entries
+are visibly marked. Agent messages, private notes, missing evidence, and dealer
+conversations cannot create customer demand. Explicit withdrawal suppresses
+interest. Existing completed/dismissed rows are not silently reopened by AI.
 
-Each extraction carries a recent customer's exact evidence and a separately
-grounded product mention/reference message. Public older context (within the
-existing 30-message window) may resolve a clear reference; only the recent ten
-messages can supply customer-request evidence. Seller suggestions alone do not
-create demand. Private messages and dealer conversations remain excluded.
-Follow-up questions reuse product identities. Stable request IDs are separate
-from the sparse unique product_key, which reuses request_key without changing
-restock dispatch identity. Existing completed/dismissed rows are not reopened.
-The page leads with the reviewed catalogue name or extracted product name;
-verbatim customer evidence is available under Customer message and in review.
+Capture validates an exact product/category phrase and quote, then evaluates the
+**whole source message**, including negation, completion, references and notification
+revocation. Legitimate titles such as Hello Kitty backpack and Nothing Phone (2) are
+not rejected by word blacklists. Unique exact matches in the tenant-selected catalogue
+can establish identity but do not establish customer interest. Compatible variants are
+required; fuzzy search remains a staff matching aid. Unknown products and categories
+remain supported through independent verification.
+
+Structured observations include entity type, interest action, notification action and
+quoted requirements. Explicit build components share their original source message;
+models are never invented from a budget/specification. Missing verification, malformed
+results, disagreement and incomplete context produce `needs_review`. A batch receives
+at most one verification call with a 45-second timeout and a 60,000-character context
+limit. Each item is validated independently; product capture failure does not prevent
+timed-purchase follow-ups being handled before the job is retried.
+
+`product_request_events` stores source-grounded observations and cached decisions.
+Identity uses exact catalogue IDs or normalized text plus quoted variant requirements;
+quantity and budget do not change the product identity. Existing request/outbox IDs are
+preserved. Source times guard updates, replay cannot freshen interest, and conflicting
+same-time observations need review. Closed/rejected interest is not automatically reopened;
+staff confirmation is required and old notification consent/deduplication is not reset.
+
+Pending uncertain changes are stored separately from accepted evidence. Review holds
+exclude requests from outreach. Uncertain withdrawal/revocation holds applicable existing
+interest and cancels pending outreach. Staff can confirm/correct/reject without a catalogue
+match. Rejecting an uncertain update to an accepted request preserves the accepted facts.
+Unresolved positive requests display “Product needs identification.”
+
+The queue retains triggering message IDs and the original WhatsApp line when coalescing
+pending work. Trigger messages and reply anchors are fetched independently of the latest
+30-message context. Public intervening context is bounded at 100 messages; a larger gap
+forces review. Customer replies can select an agent offer only when the exact reply link
+and structured product ID are verified against the selected catalogue.
+
+The default list is confirmed active interest. `verification=needs_review` includes
+pending holds, with independent interest/match/line filters. Legacy rows without verification
+are interpreted as confirmed only when `reviewed_by` exists; otherwise they enter review.
+No automatic backfill, rewrite, deletion or alias merge is performed.
 
 To send, an administrator selects requests for ONE exact catalogue product and
 ONE original WhatsApp line, creates/checks the dedicated Marketing template,
@@ -47,7 +76,10 @@ opt-outs, active interest no older than 90 days, positive stock updated within
 customer/line is never replaced with an organisation primary number.
 
 Queued/checking jobs can be cancelled by dismissing interest or clearing consent.
-The provider-send boundary is explicit. Once sending begins, cancellation cannot
+Capture and staff review use the same revision-guarded request-row update to cancel.
+The provider-send boundary atomically claims that same request row using the queued
+revision, verification, interest, consent and identity snapshot. A withdrawal/review hold
+that wins first prevents sending; a send claim that wins first is reported as already sending. Once sending begins, cancellation cannot
 recall a message. Definitely unsent blocked/cancelled jobs may be revalidated and
 retried; accepted/unknown jobs are never automatically retried. A provider timeout
 or interrupted send is UNKNOWN, not failed-and-safe-to-resend. Meta acceptance is
@@ -55,7 +87,7 @@ shown separately from subsequent message delivery status.
 
 ## Explicit limits / release gates
 
-- Text-only extraction uses the existing recent-chat context window. It does not
+- Text-only extraction uses source IDs and bounded conversation context. It does not
   read image/PDF/audio requirements unless their text is already in chat. Model
   extraction is not guaranteed recall; staff must review evidence and variants.
 - One accepted notification per organisation/customer/product/line. Repeated
@@ -72,56 +104,44 @@ shown separately from subsequent message delivery status.
 Official API reference used for exact-name template lookup:
 https://www.postman.com/meta/whatsapp-business-platform/documentation/wlk6lh4/whatsapp-cloud-api
 
-## Checks
+## API release contract and checks
 
-`python3 -m unittest test_product_requests test_product_request_extraction test_restock_dispatch -v`
+Release the dashboard and API together. PATCH review requires `expected_revision` and
+`verification_status`, with optional corrected `product_name`, catalogue match, interest
+status and separate consent evidence. Preview includes each request's `revision`; send
+requires a `revisions` map keyed by request ID. A changed row returns 409. Old clients
+without these fields receive 422 rather than silently approving stale data.
 
-With installed backend dependencies and Moonshot credentials, evaluate six
-synthetic screenshot/product cases against the actual extractor:
-`python3 test_product_request_extraction.py --live`. This calls the model only;
-it does not connect to MongoDB or schedule/send customer messages.
-
-## Review and clean previously collected requests
-
-Generate an organization-scoped report (model calls and database reads only):
+Offline checks:
 
 ```sh
-python3 -m scripts.cleanup_product_requests --org-id ORG --report /tmp/product-requests.json
+python3 -m unittest test_product_requests test_product_request_v2 test_product_request_schema test_restock_dispatch test_inbox_outage test_release_catalogue -q
+python3 scripts/evaluate_product_requests.py
 ```
 
-Review `changes`, `before`, `after`, and `review` in that file. The file contains
-customer evidence and is created with owner-only permissions; an existing file
-is not overwritten. Missing evidence, failed/ambiguous extraction, conflicting
-interest statuses and corrections affecting reviewed products or outreach are
-reported for review, not automatically discarded. Work is scoped to saved
-requests and their source context; unrelated chat history is not backfilled.
+Pydantic schema tests require the existing runtime dependency and otherwise skip.
+Frontend: `node scripts/check-product-requests.mjs` and `tsc --noEmit --incremental false`.
+The regression suite covers provenance, semantic disagreement/failure, legacy eligibility,
+source retention, state/revision conflicts, consent reopening, durable replay and send races.
 
-Reports now use version 2. Regenerate and review any existing version 1 report;
-application rejects it before accessing the database. Every saved row must have
-valid original evidence from a public customer message, including rows sharing
-a cached extraction. Output citing a different source message requires review.
-Existing specific or unfamiliar product names require an exact normalized match;
-missing/partial extraction cannot archive them or relabel them as another product.
-Only titles rejected by the existing prose/category validator can be corrected,
-split into components or archived automatically. Other protected-record and
-duplicate-identity checks still apply.
-
-Apply the exact reviewed report without another model call:
+Bounded real-model evaluation (24 labelled English/Hindi/Hinglish fixtures; at most one
+extra verification call per fixture batch):
 
 ```sh
-python3 -m scripts.cleanup_product_requests --org-id ORG --apply-report /tmp/product-requests.json
+python3 scripts/evaluate_product_requests.py --live --limit 24
 ```
 
-Each conversation applies in a MongoDB transaction (replica set/transaction
-support required). Request, customer identity and evidence snapshots must still
-match; pending outreach blocks application. On a stale report, regenerate and
-review. A partially applied report can be rerun: completed conversations are
-recognized and skipped. Concurrent writes abort the affected transaction.
-Original data remains in cleanup_original and archived rows, with replaced_by
-links. Splits receive no inherited catalogue match or notification permission;
-terminal interest status is retained. Archives are excluded before list counts
-and pagination and cannot be used for outreach. No report has been applied to
-production as part of the code changes.
+It reports accepted-entity precision, misses, review rate, primary/extra calls and errors.
+This environment has no configured model credentials; **no real-model quality measurement
+or production WhatsApp send has been completed**. Fixture/unit results are not a model
+precision or recall claim. Review unknown/reference observations conservatively until the
+labelled evaluation and a consenting end-to-end outreach check have passed.
 
-Service race/identity/retry regression tests are recorded in the top-level
-sales-workflow checklist. Frontend: `node scripts/check-product-requests.mjs`.
+## Legacy historical cleanup compatibility
+
+Archived requests remain hidden from capture, review and outreach. Existing public IDs
+and sparse unique `product_key` values are retained. The old historical-cleanup policy
+is isolated from v2 extraction: generation using v2 observations returns review entries
+instead of rewriting or archiving records. Previously reviewed version-2 reports retain
+their source, snapshot, transaction and pending-outreach safeguards; stale reports fail.
+Use dashboard review for v2 product observations. No historical cleanup was executed.

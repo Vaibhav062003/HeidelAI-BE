@@ -54,6 +54,8 @@ def enqueue_intent_check(
     customer_phone: str,
     customer_name: str,
     message_content: str,
+    source_message_id: str | None = None,
+    business_phone_id: str | None = None,
 ) -> str:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=300)  # 5-minute cooldown per conversation
@@ -66,11 +68,15 @@ def enqueue_intent_check(
         "org_id": org_id,
         "conversation_id": conversation_id,
         "status": "pending",
+        "business_phone_id": business_phone_id,
         "created_at": {"$gt": cutoff}
     })
     
     if existing:
-        return existing["job_id"]
+        result = db[COLLECTION].update_one({"job_id": existing["job_id"], "status": "pending"},
+            {"$addToSet": {"source_message_ids": {"$each": [source_message_id] if source_message_id else []}}})
+        if result.matched_count:
+            return existing["job_id"]
         
     job_id = f"intent_{uuid.uuid4().hex}"
     doc = {
@@ -80,6 +86,8 @@ def enqueue_intent_check(
         "customer_phone": customer_phone,
         "customer_name": customer_name,
         "message_content": message_content,
+        "source_message_ids": [source_message_id] if source_message_id else [],
+        "business_phone_id": business_phone_id,
         "status": "pending",
         "retry_count": 0,
         "max_retries": 3,
@@ -207,6 +215,27 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                 return
                 
             docs.reverse()
+            trigger_docs = []
+            if job.get("source_message_ids"):
+                trigger_docs = await asyncio.to_thread(lambda: list(col.find({
+                    "conversation_id": conversation_id, "message_id": {"$in": job["source_message_ids"]},
+                    "role": "customer", "mode": {"$ne": "private"}})))
+                # Trigger messages survive agent/private chatter beyond the context window.
+                by_id = {str(d.get("message_id") or d.get("_id")): d for d in [*docs, *trigger_docs]}
+                reply_ids = [str((d.get("context") or {}).get("id") or (d.get("context") or {}).get("message_id") or "") for d in trigger_docs]
+                if any(reply_ids):
+                    replies = await asyncio.to_thread(lambda: list(col.find({"conversation_id": conversation_id,
+                        "message_id": {"$in": [v for v in reply_ids if v]}, "mode": {"$ne": "private"}})))
+                    by_id.update({str(d.get("message_id") or d.get("_id")): d for d in replies})
+                from services.product_request_policy import as_utc
+                docs = sorted(by_id.values(), key=lambda d: as_utc(d["timestamp"]) if d.get("timestamp") else datetime.min.replace(tzinfo=timezone.utc))
+                if docs and docs[0].get("timestamp"):
+                    span = await asyncio.to_thread(lambda: list(col.find({"conversation_id": conversation_id,
+                        "timestamp": {"$gte": docs[0]["timestamp"], "$lte": docs[-1]["timestamp"]},
+                        "mode": {"$ne": "private"}}).sort("timestamp", 1).limit(101)))
+                    job["product_context_incomplete"] = len(span) > 100
+                    by_id.update({str(d.get("message_id") or d.get("_id")): d for d in span[:100]})
+                    docs = sorted(by_id.values(), key=lambda d: as_utc(d["timestamp"]) if d.get("timestamp") else datetime.min.replace(tzinfo=timezone.utc))
             
             # Hybrid Context: Split the last 10 messages (recent) from the older ones (context)
             recent_cutoff = 10
@@ -231,11 +260,23 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                 )
             
             ist_now = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+            if job.get("source_message_ids"):
+                messages_str += "\nPRODUCT SOURCE IDS: " + ", ".join(job["source_message_ids"])
             
             result = await extract_purchase_intent(messages_str, ist_now)
             if result is not None:
                 from services.product_request_service import capture_product_requests
-                await capture_product_requests(job, [item.model_dump() for item in getattr(result, "product_requests", [])], docs)
+                try:
+                    targets = trigger_docs if job.get("source_message_ids") else docs[-10:]
+                    target_ids = {str(d.get("message_id") or d.get("_id")) for d in targets}
+                    context = [d for d in docs if str(d.get("message_id") or d.get("_id")) not in target_ids]
+                    await capture_product_requests(job, [item.model_dump() for item in getattr(result, "product_requests", [])], targets, context)
+                except Exception as request_error:
+                    # Preserve follow-ups, then retry durable product observations below.
+                    logger.warning("Product capture failed ({})", type(request_error).__name__)
+                    capture_error = request_error
+                else:
+                    capture_error = None
             
             # Branch 1: LLM returned None → transient error (network, malformed response).
             # Do NOT cancel existing follow-ups on transient failures (Bug #2 fix).
@@ -285,6 +326,8 @@ async def _process_single_job(job: dict, semaphore: asyncio.Semaphore) -> None:
                 except Exception as cancel_err:
                     logger.warning(f"[{job_id}] Failed to cancel stale follow-ups: {cancel_err}")
                 
+            if capture_error:
+                raise RuntimeError("Product capture failed after purchase follow-ups were handled") from capture_error
             await asyncio.to_thread(
                 lambda: db[COLLECTION].update_one(
                     {"job_id": job_id},
