@@ -1491,6 +1491,8 @@ async def handle_webhook(request: Request, x_hub_signature_256: str = Header(Non
                                         customer_phone=customer_phone_no,
                                         customer_name=sender_name2,
                                         message_content=content,
+                                        source_message_id=message_id,
+                                        business_phone_id=business_phone_id,
                                     )
                                 except Exception:
                                     pass  # silently ignore — intent extraction is best-effort

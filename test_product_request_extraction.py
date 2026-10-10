@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
-from services.product_request_policy import grounded_request, request_key, eligibility_reason
+from services.product_request_policy import request_key, eligibility_reason
+from services.product_request_legacy_policy import grounded_request
 from scripts.cleanup_product_requests import plan_conversation, make_report, apply_report
 from test_restock_dispatch import service
 
@@ -72,11 +73,11 @@ class ExtractionTests(unittest.TestCase):
     def test_prompt_schema_and_worker_preserve_independent_purchase_intent(self):
         tree = ast.parse(Path("agents/intent_agent/agent.py").read_text())
         prompt = "\n".join(node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str))
-        self.assertIn("override R10's category fallback for product_requests ONLY", prompt)
-        self.assertIn("each\nidentifiable component separately", prompt)
-        self.assertIn('"Whats the avg fps ill get?"', prompt)
+        self.assertIn("Unknown catalogue products and categories are valid", prompt)
+        self.assertIn("Split explicitly named components", prompt)
+        self.assertIn("product_source_message_id", prompt)
         worker = Path("services/intent_queue_worker.py").read_text()
-        self.assertIn('getattr(result, "product_requests", [])], docs)', worker)
+        self.assertIn('getattr(result, "product_requests", [])], targets, context)', worker)
         self.assertIn('elif result.has_intent and result.confidence != "low"', worker)
 
 
@@ -227,6 +228,20 @@ class ApplyTests(unittest.IsolatedAsyncioTestCase):
             source.clear()
             source.update(original_source)
 
+    async def test_v2_output_never_generates_legacy_rewrite_plan(self):
+        original = row(evidence="I want Zotac RTX 5060")
+        source = message("I want Zotac RTX 5060")
+        class DB:
+            product_requests = SimpleNamespace(find=lambda *a, **k: Cursor([original]))
+            def __getitem__(self, name):
+                if name.startswith("conversations_"):
+                    return SimpleNamespace(find_one=AsyncMock(return_value={"conversation_id": "chat", "platform": "whatsapp"}))
+                return SimpleNamespace(find_one=AsyncMock(return_value=source), find=lambda *a, **k: Cursor([source]))
+        output = SimpleNamespace(model_dump=lambda: {**extraction(evidence=source["content"]), "entity_type": "product"})
+        report = await make_report(DB(), "org", AsyncMock(return_value=SimpleNamespace(product_requests=[output])))
+        self.assertEqual(report["conversations"], [])
+        self.assertIn("V2 observations", report["review"][0]["reason"])
+
     async def test_version_one_report_rejected_before_database_access(self):
         with self.assertRaisesRegex(ValueError, "version.*regenerate"):
             await apply_report(SimpleNamespace(), "org", {"version": 1, "org_id": "org", "report_id": "old", "conversations": []})
@@ -290,55 +305,23 @@ class ApplyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CaptureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_capture_uses_stable_product_key_and_timestamp_guard(self):
-        scope = service()
-        scope.update(grounded_request=grounded_request, uuid4=uuid4)
-        requests = SimpleNamespace(create_index=AsyncMock(), update_one=AsyncMock())
-        class DB:
-            product_requests = requests
-            def __getitem__(self, name):
-                return SimpleNamespace(find_one=AsyncMock(return_value={"platform": "whatsapp", "customer_id": "919123456789", "business_phone_id": "12345"}))
-        scope["get_async_mongo_db"] = DB
-        job = {"org_id": "org", "conversation_id": "chat"}
-        await scope["capture_product_requests"](job, [extraction()], [message()])
-        await scope["capture_product_requests"](job, [extraction()], [message()])
-        calls = requests.update_one.call_args_list
-        self.assertEqual(calls[1].args[0], calls[4].args[0])
-        self.assertEqual(calls[1].args[0], {"product_key": request_key("org", "chat", "Zotac RTX 5060")})
-        self.assertEqual(calls[2].args[0]["$or"][0], {"last_asked_at": {"$lt": STAMP}})
-        self.assertNotIn("status", calls[2].args[1]["$set"])
-        requests.update_one.reset_mock()
-        await scope["capture_product_requests"](job, [extraction("DDR4 setup with GPU")], [message()])
-        requests.update_one.assert_not_awaited()
+    async def test_archived_requests_are_excluded_from_capture_and_outreach(self):
+        from test_product_request_v2 import CaptureV2Test
+        harness = CaptureV2Test()
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        archived = harness.seed(archived_at=STAMP)
+        await harness.capture(*harness.observation())
+        self.assertEqual(archived["archived_at"], STAMP)
+        self.assertNotIn("revision", archived)
+        self.assertEqual(len(harness.db.product_requests.rows), 2)
+        self.assertIn("archived", eligibility_reason(archived, {}))
 
 
 async def evaluate_live():
-    """Optional six synthetic conversations through the actual configured agent; never sends messages."""
-    import os
-    try:
-        from agents.intent_agent.agent import extract_purchase_intent
-    except ImportError:
-        raise SystemExit("Live evaluation needs the backend's installed dependencies and Moonshot configuration.")
-    if not os.getenv("MOONSHOT_API_KEY"):
-        raise SystemExit("Live evaluation needs MOONSHOT_API_KEY; offline tests do not require credentials.")
-    cases = [
-        ([message("Whats the avg fps ill get?")], set()),
-        ([message("DDR4 setup with GPU")], set()),
-        ([message("PC build (DDR4 setup with GPU)")], set()),
-        ([message("I want AMD Ryzen 5 5600 and Zotac RTX 5060 with 16GB RAM and 512GB SSD")], {"AMD Ryzen 5 5600", "Zotac RTX 5060"}),
-        ([message("AMD Ryzen 5 5600 and Zotac RTX 5060 with 16GB RAM and 512GB SSD", role="agent"),
-          message("I want that build. Whats the avg fps ill get?", _id="m2", message_id="m2")], {"AMD Ryzen 5 5600", "Zotac RTX 5060"}),
-        ([message("Apple AirPods Pro ka price?")], {"Apple AirPods Pro"}),
-    ]
-    for index, (docs, expected) in enumerate(cases, 1):
-        text = "--- RECENT MESSAGES ---\n" + "\n".join(f"[{m['message_id']}] {m['role']}: {m['content']}" for m in docs)
-        result = await extract_purchase_intent(text, STAMP.isoformat())
-        if result is None:
-            raise AssertionError(f"Live case {index}: extraction failed")
-        accepted = [item for raw in result.product_requests if (item := grounded_request(raw.model_dump(), docs))]
-        actual = {request_key("org", "chat", value["product_name"]) for value in accepted}
-        assert actual == {request_key("org", "chat", name) for name in expected}, f"Live case {index}: product identities differ"
-        print(f"Live extraction case {index}: passed")
+    """Keep the old command usable with the current bounded v2 evaluator."""
+    from scripts.evaluate_product_requests import evaluate
+    raise SystemExit(await evaluate(24))
 
 
 if __name__ == "__main__":

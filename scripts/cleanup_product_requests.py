@@ -14,7 +14,8 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from services.product_request_policy import as_utc, grounded_request, product_name, request_key
+from services.product_request_policy import as_utc, request_key
+from services.product_request_legacy_policy import grounded_request, product_name
 
 MESSAGE_FIELDS = {field: 1 for field in ("_id", "message_id", "conversation_id", "role", "mode", "content", "timestamp")}
 CONVERSATION_FIELDS = {field: 1 for field in ("_id", "conversation_id", "platform", "customer_id", "business_phone_id", "is_dealer", "persona")}
@@ -152,7 +153,12 @@ async def make_report(db, org, extract):
                 if result is None:
                     error = "Extraction failed; no records may be archived"
                     break
+                schema = type(result).model_json_schema() if hasattr(type(result), "model_json_schema") else {}
+                properties = schema.get("$defs", {}).get("ProductRequestExtraction", {}).get("properties", {})
                 raw = [item.model_dump() for item in result.product_requests]
+                if "entity_type" in properties or any("entity_type" in value for value in raw):
+                    error = "V2 observations require dashboard review; legacy cleanup cannot rewrite them"
+                    break
                 if any(item.get("source_message_id") != source_id for item in raw):
                     error = "Extraction cites another source message; preserve requests for review"
                     break

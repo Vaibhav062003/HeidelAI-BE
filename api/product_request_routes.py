@@ -21,6 +21,9 @@ router = APIRouter(prefix="/api/product-requests", tags=["Product requests"])
 
 
 class Review(BaseModel):
+    expected_revision: int = Field(ge=0)
+    verification_status: Literal["confirmed", "needs_review", "rejected"]
+    product_name: str | None = Field(None, min_length=1, max_length=240)
     product_id: str | None = Field(None, min_length=1, max_length=120)
     status: Literal["requested", "dismissed", "fulfilled"] = "requested"
     consent_note: str | None = Field(None, max_length=1000)
@@ -28,6 +31,10 @@ class Review(BaseModel):
 
 class Audience(BaseModel):
     request_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class SendAudience(Audience):
+    revisions: dict[str, int] = Field(max_length=100)
 
 
 class Template(BaseModel):
@@ -44,7 +51,8 @@ def admin(user):
 async def list_requests(request: Request, user: CurrentUser,
     q: str = Query("", max_length=120), status: Literal["requested", "dismissed", "fulfilled", "all"] = "requested",
     phone_number_id: str = Query("", max_length=128), product_id: str = Query("", max_length=120),
-    review: Literal["all", "unmatched", "matched"] = "all", page: int = Query(1, ge=1, le=10000)):
+    review: Literal["all", "unmatched", "matched"] = "all", page: int = Query(1, ge=1, le=10000),
+    verification: Literal["confirmed", "needs_review", "rejected", "all"] = "confirmed"):
     db = get_async_mongo_db()
     match = {"org_id": user.org_id, "archived_at": {"$exists": False}}
     if status != "all":
@@ -59,7 +67,15 @@ async def list_requests(request: Request, user: CurrentUser,
         match["$or"] = [{field: {"$regex": re.escape(q.strip()), "$options": "i"}}
             for field in ("product_name", "catalogue_name", "customer_name", "customer_phone")]
     access = await conversation_access_condition(user.org_id, user.user_id, user.role)
-    pipeline = [{"$match": match}, {"$sort": {"last_asked_at": -1}}]
+    pipeline = [{"$match": match}, {"$addFields": {
+        "verification_status": {"$ifNull": ["$verification_status", {"$cond": ["$reviewed_by", "confirmed", "needs_review"]}]},
+        "revision": {"$ifNull": ["$revision", 0]},
+    }}]
+    if verification == "needs_review":
+        pipeline.append({"$match": {"$or": [{"verification_status": "needs_review"}, {"review_hold": True}]}})
+    elif verification != "all":
+        pipeline.append({"$match": {"verification_status": verification, "review_hold": {"$ne": True}}})
+    pipeline.append({"$sort": {"last_asked_at": -1}})
     # Access is evaluated against current conversation teams, not a stale copied owner.
     pipeline += [{"$lookup": {"from": f"conversations_{user.org_id}", "let": {"cid": "$conversation_id"},
         "pipeline": [{"$match": {"$and": [{"$expr": {"$eq": ["$conversation_id", "$$cid"]}}, access]}}, {"$project": {"_id": 1}}],
@@ -113,14 +129,14 @@ async def template(request: Request, body: Template, user: CurrentUser):
 
 @router.post("/restock/send")
 @limiter.limit("5/minute")
-async def send(request: Request, body: Audience, user: CurrentUser):
+async def send(request: Request, body: SendAudience, user: CurrentUser):
     admin(user)
     from services.entitlement_service import feature_access
     access = await asyncio.to_thread(feature_access, user.org_id, "BROADCASTING")
     batch_limit = access["limits"].get("max_batch_recipients")
     if batch_limit is not None and len(set(body.request_ids)) > batch_limit:
         raise HTTPException(422, f"This broadcast exceeds the {batch_limit}-recipient batch limit")
-    return await queue_restock(user, body.request_ids)
+    return await queue_restock(user, body.request_ids, body.revisions)
 
 
 @router.post("/{request_id}/restock/retry")
