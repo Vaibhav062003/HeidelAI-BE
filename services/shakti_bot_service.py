@@ -68,16 +68,16 @@ async_db = get_async_mongo_db()   # Motor async database object (not a coroutine
 
 BIKES = {
     "jawa": [
-        {"id": "jawa_42",        "title": "Jawa 42",        "price": "₹1,84,942", "img": "https://jawayezdi.com/images/jawa42.jpg"},
+        {"id": "jawa_42",        "title": "Jawa 42",        "price": "₹1,84,942", "img": "https://jawayezdi.com/images/jawa42.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791656682/shakti_pdfs/ekwrx3nd6y49cg1xwe7k.pdf"},
         {"id": "jawa_42_fj",     "title": "Jawa 42 FJ",     "price": "₹1,54,551", "img": "https://jawayezdi.com/images/jawa42fj.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791655872/shakti_pdfs/dugjwmptx2uo0yai3frl.pdf"},
         {"id": "jawa_42_bobber", "title": "Jawa 42 Bobber",  "price": "₹2,08,942", "img": "https://jawayezdi.com/images/bobber.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791655894/shakti_pdfs/iunjmy2lgebik5ngqvhs.pdf"},
         {"id": "jawa_350",       "title": "Jawa 350",       "price": "₹2,15,815", "img": "https://jawayezdi.com/images/jawa350.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791655888/shakti_pdfs/njlryveqs4kjtxrpbb35.pdf"},
-        {"id": "jawa_perak",     "title": "Jawa Perak",     "price": "₹2,15,815", "img": "https://jawayezdi.com/images/perak.jpg"},
+        {"id": "jawa_perak",     "title": "Jawa Perak",     "price": "₹2,15,815", "img": "https://jawayezdi.com/images/perak.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791656685/shakti_pdfs/o4msfvgttr01swwes2qm.pdf"},
     ],
     "yezdi": [
-        {"id": "yezdi_roadster",  "title": "Yezdi Roadster",  "price": "~₹1,98,000", "img": "https://jawayezdi.com/images/roadster.jpg"},
-        {"id": "yezdi_scrambler", "title": "Yezdi Scrambler", "price": "~₹2,14,900", "img": "https://jawayezdi.com/images/scrambler.jpg"},
-        {"id": "yezdi_adventure", "title": "Yezdi Adventure", "price": "~₹2,14,900", "img": "https://jawayezdi.com/images/adventure.jpg"},
+        {"id": "yezdi_roadster",  "title": "Yezdi Roadster",  "price": "~₹1,98,000", "img": "https://jawayezdi.com/images/roadster.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791656680/shakti_pdfs/y7bw1502bmmrplr8x4so.pdf"},
+        {"id": "yezdi_scrambler", "title": "Yezdi Scrambler", "price": "~₹2,14,900", "img": "https://jawayezdi.com/images/scrambler.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791656684/shakti_pdfs/z00gtwsfrpp1zlyopa3u.pdf"},
+        {"id": "yezdi_adventure", "title": "Yezdi Adventure", "price": "~₹2,14,900", "img": "https://jawayezdi.com/images/adventure.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791656681/shakti_pdfs/rkqyaypalizpzksn29w6.pdf"},
     ],
     "bsa": [
         {"id": "bsa_gold_star", "title": "BSA Gold Star 650", "price": "₹2,99,995", "img": "https://bsa.com/images/goldstar.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791655856/shakti_pdfs/hdcditfemj4xiidjc16f.pdf"},
