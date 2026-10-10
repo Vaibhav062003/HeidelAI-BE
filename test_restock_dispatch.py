@@ -3,10 +3,13 @@ import ast
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
+import json
+from uuid import uuid4
 import types
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from services import product_request_policy as policy
 from services.product_request_policy import eligibility_reason, request_key, approved_restock_template
 
 
@@ -28,7 +31,9 @@ def service():
                  eligibility_reason=eligibility_reason, approved_restock_template=lambda _: True,
                  RESTOCK_TEMPLATE="restock", RESTOCK_BODY="body", RESTOCK_FOOTER="footer")
     import asyncio
-    scope["asyncio"] = asyncio
+    scope.update({name: value for name, value in vars(policy).items() if not name.startswith("_")})
+    scope.update(asyncio=asyncio, json=json, logger=Mock(), uuid4=uuid4)
+    scope["approved_restock_template"] = lambda _: True
     exec(compile(ast.Module(body=functions, type_ignores=[]), "product_request_service", "exec"), scope)
     return scope
 
@@ -36,7 +41,7 @@ def service():
 def row():
     stamp = datetime.now(timezone.utc)
     return {"_id": "request", "org_id": "org", "conversation_id": "conversation", "status": "requested",
-            "product_id": "product", "catalogue_org_id": "org", "catalogue_name": "Laptop",
+            "product_name": "Laptop", "product_id": "product", "catalogue_org_id": "org", "catalogue_name": "Laptop",
             "reviewed_by": "agent", "consent_note": "Customer asked for restock notification today",
             "consent_by": "agent", "consent_at": stamp, "last_asked_at": stamp,
             "customer_phone": "919123456789", "business_phone_id": "12345"}
@@ -47,7 +52,7 @@ class RestockSafetyTest(unittest.IsolatedAsyncioTestCase):
         self.scope = service()
         self.user = types.SimpleNamespace(org_id="org", user_id="admin", role="admin")
         self.row = row()
-        self.db = types.SimpleNamespace(product_requests=Mock(), restock_outbox=Mock(), restock_dispatch=Mock())
+        self.db = types.SimpleNamespace(product_request_events=types.SimpleNamespace(update_one=AsyncMock()), product_requests=Mock(), restock_outbox=Mock(), restock_dispatch=Mock())
         self.db.product_requests.find_one = AsyncMock(return_value=self.row)
         self.db.product_requests.update_one = AsyncMock(return_value=types.SimpleNamespace(matched_count=1))
         self.db.restock_outbox.update_one = AsyncMock(return_value=types.SimpleNamespace(matched_count=1))
@@ -113,7 +118,7 @@ class RestockSafetyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.scope["publish_restock_job"](self.db, self.row, "job"))
         self.assertEqual(self.db.restock_outbox.update_one.call_args.args[1]["$set"]["status"], "blocked")
 
-    async def test_consent_withdrawal_cancels_before_row_update(self):
+    async def test_consent_withdrawal_claims_row_before_cancelling_outbox(self):
         self.row["notification_status"] = "queued"
         sequence = []
         self.db.restock_outbox.update_many.side_effect = lambda *args: sequence.append("cancel")
@@ -121,14 +126,14 @@ class RestockSafetyTest(unittest.IsolatedAsyncioTestCase):
             sequence.append("row")
             return types.SimpleNamespace(matched_count=1)
         self.db.product_requests.update_one.side_effect = update
-        payload = types.SimpleNamespace(status="requested", product_id=None, consent_note="", model_fields_set={"consent_note"})
+        payload = types.SimpleNamespace(expected_revision=0, verification_status="confirmed", product_name=None, status="requested", product_id=None, consent_note="", model_fields_set={"consent_note"})
         result = await self.scope["review_request"](self.user, "request", payload)
         self.assertFalse(result["outreach_already_sending"])
-        self.assertEqual(sequence[0], "cancel")
+        self.assertEqual(sequence, ["row", "cancel"])
         self.assertEqual(self.db.product_requests.update_one.call_args.args[1]["$set"]["consent_note"], "")
 
     async def test_explicit_null_clears_match(self):
-        payload = types.SimpleNamespace(status="requested", product_id=None, consent_note=None, model_fields_set={"product_id"})
+        payload = types.SimpleNamespace(expected_revision=0, verification_status="confirmed", product_name=None, status="requested", product_id=None, consent_note=None, model_fields_set={"product_id"})
         await self.scope["review_request"](self.user, "request", payload)
         self.assertIn("product_id", self.db.product_requests.update_one.call_args.args[1]["$unset"])
 
