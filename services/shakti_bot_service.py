@@ -69,9 +69,9 @@ async_db = get_async_mongo_db()   # Motor async database object (not a coroutine
 BIKES = {
     "jawa": [
         {"id": "jawa_42",        "title": "Jawa 42",        "price": "₹1,84,942", "img": "https://jawayezdi.com/images/jawa42.jpg"},
-        {"id": "jawa_42_fj",     "title": "Jawa 42 FJ",     "price": "₹1,54,551", "img": "https://jawayezdi.com/images/jawa42fj.jpg"},
-        {"id": "jawa_42_bobber", "title": "Jawa 42 Bobber",  "price": "₹2,08,942", "img": "https://jawayezdi.com/images/bobber.jpg"},
-        {"id": "jawa_350",       "title": "Jawa 350",       "price": "₹2,15,815", "img": "https://jawayezdi.com/images/jawa350.jpg"},
+        {"id": "jawa_42_fj",     "title": "Jawa 42 FJ",     "price": "₹1,54,551", "img": "https://jawayezdi.com/images/jawa42fj.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791655872/shakti_pdfs/dugjwmptx2uo0yai3frl.pdf"},
+        {"id": "jawa_42_bobber", "title": "Jawa 42 Bobber",  "price": "₹2,08,942", "img": "https://jawayezdi.com/images/bobber.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791655894/shakti_pdfs/iunjmy2lgebik5ngqvhs.pdf"},
+        {"id": "jawa_350",       "title": "Jawa 350",       "price": "₹2,15,815", "img": "https://jawayezdi.com/images/jawa350.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791655888/shakti_pdfs/njlryveqs4kjtxrpbb35.pdf"},
         {"id": "jawa_perak",     "title": "Jawa Perak",     "price": "₹2,15,815", "img": "https://jawayezdi.com/images/perak.jpg"},
     ],
     "yezdi": [
@@ -80,7 +80,7 @@ BIKES = {
         {"id": "yezdi_adventure", "title": "Yezdi Adventure", "price": "~₹2,14,900", "img": "https://jawayezdi.com/images/adventure.jpg"},
     ],
     "bsa": [
-        {"id": "bsa_gold_star", "title": "BSA Gold Star 650", "price": "₹2,99,995", "img": "https://bsa.com/images/goldstar.jpg"},
+        {"id": "bsa_gold_star", "title": "BSA Gold Star 650", "price": "₹2,99,995", "img": "https://bsa.com/images/goldstar.jpg", "pdf": "https://res.cloudinary.com/djpc5zfgz/raw/upload/v1791655856/shakti_pdfs/hdcditfemj4xiidjc16f.pdf"},
     ],
 }
 
@@ -413,9 +413,37 @@ async def _send_models(org_id, wa_id, cid, brand):
     await _send_interactive(org_id, wa_id, cid, payload)
 
 
+async def _send_pdf(org_id: str, wa_id: str, conversation_id: str, media_url: str, file_name: str):
+    """Send a PDF document to the user."""
+    try:
+        from services.wa_service import send_wa_media_message
+        customer_phone = _extract_phone(conversation_id)
+        if not customer_phone: return
+        await send_wa_media_message(
+            recipient_id=customer_phone,
+            media_url=media_url,
+            media_type="document",
+            wa_id=wa_id,
+            content=None,
+            org_id=org_id,
+            temp_id=None,
+            mode="reply",
+            context_type=None,
+            context=None,
+            conversation_id=conversation_id,
+            file_name=file_name
+        )
+    except Exception as e:
+        logger.error(f"[SHAKTI] Failed to send PDF to {conversation_id}: {e}")
+
 async def _send_model_detail(org_id, wa_id, cid, model_id, brand):
     brand_bikes = BIKES.get(brand, BIKES["jawa"])
     bike = next((b for b in brand_bikes if b["id"] == model_id), brand_bikes[0])
+    
+    if bike.get("pdf"):
+        await _send_pdf(org_id, wa_id, cid, bike["pdf"], f"{bike['title']} Brochure.pdf")
+        await asyncio.sleep(1)
+        
     payload = {
         "type": "button",
         "body_text": f"*{bike['title']}*\n\nGreat choice! What would you like to do next?",
