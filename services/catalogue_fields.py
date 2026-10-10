@@ -64,13 +64,22 @@ def canonical_fields(document: dict) -> dict:
         result["model_name"] = document["product_name"]
     specs = dict(document.get("specs") or {})
     for key, source_names in {
-        "processor": ("processor", "cpu"), "graphics_card": ("graphics_card", "gpu", "graphics"),
+        "processor": ("processor", "cpu"), "graphics_card": ("graphics_card", "gpu", "graphics", "graphic_card"),
+        "graphic_card": ("graphic_card",),
         "ram_gb": ("ram_gb", "ram", "memory"), "storage_gb": ("storage_gb", "storage", "ssd"),
-        "vram_gb": ("vram_gb", "graphics_card_space_gb"),
-        "screen_size": ("screen_size",), "operating_system": ("operating_system", "os"),
+        "ram": ("ram", "memory"), "storage": ("storage", "ssd"),
+        "graphic_card_space_gb": ("graphic_card_space_gb", "vram_gb", "vram"),
+        "display_hz": ("display_hz", "frame_rate", "refresh_rate", "hz"),
+        "screen_size": ("screen_size", "display_inches"),
+        "display_inches": ("display_inches", "screen_size"),
+        "display_type": ("display_type", "panel_type"),
+        "panel_type": ("panel_type", "display_type"),
+        "operating_system": ("operating_system", "os"),
         "processor_brand": ("processor_brand",), "processor_family": ("processor_family",),
         "processor_generation": ("processor_generation",),
         "processor_model_no": ("processor_model_no",), "is_touch": ("is_touch",),
+        "processor_series": ("processor_series",), "processor_suffix": ("processor_suffix",),
+        "type": ("type", "category", "category_label"),
     }.items():
         value = next((document[name] for name in source_names if document.get(name) is not None), specs.get(key))
         if value is None:
@@ -82,9 +91,26 @@ def canonical_fields(document: dict) -> dict:
             value = float(match.group(1)) * (1024 if (match.group(2) or "").lower() == "tb" else 1)
             if not math.isfinite(value) or value <= 0:
                 continue
+        elif key in ("display_inches", "screen_size"):
+            try:
+                value = float(str(value).replace('"', '').strip())
+            except ValueError:
+                pass
+        elif key in ("processor_model_no", "processor_series", "display_hz", "graphic_card_space_gb"):
+            try:
+                value = int(float(str(value).lower().replace("hz", "").replace("gb", "").replace("vram", "").strip()))
+            except ValueError:
+                pass
+        elif key == "is_touch":
+            if isinstance(value, str):
+                value = str(value).strip().casefold() in ("true", "yes", "1")
+            else:
+                value = bool(value)
         elif isinstance(value, str):
             value = re.sub(r"_+", " ", value).strip()
+            
         specs[key] = value
+        result[key] = value
     if specs:
         result["specs"] = specs
     if (any(document.get(key) is not None for key in ("stock", "quantity", "available_qty", "in_stock", "stock_available"))
@@ -105,6 +131,7 @@ def canonical_fields(document: dict) -> dict:
                 except (ValueError, TypeError):
                     pass
         result["stock_state"] = state
+        result["stock_available"] = (state == "listed")
     merged = {**document, **result}
     text_values = [merged.get("category"), merged.get("brand"), merged.get("model_name"),
                    *result["search_codes"], *(merged.get("specs") or {}).values()]

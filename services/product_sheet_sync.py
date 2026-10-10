@@ -31,7 +31,10 @@ from services.pricing_policy import (
 FIELD_ALIASES = {
     # --- Shared / Laptop fields ---
     "product_name": ["product name", "product_name", "name", "title", "product title", "item name", "item"],
-    "model_no":     ["model_no", "model no", "model number", "model", "sku", "item code", "product code", "part number", "part no", "article no"],
+    "model_no":     ["model_no", "model no", "model number", "model", "item code", "product code", "part number", "part no", "article no"],
+    "sku":          ["sku", "sku id"],
+    "sku_full":     ["sku_full", "sku full"],
+    "sku_prefix":   ["sku_prefix", "sku prefix"],
     "description":  ["description", "desc", "product description", "details", "short description"],
     # Keep price concepts separate. ``price`` remains a legacy display field;
     # it is never treated as an approved floor by the V1 pricing policy.
@@ -58,27 +61,40 @@ FIELD_ALIASES = {
     "gst_inclusive": ["gst_inclusive"],
     "gst_rate":      ["gst rate", "gst_rate", "gst percent", "gst percentage", "gst %", "tax rate"],
     "stock":        ["stock", "quantity", "qty", "available", "inventory", "units", "available qty"],
+    "stock_available": ["stock_available", "stock available", "is_stock_available"],
     "image_url":    ["image", "image url", "image_url", "image link", "photo", "picture", "product image"],
     # --- Component-specific aliases (where sheet column ≠ MongoDB field) ---
     "brand":                         ["brand", "manufacturer", "make"],
     "model_name":                    ["model_name", "model name"],
-    "graphic_card":                   ["graphic_card", "graphic card", "graphics_card", "graphics card", "gpu"],
+    "graphic_card":                   ["graphic_card", "graphic card", "gpu"],
+    "graphics_card":                  ["graphics_card", "graphics card"],
     "graphic_card_space_gb":          ["graphic_card_space_gb", "graphic card space gb", "graphics_card_space_gb", "graphics card space gb", "gpu memory", "vram"],
-    "ram_gb":                        ["ram_gb", "ram", "ram gb", "memory", "memory gb"],
-    "storage_gb":                    ["storage_gb", "ssd", "storage", "storage gb", "ssd gb"],
+    "ram_gb":                        ["ram_gb", "ram gb", "memory gb"],
+    "ram":                           ["ram", "memory"],
+    "storage_gb":                    ["storage_gb", "storage gb", "ssd gb"],
+    "storage":                       ["storage", "ssd"],
     "ssd_type":                      ["ssd_type", "ssd type", "ssd_t", "sd_type", "storage type"],
     "hdd":                           ["hdd", "hard disk", "hard drive"],
     "smps":                          ["smps", "power supply", "psu"],
     "processor":                     ["processor", "cpu", "chip"],
     "processor_series":              ["processor_series", "processor series", "cpu series"],
+    "processor_brand":               ["processor_brand", "processor brand", "cpu_brand", "cpu brand"],
+    "processor_family":              ["processor_family", "processor family", "cpu family"],
+    "processor_generation":          ["processor_generation", "processor generation", "generation", "gen", "cpu gen"],
+    "processor_model_no":            ["processor_model_no", "processor model no", "cpu model no", "processor model"],
+    "processor_suffix":              ["processor_suffix", "processor suffix", "cpu suffix"],
     "motherboard_series":            ["motherboard_series", "motherboard series", "motherboard_d_series", "motherboard d series"],
     "motherboard_support":           ["motherboard_support", "motherboard support", "motherboard_processor_support", "motherboard processor support"],
     "cabinet":                       ["cabinet", "case", "chassis"],
     "category":                      ["category", "product category", "product type"],
+    "category_label":                ["category_label", "category label"],
+    "config_raw":                    ["config_raw", "raw config", "configuration", "full config"],
     "in_stock":                      ["in_stock", "in stock"],
     "cpu_cooler":                    ["cpu_cooler", "cpu cooler"],
     "series":                        ["series", "product series"],
     "warranty":                      ["warranty", "warranty period", "guarantee"],
+    "is_touch":                      ["is_touch", "is touch", "touch", "touchscreen", "touch_screen"],
+    "operating_system":              ["operating_system", "os", "windows", "operating system"],
     # --- Case / Cabinet fields ---
     "odd_bays":                      ["odd_bays", "odd bays", "optical drive bays"],
     "hdd_bays":                      ["hdd_bays", "hdd bays", "hard drive bays"],
@@ -92,9 +108,11 @@ FIELD_ALIASES = {
     "packaging_type":                ["packaging_type", "packaging type", "package type"],
     # --- Monitor fields ---
     "screen_size":                   ["screen_size", "screen size", "display size", "monitor size"],
-    "panel_type":                    ["panel_type", "panel type", "display type"],
+    "display_inches":                ["display_inches", "display inches"],
+    "panel_type":                    ["panel_type", "panel type"],
+    "display_type":                  ["display_type", "display type"],
     "resolution":                    ["resolution", "display resolution", "native resolution"],
-    "frame_rate":                    ["frame_rate", "frame rate", "refresh rate", "refresh_rate", "hz"],
+    "display_hz":                    ["display_hz", "display hz", "frame_rate", "frame rate", "refresh rate", "refresh_rate", "hz"],
     "flat_or_curved":                ["flat_or_curved", "flat or curved", "display shape", "curved"],
     "gaming_monitor":                ["gaming_monitor", "gaming monitor", "gaming"],
     "professional_monitor":          ["professional_monitor", "professional monitor", "professional"],
@@ -254,10 +272,10 @@ def _source_value_snapshot(doc: dict) -> dict:
     return {"source_valid": True, **{key: doc.get(key) for key in fields if key in doc}}
 
 
-def source_snapshot_update(doc: dict, sheet_id: str, sheet_row: int, *, authoritative: bool) -> dict:
+def source_snapshot_update(doc: dict, sheet_id: str, sheet_row: int, *, authoritative: bool, source_name: str = "google_sheet") -> dict:
     """Publish a complete source snapshot, not a patch to old price approvals."""
     normalized = {**doc, **canonical_fields(doc)}
-    identity = ObjectId()
+    identity = str(normalized.get("unique_identifier") or normalized.get("model_no") or normalized.get("sku") or ObjectId())
     values = {k: v for k, v in normalized.items() if k not in (
         "_id", "product_id", "source", "source_sheet_id", "source_sheet_ids", "created_at", "_sheet_row",
     )}
@@ -270,8 +288,8 @@ def source_snapshot_update(doc: dict, sheet_id: str, sheet_row: int, *, authorit
     values[f"source_rows.{sheet_id}"] = sheet_row
     values[f"source_values.{sheet_id}"] = _source_value_snapshot(doc)
     update = {"$set": values, "$addToSet": {"source_sheet_ids": sheet_id},
-              "$setOnInsert": {"_id": identity, "product_id": f"mongo:oid:{identity}",
-                               "source": "google_sheet", "created_at": datetime.now(timezone.utc)}}
+              "$setOnInsert": {"_id": identity, "product_id": identity,
+                               "source": source_name, "created_at": datetime.now(timezone.utc)}}
     if unset:
         update["$unset"] = unset
     return update
@@ -596,6 +614,14 @@ def transform_row(
     now = datetime.now(timezone.utc)
     doc["org_id"] = org_id
     doc["updated_at"] = now
+    doc["ingested_at"] = now
+    doc["status"] = "active"
+    
+    if "graphic_card" in doc and "graphics_card" not in doc:
+        doc["graphics_card"] = doc["graphic_card"]
+    elif "graphics_card" in doc and "graphic_card" not in doc:
+        doc["graphic_card"] = doc["graphics_card"]
+        
     if any(doc.get(field) is not None for field in _PRICE_FIELDS):
         doc["price_source_sheet_id"] = sheet_id
         doc["price_verified_at"] = now
@@ -770,6 +796,7 @@ async def sync_product_sheet(
 
     column_mapping = connection["column_mapping"]
     tab_name = connection["tab_name"]
+    sheet_name = connection.get("sheet_name", "Google Sheet")
     product_type = connection.get("product_type", "laptop")
     # Legacy single-sheet connections predate is_primary and are authoritative.
     is_primary_source = connection.get("is_primary") is not False
@@ -1036,7 +1063,7 @@ async def sync_product_sheet(
                 operations.append(
                     UpdateOne(
                         {"unique_identifier": doc["unique_identifier"], "type": doc["type"]},
-                        source_snapshot_update(doc, sheet_id, sheet_row, authoritative=is_primary_source),
+                        source_snapshot_update(doc, sheet_id, sheet_row, authoritative=is_primary_source, source_name=sheet_name),
                         upsert=True
                     )
                 )
