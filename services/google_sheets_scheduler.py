@@ -26,7 +26,7 @@ db = get_mongo_db()
 
 # Background job intervals
 CHANNEL_RENEWAL_INTERVAL_SECONDS = 30 * 60   # 30 minutes
-RECONCILIATION_INTERVAL_SECONDS = 60 * 60    # 60 minutes
+RECONCILIATION_INTERVAL_SECONDS = 5 * 60     # 5 minutes
 
 _channel_renewal_task: Optional[asyncio.Task] = None
 _reconciliation_task: Optional[asyncio.Task] = None
