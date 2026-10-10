@@ -97,7 +97,7 @@ class StockSheetWritebackTest(unittest.IsolatedAsyncioTestCase):
         self.module.httpx.AsyncClient = lambda: client
         result = await self.module._write_product_sheet_values("org", product, {"approved_floor_price": 90, "_minimum_change_id": "c"}, self.connection)
         self.assertEqual(result["row_number"], 2)
-        self.assertEqual(result["product_document"]["unique_identifier"], "A-1")
+        self.assertEqual(result["product_document"]["unique_identifier"], "A1")
         self.assertEqual(client.rows[1][3], 80)
         for index, value in [(4, 12), (5, True), (6, 70)]:
             changed = row.copy()
